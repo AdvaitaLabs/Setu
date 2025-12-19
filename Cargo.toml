@@ -1,6 +1,6 @@
 [workspace]
 
-members = ["netcore"]
+members = ["netcore", "setu-validator"]
 
 [workspace.package]
 version = "0.1.0"
