@@ -1,6 +1,0 @@
-[package]
-name = "netcore"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
