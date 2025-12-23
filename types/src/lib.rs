@@ -17,7 +17,7 @@ pub mod sbt_view;    // New: SBT aggregated view
 
 // Export commonly used types
 pub use event::{Event, EventId, EventStatus, EventType, Transfer};
-pub use consensus::{Anchor, AnchorId, ConsensusFrame, CFId, CFStatus};
+pub use consensus::{Anchor, AnchorId, ConsensusFrame, CFId, CFStatus, Vote, ConsensusConfig};
 pub use node::*;
 
 // Re-export VLC types from setu-vlc

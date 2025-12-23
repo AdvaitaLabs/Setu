@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 # Internal dependencies
 setu-types = { path = "../types" }
-setu-netcore = { path = "../netcore" }
+
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
