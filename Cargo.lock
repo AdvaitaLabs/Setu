@@ -1991,9 +1991,11 @@ dependencies = [
  "setu-core",
  "setu-types",
  "setu-vlc",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
