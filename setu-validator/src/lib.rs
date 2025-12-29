@@ -11,7 +11,7 @@ mod dag;
 mod sampling;
 
 pub use verifier::Verifier;
-pub use dag::{DagManager, DagNode, DagStats};
+pub use dag::{DagManager, DagManagerError, DagNode, DagStats};
 pub use sampling::{SamplingVerifier, SamplingConfig, SamplingStats};
 
 use setu_core::{NodeConfig, ShardManager};
@@ -113,8 +113,8 @@ impl Validator {
                         "Event verified successfully"
                     );
                     
-                    // Add to DAG
-                    if let Err(e) = self.add_to_dag(event.clone()).await {
+                    // Add to DAG (synchronous operation)
+                    if let Err(e) = self.add_to_dag(event.clone()) {
                         error!(
                             event_id = %event.id,
                             error = %e,
@@ -287,14 +287,16 @@ impl Validator {
     }
     
     /// Add event to DAG
-    async fn add_to_dag(&mut self, event: Event) -> Result<(), ValidationError> {
+    fn add_to_dag(&mut self, event: Event) -> Result<(), ValidationError> {
         debug!(
             event_id = %event.id,
             "Adding event to DAG"
         );
         
-        self.dag_manager.add_event(event).await
-            .map_err(|e| ValidationError::InvalidCreator(
+        // Use idempotent version to handle duplicate events gracefully
+        self.dag_manager.add_event_idempotent(event)
+            .map(|_| ())
+            .map_err(|e| ValidationError::MissingParent(
                 format!("Failed to add to DAG: {}", e)
             ))
     }

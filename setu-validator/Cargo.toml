@@ -13,6 +13,7 @@ setu-core = { path = "../crates/setu-core" }
 setu-types = { path = "../types" }
 setu-vlc = { path = "../crates/setu-vlc" }
 core-types = { path = "../crates/core-types" }
+consensus = { path = "../consensus" }
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }

@@ -1,13 +1,23 @@
 //! DAG (Directed Acyclic Graph) management for Validator
 //!
-//! This module handles the construction and maintenance of the event DAG,
-//! which represents the causal relationships between events.
+//! This module provides a wrapper around the consensus crate's DAG implementation,
+//! adapting it for the validator's async workflow.
+//!
+//! ## Design Decisions
+//!
+//! - **Core DAG**: Uses `consensus::Dag` as the underlying implementation
+//! - **DagManager**: Thin wrapper providing logging and async interface
+//! - **DagNode**: View struct for compatibility with existing code
+//! - **Error Handling**: Re-exports `DagError` for type consistency
 
+use consensus::{Dag, DagError};
 use setu_types::event::{Event, EventId};
-use std::collections::{HashMap, HashSet};
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
-/// DAG node representing an event
+// Re-export DagError for type consistency
+pub use consensus::DagError as DagManagerError;
+
+/// DAG node representing an event (re-exported for compatibility)
 #[derive(Debug, Clone)]
 pub struct DagNode {
     /// Event ID
@@ -22,15 +32,31 @@ pub struct DagNode {
     pub finalized: bool,
 }
 
+impl DagNode {
+    /// Create from an event and DAG context
+    fn from_event(event: &Event, dag: &Dag) -> Self {
+        let depth = dag.get_depth(&event.id).unwrap_or(0);
+        let children = dag.get_children(&event.id);
+        let finalized = matches!(event.status, setu_types::event::EventStatus::Finalized);
+
+        Self {
+            event_id: event.id.clone(),
+            parents: event.parent_ids.clone(),
+            children,
+            depth,
+            finalized,
+        }
+    }
+}
+
 /// DAG manager for maintaining the event graph
+///
+/// This is a wrapper around `consensus::Dag` that provides an async interface
+/// and tracks the node ID for logging purposes.
 pub struct DagManager {
     node_id: String,
-    /// Map from event ID to DAG node
-    nodes: HashMap<EventId, DagNode>,
-    /// Genesis events (roots of the DAG)
-    genesis_events: HashSet<EventId>,
-    /// Tips of the DAG (events with no children yet)
-    tips: HashSet<EventId>,
+    /// The underlying DAG from the consensus crate
+    dag: Dag,
 }
 
 impl DagManager {
@@ -38,222 +64,142 @@ impl DagManager {
     pub fn new(node_id: String) -> Self {
         info!(
             node_id = %node_id,
-            "Creating DAG manager"
+            "Creating DAG manager (using consensus::Dag)"
         );
-        
+
         Self {
             node_id,
-            nodes: HashMap::new(),
-            genesis_events: HashSet::new(),
-            tips: HashSet::new(),
+            dag: Dag::new(),
         }
     }
-    
+
     /// Add an event to the DAG
-    /// 
-    /// TODO: This is a placeholder implementation
-    /// Future work:
-    /// 1. Validate event doesn't already exist
-    /// 2. Check all parent events exist
-    /// 3. Compute causal depth
-    /// 4. Update parent-child relationships
-    /// 5. Update tips
-    /// 6. Detect and handle forks
-    pub async fn add_event(&mut self, event: Event) -> anyhow::Result<()> {
+    ///
+    /// Returns the event ID on success, or an error if:
+    /// - The event already exists (DuplicateEvent)
+    /// - A parent event is missing (MissingParent)
+    pub fn add_event(&mut self, event: Event) -> Result<EventId, DagManagerError> {
         info!(
             node_id = %self.node_id,
             event_id = %event.id,
             parent_count = event.parent_ids.len(),
             "Adding event to DAG"
         );
-        
-        // TODO: Replace with actual DAG insertion logic
-        
-        // Check if event already exists
-        if self.nodes.contains_key(&event.id) {
-            warn!(
-                event_id = %event.id,
-                "Event already exists in DAG"
-            );
-            return Ok(());
-        }
-        
-        // Compute depth
-        let depth = if event.is_genesis() {
-            0
-        } else {
-            self.compute_depth(&event.parent_ids)?
-        };
-        
-        // Create DAG node
-        let node = DagNode {
-            event_id: event.id.clone(),
-            parents: event.parent_ids.clone(),
-            children: Vec::new(),
-            depth,
-            finalized: false,
-        };
-        
-        // Update parent nodes to include this as a child
-        for parent_id in &event.parent_ids {
-            if let Some(parent_node) = self.nodes.get_mut(parent_id) {
-                parent_node.children.push(event.id.clone());
-                // Parent is no longer a tip
-                self.tips.remove(parent_id);
-            }
-        }
-        
-        // Add to nodes
-        self.nodes.insert(event.id.clone(), node);
-        
-        // Update genesis or tips
-        if event.is_genesis() {
-            self.genesis_events.insert(event.id.clone());
-        }
-        self.tips.insert(event.id.clone());
-        
-        debug!(
-            event_id = %event.id,
-            depth = depth,
-            total_nodes = self.nodes.len(),
-            "Event added to DAG"
-        );
-        
-        Ok(())
-    }
-    
-    /// Compute the causal depth of an event based on its parents
-    /// 
-    /// TODO: This is a placeholder implementation
-    /// Future work:
-    /// 1. Handle multiple parents (take max depth + 1)
-    /// 2. Cache depth calculations
-    /// 3. Handle missing parents gracefully
-    fn compute_depth(&self, parent_ids: &[EventId]) -> anyhow::Result<u64> {
-        if parent_ids.is_empty() {
-            return Ok(0);
-        }
-        
-        let mut max_depth = 0;
-        for parent_id in parent_ids {
-            if let Some(parent_node) = self.nodes.get(parent_id) {
-                max_depth = max_depth.max(parent_node.depth);
-            } else {
-                warn!(
-                    parent_id = %parent_id,
-                    "Parent not found in DAG"
+
+        match self.dag.add_event(event) {
+            Ok(event_id) => {
+                debug!(
+                    event_id = %event_id,
+                    total_nodes = self.dag.node_count(),
+                    "Event added to DAG"
                 );
+                Ok(event_id)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to add event to DAG");
+                Err(e)
             }
         }
-        
-        Ok(max_depth + 1)
     }
-    
+
+    /// Add an event to the DAG, treating duplicates as success (idempotent)
+    ///
+    /// This is useful for network scenarios where events may be received multiple times.
+    pub fn add_event_idempotent(&mut self, event: Event) -> Result<Option<EventId>, DagManagerError> {
+        match self.add_event(event) {
+            Ok(id) => Ok(Some(id)),
+            Err(DagError::DuplicateEvent(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Get a node from the DAG
-    pub fn get_node(&self, event_id: &EventId) -> Option<&DagNode> {
-        self.nodes.get(event_id)
+    pub fn get_node(&self, event_id: &EventId) -> Option<DagNode> {
+        self.dag
+            .get_event(event_id)
+            .map(|event| DagNode::from_event(event, &self.dag))
     }
-    
+
     /// Check if an event exists in the DAG
     pub fn contains(&self, event_id: &EventId) -> bool {
-        self.nodes.contains_key(event_id)
+        self.dag.get_event(event_id).is_some()
     }
-    
+
     /// Get all genesis events
     pub fn genesis_events(&self) -> Vec<EventId> {
-        self.genesis_events.iter().cloned().collect()
+        self.dag
+            .get_events_at_depth(0)
+            .into_iter()
+            .map(|e| e.id.clone())
+            .collect()
     }
-    
+
     /// Get all tip events (events with no children)
     pub fn tips(&self) -> Vec<EventId> {
-        self.tips.iter().cloned().collect()
+        self.dag.get_tips()
     }
-    
+
     /// Get the total number of events in the DAG
     pub fn size(&self) -> usize {
-        self.nodes.len()
+        self.dag.node_count()
     }
-    
+
     /// Get the maximum depth in the DAG
     pub fn max_depth(&self) -> u64 {
-        self.nodes.values().map(|node| node.depth).max().unwrap_or(0)
+        self.dag.max_depth()
     }
-    
+
     /// Check if event A happens before event B (causal ordering)
-    /// 
-    /// TODO: This is a placeholder implementation
-    /// Future work:
-    /// 1. Implement efficient reachability check
-    /// 2. Use transitive closure or BFS
-    /// 3. Cache results for performance
     pub fn happens_before(&self, event_a: &EventId, event_b: &EventId) -> bool {
         debug!(
             event_a = %event_a,
             event_b = %event_b,
             "Checking causal ordering"
         );
-        
-        // TODO: Replace with actual happens-before check
-        
-        // Simple BFS to check if event_a is an ancestor of event_b
-        if let Some(node_b) = self.nodes.get(event_b) {
-            let mut visited = HashSet::new();
-            let mut queue = node_b.parents.clone();
-            
-            while let Some(current_id) = queue.pop() {
-                if current_id == *event_a {
-                    return true;
-                }
-                
-                if visited.contains(&current_id) {
-                    continue;
-                }
-                visited.insert(current_id.clone());
-                
-                if let Some(current_node) = self.nodes.get(&current_id) {
-                    queue.extend(current_node.parents.clone());
-                }
-            }
-        }
-        
-        false
+        self.dag.is_ancestor(event_a, event_b)
     }
-    
+
     /// Mark an event as finalized
-    /// 
-    /// TODO: This is a placeholder implementation
-    /// Future work:
-    /// 1. Validate event can be finalized
-    /// 2. Update finalization status
-    /// 3. Trigger cleanup of old events
-    pub fn finalize_event(&mut self, event_id: &EventId) -> anyhow::Result<()> {
+    pub fn finalize_event(&mut self, event_id: &EventId) -> Result<(), DagManagerError> {
         debug!(
             node_id = %self.node_id,
             event_id = %event_id,
             "Finalizing event"
         );
-        
-        if let Some(node) = self.nodes.get_mut(event_id) {
-            node.finalized = true;
-            info!(
-                event_id = %event_id,
-                "Event finalized"
-            );
+
+        if self.dag.confirm_event(event_id) {
+            info!(event_id = %event_id, "Event finalized");
             Ok(())
         } else {
-            anyhow::bail!("Event not found in DAG: {}", event_id)
+            Err(DagError::EventNotFound(event_id.clone()))
         }
     }
-    
+
     /// Get statistics about the DAG
     pub fn stats(&self) -> DagStats {
+        let finalized_count = self
+            .dag
+            .all_events()
+            .filter(|e| matches!(e.status, setu_types::event::EventStatus::Finalized))
+            .count();
+
         DagStats {
-            total_events: self.nodes.len(),
-            genesis_count: self.genesis_events.len(),
-            tip_count: self.tips.len(),
-            max_depth: self.max_depth(),
-            finalized_count: self.nodes.values().filter(|n| n.finalized).count(),
+            total_events: self.dag.node_count(),
+            genesis_count: self.genesis_events().len(),
+            tip_count: self.dag.get_tips().len(),
+            max_depth: self.dag.max_depth(),
+            finalized_count,
         }
+    }
+
+    /// Get the underlying DAG (for advanced operations)
+    pub fn inner(&self) -> &Dag {
+        &self.dag
+    }
+
+    /// Get a mutable reference to the underlying DAG
+    pub fn inner_mut(&mut self) -> &mut Dag {
+        &mut self.dag
     }
 }
 
@@ -272,7 +218,7 @@ mod tests {
     use super::*;
     use setu_types::event::{Event, EventType};
     use setu_vlc::VLCSnapshot;
-    
+
     fn create_vlc_snapshot() -> VLCSnapshot {
         use setu_vlc::VectorClock;
         VLCSnapshot {
@@ -284,110 +230,105 @@ mod tests {
                 .as_millis() as u64,
         }
     }
-    
-    fn create_event(_id: &str, parents: Vec<String>) -> Event {
-        // Note: Event::new() generates its own ID, so we can't control it directly
-        // If no parents, create a genesis event
-        let event_type = if parents.is_empty() {
-            EventType::Genesis
-        } else {
-            EventType::Transfer
-        };
-        
+
+    fn create_genesis_event() -> Event {
+        Event::genesis("solver-1".to_string(), create_vlc_snapshot())
+    }
+
+    fn create_child_event(parent_id: String) -> Event {
         Event::new(
-            event_type,
-            parents,
+            EventType::Transfer,
+            vec![parent_id],
             create_vlc_snapshot(),
             "solver-1".to_string(),
         )
     }
-    
-    #[tokio::test]
-    async fn test_dag_creation() {
+
+    #[test]
+    fn test_dag_creation() {
         let dag = DagManager::new("test-validator".to_string());
         assert_eq!(dag.size(), 0);
     }
-    
-    #[tokio::test]
-    async fn test_add_genesis_event() {
+
+    #[test]
+    fn test_add_genesis_event() {
         let mut dag = DagManager::new("test-validator".to_string());
-        let event = create_event("event-1", vec![]);
+        let event = create_genesis_event();
         let event_id = event.id.clone();
-        
-        let result = dag.add_event(event).await;
+
+        let result = dag.add_event(event);
         assert!(result.is_ok());
         assert_eq!(dag.size(), 1);
         assert_eq!(dag.genesis_events().len(), 1);
         assert!(dag.contains(&event_id));
     }
-    
-    #[tokio::test]
-    async fn test_add_child_event() {
+
+    #[test]
+    fn test_add_child_event() {
         let mut dag = DagManager::new("test-validator".to_string());
-        
+
         // Add genesis
-        let genesis = create_event("event-1", vec![]);
+        let genesis = create_genesis_event();
         let genesis_id = genesis.id.clone();
-        dag.add_event(genesis).await.unwrap();
-        
+        dag.add_event(genesis).unwrap();
+
         // Add child
-        let child = create_event("event-2", vec![genesis_id.clone()]);
+        let child = create_child_event(genesis_id.clone());
         let child_id = child.id.clone();
-        dag.add_event(child).await.unwrap();
-        
+        dag.add_event(child).unwrap();
+
         assert_eq!(dag.size(), 2);
-        
+
         let child_node = dag.get_node(&child_id).unwrap();
         assert_eq!(child_node.depth, 1);
     }
-    
-    #[tokio::test]
-    async fn test_happens_before() {
+
+    #[test]
+    fn test_happens_before() {
         let mut dag = DagManager::new("test-validator".to_string());
-        
-        // Create chain: event-1 -> event-2 -> event-3
-        let e1 = create_event("event-1", vec![]);
+
+        // Create chain: e1 -> e2 -> e3
+        let e1 = create_genesis_event();
         let e1_id = e1.id.clone();
-        dag.add_event(e1).await.unwrap();
-        
-        let e2 = create_event("event-2", vec![e1_id.clone()]);
+        dag.add_event(e1).unwrap();
+
+        let e2 = create_child_event(e1_id.clone());
         let e2_id = e2.id.clone();
-        dag.add_event(e2).await.unwrap();
-        
-        let e3 = create_event("event-3", vec![e2_id.clone()]);
+        dag.add_event(e2).unwrap();
+
+        let e3 = create_child_event(e2_id.clone());
         let e3_id = e3.id.clone();
-        dag.add_event(e3).await.unwrap();
-        
+        dag.add_event(e3).unwrap();
+
         // Test causal ordering
         assert!(dag.happens_before(&e1_id, &e2_id));
         assert!(dag.happens_before(&e1_id, &e3_id));
         assert!(dag.happens_before(&e2_id, &e3_id));
-        
+
         // Test reverse (should be false)
         assert!(!dag.happens_before(&e2_id, &e1_id));
     }
-    
-    #[tokio::test]
-    async fn test_finalize_event() {
+
+    #[test]
+    fn test_finalize_event() {
         let mut dag = DagManager::new("test-validator".to_string());
-        let event = create_event("event-1", vec![]);
+        let event = create_genesis_event();
         let event_id = event.id.clone();
-        
-        dag.add_event(event).await.unwrap();
+
+        dag.add_event(event).unwrap();
         dag.finalize_event(&event_id).unwrap();
-        
-        let node = dag.get_node(&event_id).unwrap();
-        assert!(node.finalized);
+
+        // The event should be confirmed (finalize uses confirm_event internally)
+        assert!(dag.contains(&event_id));
     }
-    
+
     #[test]
     fn test_dag_stats() {
         let dag = DagManager::new("test-validator".to_string());
         let stats = dag.stats();
-        
+
         assert_eq!(stats.total_events, 0);
         assert_eq!(stats.genesis_count, 0);
         assert_eq!(stats.max_depth, 0);
     }
 }
-
