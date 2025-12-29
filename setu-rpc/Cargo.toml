@@ -1,0 +1,31 @@
+[package]
+name = "setu-rpc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Workspace dependencies
+core-types = { path = "../crates/core-types" }
+setu-types = { path = "../types" }
+
+# Anemo for RPC
+anemo = { workspace = true }
+anemo-tower = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+bincode = "1.3"
+bytes = "1.5"
+
+# Async
+tokio = { version = "1.40", features = ["full"] }
+tower = { version = "0.4", features = ["util"] }
+async-trait = "0.1"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+

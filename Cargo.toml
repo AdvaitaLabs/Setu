@@ -11,6 +11,7 @@ members = [
     "setu-validator",
     "setu-solver",       # Solver node
     "setu-router",       # Router node
+    "setu-rpc",          # RPC layer
 ]
 resolver = "2"
 
