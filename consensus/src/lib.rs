@@ -1,14 +1,57 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+// Copyright (c) Hetu Project
+// SPDX-License-Identifier: Apache-2.0
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+//! Setu Consensus Module
+//!
+//! This module implements the consensus mechanism for the Setu network.
+//! It includes:
+//! - DAG-based consensus with ConsensusFrames (CF)
+//! - VLC-based leader rotation
+//! - Leader election strategies (rotating, reputation-based)
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────┐
+//! │                     ConsensusEngine                          │
+//! │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+//! │  │     DAG      │  │     VLC      │  │ ValidatorSet │      │
+//! │  └──────────────┘  └──────────────┘  └──────┬───────┘      │
+//! │                                              │               │
+//! │                                    ┌─────────▼─────────┐    │
+//! │                                    │  ProposerElection │    │
+//! │                                    │  (RotatingProposer│    │
+//! │                                    │   or Reputation)  │    │
+//! │                                    └───────────────────┘    │
+//! │  ┌──────────────────────────────────────────────────┐      │
+//! │  │              ConsensusManager (Folder)            │      │
+//! │  │  - Creates CFs when VLC delta reaches threshold   │      │
+//! │  │  - Manages voting and finalization               │      │
+//! │  └──────────────────────────────────────────────────┘      │
+//! └─────────────────────────────────────────────────────────────┘
+//! ```
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod dag;
+pub mod engine;
+pub mod folder;
+pub mod liveness;
+pub mod validator_set;
+pub mod vlc;
+
+// Re-export main types
+pub use dag::Dag;
+pub use engine::{ConsensusEngine, ConsensusMessage, DagStats};
+pub use folder::{ConsensusManager, DagFolder};
+pub use validator_set::{ElectionStrategy, ValidatorSet};
+pub use vlc::VLC;
+
+// Re-export liveness types
+pub use liveness::{
+    choose_index, choose_leader, create_default_election,
+    create_election_with_contiguous_rounds, create_reputation_election,
+    ConsensusFrameAggregation, ConsensusFrameMetadata, InMemoryMetadataBackend,
+    LeaderReputation, MetadataBackend, ProposerAndVoterHeuristic, ProposerElection,
+    ReputationConfig, ReputationHeuristic, RotatingProposer, Round, ValidatorId,
+    VotingPower, VotingPowerRatio,
+};
+
