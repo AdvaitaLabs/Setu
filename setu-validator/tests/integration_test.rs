@@ -60,6 +60,8 @@ async fn test_validator_receives_and_verifies_event() {
         transfer_type: TransferType::FluxTransfer,
         power: 0,
         resources: vec![],
+        preferred_solver: None,
+        shard_id: None,
     };
 
     transfer_tx.send(transfer).unwrap();
@@ -124,6 +126,8 @@ async fn test_validator_verifies_multiple_events() {
             transfer_type: TransferType::FluxTransfer,
             power: 0,
             resources: vec![],
+            preferred_solver: None,
+            shard_id: None,
         };
         transfer_tx.send(transfer).unwrap();
     }

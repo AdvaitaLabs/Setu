@@ -42,6 +42,8 @@ fn create_test_transfer(id: &str, from: &str, to: &str, amount: u64) -> Transfer
         resources: vec![],
         vlc: Vlc::new(),
         power: 0,
+        preferred_solver: None,
+        shard_id: None,
     }
 }
 

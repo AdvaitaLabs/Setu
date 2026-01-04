@@ -1,6 +1,6 @@
 //! Integration tests for Router
 
-use setu_router::{Router, RouterConfig, LoadBalancingStrategy};
+use setu_router::{Router, RouterConfig, LoadBalancingStrategy, RoutingStrategy};
 use core_types::{Transfer, TransferType, Vlc};
 use tokio::sync::mpsc;
 use std::sync::Arc;
@@ -19,6 +19,8 @@ fn create_test_transfer(id: &str, from: &str, to: &str, amount: i128) -> Transfe
         resources: vec![from.to_string()],
         vlc,
         power: 10,
+        preferred_solver: None,
+        shard_id: None,
     }
 }
 
@@ -32,6 +34,7 @@ async fn test_router_basic_routing() {
         load_balancing_strategy: LoadBalancingStrategy::RoundRobin,
         quick_check_timeout_ms: 100,
         enable_resource_routing: false,
+        routing_strategy: RoutingStrategy::LoadBalanceOnly,
     };
     
     let router = Router::new(config, transfer_rx);
@@ -78,6 +81,7 @@ async fn test_router_round_robin() {
         load_balancing_strategy: LoadBalancingStrategy::RoundRobin,
         quick_check_timeout_ms: 100,
         enable_resource_routing: false,
+        routing_strategy: RoutingStrategy::LoadBalanceOnly,
     };
     
     let router = Router::new(config, transfer_rx);
@@ -169,6 +173,7 @@ async fn test_router_resource_affinity() {
         load_balancing_strategy: LoadBalancingStrategy::RoundRobin,
         quick_check_timeout_ms: 100,
         enable_resource_routing: true,
+        routing_strategy: RoutingStrategy::ResourceAffinityFirst,
     };
     
     let router = Router::new(config, transfer_rx);
