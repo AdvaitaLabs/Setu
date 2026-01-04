@@ -3,10 +3,12 @@ members = [
     "types",
     "storage",                # RocksDB-based object storage
     "crates/setu-vlc",        # VLC Hybrid Logical Clock Library
+    "crates/setu-merkle",     # Merkle tree implementations (Binary + Sparse)
     "crates/core-types",
     "crates/setu-core",       # Shared core library
     "crates/setu-keys",       # Cryptographic key management
     "crates/setu-network-anemo", # Anemo-based P2P network (production)
+    "crates/setu-router",     # Transaction routing module
     "consensus",
     "setu-validator",
     "setu-solver",       # Solver node

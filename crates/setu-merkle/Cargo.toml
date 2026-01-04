@@ -1,0 +1,23 @@
+[package]
+name = "setu-merkle"
+version.workspace = true
+edition.workspace = true
+description = "Merkle tree implementations for Setu: Sparse Merkle Tree for object state and Binary Merkle Tree for event commitments"
+license = "Apache-2.0"
+
+[dependencies]
+# Serialization
+serde = { workspace = true }
+bincode = "2.0.0-rc.3"
+
+# Cryptography
+sha2 = "0.10"
+blake2 = "0.10"
+
+# Utilities
+thiserror = "1.0"
+hex = "0.4"
+lazy_static = "1.4"
+
+[dev-dependencies]
+rand = "0.8"
