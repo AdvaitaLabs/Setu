@@ -60,6 +60,8 @@ async fn main() -> anyhow::Result<()> {
             resources: vec!["alice".to_string(), "bob".to_string()],
             vlc,
             power: 10,
+            preferred_solver: None,
+            shard_id: None,
         };
         
         transfer_tx.send(transfer)?;

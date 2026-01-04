@@ -199,6 +199,8 @@ mod tests {
             resources: vec![],
             vlc: Vlc::new(),
             power: 0,
+            preferred_solver: None,
+            shard_id: None,
         }
     }
     

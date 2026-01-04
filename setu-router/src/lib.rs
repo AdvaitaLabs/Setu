@@ -313,20 +313,22 @@ impl Router {
             RoutingStrategy::ManualFirst => {
                 // Priority 1: Manual solver selection
                 if let Some(solver_id) = &transfer.preferred_solver {
-                    if self.solver_registry.is_available(solver_id) {
-                        debug!(
-                            transfer_id = %transfer.id,
-                            solver_id = %solver_id,
-                            "Using manually specified solver"
-                        );
-                        return Ok(solver_id.clone());
-                    } else {
-                        warn!(
-                            transfer_id = %transfer.id,
-                            solver_id = %solver_id,
-                            "Preferred solver not available, falling back"
-                        );
+                    // Check if solver is available
+                    if let Some(solver_info) = self.solver_registry.get(solver_id) {
+                        if solver_info.is_available() {
+                            debug!(
+                                transfer_id = %transfer.id,
+                                solver_id = %solver_id,
+                                "Using manually specified solver"
+                            );
+                            return Ok(solver_id.clone());
+                        }
                     }
+                    warn!(
+                        transfer_id = %transfer.id,
+                        solver_id = %solver_id,
+                        "Preferred solver not available, falling back"
+                    );
                 }
                 
                 // Priority 2: Shard-based routing
