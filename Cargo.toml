@@ -10,11 +10,10 @@ members = [
     "crates/setu-network-anemo", # Anemo-based P2P network (production)
     "crates/setu-router-core", # Core routing strategies
     "consensus",
-    "setu-validator",
-    "setu-solver",       # Solver node
-    "setu-router",       # Router node (uses setu-router-core)
-    "setu-rpc",          # RPC layer
-    "setu-cli",          # CLI tool
+    "setu-validator",         # Validator node (with embedded router)
+    "setu-solver",            # Solver node
+    "setu-rpc",               # RPC layer
+    "setu-cli",               # CLI tool
 ]
 resolver = "2"
 
