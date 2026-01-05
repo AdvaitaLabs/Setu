@@ -3,6 +3,7 @@ pub mod event;
 pub mod consensus;
 pub mod node;
 pub mod object;
+pub mod subnet;          // Subnet (sub-application) types
 
 // ========== Object Model ==========
 pub mod coin;           // Coin object (transferable asset)
@@ -36,6 +37,9 @@ pub use relation::{
     RelationGraph, RelationGraphData, Relation,
     create_social_graph, create_professional_graph,
 };
+
+// Subnet related
+pub use subnet::{SubnetId, SubnetConfig, UserSubnetMembership, CrossSubnetContext};
 
 // Aggregated views
 pub use account_view::AccountView;

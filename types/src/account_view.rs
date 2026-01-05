@@ -5,6 +5,9 @@
 //! - Aggregates all resources owned by an Address
 //! - Address is the root of ownership (no SBT intermediate layer)
 //! - Provides convenient query interfaces and computed fields
+//!
+//! Note: Subnet membership is stored independently in `UserSubnetMembership`.
+//! Query subnet info separately via the subnet module.
 
 use serde::{Deserialize, Serialize};
 use crate::{
@@ -21,6 +24,8 @@ use crate::{
 /// - Credentials (verifiable attestations)
 /// - Coins (assets)
 /// - RelationGraphs (social relationships)
+///
+/// Note: For subnet membership, query `UserSubnetMembership` separately.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountView {
     /// Owner address (root of ownership)
@@ -235,6 +240,7 @@ impl AccountView {
             .map(|r| r.target_sbt.clone())
             .collect()
     }
+    
 }
 
 // ============================================================================
