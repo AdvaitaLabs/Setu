@@ -1,6 +1,7 @@
 //! Setu Validator - Verification and coordination node
 //!
 //! The validator is responsible for:
+//! - Receiving transfers from relay and routing to solvers
 //! - Receiving events from solvers
 //! - Verifying event validity
 //! - Maintaining the global Foldgraph
@@ -9,11 +10,14 @@
 mod verifier;
 mod dag;
 mod sampling;
+mod router_manager;
 
 pub use verifier::Verifier;
 pub use dag::{DagManager, DagManagerError, DagNode, DagStats};
 pub use sampling::{SamplingVerifier, SamplingConfig, SamplingStats};
+pub use router_manager::{RouterManager, RouterError, SolverConnection};
 
+use core_types::Transfer;
 use setu_core::{NodeConfig, ShardManager};
 use setu_types::event::Event;
 use std::collections::HashMap;
@@ -47,6 +51,9 @@ pub enum ValidationError {
 pub struct Validator {
     config: NodeConfig,
     shard_manager: Arc<ShardManager>,
+    /// Receives transfers from relay/clients
+    transfer_rx: Option<mpsc::UnboundedReceiver<Transfer>>,
+    /// Receives events from solvers
     event_rx: mpsc::UnboundedReceiver<Event>,
     /// Store of verified events (event_id -> event)
     verified_events: HashMap<String, Event>,
@@ -56,6 +63,8 @@ pub struct Validator {
     dag_manager: DagManager,
     /// Sampling verifier for probabilistic verification
     sampling_verifier: SamplingVerifier,
+    /// Router manager for routing transfers to solvers
+    router_manager: RouterManager,
 }
 
 impl Validator {
@@ -76,16 +85,88 @@ impl Validator {
             config.node_id.clone(),
             SamplingConfig::default(),
         );
+        let router_manager = RouterManager::new();
         
         Self {
             config,
             shard_manager,
+            transfer_rx: None,
             event_rx,
             verified_events: HashMap::new(),
             verifier,
             dag_manager,
             sampling_verifier,
+            router_manager,
         }
+    }
+    
+    /// Create a new validator with both transfer and event receivers
+    pub fn with_transfer_rx(
+        config: NodeConfig,
+        transfer_rx: mpsc::UnboundedReceiver<Transfer>,
+        event_rx: mpsc::UnboundedReceiver<Event>,
+    ) -> Self {
+        info!(
+            node_id = %config.node_id,
+            "Creating validator node with transfer routing"
+        );
+        
+        let shard_manager = Arc::new(ShardManager::new());
+        let verifier = Verifier::new(config.node_id.clone());
+        let dag_manager = DagManager::new(config.node_id.clone());
+        let sampling_verifier = SamplingVerifier::new(
+            config.node_id.clone(),
+            SamplingConfig::default(),
+        );
+        let router_manager = RouterManager::new();
+        
+        Self {
+            config,
+            shard_manager,
+            transfer_rx: Some(transfer_rx),
+            event_rx,
+            verified_events: HashMap::new(),
+            verifier,
+            dag_manager,
+            sampling_verifier,
+            router_manager,
+        }
+    }
+    
+    /// Register a solver with the router
+    pub fn register_solver(
+        &self,
+        solver_id: String,
+        address: String,
+        capacity: u32,
+        channel: mpsc::UnboundedSender<Transfer>,
+    ) {
+        self.router_manager.register_solver(solver_id, address, capacity, channel);
+    }
+    
+    /// Register a solver with shard and resource affinity
+    pub fn register_solver_with_affinity(
+        &self,
+        solver_id: String,
+        address: String,
+        capacity: u32,
+        channel: mpsc::UnboundedSender<Transfer>,
+        shard_id: Option<String>,
+        resources: Vec<String>,
+    ) {
+        self.router_manager.register_solver_with_affinity(
+            solver_id, address, capacity, channel, shard_id, resources
+        );
+    }
+    
+    /// Unregister a solver
+    pub fn unregister_solver(&self, solver_id: &str) {
+        self.router_manager.unregister_solver(solver_id);
+    }
+    
+    /// Get router manager reference
+    pub fn router(&self) -> &RouterManager {
+        &self.router_manager
     }
     
     /// Run the validator
@@ -93,56 +174,104 @@ impl Validator {
         info!(
             node_id = %self.config.node_id,
             port = self.config.network.port,
-            "Validator started, waiting for events..."
+            "Validator started, waiting for transfers and events..."
         );
         
-        // Main loop: receive and verify events
-        while let Some(event) = self.event_rx.recv().await {
-            info!(
-                event_id = %event.id,
-                creator = %event.creator,
-                event_type = ?event.event_type,
-                "Received event"
-            );
-            
-            // Verify the event (comprehensive verification)
-            match self.verify_event_comprehensive(&event).await {
-                Ok(()) => {
-                    info!(
-                        event_id = %event.id,
-                        "Event verified successfully"
-                    );
-                    
-                    // Add to DAG (synchronous operation)
-                    if let Err(e) = self.add_to_dag(event.clone()) {
-                        error!(
-                            event_id = %event.id,
-                            error = %e,
-                            "Failed to add event to DAG"
+        // Check if we have transfer routing enabled
+        if let Some(mut transfer_rx) = self.transfer_rx.take() {
+            // Run with both transfer and event handling
+            loop {
+                tokio::select! {
+                    // Handle incoming transfers (route to solvers)
+                    Some(transfer) = transfer_rx.recv() => {
+                        info!(
+                            transfer_id = %transfer.id,
+                            from = %transfer.from,
+                            to = %transfer.to,
+                            amount = %transfer.amount,
+                            "Received transfer, routing to solver"
                         );
-                        continue;
+                        
+                        match self.router_manager.route_and_send(transfer.clone()).await {
+                            Ok(solver_id) => {
+                                info!(
+                                    transfer_id = %transfer.id,
+                                    solver_id = %solver_id,
+                                    "Transfer routed successfully"
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    transfer_id = %transfer.id,
+                                    error = %e,
+                                    "Failed to route transfer"
+                                );
+                            }
+                        }
                     }
                     
-                    // Store the verified event
-                    self.verified_events.insert(event.id.clone(), event);
+                    // Handle incoming events (verify and add to DAG)
+                    Some(event) = self.event_rx.recv() => {
+                        self.handle_event(event).await;
+                    }
                     
-                    info!(
-                        total_verified = self.verified_events.len(),
-                        dag_size = self.dag_manager.size(),
-                        "Event added to verified store and DAG"
-                    );
+                    else => break,
                 }
-                Err(e) => {
-                    warn!(
-                        event_id = %event.id,
-                        error = %e,
-                        "Event verification failed"
-                    );
-                }
+            }
+        } else {
+            // Run with event handling only (legacy mode)
+            while let Some(event) = self.event_rx.recv().await {
+                self.handle_event(event).await;
             }
         }
         
         info!("Validator stopped");
+    }
+    
+    /// Handle an incoming event
+    async fn handle_event(&mut self, event: Event) {
+        info!(
+            event_id = %event.id,
+            creator = %event.creator,
+            event_type = ?event.event_type,
+            "Received event"
+        );
+        
+        // Verify the event (comprehensive verification)
+        match self.verify_event_comprehensive(&event).await {
+            Ok(()) => {
+                info!(
+                    event_id = %event.id,
+                    "Event verified successfully"
+                );
+                
+                // Add to DAG (synchronous operation)
+                if let Err(e) = self.add_to_dag(event.clone()) {
+                    error!(
+                        event_id = %event.id,
+                        error = %e,
+                        "Failed to add event to DAG"
+                    );
+                    return;
+                }
+                
+                // Store the verified event
+                self.verified_events.insert(event.id.clone(), event);
+                
+                info!(
+                    total_verified = self.verified_events.len(),
+                    dag_size = self.dag_manager.size(),
+                    "Event added to verified store and DAG"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    event_id = %event.id,
+                    error = %e,
+                    "Event verification failed"
+                );
+            }
+        }
     }
     
     /// Verify an event (legacy method, kept for compatibility)
