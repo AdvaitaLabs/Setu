@@ -11,11 +11,7 @@ mod config;
 mod client;
 
 use clap::{Parser, Subcommand};
-use colored::Colorize;
 use tracing::Level;
-
-// Add uuid dependency
-use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(name = "setu")]
