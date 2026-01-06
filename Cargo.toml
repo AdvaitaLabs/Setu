@@ -9,6 +9,7 @@ members = [
     "crates/setu-keys",       # Cryptographic key management
     "crates/setu-network-anemo", # Anemo-based P2P network (production)
     "crates/setu-router-core", # Core routing strategies
+    "crates/setu-runtime",    # Simple runtime executor (pre-Move VM)
     "consensus",
     "setu-validator",         # Validator node (with embedded router)
     "setu-solver",            # Solver node
