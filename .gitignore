@@ -26,3 +26,8 @@ target
 /target
 /tests
 /Cargo.lock
+*.lock
+docs
+*.md
+examples
+tests
