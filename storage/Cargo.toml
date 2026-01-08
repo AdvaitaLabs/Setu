@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 setu-types = { path = "../types" }
+setu-merkle = { path = "../crates/setu-merkle" }
 serde = { workspace = true }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
