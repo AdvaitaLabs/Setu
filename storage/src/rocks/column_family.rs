@@ -14,6 +14,9 @@ pub enum ColumnFamily {
     Events,
     Anchors,
     Checkpoints,
+    // Merkle tree storage
+    MerkleNodes,
+    MerkleRoots,
 }
 
 impl ColumnFamily {
@@ -32,6 +35,8 @@ impl ColumnFamily {
             Self::Events => "events",
             Self::Anchors => "anchors",
             Self::Checkpoints => "checkpoints",
+            Self::MerkleNodes => "merkle_nodes",
+            Self::MerkleRoots => "merkle_roots",
         }
     }
     
@@ -50,6 +55,8 @@ impl ColumnFamily {
             Self::Events,
             Self::Anchors,
             Self::Checkpoints,
+            Self::MerkleNodes,
+            Self::MerkleRoots,
         ]
     }
     
@@ -78,6 +85,17 @@ impl ColumnFamily {
                     }
                     Self::Checkpoints => {
                         opts.set_write_buffer_size(16 * 1024 * 1024);
+                    }
+                    Self::MerkleNodes => {
+                        // Merkle nodes: high read/write, benefit from larger cache
+                        opts.set_write_buffer_size(64 * 1024 * 1024);
+                        opts.set_max_write_buffer_number(4);
+                        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+                    }
+                    Self::MerkleRoots => {
+                        // Merkle roots: smaller, historical data
+                        opts.set_write_buffer_size(16 * 1024 * 1024);
+                        opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
                     }
                 }
                 rocksdb::ColumnFamilyDescriptor::new(cf.name(), opts)
