@@ -4,6 +4,7 @@ pub mod consensus;
 pub mod node;
 pub mod object;
 pub mod subnet;          // Subnet (sub-application) types
+pub mod merkle;          // Merkle tree types for state commitment
 
 // ========== Object Model ==========
 pub mod coin;           // Coin object (transferable asset)
@@ -12,7 +13,7 @@ pub mod relation;       // RelationGraph object (social)
 pub mod account_view;   // Account aggregated view
 
 // Export commonly used types
-pub use event::{Event, EventId, EventStatus, EventType, Transfer};
+pub use event::{Event, EventId, EventStatus, EventType, Transfer, EventPayload};
 pub use consensus::{Anchor, AnchorId, ConsensusFrame, CFId, CFStatus, Vote, ConsensusConfig};
 pub use node::*;
 
@@ -39,7 +40,14 @@ pub use relation::{
 };
 
 // Subnet related
-pub use subnet::{SubnetId, SubnetConfig, UserSubnetMembership, CrossSubnetContext};
+pub use subnet::{SubnetId, SubnetType, SubnetConfig, UserSubnetMembership, CrossSubnetContext};
+
+// Merkle tree types
+pub use merkle::{
+    HashValue, ObjectStateValue, SubnetStateRoot, AnchorMerkleRoots,
+    MerkleExecutionResult, CrossSubnetLock, CrossSubnetLockStatus,
+    object_type, ZERO_HASH,
+};
 
 // Aggregated views
 pub use account_view::AccountView;
