@@ -112,6 +112,25 @@ impl EventType {
         )
     }
     
+    /// Check if this event should be routed to ROOT subnet
+    /// These events are executed by validators directly, not solvers
+    pub fn is_root_event(&self) -> bool {
+        matches!(
+            self,
+            EventType::Genesis
+                | EventType::System
+                | EventType::ValidatorRegister
+                | EventType::ValidatorUnregister
+                | EventType::SolverRegister
+                | EventType::SolverUnregister
+        )
+    }
+    
+    /// Check if this event should be executed by validators (ROOT) or solvers (App)
+    pub fn is_validator_executed(&self) -> bool {
+        self.is_root_event()
+    }
+    
     /// Get human-readable name
     pub fn name(&self) -> &'static str {
         match self {
@@ -154,6 +173,10 @@ pub struct Event {
     pub id: EventId,
     pub event_type: EventType,
     pub parent_ids: Vec<EventId>,
+    /// The subnet this event belongs to (determines routing)
+    /// If None, will be inferred from event_type
+    #[serde(default)]
+    pub subnet_id: Option<crate::subnet::SubnetId>,
     /// Legacy transfer field (for backward compatibility)
     pub transfer: Option<Transfer>,
     /// New unified payload field
@@ -193,10 +216,18 @@ impl Event {
         
         let id = Self::compute_id(&parent_ids, &vlc_snapshot, &creator, timestamp);
         
+        // Infer subnet_id from event_type
+        let subnet_id = if event_type.is_root_event() {
+            Some(crate::subnet::SubnetId::ROOT)
+        } else {
+            None // App subnet, to be specified by caller
+        };
+        
         Self {
             id,
             event_type,
             parent_ids,
+            subnet_id,
             transfer: None,
             payload: EventPayload::None,
             vlc_snapshot,
@@ -365,6 +396,35 @@ impl Event {
             self.event_type,
             EventType::ValidatorUnregister | EventType::SolverUnregister
         )
+    }
+    
+    /// Get the subnet this event belongs to
+    /// Returns ROOT subnet if not explicitly set and event is a root event
+    pub fn get_subnet_id(&self) -> crate::subnet::SubnetId {
+        self.subnet_id.unwrap_or_else(|| {
+            if self.event_type.is_root_event() {
+                crate::subnet::SubnetId::ROOT
+            } else {
+                // Default to ROOT if not specified (for backward compatibility)
+                crate::subnet::SubnetId::ROOT
+            }
+        })
+    }
+    
+    /// Set the subnet for this event
+    pub fn with_subnet(mut self, subnet_id: crate::subnet::SubnetId) -> Self {
+        self.subnet_id = Some(subnet_id);
+        self
+    }
+    
+    /// Check if this event has an explicit subnet assignment
+    pub fn has_subnet(&self) -> bool {
+        self.subnet_id.is_some()
+    }
+    
+    /// Check if this event should be executed by validators (ROOT) or solvers (App)
+    pub fn is_validator_executed(&self) -> bool {
+        self.event_type.is_validator_executed()
     }
     
     /// Get resources affected by this event (for dependency tracking)
