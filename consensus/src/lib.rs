@@ -35,6 +35,9 @@ pub mod dag;
 pub mod engine;
 pub mod folder;
 pub mod liveness;
+pub mod merkle_integration;
+pub mod root_executor;
+pub mod router;
 pub mod validator_set;
 pub mod vlc;
 
@@ -42,6 +45,12 @@ pub mod vlc;
 pub use dag::{Dag, DagError};
 pub use engine::{ConsensusEngine, ConsensusMessage, DagStats};
 pub use folder::{ConsensusManager, DagFolder};
+pub use merkle_integration::{
+    compute_events_root, compute_anchor_chain_root, compute_global_state_root,
+    AnchorMerkleRootsBuilder,
+};
+pub use root_executor::{RootSubnetExecutor, RootExecutorError, RootExecutionResult};
+pub use router::{EventRouter, RoutedEvents, SubnetExecutionBatch, create_execution_batches};
 pub use validator_set::{ElectionStrategy, ValidatorSet};
 pub use vlc::VLC;
 

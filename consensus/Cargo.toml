@@ -6,10 +6,12 @@ edition.workspace = true
 [dependencies]
 setu-types = { path = "../types" }
 setu-vlc = { path = "../crates/setu-vlc" }
+setu-merkle = { path = "../crates/setu-merkle" }
 sha2 = "0.10"
 hex = "0.4"
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 thiserror = "1.0"
 
 [dev-dependencies]
+setu-types = { path = "../types", features = ["test-utils"] }
 tokio = { version = "1", features = ["full", "test-util"] }
