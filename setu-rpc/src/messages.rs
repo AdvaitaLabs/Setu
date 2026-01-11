@@ -216,6 +216,8 @@ pub struct SubmitTransferRequest {
     pub preferred_solver: Option<String>,
     /// Optional shard assignment
     pub shard_id: Option<String>,
+    /// Optional subnet ID for subnet-based routing
+    pub subnet_id: Option<String>,
     /// Resources involved in this transfer
     pub resources: Vec<String>,
 }

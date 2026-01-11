@@ -14,6 +14,7 @@ struct SubmitTransferRequest {
     pub transfer_type: String,
     pub preferred_solver: Option<String>,
     pub shard_id: Option<String>,
+    pub subnet_id: Option<String>,
     pub resources: Vec<String>,
 }
 
@@ -91,6 +92,7 @@ pub async fn handle(action: crate::TransferAction, _config: &Config) -> Result<(
                 transfer_type: transfer_type.clone(),
                 preferred_solver: solver,
                 shard_id: shard,
+                subnet_id: None, // TODO: Add subnet support to CLI
                 resources: vec![
                     format!("account:{}", from),
                     format!("account:{}", to),

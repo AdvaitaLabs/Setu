@@ -201,6 +201,8 @@ mod tests {
             power: 0,
             preferred_solver: None,
             shard_id: None,
+            subnet_id: None,
+            assigned_vlc: None,
         }
     }
     

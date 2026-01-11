@@ -37,6 +37,8 @@ async fn simulate_relay(transfer_tx: mpsc::UnboundedSender<Transfer>) {
         power: 100,
         preferred_solver: None,
         shard_id: None,
+        subnet_id: None,
+        assigned_vlc: None,
     };
     info!("🟢 Relay: Sending transfer tx-001 (alice -> bob, 1000)");
     transfer_tx.send(transfer1).unwrap();
@@ -57,6 +59,8 @@ async fn simulate_relay(transfer_tx: mpsc::UnboundedSender<Transfer>) {
         power: 200,
         preferred_solver: None,
         shard_id: Some("shard-1".to_string()),
+        subnet_id: None,
+        assigned_vlc: None,
     };
     info!("🟢 Relay: Sending transfer tx-002 (charlie -> dave, 2000, shard-1)");
     transfer_tx.send(transfer2).unwrap();
@@ -77,6 +81,8 @@ async fn simulate_relay(transfer_tx: mpsc::UnboundedSender<Transfer>) {
         power: 150,
         preferred_solver: Some("solver-1".to_string()),
         shard_id: None,
+        subnet_id: None,
+        assigned_vlc: None,
     };
     info!("🟢 Relay: Sending transfer tx-003 (bob -> alice, 500, manual solver-1)");
     transfer_tx.send(transfer3).unwrap();

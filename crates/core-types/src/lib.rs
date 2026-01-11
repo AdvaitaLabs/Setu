@@ -64,6 +64,24 @@ pub struct Transfer {
     pub preferred_solver: Option<String>,
     /// Optional: Shard ID for shard-based routing
     pub shard_id: Option<String>,
+    /// Optional: Subnet ID for subnet-based routing
+    pub subnet_id: Option<String>,
+    
+    /// VLC assigned by Validator when receiving the transfer
+    /// Solver should use this VLC when creating Event, NOT generate its own
+    pub assigned_vlc: Option<AssignedVlc>,
+}
+
+/// VLC assigned by Validator to a Transfer
+/// This is passed to Solver and should be used in the resulting Event
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssignedVlc {
+    /// The logical time assigned by Validator
+    pub logical_time: u64,
+    /// The physical time when assigned
+    pub physical_time: u64,
+    /// The Validator ID that assigned this VLC
+    pub validator_id: String,
 }
 
 /// Snapshot of an object's version, roughly mirroring `object_versions` table.

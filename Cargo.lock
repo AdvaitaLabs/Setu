@@ -2893,6 +2893,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "setu-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "setu-types",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "setu-solver"
 version = "0.1.0"
 dependencies = [

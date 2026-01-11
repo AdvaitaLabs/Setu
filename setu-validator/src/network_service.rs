@@ -18,7 +18,7 @@ use axum::{
     Router, Json,
     extract::State,
 };
-use core_types::{Transfer, TransferType, Vlc};
+use core_types::{Transfer, TransferType, Vlc, AssignedVlc};
 use parking_lot::RwLock;
 use setu_rpc::{
     RegisterSolverRequest, RegisterSolverResponse,
@@ -273,15 +273,29 @@ impl ValidatorNetworkService {
             timestamp: now,
         });
         
-        // Step 2: VLC Assignment (Simulated)
+        // Step 2: VLC Assignment - Validator assigns VLC to the transfer
+        // This VLC will be passed to Solver and used in the resulting Event
         let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst);
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
         info!("[STEP 2/7] ⏰ [VLC] Assigning Vector Logical Clock...");
-        info!("           └─ VLC Time: {} (simulated)", vlc_time);
-        info!("           └─ Node: {}", self.validator_id);
+        info!("           └─ VLC Time: {}", vlc_time);
+        info!("           └─ Validator: {}", self.validator_id);
+        info!("           └─ Note: Solver will use this VLC, not generate its own");
+        
+        let assigned_vlc = AssignedVlc {
+            logical_time: vlc_time,
+            physical_time: now_millis,
+            validator_id: self.validator_id.clone(),
+        };
+        
         steps.push(ProcessingStep {
             step: "vlc_assign".to_string(),
             status: "completed".to_string(),
-            details: Some(format!("VLC time: {} (simulated)", vlc_time)),
+            details: Some(format!("VLC time: {} assigned by Validator", vlc_time)),
             timestamp: now,
         });
         
@@ -324,6 +338,9 @@ impl ValidatorNetworkService {
             power: 10,
             preferred_solver: request.preferred_solver.clone(),
             shard_id: request.shard_id.clone(),
+            subnet_id: request.subnet_id.clone(),
+            // VLC assigned by Validator - Solver must use this, not generate its own
+            assigned_vlc: Some(assigned_vlc),
         };
         
         // Route to solver

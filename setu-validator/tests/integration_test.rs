@@ -62,6 +62,8 @@ async fn test_validator_receives_and_verifies_event() {
         resources: vec![],
         preferred_solver: None,
         shard_id: None,
+        subnet_id: None,
+        assigned_vlc: None,
     };
 
     transfer_tx.send(transfer).unwrap();
@@ -128,6 +130,8 @@ async fn test_validator_verifies_multiple_events() {
             resources: vec![],
             preferred_solver: None,
             shard_id: None,
+            subnet_id: None,
+            assigned_vlc: None,
         };
         transfer_tx.send(transfer).unwrap();
     }

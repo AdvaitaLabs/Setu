@@ -107,7 +107,8 @@ impl SolverConfig {
 
 /// Event counter for generating unique IDs
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
-static VLC_COUNTER: AtomicU64 = AtomicU64::new(0);
+// NOTE: VLC is now managed by Validator, not Solver
+// Solver uses the assigned_vlc from Transfer
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -307,14 +308,14 @@ async fn process_transfers(
         info!("╚════════════════════════════════════════════════════════════╝");
         
         // Step 1: Dependency Resolution (Simulated)
-        info!("[STEP 1/6] 🔍 [DEP] Resolving dependencies...");
+        info!("[STEP 1/5] 🔍 [DEP] Resolving dependencies...");
         info!("           └─ Resources: {:?}", transfer.resources);
         info!("           └─ Checking for conflicts...");
         info!("           └─ No conflicts found (simulated)");
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         
         // Step 2: TEE Execution (Simulated)
-        info!("[STEP 2/6] 🔐 [TEE] Executing in Trusted Environment...");
+        info!("[STEP 2/5] 🔐 [TEE] Executing in Trusted Environment...");
         info!("           └─ Enclave: mock-enclave-001");
         info!("           └─ Loading state for accounts...");
         info!("           └─ Executing transfer logic...");
@@ -322,7 +323,7 @@ async fn process_transfers(
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         
         // Step 3: State Changes (Simulated)
-        info!("[STEP 3/6] 📝 Applying state changes...");
+        info!("[STEP 3/5] 📝 Applying state changes...");
         let state_changes = vec![
             StateChange {
                 key: format!("balance:{}", transfer.from),
@@ -339,24 +340,37 @@ async fn process_transfers(
             info!("           └─ {}: {:?} → {:?}", change.key, change.old_value, change.new_value);
         }
         
-        // Step 4: VLC Update (Simulated)
-        let vlc_time = VLC_COUNTER.fetch_add(1, Ordering::SeqCst);
-        info!("[STEP 4/6] ⏰ [VLC] Updating Vector Logical Clock...");
-        info!("           └─ Previous: {}", vlc_time);
-        info!("           └─ New: {}", vlc_time + 1);
-        info!("           └─ Merging with transfer VLC...");
-        
-        let mut vector_clock = VectorClock::new();
-        vector_clock.increment(&solver_id);
-        let vlc_snapshot = VLCSnapshot {
-            vector_clock,
-            logical_time: vlc_time + 1,
-            physical_time: now,
+        // Step 4: Use VLC assigned by Validator (NOT generate our own)
+        // This is the key change: Solver does NOT manage VLC, Validator does
+        let vlc_snapshot = if let Some(ref assigned) = transfer.assigned_vlc {
+            info!("[STEP 4/5] ⏰ [VLC] Using Validator-assigned VLC...");
+            info!("           └─ VLC Time: {} (assigned by Validator)", assigned.logical_time);
+            info!("           └─ Validator: {}", assigned.validator_id);
+            info!("           └─ Note: Solver does NOT increment VLC");
+            
+            let mut vector_clock = VectorClock::new();
+            vector_clock.increment(&assigned.validator_id);
+            VLCSnapshot {
+                vector_clock,
+                logical_time: assigned.logical_time,
+                physical_time: assigned.physical_time,
+            }
+        } else {
+            // Fallback for backward compatibility (should not happen in normal flow)
+            warn!("[STEP 4/5] ⚠️ [VLC] No assigned VLC from Validator, using fallback...");
+            warn!("           └─ This should not happen in normal operation!");
+            let mut vector_clock = VectorClock::new();
+            vector_clock.increment(&solver_id);
+            VLCSnapshot {
+                vector_clock,
+                logical_time: 0,
+                physical_time: now,
+            }
         };
         
         // Step 5: Generate Event
         let event_id = EVENT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        info!("[STEP 5/6] 📦 Generating event...");
+        info!("[STEP 5/5] 📦 Generating event...");
         info!("           └─ Event ID: evt-{}-{}", now, event_id);
         info!("           └─ Type: Transfer");
         info!("           └─ Parents: [] (genesis)");
@@ -383,18 +397,19 @@ async fn process_transfers(
         };
         event.set_execution_result(execution_result);
         
-        // Step 6: TEE Proof (Simulated)
-        info!("[STEP 6/6] 🔏 [TEE] Generating attestation proof...");
-        info!("           └─ Proof type: mock-attestation");
-        info!("           └─ Proof size: 256 bytes (simulated)");
-        info!("           └─ Signature: [mock-signature]");
+        // Log TEE Proof (Simulated - for future implementation)
+        info!("[TEE] 🔏 Generating attestation proof (simulated)...");
+        info!("      └─ Proof type: mock-attestation");
+        info!("      └─ Proof size: 256 bytes (simulated)");
         
+        let vlc_time = transfer.assigned_vlc.as_ref().map(|v| v.logical_time).unwrap_or(0);
         info!("╔════════════════════════════════════════════════════════════╗");
         info!("║              Transfer Execution Complete                   ║");
         info!("╠════════════════════════════════════════════════════════════╣");
         info!("║  Status:     SUCCESS                                       ║");
         info!("║  Event ID:   {:^44} ║", &event.id[..20.min(event.id.len())]);
-        info!("║  VLC Time:   {:^44} ║", vlc_time + 1);
+        info!("║  VLC Time:   {:^44} ║", vlc_time);
+        info!("║  Note:       VLC assigned by Validator                     ║");
         info!("╚════════════════════════════════════════════════════════════╝");
         
         // Send event to validator
