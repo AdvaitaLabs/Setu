@@ -34,7 +34,11 @@ use setu_rpc::{
     SolverListItem, ValidatorListItem, NodeType,
     RegistrationHandler,
 };
-use setu_types::event::{Event, EventType, EventStatus, EventPayload, SolverRegistration, ValidatorRegistration, Unregistration};
+use setu_types::event::{
+    Event, EventType, EventStatus, EventPayload, 
+    SolverRegistration, ValidatorRegistration, Unregistration,
+    SubnetRegistration, SubnetType, SubnetResourceLimits, UserRegistration,
+};
 use setu_vlc;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -51,6 +55,27 @@ pub struct ValidatorInfo {
     pub address: String,
     pub port: u16,
     pub status: String,
+    pub registered_at: u64,
+}
+
+/// Subnet info for tracking registered subnets
+#[derive(Debug, Clone)]
+pub struct SubnetInfo {
+    pub subnet_id: String,
+    pub name: String,
+    pub owner: String,
+    pub subnet_type: SubnetType,
+    pub assigned_solvers: Vec<String>,
+    pub user_count: u64,
+    pub created_at: u64,
+}
+
+/// User info for tracking registered users
+#[derive(Debug, Clone)]
+pub struct UserInfo {
+    pub user_id: String,
+    pub subnet_id: String,
+    pub display_name: Option<String>,
     pub registered_at: u64,
 }
 
@@ -123,6 +148,12 @@ pub struct ValidatorNetworkService {
     
     /// Event counter
     event_counter: AtomicU64,
+    
+    /// Subnet registry (subnet_id -> SubnetInfo)
+    subnet_registry: Arc<RwLock<HashMap<String, SubnetInfo>>>,
+    
+    /// User registry (user_id -> UserInfo)
+    user_registry: Arc<RwLock<HashMap<String, UserInfo>>>,
 }
 
 /// Transfer tracking information
@@ -182,6 +213,44 @@ impl ValidatorNetworkService {
             "Creating validator network service"
         );
         
+        // Initialize subnet registry with Genesis Subnet 0 (Root Subnet)
+        let mut subnet_registry = HashMap::new();
+        let genesis_subnet = SubnetInfo {
+            subnet_id: "subnet-0".to_string(),
+            name: "Genesis Root Subnet".to_string(),
+            owner: "system".to_string(),
+            subnet_type: SubnetType::Root,
+            assigned_solvers: vec![],
+            user_count: 0,
+            created_at: start_time,
+        };
+        subnet_registry.insert("subnet-0".to_string(), genesis_subnet);
+        
+        info!(
+            "╔════════════════════════════════════════════════════════════╗"
+        );
+        info!(
+            "║              Genesis Subnet 0 Created                      ║"
+        );
+        info!(
+            "╠════════════════════════════════════════════════════════════╣"
+        );
+        info!(
+            "║  Subnet ID:  {:^44} ║", "subnet-0"
+        );
+        info!(
+            "║  Name:       {:^44} ║", "Genesis Root Subnet"
+        );
+        info!(
+            "║  Type:       {:^44} ║", "Root"
+        );
+        info!(
+            "║  Owner:      {:^44} ║", "system"
+        );
+        info!(
+            "╚════════════════════════════════════════════════════════════╝"
+        );
+        
         Self {
             validator_id,
             router_manager,
@@ -197,6 +266,8 @@ impl ValidatorNetworkService {
             transfer_counter: AtomicU64::new(0),
             vlc_counter: AtomicU64::new(0),
             event_counter: AtomicU64::new(0),
+            subnet_registry: Arc::new(RwLock::new(subnet_registry)),
+            user_registry: Arc::new(RwLock::new(HashMap::new())),
         }
     }
     
@@ -701,6 +772,45 @@ impl ValidatorNetworkService {
             }
             EventPayload::TaskSubmit(t) => {
                 info!("[SIDE_EFFECT] TaskSubmit: task_id={}", t.task_id);
+            }
+            EventPayload::SubnetRegister(reg) => {
+                info!("[SIDE_EFFECT] Applying SubnetRegister: {}", reg.subnet_id);
+                let subnet_info = SubnetInfo {
+                    subnet_id: reg.subnet_id.clone(),
+                    name: reg.name.clone(),
+                    owner: reg.owner.clone(),
+                    subnet_type: reg.subnet_type.clone(),
+                    assigned_solvers: vec![],
+                    user_count: 0,
+                    created_at: event.timestamp / 1000,
+                };
+                self.subnet_registry.write().insert(reg.subnet_id.clone(), subnet_info);
+                info!("           └─ Subnet registered: {} (type: {:?})", reg.subnet_id, reg.subnet_type);
+                info!("           └─ Total subnets: {}", self.subnet_registry.read().len());
+            }
+            EventPayload::UserRegister(reg) => {
+                info!("[SIDE_EFFECT] Applying UserRegister: {}", reg.user_id);
+                // Default to subnet-0 if no subnet specified
+                let subnet_id = reg.subnet_id.clone().unwrap_or_else(|| "subnet-0".to_string());
+                
+                let user_info = UserInfo {
+                    user_id: reg.user_id.clone(),
+                    subnet_id: subnet_id.clone(),
+                    display_name: reg.display_name.clone(),
+                    registered_at: event.timestamp / 1000,
+                };
+                self.user_registry.write().insert(reg.user_id.clone(), user_info);
+                
+                // Update subnet user count
+                if let Some(subnet) = self.subnet_registry.write().get_mut(&subnet_id) {
+                    subnet.user_count += 1;
+                    info!("           └─ User {} registered to subnet {} (total users: {})", 
+                          reg.user_id, subnet_id, subnet.user_count);
+                } else {
+                    warn!("           └─ User {} registered but subnet {} not found, using default", 
+                          reg.user_id, subnet_id);
+                }
+                info!("           └─ Total users: {}", self.user_registry.read().len());
             }
             EventPayload::None => {}
         }
