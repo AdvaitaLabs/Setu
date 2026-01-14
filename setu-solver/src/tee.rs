@@ -115,31 +115,6 @@ impl TeeExecutor {
         Ok(TeeExecutionResult::from_stf_output(output))
     }
     
-    /// Execute a single transfer (legacy API for backward compatibility)
-    #[allow(dead_code)]
-    pub async fn execute_transfer(
-        &self,
-        transfer: &Transfer,
-        pre_state_root: [u8; 32],
-    ) -> anyhow::Result<TeeExecutionResult> {
-        // Convert transfer to event (simplified)
-        let event = self.transfer_to_event(transfer)?;
-        
-        // Get subnet_id from transfer or default to ROOT
-        let subnet_id = transfer.subnet_id
-            .as_ref()
-            .map(|s| SubnetId::from_str_id(s))
-            .unwrap_or(SubnetId::ROOT);
-        
-        // Build read set from transfer
-        let read_set = vec![
-            (format!("balance:{}", transfer.from), vec![]),
-            (format!("balance:{}", transfer.to), vec![]),
-        ];
-        
-        self.execute_events(subnet_id, pre_state_root, vec![event], read_set).await
-    }
-    
     /// Get enclave information
     pub fn enclave_info(&self) -> EnclaveInfo {
         self.enclave.info()
@@ -156,16 +131,132 @@ impl TeeExecutor {
         self.enclave.measurement()
     }
     
+    /// Execute a transfer in TEE and return execution result
+    ///
+    /// This method combines the enclave execution with result conversion,
+    /// providing the primary API for Solver's transfer execution pipeline.
+    pub async fn execute_in_tee(&self, transfer: &Transfer) -> anyhow::Result<ExecutionResult> {
+        debug!(
+            transfer_id = %transfer.id,
+            from = %transfer.from,
+            to = %transfer.to,
+            amount = %transfer.amount,
+            "Executing transfer in TEE"
+        );
+        
+        // Convert transfer to event
+        let event = self.transfer_to_event(transfer)?;
+        
+        // Get subnet_id from transfer or default to ROOT
+        let subnet_id = transfer.subnet_id
+            .as_ref()
+            .map(|s| SubnetId::from_str_id(s))
+            .unwrap_or(SubnetId::ROOT);
+        
+        // Build read set from transfer accounts
+        let read_set = vec![
+            (format!("balance:{}", transfer.from), vec![]),
+            (format!("balance:{}", transfer.to), vec![]),
+        ];
+        
+        // Use zero as pre-state root for now
+        // TODO: fetch actual state root from storage
+        let pre_state_root = [0u8; 32];
+        
+        // Execute in enclave
+        let tee_result = self.execute_events(subnet_id, pre_state_root, vec![event], read_set).await?;
+        
+        // Generate state changes for this transfer
+        let state_changes = self.compute_transfer_state_changes(transfer);
+        
+        info!(
+            transfer_id = %transfer.id,
+            success = tee_result.events_failed == 0,
+            attestation_type = ?tee_result.attestation.attestation_type,
+            "Transfer TEE execution completed"
+        );
+        
+        Ok(ExecutionResult {
+            success: tee_result.events_failed == 0,
+            message: Some(format!(
+                "TEE execution: {} events processed, {} failed",
+                tee_result.events_processed,
+                tee_result.events_failed
+            )),
+            state_changes,
+        })
+    }
+    
+    /// Apply state changes to local storage
+    ///
+    /// Currently logs the changes. In production, this should persist
+    /// to the storage layer (RocksDB, etc.)
+    pub async fn apply_state_changes(&self, changes: &[StateChange]) -> anyhow::Result<()> {
+        for change in changes {
+            debug!(
+                key = %change.key,
+                has_old = change.old_value.is_some(),
+                has_new = change.new_value.is_some(),
+                "Applying state change"
+            );
+            
+            // TODO: Persist to storage layer
+            // self.storage.apply_change(change).await?;
+        }
+        
+        info!(
+            changes_count = changes.len(),
+            "State changes applied (simulated)"
+        );
+        
+        Ok(())
+    }
+    
+    /// Compute state changes for a transfer
+    fn compute_transfer_state_changes(&self, transfer: &Transfer) -> Vec<StateChange> {
+        let amount = transfer.amount.unsigned_abs();
+        vec![
+            // Debit from sender
+            StateChange {
+                key: format!("balance:{}", transfer.from),
+                old_value: None,  // TODO: fetch from storage
+                new_value: Some(self.encode_balance_change(amount, false)),
+            },
+            // Credit to receiver
+            StateChange {
+                key: format!("balance:{}", transfer.to),
+                old_value: None,
+                new_value: Some(self.encode_balance_change(amount, true)),
+            },
+        ]
+    }
+    
+    /// Encode a balance change
+    fn encode_balance_change(&self, amount: u128, is_credit: bool) -> Vec<u8> {
+        let mut result = vec![if is_credit { 0x01 } else { 0x00 }];
+        result.extend_from_slice(&amount.to_le_bytes());
+        result
+    }
+    
     // Helper: Convert Transfer to Event
-    fn transfer_to_event(&self, _transfer: &Transfer) -> anyhow::Result<Event> {
+    fn transfer_to_event(&self, transfer: &Transfer) -> anyhow::Result<Event> {
         use setu_types::event::{EventType, VLCSnapshot};
         
-        Ok(Event::new(
+        let mut event = Event::new(
             EventType::Transfer,
             vec![],
             VLCSnapshot::default(),
             self.solver_id.clone(),
-        ))
+        );
+        
+        // Attach transfer data
+        event = event.with_transfer(setu_types::event::Transfer {
+            from: transfer.from.clone(),
+            to: transfer.to.clone(),
+            amount: transfer.amount as u64,
+        });
+        
+        Ok(event)
     }
 }
 
