@@ -46,6 +46,9 @@ pub use profile::{
 pub use relation::{
     RelationGraph, RelationGraphData, Relation,
     create_social_graph, create_professional_graph,
+    // User relation network
+    relation_type, UserRelationNetwork, UserRelationNetworkObject,
+    SubnetInteractionSummary, create_user_relation_network,
 };
 
 // Subnet related

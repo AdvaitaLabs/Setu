@@ -203,6 +203,177 @@ pub fn create_professional_graph(owner_sbt: ObjectId, owner_address: Address) ->
     RelationGraph::new(owner_sbt, owner_address, "professional".to_string())
 }
 
+// ============================================================================
+// User Relation Network - Specialized for User Registration
+// ============================================================================
+
+/// Subnet interaction summary - tracks user interactions within a subnet
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SubnetInteractionSummary {
+    /// Number of unique users interacted with
+    pub interaction_count: u64,
+    /// Recent users interacted with (limited to last N)
+    pub recent_interactions: Vec<Address>,
+    /// Last interaction timestamp
+    pub last_interaction: u64,
+    /// Total interaction events count
+    pub total_events: u64,
+}
+
+impl SubnetInteractionSummary {
+    /// Create a new empty summary
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Record an interaction with a user
+    pub fn record_interaction(&mut self, user: Address) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        // Check if this is a new user
+        if !self.recent_interactions.contains(&user) {
+            self.interaction_count += 1;
+            // Keep only last 100 recent interactions
+            if self.recent_interactions.len() >= 100 {
+                self.recent_interactions.remove(0);
+            }
+            self.recent_interactions.push(user);
+        }
+        
+        self.total_events += 1;
+        self.last_interaction = now;
+    }
+}
+
+/// User Relation Network - stores all relationship data for a user
+/// 
+/// This is created when a user registers and tracks:
+/// - Who invited this user
+/// - All relationships built over time
+/// - Subnet-specific interaction summaries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserRelationNetwork {
+    /// User's address (owner of this network)
+    pub user: Address,
+    
+    /// Inviter's address (who invited this user to register)
+    pub invited_by: Option<Address>,
+    
+    /// Invite code used during registration
+    pub invite_code: Option<String>,
+    
+    /// Main relation graph (stores detailed relationships)
+    pub relation_graph: RelationGraphData,
+    
+    /// Per-subnet interaction summaries
+    pub subnet_interactions: HashMap<SubnetId, SubnetInteractionSummary>,
+    
+    /// Total number of users this user has invited
+    pub invite_count: u64,
+    
+    /// Creation timestamp
+    pub created_at: u64,
+    
+    /// Last update timestamp
+    pub updated_at: u64,
+}
+
+/// UserRelationNetwork as an Object
+pub type UserRelationNetworkObject = Object<UserRelationNetwork>;
+
+impl UserRelationNetwork {
+    /// Create a new user relation network
+    pub fn new(user: Address, invited_by: Option<Address>, invite_code: Option<String>) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        // Create a default relation graph for this user
+        let owner_id = generate_object_id(format!("user_network:{}", user).as_bytes());
+        let relation_graph = RelationGraphData::new(owner_id, user, "user_network".to_string());
+        
+        Self {
+            user,
+            invited_by,
+            invite_code,
+            relation_graph,
+            subnet_interactions: HashMap::new(),
+            invite_count: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+    
+    /// Add a relationship to another user
+    pub fn add_relation(&mut self, target: Address, relation_type: &str, weight: u32) {
+        let target_id = generate_object_id(format!("user:{}", target).as_bytes());
+        self.relation_graph.add_relation(target_id, relation_type.to_string(), weight);
+        self.touch();
+    }
+    
+    /// Remove a relationship
+    pub fn remove_relation(&mut self, target: Address, relation_type: &str) -> bool {
+        let target_id = generate_object_id(format!("user:{}", target).as_bytes());
+        let removed = self.relation_graph.remove_relation(&target_id, relation_type);
+        if removed {
+            self.touch();
+        }
+        removed
+    }
+    
+    /// Record an interaction in a subnet
+    pub fn record_subnet_interaction(&mut self, subnet_id: SubnetId, with_user: Address) {
+        self.subnet_interactions
+            .entry(subnet_id)
+            .or_insert_with(SubnetInteractionSummary::new)
+            .record_interaction(with_user);
+        self.touch();
+    }
+    
+    /// Increment invite count (when this user invites someone)
+    pub fn increment_invite_count(&mut self) {
+        self.invite_count += 1;
+        self.touch();
+    }
+    
+    /// Get total relation count
+    pub fn relation_count(&self) -> usize {
+        self.relation_graph.relation_count()
+    }
+    
+    /// Get relations by type
+    pub fn get_relations_by_type(&self, relation_type: &str) -> Vec<&Relation> {
+        self.relation_graph.get_relations_by_type(relation_type)
+    }
+    
+    /// Get subnet interaction summary
+    pub fn get_subnet_summary(&self, subnet_id: &SubnetId) -> Option<&SubnetInteractionSummary> {
+        self.subnet_interactions.get(subnet_id)
+    }
+    
+    fn touch(&mut self) {
+        self.updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+    }
+}
+
+/// Helper function: create a user relation network object
+pub fn create_user_relation_network(
+    user: Address,
+    invited_by: Option<Address>,
+    invite_code: Option<String>,
+) -> UserRelationNetworkObject {
+    let id = generate_object_id(format!("user_relation_network:{}", user).as_bytes());
+    let data = UserRelationNetwork::new(user, invited_by, invite_code);
+    Object::new_owned(id, user, data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
