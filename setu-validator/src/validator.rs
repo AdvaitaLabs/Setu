@@ -5,7 +5,9 @@ use setu_types::{
 };
 use setu_consensus::{ConsensusEngine, ConsensusMessage, ValidatorSet};
 use setu_network::{NetworkConfig, NetworkService, NetworkEvent, NetworkClient, PeerRole};
-use setu_storage::{StateStore, EventStore, AnchorStore, CFStore};
+use setu_storage::{StateStore, EventStore, AnchorStore, CFStore, RocksDBMerkleStore};
+use setu_storage::subnet_state::GlobalStateManager;
+use setu_merkle::MerkleStore;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -76,6 +78,51 @@ impl Validator {
             running: Arc::new(RwLock::new(false)),
         }
     }
+    
+    /// Create a validator with persistent Merkle store for state management
+    /// 
+    /// This constructor initializes the validator with a RocksDB-backed
+    /// MerkleStore for persisting subnet state roots and global state roots.
+    pub fn with_merkle_store(
+        node_info: NodeInfo, 
+        is_leader: bool, 
+        config: ValidatorConfig,
+        merkle_store: Arc<dyn MerkleStore>,
+    ) -> Self {
+        let validator_info = ValidatorInfo::new(node_info.clone(), is_leader);
+        
+        let mut validator_set = ValidatorSet::new();
+        validator_set.add_validator(validator_info.clone());
+
+        // Create GlobalStateManager with persistent store
+        let state_manager = GlobalStateManager::with_store(merkle_store);
+        
+        // Create ConsensusEngine with state manager
+        let consensus_engine = Arc::new(ConsensusEngine::with_state_manager(
+            config.consensus.clone(),
+            node_info.id.clone(),
+            validator_set,
+            state_manager,
+        ));
+
+        Self {
+            config: config.clone(),
+            node_info: node_info.clone(),
+            validator_info: Arc::new(RwLock::new(validator_info)),
+            consensus_engine,
+            network: None,
+            state_store: Arc::new(StateStore::new()),
+            event_store: Arc::new(EventStore::new()),
+            anchor_store: Arc::new(AnchorStore::new()),
+            cf_store: Arc::new(CFStore::new()),
+            event_verifier: Arc::new(EventVerifier::new(node_info.id.clone())),
+            cf_verifier: Arc::new(CFVerifier::new(
+                node_info.id.clone(),
+                config.consensus.validator_count,
+            )),
+            running: Arc::new(RwLock::new(false)),
+        }
+    }
 
     pub async fn start(&self) -> SetuResult<()> {
         *self.running.write().await = true;
@@ -106,6 +153,7 @@ impl Validator {
         let consensus_engine = Arc::clone(&self.consensus_engine);
         let event_store = Arc::clone(&self.event_store);
         let cf_store = Arc::clone(&self.cf_store);
+        let anchor_store = Arc::clone(&self.anchor_store);
         let event_verifier = Arc::clone(&self.event_verifier);
         let cf_verifier = Arc::clone(&self.cf_verifier);
 
@@ -126,10 +174,24 @@ impl Validator {
                             }
                         }
                         NetworkEvent::VoteReceived { vote, .. } => {
-                            let _ = consensus_engine.receive_vote(vote).await;
+                            // receive_vote now returns (finalized, Option<Anchor>)
+                            if let Ok((finalized, anchor)) = consensus_engine.receive_vote(vote).await {
+                                if finalized {
+                                    // Store the finalized anchor
+                                    if let Some(anchor) = anchor {
+                                        if let Err(e) = anchor_store.store(anchor).await {
+                                            tracing::error!("Failed to store finalized anchor: {}", e);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         NetworkEvent::CFFinalized { cf, .. } => {
                             cf_store.mark_finalized(&cf.id).await;
+                            // Also store the anchor from the finalized CF
+                            if let Err(e) = anchor_store.store(cf.anchor.clone()).await {
+                                tracing::error!("Failed to store anchor from finalized CF: {}", e);
+                            }
                             tracing::info!("CF finalized: {}", cf.id);
                         }
                         _ => {}

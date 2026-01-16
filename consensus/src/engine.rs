@@ -19,6 +19,7 @@
 
 use setu_types::{ConsensusConfig, ConsensusFrame, Event, EventId, SetuResult, Vote};
 use setu_vlc::VLCSnapshot;
+use setu_storage::subnet_state::GlobalStateManager;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -81,6 +82,34 @@ impl ConsensusEngine {
             consensus_manager: Arc::new(RwLock::new(ConsensusManager::new(
                 config,
                 validator_id.clone(),
+            ))),
+            local_validator_id: validator_id,
+            message_tx: tx,
+            message_rx: Arc::new(RwLock::new(rx)),
+        }
+    }
+    
+    /// Create a new consensus engine with state manager for Merkle tree persistence
+    /// 
+    /// This constructor allows injecting a pre-configured GlobalStateManager
+    /// with MerkleStore for persisting state roots.
+    pub fn with_state_manager(
+        config: ConsensusConfig,
+        validator_id: String,
+        validator_set: ValidatorSet,
+        state_manager: GlobalStateManager,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel(1000);
+
+        Self {
+            config: config.clone(),
+            dag: Arc::new(RwLock::new(Dag::new())),
+            vlc: Arc::new(RwLock::new(VLC::new(validator_id.clone()))),
+            validator_set: Arc::new(RwLock::new(validator_set)),
+            consensus_manager: Arc::new(RwLock::new(ConsensusManager::with_state_manager(
+                config,
+                validator_id.clone(),
+                state_manager,
             ))),
             local_validator_id: validator_id,
             message_tx: tx,
@@ -211,9 +240,36 @@ impl ConsensusEngine {
         Ok(cf)
     }
 
-    /// Receive a ConsensusFrame from another validator
+    /// Receive a ConsensusFrame from another validator (Follower path)
+    /// 
+    /// When a follower receives a CF from the leader:
+    /// 1. Verify the CF's merkle roots are valid
+    /// 2. Apply the state changes from the anchor's events to local SMT
+    /// 3. Verify resulting state matches the anchor's state root
+    /// 4. Vote for the CF
+    /// 
+    /// This ensures followers have consistent state with the leader.
     pub async fn receive_cf(&self, cf: ConsensusFrame) -> SetuResult<()> {
+        let dag = self.dag.read().await;
         let mut manager = self.consensus_manager.write().await;
+        
+        // First verify the CF's merkle roots are internally consistent
+        if !manager.verify_cf_merkle_roots(&cf) {
+            return Err(setu_types::SetuError::InvalidData(
+                "CF merkle roots verification failed".to_string()
+            ));
+        }
+        
+        // Apply state changes from the CF's events to maintain consistent state
+        // This also verifies the resulting state matches the anchor's state root
+        let state_verified = manager.apply_cf_state_changes(&dag, &cf);
+        if !state_verified {
+            return Err(setu_types::SetuError::InvalidData(
+                "State root mismatch after applying CF state changes".to_string()
+            ));
+        }
+        
+        // Receive the CF
         manager.receive_cf(cf.clone());
 
         // Vote for the CF (in MVP, we always approve valid CFs)
@@ -226,24 +282,35 @@ impl ConsensusEngine {
     }
 
     /// Receive a vote from another validator
-    pub async fn receive_vote(&self, vote: Vote) -> SetuResult<bool> {
+    /// 
+    /// Returns (finalized, Option<Anchor>) - the anchor is returned when finalized
+    /// so the caller can persist it to storage.
+    pub async fn receive_vote(&self, vote: Vote) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
         let mut manager = self.consensus_manager.write().await;
         let finalized = manager.receive_vote(vote);
 
-        if finalized {
-            if let Some(cf) = manager.last_finalized_cf() {
+        let anchor = if finalized {
+            let finalized_anchor = if let Some(cf) = manager.last_finalized_cf() {
                 let _ = self
                     .message_tx
                     .send(ConsensusMessage::FrameFinalized(cf.clone()))
                     .await;
 
-                // Advance to the next round after finalization
-                drop(manager);
-                self.advance_round().await;
-            }
-        }
+                // Get the finalized anchor for storage
+                manager.get_last_finalized_anchor()
+            } else {
+                None
+            };
+            
+            // Advance to the next round after finalization
+            drop(manager);
+            self.advance_round().await;
+            finalized_anchor
+        } else {
+            None
+        };
 
-        Ok(finalized)
+        Ok((finalized, anchor))
     }
 
     /// Compute the state root from the DAG (legacy method)
