@@ -1,10 +1,14 @@
 use setu_types::{
     Anchor, ConsensusConfig, ConsensusFrame, EventId, Vote,
 };
+use crate::anchor_builder::{AnchorBuilder, AnchorBuildResult, AnchorBuildError};
 use crate::dag::Dag;
 use crate::vlc::VLC;
+use setu_storage::subnet_state::GlobalStateManager;
 use std::collections::HashMap;
 
+/// Legacy DagFolder - kept for backward compatibility
+/// For new code, use AnchorBuilder directly or through ConsensusManager
 #[derive(Debug)]
 pub struct DagFolder {
     config: ConsensusConfig,
@@ -72,36 +76,110 @@ impl DagFolder {
     }
 }
 
-#[derive(Debug)]
+/// ConsensusManager with integrated AnchorBuilder for Merkle tree management
+/// 
+/// This manager handles:
+/// - Anchor creation with full Merkle tree computation (via AnchorBuilder)
+/// - ConsensusFrame creation, voting, and finalization
+/// - State management across all subnets
 pub struct ConsensusManager {
     config: ConsensusConfig,
-    folder: DagFolder,
+    /// AnchorBuilder handles DAG folding with Merkle tree updates
+    anchor_builder: AnchorBuilder,
+    /// Legacy folder (kept for backward compatibility, not used in main flow)
+    #[allow(dead_code)]
+    legacy_folder: DagFolder,
+    /// Pending ConsensusFrames awaiting votes
     pending_cfs: HashMap<String, ConsensusFrame>,
+    /// Finalized ConsensusFrames
     finalized_cfs: Vec<ConsensusFrame>,
+    /// This validator's ID
     local_validator_id: String,
+    /// Last build result for diagnostics
+    last_build_result: Option<AnchorBuildResult>,
 }
 
 impl ConsensusManager {
+    /// Create a new ConsensusManager with AnchorBuilder
     pub fn new(config: ConsensusConfig, validator_id: String) -> Self {
         Self {
             config: config.clone(),
-            folder: DagFolder::new(config),
+            anchor_builder: AnchorBuilder::new(config.clone()),
+            legacy_folder: DagFolder::new(config),
             pending_cfs: HashMap::new(),
             finalized_cfs: Vec::new(),
             local_validator_id: validator_id,
+            last_build_result: None,
+        }
+    }
+    
+    /// Create with an existing GlobalStateManager (for state persistence)
+    pub fn with_state_manager(
+        config: ConsensusConfig, 
+        validator_id: String,
+        state_manager: GlobalStateManager,
+    ) -> Self {
+        Self {
+            config: config.clone(),
+            anchor_builder: AnchorBuilder::with_state_manager(config.clone(), state_manager),
+            legacy_folder: DagFolder::new(config),
+            pending_cfs: HashMap::new(),
+            finalized_cfs: Vec::new(),
+            local_validator_id: validator_id,
+            last_build_result: None,
         }
     }
 
+    /// Try to create a ConsensusFrame with full Merkle tree computation
+    /// 
+    /// This is the main entry point that:
+    /// 1. Checks VLC delta threshold
+    /// 2. Collects events from DAG
+    /// 3. Applies state changes to subnet SMTs
+    /// 4. Computes all Merkle roots (events, anchor chain, global state)
+    /// 5. Creates Anchor with merkle_roots
+    /// 6. Wraps in ConsensusFrame for voting
     pub fn try_create_cf(
         &mut self,
         dag: &Dag,
         vlc: &VLC,
-        state_root: String,
     ) -> Option<ConsensusFrame> {
-        let anchor = self.folder.fold(dag, vlc, state_root)?;
-        let cf = ConsensusFrame::new(anchor, self.local_validator_id.clone());
-        self.pending_cfs.insert(cf.id.clone(), cf.clone());
-        Some(cf)
+        // Use AnchorBuilder to create anchor with full Merkle computation
+        match self.anchor_builder.try_build(dag, vlc) {
+            Ok(build_result) => {
+                let anchor = build_result.anchor.clone();
+                
+                // Store build result for diagnostics
+                self.last_build_result = Some(build_result);
+                
+                // Create ConsensusFrame from anchor
+                let cf = ConsensusFrame::new(anchor, self.local_validator_id.clone());
+                self.pending_cfs.insert(cf.id.clone(), cf.clone());
+                Some(cf)
+            }
+            Err(AnchorBuildError::DeltaNotReached { .. }) => None,
+            Err(AnchorBuildError::InsufficientEvents { .. }) => None,
+            Err(AnchorBuildError::NoEvents) => None,
+            Err(e) => {
+                // Log error but don't crash
+                eprintln!("AnchorBuilder error: {}", e);
+                None
+            }
+        }
+    }
+    
+    /// Legacy method: Try to create CF with external state_root (deprecated)
+    /// 
+    /// This method is kept for backward compatibility.
+    /// Prefer using `try_create_cf(dag, vlc)` which computes state roots internally.
+    #[deprecated(since = "0.2.0", note = "Use try_create_cf(dag, vlc) instead")]
+    pub fn try_create_cf_legacy(
+        &mut self,
+        dag: &Dag,
+        vlc: &VLC,
+        _state_root: String,
+    ) -> Option<ConsensusFrame> {
+        self.try_create_cf(dag, vlc)
     }
 
     pub fn receive_cf(&mut self, cf: ConsensusFrame) {
@@ -166,7 +244,51 @@ impl ConsensusManager {
     }
 
     pub fn should_fold(&self, vlc: &VLC) -> bool {
-        self.folder.should_fold(vlc)
+        self.anchor_builder.should_fold(vlc)
+    }
+    
+    // =========================================================================
+    // New methods for Merkle tree access
+    // =========================================================================
+    
+    /// Get the AnchorBuilder (read-only)
+    pub fn anchor_builder(&self) -> &AnchorBuilder {
+        &self.anchor_builder
+    }
+    
+    /// Get the AnchorBuilder (mutable)
+    pub fn anchor_builder_mut(&mut self) -> &mut AnchorBuilder {
+        &mut self.anchor_builder
+    }
+    
+    /// Get the GlobalStateManager (read-only)
+    pub fn state_manager(&self) -> &GlobalStateManager {
+        self.anchor_builder.state_manager()
+    }
+    
+    /// Get the GlobalStateManager (mutable)
+    pub fn state_manager_mut(&mut self) -> &mut GlobalStateManager {
+        self.anchor_builder.state_manager_mut()
+    }
+    
+    /// Get the last build result (for diagnostics)
+    pub fn last_build_result(&self) -> Option<&AnchorBuildResult> {
+        self.last_build_result.as_ref()
+    }
+    
+    /// Get a subnet's current state root
+    pub fn get_subnet_root(&self, subnet_id: &setu_types::SubnetId) -> Option<[u8; 32]> {
+        self.anchor_builder.get_subnet_root(subnet_id)
+    }
+    
+    /// Get the current global state root
+    pub fn get_global_root(&self) -> [u8; 32] {
+        self.anchor_builder.get_global_root()
+    }
+    
+    /// Get anchor count
+    pub fn anchor_count(&self) -> usize {
+        self.anchor_builder.anchor_count()
     }
 }
 
@@ -229,7 +351,33 @@ mod tests {
         let mut manager = ConsensusManager::new(config, "validator1".to_string());
         let (dag, vlc) = setup_dag_with_events(10);
 
-        let cf = manager.try_create_cf(&dag, &vlc, "state_root".to_string());
+        // New API: try_create_cf without external state_root
+        let cf = manager.try_create_cf(&dag, &vlc);
         assert!(cf.is_some());
+        
+        // Verify anchor has merkle_roots
+        let cf = cf.unwrap();
+        assert!(cf.anchor.merkle_roots.is_some());
+    }
+    
+    #[test]
+    fn test_consensus_manager_state_access() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 5,
+            min_events_per_cf: 1,
+            ..Default::default()
+        };
+        let mut manager = ConsensusManager::new(config, "validator1".to_string());
+        let (dag, vlc) = setup_dag_with_events(10);
+
+        // Create CF and verify state roots are accessible
+        let _ = manager.try_create_cf(&dag, &vlc);
+        
+        // Global root should be computed
+        let global_root = manager.get_global_root();
+        assert_ne!(global_root, [0u8; 32]);
+        
+        // Anchor count should be 1
+        assert_eq!(manager.anchor_count(), 1);
     }
 }

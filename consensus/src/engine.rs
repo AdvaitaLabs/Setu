@@ -198,8 +198,8 @@ impl ConsensusEngine {
         }
 
         let dag = self.dag.read().await;
-        let state_root = self.compute_state_root_internal(&dag);
-        let cf = manager.try_create_cf(&dag, &vlc, state_root);
+        // AnchorBuilder now handles all Merkle tree computation internally
+        let cf = manager.try_create_cf(&dag, &vlc);
 
         if let Some(ref frame) = cf {
             let _ = self
@@ -246,7 +246,11 @@ impl ConsensusEngine {
         Ok(finalized)
     }
 
-    /// Compute the state root from the DAG
+    /// Compute the state root from the DAG (legacy method)
+    /// 
+    /// This is a simple hash-based computation for backward compatibility.
+    /// The real state root is now computed by AnchorBuilder using SMTs.
+    #[deprecated(since = "0.2.0", note = "State root is now computed internally by ConsensusManager/AnchorBuilder")]
     fn compute_state_root_internal(&self, dag: &Dag) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -255,10 +259,30 @@ impl ConsensusEngine {
         hex::encode(hasher.finalize())
     }
 
-    /// Compute the state root (async version)
+    /// Compute the state root (async version, legacy)
+    #[deprecated(since = "0.2.0", note = "Use get_global_state_root() instead")]
     pub async fn compute_state_root(&self) -> String {
         let dag = self.dag.read().await;
+        #[allow(deprecated)]
         self.compute_state_root_internal(&dag)
+    }
+    
+    /// Get the current global state root from AnchorBuilder
+    pub async fn get_global_state_root(&self) -> [u8; 32] {
+        let manager = self.consensus_manager.read().await;
+        manager.get_global_root()
+    }
+    
+    /// Get a subnet's current state root
+    pub async fn get_subnet_state_root(&self, subnet_id: &setu_types::SubnetId) -> Option<[u8; 32]> {
+        let manager = self.consensus_manager.read().await;
+        manager.get_subnet_root(subnet_id)
+    }
+    
+    /// Get the number of anchors created
+    pub async fn get_anchor_count(&self) -> usize {
+        let manager = self.consensus_manager.read().await;
+        manager.anchor_count()
     }
 
     /// Get the message sender for external communication
