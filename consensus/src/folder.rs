@@ -230,6 +230,11 @@ impl ConsensusManager {
 
         false
     }
+    
+    /// Get the last finalized anchor (for storage)
+    pub fn get_last_finalized_anchor(&self) -> Option<setu_types::Anchor> {
+        self.finalized_cfs.last().map(|cf| cf.anchor.clone())
+    }
 
     pub fn get_pending_cf(&self, cf_id: &str) -> Option<&ConsensusFrame> {
         self.pending_cfs.get(cf_id)
@@ -289,6 +294,83 @@ impl ConsensusManager {
     /// Get anchor count
     pub fn anchor_count(&self) -> usize {
         self.anchor_builder.anchor_count()
+    }
+    
+    // =========================================================================
+    // Follower State Synchronization
+    // =========================================================================
+    
+    /// Apply state changes from a received ConsensusFrame (follower path)
+    /// 
+    /// When a follower receives a CF from the leader, it needs to apply
+    /// the same state changes to maintain consistency. This method:
+    /// 1. Gets the events referenced in the CF's anchor
+    /// 2. Applies their state changes to the local SMT
+    /// 3. Verifies the resulting state root matches the anchor's merkle_roots
+    /// 
+    /// Returns true if state was applied and verified successfully.
+    pub fn apply_cf_state_changes(&mut self, dag: &Dag, cf: &setu_types::ConsensusFrame) -> bool {
+        // Get events from the anchor's event_ids
+        let events: Vec<setu_types::Event> = cf.anchor.event_ids
+            .iter()
+            .filter_map(|id| dag.get_event(id).cloned())
+            .collect();
+        
+        if events.is_empty() {
+            // No events to apply, but anchor might be empty - check merkle roots
+            return cf.anchor.merkle_roots.is_none() || 
+                   cf.anchor.merkle_roots.as_ref()
+                       .map(|r| r.global_state_root == self.get_global_root())
+                       .unwrap_or(true);
+        }
+        
+        // Apply state changes from these events
+        let _ = self.anchor_builder.state_manager_mut().apply_committed_events(&events);
+        
+        // Verify the resulting global state root matches the anchor's
+        if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
+            let local_root = self.get_global_root();
+            if local_root != merkle_roots.global_state_root {
+                eprintln!(
+                    "State root mismatch! Local: {:?}, Anchor: {:?}",
+                    hex::encode(local_root),
+                    hex::encode(merkle_roots.global_state_root)
+                );
+                return false;
+            }
+        }
+        
+        true
+    }
+    
+    /// Verify a ConsensusFrame's merkle roots without applying state
+    /// 
+    /// This is a lighter verification that just checks the anchor's
+    /// merkle roots are internally consistent.
+    pub fn verify_cf_merkle_roots(&self, cf: &setu_types::ConsensusFrame) -> bool {
+        let Some(ref merkle_roots) = cf.anchor.merkle_roots else {
+            // No merkle roots to verify (legacy anchor)
+            return true;
+        };
+        
+        // Verify events_root is not all zeros (unless no events)
+        if cf.anchor.event_ids.is_empty() && merkle_roots.events_root != [0u8; 32] {
+            return false;
+        }
+        
+        // Verify global_state_root is not all zeros (should have at least ROOT subnet)
+        if merkle_roots.global_state_root == [0u8; 32] && !merkle_roots.subnet_roots.is_empty() {
+            return false;
+        }
+        
+        // Verify subnet_roots contains at least ROOT subnet
+        if !merkle_roots.subnet_roots.is_empty() {
+            if !merkle_roots.subnet_roots.contains_key(&setu_types::SubnetId::ROOT) {
+                return false;
+            }
+        }
+        
+        true
     }
 }
 
