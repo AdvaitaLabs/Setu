@@ -93,6 +93,9 @@ pub struct ConsensusManager {
     pending_cfs: HashMap<String, ConsensusFrame>,
     /// Finalized ConsensusFrames
     finalized_cfs: Vec<ConsensusFrame>,
+    /// Set of anchor IDs that have been persisted to storage
+    /// Used to safely garbage collect finalized_cfs
+    persisted_anchor_ids: std::collections::HashSet<String>,
     /// This validator's ID
     local_validator_id: String,
     /// Last build result for diagnostics
@@ -108,6 +111,7 @@ impl ConsensusManager {
             legacy_folder: DagFolder::new(config),
             pending_cfs: HashMap::new(),
             finalized_cfs: Vec::new(),
+            persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
             last_build_result: None,
         }
@@ -125,6 +129,7 @@ impl ConsensusManager {
             legacy_folder: DagFolder::new(config),
             pending_cfs: HashMap::new(),
             finalized_cfs: Vec::new(),
+            persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
             last_build_result: None,
         }
@@ -182,6 +187,12 @@ impl ConsensusManager {
         self.try_create_cf(dag, vlc)
     }
 
+    /// Check if a CF (pending or finalized) already exists
+    pub fn has_cf(&self, cf_id: &str) -> bool {
+        self.pending_cfs.contains_key(cf_id) ||
+            self.finalized_cfs.iter().any(|cf| cf.id == cf_id)
+    }
+
     pub fn receive_cf(&mut self, cf: ConsensusFrame) {
         if !self.pending_cfs.contains_key(&cf.id) {
             self.pending_cfs.insert(cf.id.clone(), cf);
@@ -224,11 +235,67 @@ impl ConsensusManager {
             if let Some(mut cf) = self.pending_cfs.remove(cf_id) {
                 cf.finalize();
                 self.finalized_cfs.push(cf);
+                
+                // Trigger safe garbage collection
+                self.gc_finalized_cfs();
+                
                 return true;
             }
         }
 
         false
+    }
+    
+    /// Mark an anchor as persisted to storage
+    /// 
+    /// Call this after successfully storing the anchor to AnchorStore.
+    /// This enables safe garbage collection of finalized CFs.
+    pub fn mark_anchor_persisted(&mut self, anchor_id: &str) {
+        self.persisted_anchor_ids.insert(anchor_id.to_string());
+        // Note: persisted_anchor_ids is cleaned up when corresponding CFs are GC'd
+        // in gc_finalized_cfs(), so it won't grow unbounded
+    }
+    
+    /// Garbage collect finalized CFs, only removing those that have been persisted
+    fn gc_finalized_cfs(&mut self) {
+        const MAX_FINALIZED_CFS: usize = 1000;
+        
+        if self.finalized_cfs.len() <= MAX_FINALIZED_CFS {
+            return;
+        }
+        
+        let excess = self.finalized_cfs.len() - MAX_FINALIZED_CFS;
+        
+        // Collect anchor IDs that will be removed (for cleaning persisted_anchor_ids)
+        let mut removed_anchor_ids = Vec::new();
+        let mut removed_count = 0;
+        
+        // Only remove CFs that have been persisted
+        self.finalized_cfs.retain(|cf| {
+            if removed_count >= excess {
+                return true;
+            }
+            if self.persisted_anchor_ids.contains(&cf.anchor.id) {
+                removed_anchor_ids.push(cf.anchor.id.clone());
+                removed_count += 1;
+                false // remove this CF
+            } else {
+                true // keep unpersisted CF
+            }
+        });
+        
+        // Clean up persisted_anchor_ids for removed CFs
+        for id in removed_anchor_ids {
+            self.persisted_anchor_ids.remove(&id);
+        }
+        
+        // Safety valve: if too many unpersisted CFs, log warning but don't drop
+        if self.finalized_cfs.len() > MAX_FINALIZED_CFS * 2 {
+            eprintln!(
+                "WARNING: {} finalized CFs in memory, persistence may be failing",
+                self.finalized_cfs.len()
+            );
+        }
     }
     
     /// Get the last finalized anchor (for storage)

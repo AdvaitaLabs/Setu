@@ -178,9 +178,15 @@ impl Validator {
                             if let Ok((finalized, anchor)) = consensus_engine.receive_vote(vote).await {
                                 if finalized {
                                     // Store the finalized anchor
-                                    if let Some(anchor) = anchor {
-                                        if let Err(e) = anchor_store.store(anchor).await {
-                                            tracing::error!("Failed to store finalized anchor: {}", e);
+                                    if let Some(ref anchor) = anchor {
+                                        match anchor_store.store(anchor.clone()).await {
+                                            Ok(_) => {
+                                                // Mark as persisted for safe GC
+                                                consensus_engine.mark_anchor_persisted(&anchor.id).await;
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("Failed to store finalized anchor: {}", e);
+                                            }
                                         }
                                     }
                                 }
@@ -189,8 +195,14 @@ impl Validator {
                         NetworkEvent::CFFinalized { cf, .. } => {
                             cf_store.mark_finalized(&cf.id).await;
                             // Also store the anchor from the finalized CF
-                            if let Err(e) = anchor_store.store(cf.anchor.clone()).await {
-                                tracing::error!("Failed to store anchor from finalized CF: {}", e);
+                            match anchor_store.store(cf.anchor.clone()).await {
+                                Ok(_) => {
+                                    // Mark as persisted for safe GC
+                                    consensus_engine.mark_anchor_persisted(&cf.anchor.id).await;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to store anchor from finalized CF: {}", e);
+                                }
                             }
                             tracing::info!("CF finalized: {}", cf.id);
                         }
