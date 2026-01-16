@@ -51,6 +51,24 @@ pub fn compute_anchor_chain_root(anchors: &[&Anchor]) -> MerkleHash {
     tree.root()
 }
 
+/// Computes the anchor chain root from anchor hash history
+///
+/// This variant takes pre-computed anchor hashes instead of anchor references.
+/// Useful when maintaining an append-only history of anchor hashes.
+pub fn compute_anchor_chain_root_from_hashes(anchor_hashes: &[[u8; 32]]) -> [u8; 32] {
+    if anchor_hashes.is_empty() {
+        return [0u8; 32];
+    }
+    
+    let leaves: Vec<&[u8]> = anchor_hashes
+        .iter()
+        .map(|h| h.as_slice())
+        .collect();
+    
+    let tree = BinaryMerkleTree::build(&leaves);
+    *tree.root().as_bytes()
+}
+
 /// Computes the global state root from subnet state roots
 ///
 /// Uses SubnetAggregationTree to combine all subnet roots into a single

@@ -16,8 +16,10 @@ use setu_merkle::{
     MerkleStore, SubnetAggregationTree, SubnetStateEntry,
 };
 use setu_types::{SubnetId, AnchorMerkleRoots};
+use setu_types::event::{Event, StateChange, ExecutionResult};
 use std::collections::HashMap;
 use std::sync::Arc;
+use sha2::{Sha256, Digest};
 
 /// Manages Object State SMT for a single subnet
 pub struct SubnetStateSMT {
@@ -302,6 +304,211 @@ impl GlobalStateManager {
             return false; // Cannot remove ROOT
         }
         self.subnet_states.remove(subnet_id).is_some()
+    }
+    
+    // =========================================================================
+    // StateChange Application Methods (Connecting Solver Output to SMT)
+    // =========================================================================
+    
+    /// Apply a single StateChange to a subnet's SMT
+    ///
+    /// This is called when processing Solver execution results.
+    /// The key is hashed to create a 32-byte ObjectId for the SMT.
+    pub fn apply_state_change(
+        &mut self,
+        subnet_id: SubnetId,
+        change: &StateChange,
+    ) -> ApplyResult {
+        let object_id = Self::key_to_object_id(&change.key);
+        let smt = self.get_subnet_mut(subnet_id);
+        
+        match &change.new_value {
+            Some(value) => {
+                // Insert or update
+                let root = smt.upsert(object_id, value.clone());
+                ApplyResult::Updated {
+                    object_id: *object_id.as_bytes(),
+                    new_root: *root.as_bytes(),
+                }
+            }
+            None => {
+                // Delete
+                let removed = smt.delete(&object_id);
+                ApplyResult::Deleted {
+                    object_id: *object_id.as_bytes(),
+                    existed: removed.is_some(),
+                }
+            }
+        }
+    }
+    
+    /// Apply all state changes from an ExecutionResult to a subnet
+    ///
+    /// Returns the new subnet root after applying all changes.
+    pub fn apply_execution_result(
+        &mut self,
+        subnet_id: SubnetId,
+        result: &ExecutionResult,
+    ) -> [u8; 32] {
+        for change in &result.state_changes {
+            self.apply_state_change(subnet_id, change);
+        }
+        self.get_subnet_mut(subnet_id).root_bytes()
+    }
+    
+    /// Apply all committed events' execution results to the state
+    ///
+    /// This is the main entry point called during Anchor creation.
+    /// It processes all events, extracts their execution results,
+    /// and applies the state changes to the appropriate subnet SMTs.
+    ///
+    /// # Returns
+    /// A summary of all state changes applied, grouped by subnet.
+    pub fn apply_committed_events(
+        &mut self,
+        events: &[Event],
+    ) -> StateApplySummary {
+        let mut summary = StateApplySummary::new();
+        
+        for event in events {
+            let subnet_id = event.get_subnet_id();
+            
+            if let Some(result) = &event.execution_result {
+                if !result.success {
+                    // Skip failed executions
+                    summary.failed_events.push(event.id.clone());
+                    continue;
+                }
+                
+                let changes_count = result.state_changes.len();
+                
+                // Apply all state changes for this event
+                let new_root = self.apply_execution_result(subnet_id, result);
+                
+                // Track in summary
+                summary.record_event(
+                    subnet_id,
+                    &event.id,
+                    changes_count,
+                    new_root,
+                );
+            }
+        }
+        
+        summary
+    }
+    
+    /// Apply events and compute final anchor merkle roots
+    ///
+    /// This is the complete flow for Anchor creation:
+    /// 1. Apply all event state changes
+    /// 2. Compute global state root
+    /// 3. Build AnchorMerkleRoots
+    pub fn process_anchor(
+        &mut self,
+        events: &[Event],
+        events_root: [u8; 32],
+        anchor_chain_root: [u8; 32],
+        anchor_id: u64,
+    ) -> Result<(AnchorMerkleRoots, StateApplySummary), StateApplyError> {
+        // Apply all state changes
+        let summary = self.apply_committed_events(events);
+        
+        // Build anchor roots
+        let anchor_roots = self.build_anchor_roots(events_root, anchor_chain_root);
+        
+        // Commit state
+        self.commit(anchor_id)
+            .map_err(|e| StateApplyError::CommitFailed(e.to_string()))?;
+        
+        Ok((anchor_roots, summary))
+    }
+    
+    /// Convert a string key to a 32-byte ObjectId using SHA-256
+    fn key_to_object_id(key: &str) -> HashValue {
+        let mut hasher = Sha256::new();
+        hasher.update(key.as_bytes());
+        let result = hasher.finalize();
+        HashValue::from_slice(&result).expect("SHA-256 produces 32 bytes")
+    }
+}
+
+/// Result of applying a single StateChange
+#[derive(Debug, Clone)]
+pub enum ApplyResult {
+    Updated {
+        object_id: [u8; 32],
+        new_root: [u8; 32],
+    },
+    Deleted {
+        object_id: [u8; 32],
+        existed: bool,
+    },
+}
+
+/// Error type for state application
+#[derive(Debug, Clone)]
+pub enum StateApplyError {
+    CommitFailed(String),
+    InvalidStateChange(String),
+}
+
+impl std::fmt::Display for StateApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StateApplyError::CommitFailed(msg) => write!(f, "Commit failed: {}", msg),
+            StateApplyError::InvalidStateChange(msg) => write!(f, "Invalid state change: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for StateApplyError {}
+
+/// Summary of state changes applied during anchor processing
+#[derive(Debug, Clone, Default)]
+pub struct StateApplySummary {
+    /// Changes per subnet: (event_count, total_changes, final_root)
+    pub subnet_stats: HashMap<SubnetId, SubnetApplyStats>,
+    /// Events that failed execution (skipped)
+    pub failed_events: Vec<String>,
+    /// Total events processed
+    pub total_events: usize,
+    /// Total state changes applied
+    pub total_changes: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SubnetApplyStats {
+    pub event_count: usize,
+    pub change_count: usize,
+    pub event_ids: Vec<String>,
+    pub final_root: [u8; 32],
+}
+
+impl StateApplySummary {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    pub fn record_event(
+        &mut self,
+        subnet_id: SubnetId,
+        event_id: &str,
+        changes_count: usize,
+        new_root: [u8; 32],
+    ) {
+        self.total_events += 1;
+        self.total_changes += changes_count;
+        
+        let stats = self.subnet_stats.entry(subnet_id).or_default();
+        stats.event_count += 1;
+        stats.change_count += changes_count;
+        stats.event_ids.push(event_id.to_string());
+        stats.final_root = new_root;
+    }
+    
+    pub fn subnets_updated(&self) -> usize {
+        self.subnet_stats.len()
     }
 }
 

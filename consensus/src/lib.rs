@@ -31,6 +31,7 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+pub mod anchor_builder;
 pub mod dag;
 pub mod engine;
 pub mod folder;
@@ -38,10 +39,12 @@ pub mod liveness;
 pub mod merkle_integration;
 pub mod root_executor;
 pub mod router;
+pub mod tee_verifier;
 pub mod validator_set;
 pub mod vlc;
 
 // Re-export main types
+pub use anchor_builder::{AnchorBuilder, AnchorBuildResult, AnchorBuildError};
 pub use dag::{Dag, DagError};
 pub use engine::{ConsensusEngine, ConsensusMessage, DagStats};
 pub use folder::{ConsensusManager, DagFolder};
@@ -51,6 +54,7 @@ pub use merkle_integration::{
 };
 pub use root_executor::{RootSubnetExecutor, RootExecutorError, RootExecutionResult};
 pub use router::{EventRouter, RoutedEvents, SubnetExecutionBatch, create_execution_batches};
+pub use tee_verifier::{TeeVerifier, TeeAttestation, VerificationResult, SolverRegistry, SolverInfo};
 pub use validator_set::{ElectionStrategy, ValidatorSet};
 pub use vlc::VLC;
 

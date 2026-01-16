@@ -7,14 +7,13 @@
 //! - Broadcasting to the network
 //! - Registering with Validator
 
-mod executor;
 mod dependency;
 mod tee;
 mod network_client;
 
-pub use executor::Executor;
 pub use dependency::{DependencyTracker, DependencyStats};
-pub use tee::{TeeEnvironment, TeeProof, EnclaveInfo};
+pub use tee::{TeeExecutor, TeeExecutionResult};
+pub use setu_enclave::{EnclaveInfo, Attestation};
 pub use network_client::{SolverNetworkClient, SolverNetworkConfig, SubmitEventRequest, SubmitEventResponse};
 
 use core_types::Transfer;
@@ -31,12 +30,10 @@ pub struct Solver {
     shard_manager: Arc<ShardManager>,
     transfer_rx: mpsc::UnboundedReceiver<Transfer>,
     event_tx: mpsc::UnboundedSender<Event>,
-    /// Executor for running transfers
-    executor: Executor,
     /// Dependency tracker for building DAG
     dependency_tracker: DependencyTracker,
-    /// TEE environment for secure execution
-    tee: TeeEnvironment,
+    /// TEE executor for secure execution and state management
+    tee: TeeExecutor,
     /// Current VLC state
     vlc: VectorClock,
 }
@@ -54,9 +51,8 @@ impl Solver {
         );
         
         let shard_manager = Arc::new(ShardManager::new());
-        let executor = Executor::new(config.node_id.clone());
         let dependency_tracker = DependencyTracker::new(config.node_id.clone());
-        let tee = TeeEnvironment::new(config.node_id.clone());
+        let tee = TeeExecutor::new(config.node_id.clone());
         let vlc = VectorClock::new();
         
         Self {
@@ -64,7 +60,6 @@ impl Solver {
             shard_manager,
             transfer_rx,
             event_tx,
-            executor,
             dependency_tracker,
             tee,
             vlc,
@@ -142,14 +137,10 @@ impl Solver {
             "State changes applied"
         );
         
-        // Step 4: Generate TEE proof
-        let _proof = self.generate_proof(transfer, &execution_result).await?;
-        debug!(
-            transfer_id = %transfer.id,
-            "TEE proof generated"
-        );
+        // Note: TEE attestation is already included in execution_result
+        // from execute_in_tee() via TeeExecutor.execute_events()
         
-        // Step 5: Update VLC
+        // Step 4: Update VLC
         let vlc_snapshot = self.update_vlc(transfer);
         debug!(
             transfer_id = %transfer.id,
@@ -201,21 +192,12 @@ impl Solver {
     
     /// Execute transfer in TEE environment
     async fn execute_in_tee(&self, transfer: &Transfer) -> anyhow::Result<setu_types::event::ExecutionResult> {
-        self.executor.execute_in_tee(transfer).await
+        self.tee.execute_in_tee(transfer).await
     }
     
     /// Apply state changes to local storage
     async fn apply_state_changes(&self, changes: &[setu_types::event::StateChange]) -> anyhow::Result<()> {
-        self.executor.apply_state_changes(changes).await
-    }
-    
-    /// Generate TEE proof for execution
-    async fn generate_proof(
-        &self,
-        transfer: &Transfer,
-        result: &setu_types::event::ExecutionResult,
-    ) -> anyhow::Result<TeeProof> {
-        self.tee.generate_proof(transfer, result).await
+        self.tee.apply_state_changes(changes).await
     }
     
     /// Update VLC and return snapshot

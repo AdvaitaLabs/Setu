@@ -60,9 +60,9 @@ impl Anchor {
     pub fn with_merkle_roots(
         event_ids: Vec<EventId>,
         vlc_snapshot: VLCSnapshot,
-        merkle_roots: AnchorMerkleRoots,
         previous_anchor: Option<AnchorId>,
         depth: u64,
+        merkle_roots: AnchorMerkleRoots,
     ) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -130,6 +130,27 @@ impl Anchor {
         self.merkle_roots
             .as_ref()
             .and_then(|m| m.get_subnet_root(subnet_id))
+    }
+    
+    /// Compute a hash of this anchor for anchor chain tree
+    pub fn compute_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.id.as_bytes());
+        hasher.update(self.depth.to_le_bytes());
+        if let Some(prev) = &self.previous_anchor {
+            hasher.update(prev.as_bytes());
+        }
+        if let Some(roots) = &self.merkle_roots {
+            hasher.update(&roots.events_root);
+            hasher.update(&roots.global_state_root);
+        }
+        hasher.update(self.vlc_snapshot.logical_time.to_le_bytes());
+        hasher.update(self.timestamp.to_le_bytes());
+        
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
     }
 }
 
