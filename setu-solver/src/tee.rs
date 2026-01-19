@@ -3,7 +3,7 @@
 //! This module provides a wrapper around `setu-enclave` for Solver-specific use cases.
 //! It bridges the gap between the generic enclave abstraction and the Solver's needs.
 //!
-//! ## Architecture
+//! ## Architecture (Scheme B - Stateless Solver)
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────────┐
@@ -11,7 +11,8 @@
 //! │  ┌───────────────────────────────────────────────────────────────┐  │
 //! │  │                   TeeExecutor (this module)                    │  │
 //! │  │   • Wraps EnclaveRuntime                                       │  │
-//! │  │   • Converts Event/Transfer → StfInput                         │  │
+//! │  │   • Reads current state from Validator via StateReader         │  │
+//! │  │   • Computes final state values (not deltas)                   │  │
 //! │  │   • Handles attestation generation                             │  │
 //! │  └───────────────────────────────────────────────────────────────┘  │
 //! │                              │                                      │
@@ -23,7 +24,15 @@
 //! │  └───────────────────────────────────────────────────────────────┘  │
 //! └─────────────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! ## State Management (Scheme B)
+//!
+//! - Solver is **stateless** - does not maintain local state
+//! - Reads current committed state from Validator via `StateReader`
+//! - Computes **final state values** (not deltas) for `StateChange.new_value`
+//! - Validator is the single source of truth for state
 
+use async_trait::async_trait;
 use core_types::Transfer;
 use setu_enclave::{
     Attestation, EnclaveInfo, EnclaveRuntime,
@@ -32,31 +41,80 @@ use setu_enclave::{
 use setu_types::event::{Event, ExecutionResult, StateChange};
 use setu_types::SubnetId;
 use std::sync::Arc;
-use tracing::{info, debug};
+use tracing::{info, debug, warn};
+
+/// State reader trait for reading current state from Validator
+///
+/// In Scheme B, Solver is stateless. It reads current committed state
+/// from Validator before executing transactions.
+#[async_trait]
+pub trait StateReader: Send + Sync {
+    /// Get the current balance for an account
+    /// Returns 0 if account doesn't exist
+    async fn get_balance(&self, account: &str) -> anyhow::Result<u128>;
+    
+    /// Get raw object data by key
+    async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>>;
+}
+
+/// Mock state reader for testing
+/// Returns predefined balances or defaults
+pub struct MockStateReader {
+    default_balance: u128,
+}
+
+impl MockStateReader {
+    pub fn new(default_balance: u128) -> Self {
+        Self { default_balance }
+    }
+}
+
+impl Default for MockStateReader {
+    fn default() -> Self {
+        Self { default_balance: 1_000_000 } // 1M default balance for testing
+    }
+}
+
+#[async_trait]
+impl StateReader for MockStateReader {
+    async fn get_balance(&self, _account: &str) -> anyhow::Result<u128> {
+        Ok(self.default_balance)
+    }
+    
+    async fn get_object(&self, _key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+}
 
 /// TEE Executor for Solver nodes
 ///
 /// Wraps an `EnclaveRuntime` implementation and provides high-level APIs
 /// for event execution and attestation generation.
+///
+/// In Scheme B, TeeExecutor uses `StateReader` to fetch current state from
+/// Validator before computing state changes.
 pub struct TeeExecutor {
     solver_id: String,
     enclave: Arc<dyn EnclaveRuntime>,
+    /// State reader for fetching current state from Validator
+    state_reader: Arc<dyn StateReader>,
 }
 
 impl TeeExecutor {
-    /// Create a new TEE Executor with the default enclave (MockEnclave for now)
+    /// Create a new TEE Executor with the default enclave and mock state reader
     pub fn new(solver_id: String) -> Self {
         let enclave = MockEnclave::default_with_solver_id(solver_id.clone());
         
         info!(
             solver_id = %solver_id,
             platform = %enclave.info().platform,
-            "Initializing TEE Executor"
+            "Initializing TEE Executor with MockStateReader"
         );
         
         Self {
             solver_id,
             enclave: Arc::new(enclave),
+            state_reader: Arc::new(MockStateReader::default()),
         }
     }
     
@@ -66,15 +124,53 @@ impl TeeExecutor {
             solver_id = %solver_id,
             platform = %enclave.info().platform,
             simulated = enclave.is_simulated(),
-            "Initializing TEE Executor with custom enclave"
+            "Initializing TEE Executor with custom enclave and MockStateReader"
         );
         
         Self {
             solver_id,
             enclave,
+            state_reader: Arc::new(MockStateReader::default()),
         }
     }
     
+    /// Create with custom enclave and state reader
+    pub fn with_enclave_and_reader(
+        solver_id: String,
+        enclave: Arc<dyn EnclaveRuntime>,
+        state_reader: Arc<dyn StateReader>,
+    ) -> Self {
+        info!(
+            solver_id = %solver_id,
+            platform = %enclave.info().platform,
+            simulated = enclave.is_simulated(),
+            "Initializing TEE Executor with custom enclave and state reader"
+        );
+        
+        Self {
+            solver_id,
+            enclave,
+            state_reader,
+        }
+    }
+    
+    /// Create with custom state reader (using default MockEnclave)
+    pub fn with_state_reader(solver_id: String, state_reader: Arc<dyn StateReader>) -> Self {
+        let enclave = MockEnclave::default_with_solver_id(solver_id.clone());
+        
+        info!(
+            solver_id = %solver_id,
+            platform = %enclave.info().platform,
+            "Initializing TEE Executor with custom state reader"
+        );
+        
+        Self {
+            solver_id,
+            enclave: Arc::new(enclave),
+            state_reader,
+        }
+    }
+
     /// Execute events and generate attestation
     ///
     /// This is the main entry point for Solver event execution.
@@ -135,6 +231,12 @@ impl TeeExecutor {
     ///
     /// This method combines the enclave execution with result conversion,
     /// providing the primary API for Solver's transfer execution pipeline.
+    ///
+    /// In Scheme B:
+    /// 1. Reads current state from Validator via StateReader
+    /// 2. Validates transaction (e.g., sufficient balance)
+    /// 3. Executes in TEE enclave
+    /// 4. Returns ExecutionResult with final state values (not deltas)
     pub async fn execute_in_tee(&self, transfer: &Transfer) -> anyhow::Result<ExecutionResult> {
         debug!(
             transfer_id = %transfer.id,
@@ -143,6 +245,24 @@ impl TeeExecutor {
             amount = %transfer.amount,
             "Executing transfer in TEE"
         );
+        
+        // Step 1: Compute state changes (reads current state from Validator)
+        // This validates the transaction and computes final state values
+        let state_changes = match self.compute_transfer_state_changes(transfer).await {
+            Ok(changes) => changes,
+            Err(e) => {
+                warn!(
+                    transfer_id = %transfer.id,
+                    error = %e,
+                    "Transfer validation failed"
+                );
+                return Ok(ExecutionResult {
+                    success: false,
+                    message: Some(format!("Validation failed: {}", e)),
+                    state_changes: vec![],
+                });
+            }
+        };
         
         // Convert transfer to event
         let event = self.transfer_to_event(transfer)?;
@@ -153,26 +273,25 @@ impl TeeExecutor {
             .map(|s| SubnetId::from_str_id(s))
             .unwrap_or(SubnetId::ROOT);
         
-        // Build read set from transfer accounts
-        let read_set = vec![
-            (format!("balance:{}", transfer.from), vec![]),
-            (format!("balance:{}", transfer.to), vec![]),
-        ];
+        // Build read set with actual current values for TEE verification
+        let read_set: Vec<(String, Vec<u8>)> = state_changes.iter()
+            .filter_map(|sc| {
+                sc.old_value.as_ref().map(|v| (sc.key.clone(), v.clone()))
+            })
+            .collect();
         
         // Use zero as pre-state root for now
-        // TODO: fetch actual state root from storage
+        // TODO: fetch actual state root from Validator
         let pre_state_root = [0u8; 32];
         
-        // Execute in enclave
+        // Step 2: Execute in TEE enclave
         let tee_result = self.execute_events(subnet_id, pre_state_root, vec![event], read_set).await?;
-        
-        // Generate state changes for this transfer
-        let state_changes = self.compute_transfer_state_changes(transfer);
         
         info!(
             transfer_id = %transfer.id,
             success = tee_result.events_failed == 0,
             attestation_type = ?tee_result.attestation.attestation_type,
+            state_changes_count = state_changes.len(),
             "Transfer TEE execution completed"
         );
         
@@ -215,25 +334,86 @@ impl TeeExecutor {
     }
     
     /// Compute state changes for a transfer
-    fn compute_transfer_state_changes(&self, transfer: &Transfer) -> Vec<StateChange> {
+    ///
+    /// In Scheme B, this method:
+    /// 1. Reads current balance from Validator via StateReader
+    /// 2. Validates sufficient balance for sender
+    /// 3. Computes final balance values (not deltas)
+    /// 4. Returns StateChange with old_value and new_value as final states
+    async fn compute_transfer_state_changes(&self, transfer: &Transfer) -> anyhow::Result<Vec<StateChange>> {
         let amount = transfer.amount.unsigned_abs();
-        vec![
-            // Debit from sender
+        
+        // Read current balances from Validator
+        let sender_balance = self.state_reader.get_balance(&transfer.from).await?;
+        let receiver_balance = self.state_reader.get_balance(&transfer.to).await?;
+        
+        debug!(
+            transfer_id = %transfer.id,
+            sender = %transfer.from,
+            sender_balance = sender_balance,
+            receiver = %transfer.to,
+            receiver_balance = receiver_balance,
+            amount = amount,
+            "Read current balances from Validator"
+        );
+        
+        // Validate sufficient balance
+        if sender_balance < amount {
+            return Err(anyhow::anyhow!(
+                "Insufficient balance: {} has {} but trying to send {}",
+                transfer.from,
+                sender_balance,
+                amount
+            ));
+        }
+        
+        // Compute final balances
+        let new_sender_balance = sender_balance - amount;
+        let new_receiver_balance = receiver_balance + amount;
+        
+        debug!(
+            transfer_id = %transfer.id,
+            new_sender_balance = new_sender_balance,
+            new_receiver_balance = new_receiver_balance,
+            "Computed final balances"
+        );
+        
+        Ok(vec![
+            // Debit from sender - store FINAL balance value
             StateChange {
                 key: format!("balance:{}", transfer.from),
-                old_value: None,  // TODO: fetch from storage
-                new_value: Some(self.encode_balance_change(amount, false)),
+                old_value: Some(Self::encode_balance(sender_balance)),
+                new_value: Some(Self::encode_balance(new_sender_balance)),
             },
-            // Credit to receiver
+            // Credit to receiver - store FINAL balance value
             StateChange {
                 key: format!("balance:{}", transfer.to),
-                old_value: None,
-                new_value: Some(self.encode_balance_change(amount, true)),
+                old_value: Some(Self::encode_balance(receiver_balance)),
+                new_value: Some(Self::encode_balance(new_receiver_balance)),
             },
-        ]
+        ])
     }
     
-    /// Encode a balance change
+    /// Encode a balance as bytes (u128 little-endian)
+    fn encode_balance(balance: u128) -> Vec<u8> {
+        balance.to_le_bytes().to_vec()
+    }
+    
+    /// Decode bytes to balance (u128 little-endian)
+    #[allow(dead_code)]
+    fn decode_balance(bytes: &[u8]) -> u128 {
+        if bytes.len() >= 16 {
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(&bytes[..16]);
+            u128::from_le_bytes(arr)
+        } else {
+            0
+        }
+    }
+    
+    /// Encode a balance change (DEPRECATED - kept for backward compatibility)
+    #[deprecated(since = "0.2.0", note = "Use encode_balance() instead. new_value should be final state, not delta.")]
+    #[allow(dead_code)]
     fn encode_balance_change(&self, amount: u128, is_credit: bool) -> Vec<u8> {
         let mut result = vec![if is_credit { 0x01 } else { 0x00 }];
         result.extend_from_slice(&amount.to_le_bytes());
