@@ -189,25 +189,27 @@ impl TeeExecutor {
     
     /// Apply state changes to local storage
     ///
-    /// Currently logs the changes. In production, this should persist
-    /// to the storage layer (RocksDB, etc.)
+    /// DEPRECATED: In Scheme B, Solver is stateless. State changes are applied
+    /// only by Validator after ConsensusFrame finalization.
+    /// This method is kept for backward compatibility but should not be called.
+    /// 
+    /// See: storage/src/subnet_state.rs - apply_committed_events()
+    #[deprecated(since = "0.2.0", note = "Solver is stateless in Scheme B. State is managed by Validator only.")]
     pub async fn apply_state_changes(&self, changes: &[StateChange]) -> anyhow::Result<()> {
+        warn!(
+            changes_count = changes.len(),
+            "apply_state_changes called but Solver is stateless - changes will be applied by Validator"
+        );
+        
+        // Log for debugging only, do not actually apply
         for change in changes {
             debug!(
                 key = %change.key,
                 has_old = change.old_value.is_some(),
                 has_new = change.new_value.is_some(),
-                "Applying state change"
+                "State change (not applied locally)"
             );
-            
-            // TODO: Persist to storage layer
-            // self.storage.apply_change(change).await?;
         }
-        
-        info!(
-            changes_count = changes.len(),
-            "State changes applied (simulated)"
-        );
         
         Ok(())
     }

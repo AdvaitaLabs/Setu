@@ -126,21 +126,17 @@ impl Solver {
         debug!(
             transfer_id = %transfer.id,
             success = execution_result.success,
+            state_changes_count = execution_result.state_changes.len(),
             "TEE execution completed"
         );
         
-        // Step 3: Apply state changes
-        self.apply_state_changes(&execution_result.state_changes).await?;
-        debug!(
-            transfer_id = %transfer.id,
-            changes_count = execution_result.state_changes.len(),
-            "State changes applied"
-        );
+        // NOTE: Solver does NOT apply state changes locally (Scheme B)
+        // - Solver is stateless, Validator is the single source of truth
+        // - State changes are included in the Event and sent to Validator
+        // - Validator applies state changes after CF (ConsensusFrame) is finalized
+        // - This ensures Solver/Validator state consistency
         
-        // Note: TEE attestation is already included in execution_result
-        // from execute_in_tee() via TeeExecutor.execute_events()
-        
-        // Step 4: Update VLC
+        // Step 3: Update VLC
         let vlc_snapshot = self.update_vlc(transfer);
         debug!(
             transfer_id = %transfer.id,
@@ -195,11 +191,10 @@ impl Solver {
         self.tee.execute_in_tee(transfer).await
     }
     
-    /// Apply state changes to local storage
-    async fn apply_state_changes(&self, changes: &[setu_types::event::StateChange]) -> anyhow::Result<()> {
-        self.tee.apply_state_changes(changes).await
-    }
-    
+    // NOTE: apply_state_changes() removed - Solver is stateless in Scheme B
+    // State changes are applied only by Validator after CF finalization
+    // See: storage/src/subnet_state.rs - apply_committed_events()
+
     /// Update VLC and return snapshot
     /// 
     /// NOTE: In the new architecture, VLC is managed by Validator.
