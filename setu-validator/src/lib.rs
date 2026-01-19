@@ -13,12 +13,14 @@ mod dag;
 mod sampling;
 mod router_manager;
 mod network_service;
+mod user_handler;
 
 pub use verifier::Verifier;
 pub use dag::{DagManager, DagManagerError, DagNode, DagStats};
 pub use sampling::{SamplingVerifier, SamplingConfig, SamplingStats};
 pub use router_manager::{RouterManager, RouterError, SolverConnection};
 pub use network_service::{ValidatorNetworkService, ValidatorRegistrationHandler, NetworkServiceConfig, ValidatorInfo};
+pub use user_handler::ValidatorUserHandler;
 
 use core_types::Transfer;
 use setu_core::{NodeConfig, ShardManager};

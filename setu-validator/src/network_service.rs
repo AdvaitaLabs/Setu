@@ -106,12 +106,13 @@ impl Default for NetworkServiceConfig {
 /// - Status queries
 /// - Transfer submission
 /// - Event submission (from Solver)
+/// - User RPC (account queries, user registration, etc.)
 pub struct ValidatorNetworkService {
     /// Validator ID
-    validator_id: String,
+    pub validator_id: String,
     
     /// Router manager for solver management
-    router_manager: Arc<RouterManager>,
+    pub router_manager: Arc<RouterManager>,
     
     /// Registered validators (other validators in the network)
     validators: Arc<RwLock<HashMap<String, ValidatorInfo>>>,
@@ -123,16 +124,16 @@ pub struct ValidatorNetworkService {
     transfer_status: Arc<RwLock<HashMap<String, TransferTracker>>>,
     
     /// Event storage (event_id -> event)
-    events: Arc<RwLock<HashMap<String, Event>>>,
+    pub events: Arc<RwLock<HashMap<String, Event>>>,
     
     /// Event tracking (event_id -> tracker)
-    event_trackers: Arc<RwLock<HashMap<String, EventTracker>>>,
+    pub event_trackers: Arc<RwLock<HashMap<String, EventTracker>>>,
     
     /// Pending event queue (events waiting for verification)
-    pending_events: Arc<RwLock<Vec<String>>>,
+    pub pending_events: Arc<RwLock<Vec<String>>>,
     
     /// Verified events in DAG order
-    dag_events: Arc<RwLock<Vec<String>>>,
+    pub dag_events: Arc<RwLock<Vec<String>>>,
     
     /// Configuration
     config: NetworkServiceConfig,
@@ -141,19 +142,19 @@ pub struct ValidatorNetworkService {
     start_time: u64,
     
     /// Transfer counter for generating IDs
-    transfer_counter: AtomicU64,
+    pub transfer_counter: AtomicU64,
     
     /// VLC counter (simulated)
-    vlc_counter: AtomicU64,
+    pub vlc_counter: AtomicU64,
     
     /// Event counter
-    event_counter: AtomicU64,
+    pub event_counter: AtomicU64,
     
     /// Subnet registry (subnet_id -> SubnetInfo)
-    subnet_registry: Arc<RwLock<HashMap<String, SubnetInfo>>>,
+    pub subnet_registry: Arc<RwLock<HashMap<String, SubnetInfo>>>,
     
     /// User registry (user_id -> UserInfo)
-    user_registry: Arc<RwLock<HashMap<String, UserInfo>>>,
+    pub user_registry: Arc<RwLock<HashMap<String, UserInfo>>>,
 }
 
 /// Transfer tracking information
@@ -296,6 +297,14 @@ impl ValidatorNetworkService {
             // Event endpoints (for Solver to submit events)
             .route("/api/v1/event", post(http_submit_event))
             .route("/api/v1/events", get(http_get_events))
+            // User RPC endpoints (for Wallet/DApp)
+            .route("/api/v1/user/register", post(http_user_register))
+            .route("/api/v1/user/account", post(http_user_get_account))
+            .route("/api/v1/user/balance", post(http_user_get_balance))
+            .route("/api/v1/user/power", post(http_user_get_power))
+            .route("/api/v1/user/credit", post(http_user_get_credit))
+            .route("/api/v1/user/credentials", post(http_user_get_credentials))
+            .route("/api/v1/user/transfer", post(http_user_transfer))
             // Heartbeat
             .route("/api/v1/heartbeat", post(http_heartbeat))
             .with_state(service);
@@ -732,7 +741,7 @@ impl ValidatorNetworkService {
     }
     
     /// Apply side effects for specific event types
-    async fn apply_event_side_effects(&self, event_id: &str) {
+    pub async fn apply_event_side_effects(&self, event_id: &str) {
         let event = match self.events.read().get(event_id).cloned() {
             Some(e) => e,
             None => return,
@@ -1458,5 +1467,86 @@ async fn http_health(
         "solver_count": service.router_manager.solver_count(),
         "validator_count": service.validators.read().len(),
     }))
+}
+
+// ============================================
+// User RPC HTTP Handler Functions
+// ============================================
+
+async fn http_user_register(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<setu_rpc::RegisterUserRequest>,
+) -> Json<setu_rpc::RegisterUserResponse> {
+    use crate::ValidatorUserHandler;
+    use setu_rpc::UserRpcHandler;
+    
+    let handler = ValidatorUserHandler::new(service);
+    Json(handler.register_user(request).await)
+}
+
+async fn http_user_get_account(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<setu_rpc::GetAccountRequest>,
+) -> Json<setu_rpc::GetAccountResponse> {
+    use crate::ValidatorUserHandler;
+    use setu_rpc::UserRpcHandler;
+    
+    let handler = ValidatorUserHandler::new(service);
+    Json(handler.get_account(request).await)
+}
+
+async fn http_user_get_balance(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<setu_rpc::GetBalanceRequest>,
+) -> Json<setu_rpc::GetBalanceResponse> {
+    use crate::ValidatorUserHandler;
+    use setu_rpc::UserRpcHandler;
+    
+    let handler = ValidatorUserHandler::new(service);
+    Json(handler.get_balance(request).await)
+}
+
+async fn http_user_get_power(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<setu_rpc::GetPowerRequest>,
+) -> Json<setu_rpc::GetPowerResponse> {
+    use crate::ValidatorUserHandler;
+    use setu_rpc::UserRpcHandler;
+    
+    let handler = ValidatorUserHandler::new(service);
+    Json(handler.get_power(request).await)
+}
+
+async fn http_user_get_credit(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<setu_rpc::GetCreditRequest>,
+) -> Json<setu_rpc::GetCreditResponse> {
+    use crate::ValidatorUserHandler;
+    use setu_rpc::UserRpcHandler;
+    
+    let handler = ValidatorUserHandler::new(service);
+    Json(handler.get_credit(request).await)
+}
+
+async fn http_user_get_credentials(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<setu_rpc::GetCredentialsRequest>,
+) -> Json<setu_rpc::GetCredentialsResponse> {
+    use crate::ValidatorUserHandler;
+    use setu_rpc::UserRpcHandler;
+    
+    let handler = ValidatorUserHandler::new(service);
+    Json(handler.get_credentials(request).await)
+}
+
+async fn http_user_transfer(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<setu_rpc::TransferRequest>,
+) -> Json<setu_rpc::TransferResponse> {
+    use crate::ValidatorUserHandler;
+    use setu_rpc::UserRpcHandler;
+    
+    let handler = ValidatorUserHandler::new(service);
+    Json(handler.transfer(request).await)
 }
 
