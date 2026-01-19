@@ -309,6 +309,48 @@ impl<S: StateStore> RuntimeExecutor<S> {
         })
     }
     
+    /// Execute a transfer using a specific coin_id (solver-tee3 architecture)
+    ///
+    /// This method is called when Validator has already selected the coin_id
+    /// via ResolvedInputs. The TEE should use this method instead of
+    /// execute_simple_transfer to honor the Validator's coin selection.
+    ///
+    /// # Arguments
+    /// * `coin_id` - The specific coin object ID selected by Validator
+    /// * `sender` - Sender address (for ownership verification)
+    /// * `recipient` - Recipient address
+    /// * `amount` - Amount to transfer (None for full transfer)
+    /// * `ctx` - Execution context
+    pub fn execute_transfer_with_coin(
+        &mut self,
+        coin_id: ObjectId,
+        sender: &str,
+        recipient: &str,
+        amount: Option<u64>,
+        ctx: &ExecutionContext,
+    ) -> RuntimeResult<ExecutionOutput> {
+        let sender_addr = Address::from(sender);
+        let recipient_addr = Address::from(recipient);
+        
+        info!(
+            coin_id = %coin_id,
+            from = %sender,
+            to = %recipient,
+            amount = ?amount,
+            "Executing transfer with specified coin_id"
+        );
+        
+        // Create and execute the transfer transaction
+        let tx = Transaction::new_transfer(
+            sender_addr,
+            coin_id,
+            recipient_addr,
+            amount,
+        );
+        
+        self.execute_transaction(&tx, ctx)
+    }
+    
     /// 获取状态存储的引用（用于外部查询）
     pub fn state(&self) -> &S {
         &self.state
@@ -317,6 +359,97 @@ impl<S: StateStore> RuntimeExecutor<S> {
     /// 获取状态存储的可变引用
     pub fn state_mut(&mut self) -> &mut S {
         &mut self.state
+    }
+    
+    /// Execute a simple account-based transfer (convenience method)
+    /// 
+    /// This method accepts a simple `Transfer` request (from/to/amount) from users,
+    /// automatically finds suitable Coin objects from the sender, and executes the transfer.
+    /// 
+    /// This bridges the gap between user-facing account model and internal object model.
+    /// 
+    /// # Arguments
+    /// * `from` - Sender address (account)
+    /// * `to` - Recipient address (account)  
+    /// * `amount` - Amount to transfer
+    /// * `ctx` - Execution context
+    /// 
+    /// # Returns
+    /// * `ExecutionOutput` with state changes in object model format
+    pub fn execute_simple_transfer(
+        &mut self,
+        from: &str,
+        to: &str,
+        amount: u64,
+        ctx: &ExecutionContext,
+    ) -> RuntimeResult<ExecutionOutput> {
+        let sender = Address::from(from);
+        let recipient = Address::from(to);
+        
+        info!(
+            from = %from,
+            to = %to,
+            amount = amount,
+            "Executing simple transfer"
+        );
+        
+        // 1. Find sender's Coin objects
+        let owned_objects = self.state.get_owned_objects(&sender)?;
+        
+        if owned_objects.is_empty() {
+            return Err(RuntimeError::InsufficientBalance {
+                address: sender.to_string(),
+                required: amount,
+                available: 0,
+            });
+        }
+        
+        // 2. Calculate total balance and find a suitable coin
+        let mut total_balance = 0u64;
+        let mut selected_coin_id: Option<ObjectId> = None;
+        let mut selected_coin_balance = 0u64;
+        
+        for obj_id in &owned_objects {
+            if let Some(coin) = self.state.get_object(obj_id)? {
+                let balance = coin.data.balance.value();
+                total_balance += balance;
+                
+                // Select a coin that can cover the amount (prefer exact match or smallest sufficient)
+                if balance >= amount {
+                    if selected_coin_id.is_none() || balance < selected_coin_balance {
+                        selected_coin_id = Some(*obj_id);
+                        selected_coin_balance = balance;
+                    }
+                }
+            }
+        }
+        
+        // Check total balance
+        if total_balance < amount {
+            return Err(RuntimeError::InsufficientBalance {
+                address: sender.to_string(),
+                required: amount,
+                available: total_balance,
+            });
+        }
+        
+        // 3. If no single coin is sufficient, we need to merge (future: for now, error out)
+        let coin_id = selected_coin_id.ok_or_else(|| {
+            RuntimeError::InvalidTransaction(format!(
+                "No single coin with sufficient balance. Total: {}, Required: {}. Coin merging not yet implemented.",
+                total_balance, amount
+            ))
+        })?;
+        
+        // 4. Create and execute the transfer transaction
+        let tx = Transaction::new_transfer(
+            sender,
+            coin_id,
+            recipient,
+            Some(amount), // Always partial transfer for simple API
+        );
+        
+        self.execute_transaction(&tx, ctx)
     }
 }
 
