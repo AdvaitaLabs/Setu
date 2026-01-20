@@ -548,7 +548,7 @@ impl ValidatorNetworkService {
         Ok(())
     }
 
-    async fn apply_event_side_effects(&self, event_id: &str) {
+    pub async fn apply_event_side_effects(&self, event_id: &str) {
         let event = match self.events.read().get(event_id).cloned() {
             Some(e) => e,
             None => return,
