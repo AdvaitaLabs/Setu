@@ -1,19 +1,32 @@
 //! TEE (Trusted Execution Environment) integration for Solver
 //!
 //! This module provides a wrapper around `setu-enclave` for Solver-specific use cases.
-//! It bridges the gap between the generic enclave abstraction and the Solver's needs.
+//! In solver-tee3 architecture, Solver acts as a **pass-through** layer:
 //!
-//! ## Architecture (Scheme B - Stateless Solver)
+//! - Validator prepares `SolverTask` with all necessary data (coin selection, proofs)
+//! - Solver receives `SolverTask` and passes it to TEE
+//! - TEE validates proofs and executes the state transition
+//! - Solver returns the result to Validator
+//!
+//! ## Architecture (solver-tee3)
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────────┐
-//! │                          Solver                                     │
+//! │                        Validator                                    │
+//! │  TaskPreparer: coin selection, read_set, Merkle proofs             │
+//! └─────────────────────────────────────────────────────────────────────┘
+//!                              │
+//!                        SolverTask
+//!                              │
+//!                              ▼
+//! ┌─────────────────────────────────────────────────────────────────────┐
+//! │                    Solver (Pass-through)                            │
 //! │  ┌───────────────────────────────────────────────────────────────┐  │
-//! │  │                   TeeExecutor (this module)                    │  │
-//! │  │   • Wraps EnclaveRuntime                                       │  │
-//! │  │   • Reads current state from Validator via StateReader         │  │
-//! │  │   • Computes final state values (not deltas)                   │  │
-//! │  │   • Handles attestation generation                             │  │
+//! │  │               TeeExecutor (this module)                        │  │
+//! │  │   • Receives SolverTask from Validator                         │  │
+//! │  │   • Converts to StfInput                                       │  │
+//! │  │   • Passes to EnclaveRuntime                                   │  │
+//! │  │   • Returns TeeExecutionResult                                 │  │
 //! │  └───────────────────────────────────────────────────────────────┘  │
 //! │                              │                                      │
 //! │                              ▼                                      │
@@ -23,99 +36,65 @@
 //! │  │   • NitroEnclave (production)                                  │  │
 //! │  └───────────────────────────────────────────────────────────────┘  │
 //! └─────────────────────────────────────────────────────────────────────┘
+//!                              │
+//!                     TeeExecutionResult
+//!                              │
+//!                              ▼
+//! ┌─────────────────────────────────────────────────────────────────────┐
+//! │                        Validator                                    │
+//! │  Verifies attestation, applies state changes                       │
+//! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! ## State Management (Scheme B)
+//! ## Key Design Principle
 //!
-//! - Solver is **stateless** - does not maintain local state
-//! - Reads current committed state from Validator via `StateReader`
-//! - Computes **final state values** (not deltas) for `StateChange.new_value`
-//! - Validator is the single source of truth for state
+//! **Solver does NOT**:
+//! - Read state from anywhere
+//! - Perform coin selection
+//! - Compute state changes
+//! - Maintain local state
+//!
+//! **Solver ONLY**:
+//! - Receives fully-prepared SolverTask
+//! - Passes it to TEE
+//! - Returns the result
 
-use async_trait::async_trait;
-use core_types::Transfer;
 use setu_enclave::{
     Attestation, EnclaveInfo, EnclaveRuntime,
-    MockEnclave, StfInput, StfOutput, ReadSetEntry,
-    SolverTask, ResolvedInputs, GasBudget, GasUsage,
+    MockEnclave, StfInput, StfOutput,
+    SolverTask, GasUsage,
 };
-use setu_types::event::{Event, ExecutionResult, StateChange};
+use setu_types::event::{ExecutionResult, StateChange};
 use setu_types::SubnetId;
 use std::sync::Arc;
-use tracing::{info, debug, warn};
-
-/// State reader trait for reading current state from Validator
-///
-/// In Scheme B, Solver is stateless. It reads current committed state
-/// from Validator before executing transactions.
-#[async_trait]
-pub trait StateReader: Send + Sync {
-    /// Get the current balance for an account
-    /// Returns 0 if account doesn't exist
-    async fn get_balance(&self, account: &str) -> anyhow::Result<u128>;
-    
-    /// Get raw object data by key
-    async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>>;
-}
-
-/// Mock state reader for testing
-/// Returns predefined balances or defaults
-pub struct MockStateReader {
-    default_balance: u128,
-}
-
-impl MockStateReader {
-    pub fn new(default_balance: u128) -> Self {
-        Self { default_balance }
-    }
-}
-
-impl Default for MockStateReader {
-    fn default() -> Self {
-        Self { default_balance: 1_000_000 } // 1M default balance for testing
-    }
-}
-
-#[async_trait]
-impl StateReader for MockStateReader {
-    async fn get_balance(&self, _account: &str) -> anyhow::Result<u128> {
-        Ok(self.default_balance)
-    }
-    
-    async fn get_object(&self, _key: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        Ok(None)
-    }
-}
+use tracing::{info, debug};
 
 /// TEE Executor for Solver nodes
 ///
-/// Wraps an `EnclaveRuntime` implementation and provides high-level APIs
-/// for event execution and attestation generation.
+/// Wraps an `EnclaveRuntime` implementation and provides the pass-through
+/// interface for executing `SolverTask` from Validator.
 ///
-/// In Scheme B, TeeExecutor uses `StateReader` to fetch current state from
-/// Validator before computing state changes.
+/// In solver-tee3 architecture, TeeExecutor is intentionally simple:
+/// it only converts `SolverTask` to `StfInput` and forwards to the enclave.
 pub struct TeeExecutor {
     solver_id: String,
     enclave: Arc<dyn EnclaveRuntime>,
-    /// State reader for fetching current state from Validator
-    state_reader: Arc<dyn StateReader>,
 }
 
 impl TeeExecutor {
-    /// Create a new TEE Executor with the default enclave and mock state reader
+    /// Create a new TEE Executor with the default MockEnclave
     pub fn new(solver_id: String) -> Self {
         let enclave = MockEnclave::default_with_solver_id(solver_id.clone());
         
         info!(
             solver_id = %solver_id,
             platform = %enclave.info().platform,
-            "Initializing TEE Executor with MockStateReader"
+            "Initializing TEE Executor"
         );
         
         Self {
             solver_id,
             enclave: Arc::new(enclave),
-            state_reader: Arc::new(MockStateReader::default()),
         }
     }
     
@@ -125,73 +104,42 @@ impl TeeExecutor {
             solver_id = %solver_id,
             platform = %enclave.info().platform,
             simulated = enclave.is_simulated(),
-            "Initializing TEE Executor with custom enclave and MockStateReader"
+            "Initializing TEE Executor with custom enclave"
         );
         
         Self {
             solver_id,
             enclave,
-            state_reader: Arc::new(MockStateReader::default()),
-        }
-    }
-    
-    /// Create with custom enclave and state reader
-    pub fn with_enclave_and_reader(
-        solver_id: String,
-        enclave: Arc<dyn EnclaveRuntime>,
-        state_reader: Arc<dyn StateReader>,
-    ) -> Self {
-        info!(
-            solver_id = %solver_id,
-            platform = %enclave.info().platform,
-            simulated = enclave.is_simulated(),
-            "Initializing TEE Executor with custom enclave and state reader"
-        );
-        
-        Self {
-            solver_id,
-            enclave,
-            state_reader,
-        }
-    }
-    
-    /// Create with custom state reader (using default MockEnclave)
-    pub fn with_state_reader(solver_id: String, state_reader: Arc<dyn StateReader>) -> Self {
-        let enclave = MockEnclave::default_with_solver_id(solver_id.clone());
-        
-        info!(
-            solver_id = %solver_id,
-            platform = %enclave.info().platform,
-            "Initializing TEE Executor with custom state reader"
-        );
-        
-        Self {
-            solver_id,
-            enclave: Arc::new(enclave),
-            state_reader,
         }
     }
 
     /// Execute a SolverTask prepared by Validator (solver-tee3 architecture)
     ///
-    /// This is the recommended entry point that follows the pass-through pattern:
-    /// - Validator prepares SolverTask with all necessary data
-    /// - Solver converts to StfInput and passes to TEE
-    /// - TEE validates and executes
+    /// This is the **primary entry point** for Solver TEE execution.
+    /// The method follows the pass-through pattern:
     ///
-    /// The Solver does NOT perform coin selection or state lookups - all that
-    /// is done by Validator and included in SolverTask.
+    /// 1. Receives `SolverTask` from Validator (contains everything needed)
+    /// 2. Converts to `StfInput` (direct mapping, no additional processing)
+    /// 3. Passes to TEE enclave for execution
+    /// 4. Returns `TeeExecutionResult` with attestation
+    ///
+    /// # Arguments
+    /// * `task` - Fully prepared SolverTask from Validator's TaskPreparer
+    ///
+    /// # Returns
+    /// * `TeeExecutionResult` containing post_state_root, state_diff, and attestation
     pub async fn execute_solver_task(&self, task: SolverTask) -> anyhow::Result<TeeExecutionResult> {
         debug!(
             solver_id = %self.solver_id,
-            task_id = ?task.task_id,
+            task_id = ?hex::encode(&task.task_id[..8]),
             subnet_id = ?task.subnet_id,
             event_id = %task.event.id,
             read_set_len = task.read_set.len(),
+            resolved_objects = task.resolved_inputs.input_objects.len(),
             "Executing SolverTask in TEE (pass-through)"
         );
         
-        // Convert SolverTask to StfInput (direct pass-through)
+        // Convert SolverTask to StfInput (direct pass-through, no modification)
         let input = StfInput::new(
             task.task_id,
             task.subnet_id.clone(),
@@ -208,72 +156,12 @@ impl TeeExecutor {
         
         info!(
             solver_id = %self.solver_id,
-            task_id = ?output.task_id,
+            task_id = ?hex::encode(&output.task_id[..8]),
             events_processed = output.events_processed.len(),
             events_failed = output.events_failed.len(),
             gas_used = output.gas_usage.gas_used,
+            attestation_type = ?output.attestation.attestation_type,
             "SolverTask TEE execution completed"
-        );
-        
-        Ok(TeeExecutionResult::from_stf_output(output))
-    }
-    
-    /// Execute events and generate attestation (legacy API, uses mock task_id)
-    ///
-    /// DEPRECATED: Use `execute_solver_task` instead which properly handles
-    /// task_id binding from Validator-prepared SolverTask.
-    #[deprecated(since = "0.3.0", note = "Use execute_solver_task() instead")]
-    pub async fn execute_events(
-        &self,
-        subnet_id: SubnetId,
-        pre_state_root: [u8; 32],
-        events: Vec<Event>,
-        read_set: Vec<(String, Vec<u8>)>,
-    ) -> anyhow::Result<TeeExecutionResult> {
-        debug!(
-            solver_id = %self.solver_id,
-            subnet_id = ?subnet_id,
-            event_count = events.len(),
-            "Executing events in TEE (legacy API)"
-        );
-        
-        // Generate a task_id from events (legacy behavior)
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        for event in &events {
-            hasher.update(event.id.as_bytes());
-        }
-        hasher.update(&pre_state_root);
-        let task_id: [u8; 32] = hasher.finalize().into();
-        
-        // Use default/empty resolved_inputs for legacy API
-        let resolved_inputs = ResolvedInputs::new();
-        let gas_budget = GasBudget::default();
-        
-        // Build StfInput
-        let input = StfInput::new(
-            task_id,
-            subnet_id.clone(),
-            pre_state_root,
-            resolved_inputs,
-            gas_budget,
-        )
-            .with_events(events)
-            .with_read_set(
-                read_set.into_iter()
-                    .map(|(k, v)| ReadSetEntry::new(k, v))
-                    .collect()
-            );
-        
-        // Execute STF
-        let output = self.enclave.execute_stf(input).await
-            .map_err(|e| anyhow::anyhow!("STF execution failed: {}", e))?;
-        
-        info!(
-            solver_id = %self.solver_id,
-            events_processed = output.events_processed.len(),
-            events_failed = output.events_failed.len(),
-            "TEE execution completed"
         );
         
         Ok(TeeExecutionResult::from_stf_output(output))
@@ -289,252 +177,56 @@ impl TeeExecutor {
         self.enclave.is_simulated()
     }
     
-    /// Get enclave measurement
-    #[allow(dead_code)]
+    /// Get enclave measurement (PCR0 for Nitro, MRENCLAVE for SGX)
     pub fn measurement(&self) -> [u8; 32] {
         self.enclave.measurement()
     }
     
-    /// Execute a transfer in TEE and return execution result
-    ///
-    /// This method combines the enclave execution with result conversion,
-    /// providing the primary API for Solver's transfer execution pipeline.
-    ///
-    /// In Scheme B:
-    /// 1. Reads current state from Validator via StateReader
-    /// 2. Validates transaction (e.g., sufficient balance)
-    /// 3. Executes in TEE enclave
-    /// 4. Returns ExecutionResult with final state values (not deltas)
-    pub async fn execute_in_tee(&self, transfer: &Transfer) -> anyhow::Result<ExecutionResult> {
-        debug!(
-            transfer_id = %transfer.id,
-            from = %transfer.from,
-            to = %transfer.to,
-            amount = %transfer.amount,
-            "Executing transfer in TEE"
-        );
-        
-        // Step 1: Compute state changes (reads current state from Validator)
-        // This validates the transaction and computes final state values
-        let state_changes = match self.compute_transfer_state_changes(transfer).await {
-            Ok(changes) => changes,
-            Err(e) => {
-                warn!(
-                    transfer_id = %transfer.id,
-                    error = %e,
-                    "Transfer validation failed"
-                );
-                return Ok(ExecutionResult {
-                    success: false,
-                    message: Some(format!("Validation failed: {}", e)),
-                    state_changes: vec![],
-                });
-            }
-        };
-        
-        // Convert transfer to event
-        let event = self.transfer_to_event(transfer)?;
-        
-        // Get subnet_id from transfer or default to ROOT
-        let subnet_id = transfer.subnet_id
-            .as_ref()
-            .map(|s| SubnetId::from_str_id(s))
-            .unwrap_or(SubnetId::ROOT);
-        
-        // Build read set with actual current values for TEE verification
-        let read_set: Vec<(String, Vec<u8>)> = state_changes.iter()
-            .filter_map(|sc| {
-                sc.old_value.as_ref().map(|v| (sc.key.clone(), v.clone()))
-            })
-            .collect();
-        
-        // Use zero as pre-state root for now
-        // TODO: fetch actual state root from Validator
-        let pre_state_root = [0u8; 32];
-        
-        // Step 2: Execute in TEE enclave
-        let tee_result = self.execute_events(subnet_id, pre_state_root, vec![event], read_set).await?;
-        
-        info!(
-            transfer_id = %transfer.id,
-            success = tee_result.events_failed == 0,
-            attestation_type = ?tee_result.attestation.attestation_type,
-            state_changes_count = state_changes.len(),
-            "Transfer TEE execution completed"
-        );
-        
-        Ok(ExecutionResult {
-            success: tee_result.events_failed == 0,
-            message: Some(format!(
-                "TEE execution: {} events processed, {} failed",
-                tee_result.events_processed,
-                tee_result.events_failed
-            )),
-            state_changes,
-        })
-    }
-    
-    /// Apply state changes to local storage
-    ///
-    /// DEPRECATED: In Scheme B, Solver is stateless. State changes are applied
-    /// only by Validator after ConsensusFrame finalization.
-    /// This method is kept for backward compatibility but should not be called.
-    /// 
-    /// See: storage/src/subnet_state.rs - apply_committed_events()
-    #[deprecated(since = "0.2.0", note = "Solver is stateless in Scheme B. State is managed by Validator only.")]
-    pub async fn apply_state_changes(&self, changes: &[StateChange]) -> anyhow::Result<()> {
-        warn!(
-            changes_count = changes.len(),
-            "apply_state_changes called but Solver is stateless - changes will be applied by Validator"
-        );
-        
-        // Log for debugging only, do not actually apply
-        for change in changes {
-            debug!(
-                key = %change.key,
-                has_old = change.old_value.is_some(),
-                has_new = change.new_value.is_some(),
-                "State change (not applied locally)"
-            );
-        }
-        
-        Ok(())
-    }
-    
-    /// Compute state changes for a transfer
-    ///
-    /// In Scheme B, this method:
-    /// 1. Reads current balance from Validator via StateReader
-    /// 2. Validates sufficient balance for sender
-    /// 3. Computes final balance values (not deltas)
-    /// 4. Returns StateChange with old_value and new_value as final states
-    async fn compute_transfer_state_changes(&self, transfer: &Transfer) -> anyhow::Result<Vec<StateChange>> {
-        let amount = transfer.amount.unsigned_abs();
-        
-        // Read current balances from Validator
-        let sender_balance = self.state_reader.get_balance(&transfer.from).await?;
-        let receiver_balance = self.state_reader.get_balance(&transfer.to).await?;
-        
-        debug!(
-            transfer_id = %transfer.id,
-            sender = %transfer.from,
-            sender_balance = sender_balance,
-            receiver = %transfer.to,
-            receiver_balance = receiver_balance,
-            amount = amount,
-            "Read current balances from Validator"
-        );
-        
-        // Validate sufficient balance
-        if sender_balance < amount {
-            return Err(anyhow::anyhow!(
-                "Insufficient balance: {} has {} but trying to send {}",
-                transfer.from,
-                sender_balance,
-                amount
-            ));
-        }
-        
-        // Compute final balances
-        let new_sender_balance = sender_balance - amount;
-        let new_receiver_balance = receiver_balance + amount;
-        
-        debug!(
-            transfer_id = %transfer.id,
-            new_sender_balance = new_sender_balance,
-            new_receiver_balance = new_receiver_balance,
-            "Computed final balances"
-        );
-        
-        Ok(vec![
-            // Debit from sender - store FINAL balance value
-            StateChange {
-                key: format!("balance:{}", transfer.from),
-                old_value: Some(Self::encode_balance(sender_balance)),
-                new_value: Some(Self::encode_balance(new_sender_balance)),
-            },
-            // Credit to receiver - store FINAL balance value
-            StateChange {
-                key: format!("balance:{}", transfer.to),
-                old_value: Some(Self::encode_balance(receiver_balance)),
-                new_value: Some(Self::encode_balance(new_receiver_balance)),
-            },
-        ])
-    }
-    
-    /// Encode a balance as bytes (u128 little-endian)
-    fn encode_balance(balance: u128) -> Vec<u8> {
-        balance.to_le_bytes().to_vec()
-    }
-    
-    /// Decode bytes to balance (u128 little-endian)
-    #[allow(dead_code)]
-    fn decode_balance(bytes: &[u8]) -> u128 {
-        if bytes.len() >= 16 {
-            let mut arr = [0u8; 16];
-            arr.copy_from_slice(&bytes[..16]);
-            u128::from_le_bytes(arr)
-        } else {
-            0
-        }
-    }
-    
-    /// Encode a balance change (DEPRECATED - kept for backward compatibility)
-    #[deprecated(since = "0.2.0", note = "Use encode_balance() instead. new_value should be final state, not delta.")]
-    #[allow(dead_code)]
-    fn encode_balance_change(&self, amount: u128, is_credit: bool) -> Vec<u8> {
-        let mut result = vec![if is_credit { 0x01 } else { 0x00 }];
-        result.extend_from_slice(&amount.to_le_bytes());
-        result
-    }
-    
-    // Helper: Convert Transfer to Event
-    fn transfer_to_event(&self, transfer: &Transfer) -> anyhow::Result<Event> {
-        use setu_types::event::{EventType, VLCSnapshot};
-        
-        let mut event = Event::new(
-            EventType::Transfer,
-            vec![],
-            VLCSnapshot::default(),
-            self.solver_id.clone(),
-        );
-        
-        // Attach transfer data
-        event = event.with_transfer(setu_types::event::Transfer {
-            from: transfer.from.clone(),
-            to: transfer.to.clone(),
-            amount: transfer.amount as u64,
-        });
-        
-        Ok(event)
+    /// Get solver ID
+    pub fn solver_id(&self) -> &str {
+        &self.solver_id
     }
 }
 
 /// Result of TEE execution
+///
+/// Contains all information needed by Validator to:
+/// 1. Verify the attestation
+/// 2. Apply state changes to the Merkle store
+/// 3. Update the DAG with execution result
 #[derive(Debug, Clone)]
 pub struct TeeExecutionResult {
-    /// Task ID for this execution (for attestation verification)
+    /// Task ID for this execution (matches input for verification)
     pub task_id: [u8; 32],
+    
     /// Subnet that was executed
     pub subnet_id: SubnetId,
-    /// Post-execution state root
+    
+    /// Post-execution state root (commitment to new state)
     pub post_state_root: [u8; 32],
-    /// State changes to apply
+    
+    /// State changes to apply (key-value pairs)
     pub state_changes: Vec<StateChange>,
-    /// Number of events processed
+    
+    /// Number of events successfully processed
     pub events_processed: usize,
-    /// Number of events failed
+    
+    /// Number of events that failed
     pub events_failed: usize,
+    
     /// Gas usage for this execution
     pub gas_usage: GasUsage,
-    /// TEE attestation
+    
+    /// TEE attestation (proof of execution in enclave)
+    /// Contains: task_id binding, input_hash, state roots
     pub attestation: Attestation,
+    
     /// Execution time in microseconds
     pub execution_time_us: u64,
 }
 
 impl TeeExecutionResult {
-    /// Convert from StfOutput
+    /// Convert from StfOutput (internal enclave output)
     pub fn from_stf_output(output: StfOutput) -> Self {
         // Convert StateDiff to Vec<StateChange>
         let state_changes: Vec<StateChange> = output.state_diff.writes
@@ -566,25 +258,58 @@ impl TeeExecutionResult {
         }
     }
     
-    /// Convert to ExecutionResult (for backward compatibility)
+    /// Convert to ExecutionResult (for backward compatibility with existing APIs)
     pub fn to_execution_result(&self) -> ExecutionResult {
         ExecutionResult {
             success: self.events_failed == 0,
             message: if self.events_failed == 0 {
-                Some(format!("Processed {} events", self.events_processed))
+                Some(format!("Processed {} events in {}μs", self.events_processed, self.execution_time_us))
             } else {
-                Some(format!("{} events failed", self.events_failed))
+                Some(format!("{} events failed out of {}", self.events_failed, self.events_processed + self.events_failed))
             },
             state_changes: self.state_changes.clone(),
         }
+    }
+    
+    /// Check if execution was successful (no failed events)
+    pub fn is_success(&self) -> bool {
+        self.events_failed == 0
+    }
+    
+    /// Get task_id as hex string (for logging)
+    pub fn task_id_hex(&self) -> String {
+        hex::encode(&self.task_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_enclave::EnclavePlatform;
-    use setu_types::event::{EventType, VLCSnapshot};
+    use setu_enclave::{EnclavePlatform, ResolvedInputs, GasBudget};
+    use setu_types::event::{Event, EventType, VLCSnapshot};
+    use setu_types::SubnetId;
+    
+    fn create_test_event(_id: &str) -> Event {
+        Event::new(
+            EventType::Transfer,
+            vec![],
+            VLCSnapshot::default(),
+            "test-creator".to_string(),
+        )
+    }
+    
+    fn create_test_solver_task() -> SolverTask {
+        let event = create_test_event("test-event");
+        let task_id = SolverTask::generate_task_id(&event, &[0u8; 32]);
+        
+        SolverTask::new(
+            task_id,
+            event,
+            ResolvedInputs::new(),
+            [0u8; 32],
+            SubnetId::ROOT,
+        ).with_gas_budget(GasBudget::default())
+    }
     
     #[tokio::test]
     async fn test_tee_executor_creation() {
@@ -593,52 +318,53 @@ mod tests {
         
         assert_eq!(info.platform, EnclavePlatform::Mock);
         assert!(executor.is_simulated());
+        assert_eq!(executor.solver_id(), "test-solver");
     }
     
     #[tokio::test]
-    async fn test_execute_events() {
+    async fn test_execute_solver_task() {
         let executor = TeeExecutor::new("test-solver".to_string());
+        let task = create_test_solver_task();
+        let task_id = task.task_id;
         
-        let event = Event::new(
-            EventType::Transfer,
-            vec![],
-            VLCSnapshot::default(),
-            "test".to_string(),
-        );
-        
-        let result = executor.execute_events(
-            SubnetId::ROOT,
-            [0u8; 32],
-            vec![event],
-            vec![],
-        ).await;
+        let result = executor.execute_solver_task(task).await;
         
         assert!(result.is_ok());
         let result = result.unwrap();
+        
+        assert_eq!(result.task_id, task_id);
         assert_eq!(result.events_processed, 1);
+        assert_eq!(result.events_failed, 0);
+        assert!(result.is_success());
         assert!(result.attestation.is_mock());
     }
     
     #[tokio::test]
     async fn test_execution_result_conversion() {
         let executor = TeeExecutor::new("test-solver".to_string());
+        let task = create_test_solver_task();
         
-        let event = Event::new(
-            EventType::Transfer,
-            vec![],
-            VLCSnapshot::default(),
-            "test".to_string(),
-        );
-        
-        let result = executor.execute_events(
-            SubnetId::ROOT,
-            [0u8; 32],
-            vec![event],
-            vec![],
-        ).await.unwrap();
-        
+        let result = executor.execute_solver_task(task).await.unwrap();
         let exec_result = result.to_execution_result();
+        
         assert!(exec_result.success);
+        assert!(exec_result.message.is_some());
+    }
+    
+    #[test]
+    fn test_task_id_hex() {
+        let result = TeeExecutionResult {
+            task_id: [0xab; 32],
+            subnet_id: SubnetId::ROOT,
+            post_state_root: [0u8; 32],
+            state_changes: vec![],
+            events_processed: 1,
+            events_failed: 0,
+            gas_usage: GasUsage::default(),
+            attestation: Attestation::mock([0u8; 32]),
+            execution_time_us: 100,
+        };
+        
+        assert_eq!(result.task_id_hex(), "ab".repeat(32));
     }
 }
-
