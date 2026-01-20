@@ -60,6 +60,12 @@ pub trait StateProvider: Send + Sync {
     
     /// Get Merkle proof for object
     fn get_merkle_proof(&self, object_id: &ObjectId) -> Option<MerkleProof>;
+    
+    /// Get the event ID that last modified this object
+    ///
+    /// This is used to derive event dependencies from input objects.
+    /// Returns None for genesis objects or if tracking is not available.
+    fn get_last_modifying_event(&self, object_id: &ObjectId) -> Option<String>;
 }
 
 /// Mock state provider for development
@@ -121,6 +127,11 @@ impl StateProvider for MockStateProvider {
             path_bits: vec![],
             leaf_index: Some(0),
         })
+    }
+    
+    fn get_last_modifying_event(&self, _object_id: &ObjectId) -> Option<String> {
+        // Mock: no event tracking, objects are genesis
+        None
     }
 }
 
@@ -190,7 +201,11 @@ impl TaskPreparer {
         
         let resolved_inputs = ResolvedInputs::transfer(resolved_coin.clone(), amount);
         
-        // Step 3: Build read_set with Merkle proof
+        // Step 3: Derive event dependencies from input objects
+        let input_objects: Vec<&ObjectId> = vec![&selected_coin.object_id];
+        let parent_ids = self.derive_dependencies(&input_objects);
+        
+        // Step 4: Build read_set with Merkle proof
         let coin_data = self.state_provider.get_object(&selected_coin.object_id)
             .ok_or(TaskPrepareError::ObjectNotFound(hex::encode(&selected_coin.object_id)))?;
         
@@ -207,16 +222,16 @@ impl TaskPreparer {
             ),
         ];
         
-        // Step 4: Create Event from Transfer
-        let event = self.create_event_from_transfer(transfer)?;
+        // Step 5: Create Event from Transfer with derived dependencies
+        let event = self.create_event_from_transfer(transfer, parent_ids)?;
         
-        // Step 5: Get pre-state root
+        // Step 6: Get pre-state root
         let pre_state_root = self.state_provider.get_state_root();
         
-        // Step 6: Generate task_id
+        // Step 7: Generate task_id
         let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
         
-        // Step 7: Create SolverTask
+        // Step 8: Create SolverTask
         let task = SolverTask::new(
             task_id,
             event,
@@ -229,7 +244,7 @@ impl TaskPreparer {
         
         info!(
             transfer_id = %transfer.id,
-            task_id = ?task_id,
+            task_id = %hex::encode(&task_id[..8]),
             "SolverTask prepared successfully"
         );
         
@@ -265,11 +280,15 @@ impl TaskPreparer {
         Ok(eligible_coins.remove(0))
     }
     
-    /// Create Event from Transfer
-    fn create_event_from_transfer(&self, transfer: &core_types::Transfer) -> Result<Event, TaskPrepareError> {
+    /// Create Event from Transfer with derived parent IDs
+    fn create_event_from_transfer(
+        &self,
+        transfer: &core_types::Transfer,
+        parent_ids: Vec<String>,
+    ) -> Result<Event, TaskPrepareError> {
         let mut event = Event::new(
             EventType::Transfer,
-            vec![],
+            parent_ids,  // Dependencies derived from input objects
             VLCSnapshot::default(),
             self.validator_id.clone(),
         );
@@ -282,6 +301,37 @@ impl TaskPreparer {
         });
         
         Ok(event)
+    }
+    
+    /// Derive event dependencies from input objects
+    ///
+    /// For each input object, find the last event that modified it.
+    /// These events become the parent_ids (dependencies) of the new event.
+    fn derive_dependencies(&self, input_objects: &[&ObjectId]) -> Vec<String> {
+        let mut parent_ids = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        
+        for object_id in input_objects {
+            if let Some(event_id) = self.state_provider.get_last_modifying_event(object_id) {
+                // Deduplicate: same event might have modified multiple objects
+                if seen.insert(event_id.clone()) {
+                    debug!(
+                        object_id = %object_id,
+                        parent_event = %event_id,
+                        "Found dependency from input object"
+                    );
+                    parent_ids.push(event_id);
+                }
+            }
+        }
+        
+        debug!(
+            input_count = input_objects.len(),
+            dependency_count = parent_ids.len(),
+            "Derived event dependencies from input objects"
+        );
+        
+        parent_ids
     }
 }
 
