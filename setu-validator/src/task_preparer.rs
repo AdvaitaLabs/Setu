@@ -36,7 +36,7 @@ use setu_enclave::{
     SolverTask, ResolvedInputs, ResolvedObject,
     GasBudget, ReadSetEntry, MerkleProof,
 };
-use setu_types::{Event, EventType, SubnetId, Transfer as SetuTransfer, ObjectId};
+use setu_types::{Event, EventType, SubnetId, ObjectId};
 use setu_types::event::VLCSnapshot;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -116,6 +116,20 @@ impl TaskPreparer {
         transfer: &setu_types::Transfer,
         subnet_id: SubnetId,
     ) -> Result<SolverTask, TaskPrepareError> {
+        // Use default coin type (native SETU)
+        self.prepare_transfer_task_with_coin_type(transfer, subnet_id, None)
+    }
+    
+    /// Prepare a SolverTask from a Transfer request with specified coin type
+    ///
+    /// This variant allows specifying a coin type for multi-subnet scenarios
+    /// where each subnet application may have its own token type.
+    pub fn prepare_transfer_task_with_coin_type(
+        &self,
+        transfer: &setu_types::Transfer,
+        subnet_id: SubnetId,
+        coin_type: Option<&str>,
+    ) -> Result<SolverTask, TaskPrepareError> {
         let amount = transfer.amount;
         
         debug!(
@@ -123,16 +137,21 @@ impl TaskPreparer {
             from = %transfer.from,
             to = %transfer.to,
             amount = amount,
+            coin_type = ?coin_type,
             "Preparing SolverTask for transfer"
         );
         
-        // Step 1: Select coins for sender
-        let sender_coins = self.state_provider.get_coins_for_address(&transfer.from);
+        // Step 1: Select coins for sender (filter by coin_type if specified)
+        let sender_coins = match coin_type {
+            Some(ct) => self.state_provider.get_coins_for_address_by_type(&transfer.from, ct),
+            None => self.state_provider.get_coins_for_address(&transfer.from),
+        };
         let selected_coin = self.select_coin_for_transfer(&sender_coins, amount)?;
         
         debug!(
             object_id = ?selected_coin.object_id,
             coin_balance = selected_coin.balance,
+            coin_type = %selected_coin.coin_type,
             "Selected coin for transfer"
         );
         
@@ -161,7 +180,7 @@ impl TaskPreparer {
                 coin_data,
             ).with_proof(
                 merkle_proof
-                    .map(|p| bincode::serialize(&p).unwrap_or_default())
+                    .map(|p| bcs::to_bytes(&p).unwrap_or_default())
                     .unwrap_or_default()
             ),
         ];
@@ -203,6 +222,11 @@ impl TaskPreparer {
         coins: &[CoinInfo],
         amount: u64,
     ) -> Result<CoinInfo, TaskPrepareError> {
+        // Check if coins is empty first
+        if coins.is_empty() {
+            return Err(TaskPrepareError::NoCoinsFound("sender has no coins".to_string()));
+        }
+        
         // Filter coins with sufficient balance
         let mut eligible_coins: Vec<_> = coins
             .iter()
@@ -341,18 +365,21 @@ mod tests {
                 owner: "alice".to_string(),
                 balance: 500,
                 version: 1,
+                coin_type: "SETU".to_string(),
             },
             CoinInfo {
                 object_id: ObjectId::new([2u8; 32]),
                 owner: "alice".to_string(),
                 balance: 200,
                 version: 1,
+                coin_type: "SETU".to_string(),
             },
             CoinInfo {
                 object_id: ObjectId::new([3u8; 32]),
                 owner: "alice".to_string(),
                 balance: 1000,
                 version: 1,
+                coin_type: "SETU".to_string(),
             },
         ];
         
@@ -377,6 +404,7 @@ mod tests {
                 owner: "alice".to_string(),
                 balance: 50,
                 version: 1,
+                coin_type: "SETU".to_string(),
             },
         ];
         
