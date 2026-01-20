@@ -135,16 +135,8 @@ impl UserRpcHandler for ValidatorUserHandler {
         self.network_service.events.write().insert(event_id.clone(), event);
         self.network_service.dag_events.write().push(event_id.clone());
         
-        let tracker = crate::network_service::EventTracker {
-            event_id: event_id.clone(),
-            event_type: EventType::UserRegister,
-            status: setu_types::event::EventStatus::Confirmed,
-            solver_id: self.network_service.validator_id.clone(),
-            verified: true,
-            vlc_time,
-            created_at: now / 1000,
-        };
-        self.network_service.event_trackers.write().insert(event_id.clone(), tracker);
+        // Note: EventTracker removed in new architecture
+        // Event tracking is now handled by the DAG manager
         
         info!("           └─ Event added to DAG");
         

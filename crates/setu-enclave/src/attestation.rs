@@ -10,6 +10,21 @@
 //! - **Intel SGX**: (Future) Intel SGX attestation
 //! - **AMD SEV**: (Future) AMD SEV attestation
 //!
+//! ## Attestation Data (solver-tee3 Architecture)
+//!
+//! The attestation binds the following data to ensure task identity:
+//!
+//! ```text
+//! AttestationData {
+//!     task_id: [u8; 32],        // Unique task identifier (replay protection)
+//!     input_hash: [u8; 32],     // Hash of all inputs (tampering protection)
+//!     pre_state_root: [u8; 32], // State before execution (consistency)
+//!     post_state_root: [u8; 32],// State after execution (result commitment)
+//! }
+//!
+//! user_data = SHA256(task_id || input_hash || pre_state_root || post_state_root)
+//! ```
+//!
 //! ## Verification Flow
 //!
 //! ```text
@@ -21,7 +36,8 @@
 //! │  2. Verify signature/document            │
 //! │  3. Extract enclave measurement (PCR)    │
 //! │  4. Check measurement against allowlist  │
-//! │  5. Verify user_data matches output hash │
+//! │  5. Recompute AttestationData from input │
+//! │  6. Verify user_data matches computed    │
 //! └──────────────────────────────────────────┘
 //!        │
 //!        ▼
@@ -46,6 +62,15 @@ pub enum AttestationError {
     #[error("User data mismatch: expected {expected}, got {actual}")]
     UserDataMismatch { expected: String, actual: String },
     
+    #[error("Task ID mismatch in attestation")]
+    TaskIdMismatch,
+    
+    #[error("Input hash mismatch in attestation")]
+    InputHashMismatch,
+    
+    #[error("Pre-state root mismatch in attestation")]
+    PreStateRootMismatch,
+    
     #[error("Attestation expired")]
     Expired,
     
@@ -57,6 +82,60 @@ pub enum AttestationError {
 }
 
 pub type AttestationResult<T> = Result<T, AttestationError>;
+
+/// Data bound in attestation for task identity verification
+///
+/// This structure captures all information needed to verify that
+/// an attestation corresponds to a specific execution task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttestationData {
+    /// Unique task identifier (for replay protection)
+    pub task_id: [u8; 32],
+    
+    /// Hash of all inputs (for tampering protection)
+    pub input_hash: [u8; 32],
+    
+    /// State root before execution (for consistency verification)
+    pub pre_state_root: [u8; 32],
+    
+    /// State root after execution (result commitment)
+    pub post_state_root: [u8; 32],
+}
+
+impl AttestationData {
+    pub fn new(
+        task_id: [u8; 32],
+        input_hash: [u8; 32],
+        pre_state_root: [u8; 32],
+        post_state_root: [u8; 32],
+    ) -> Self {
+        Self {
+            task_id,
+            input_hash,
+            pre_state_root,
+            post_state_root,
+        }
+    }
+    
+    /// Compute the user_data hash from this attestation data
+    /// This is the value that goes into Attestation.user_data
+    pub fn to_user_data(&self) -> [u8; 32] {
+        use sha2::{Sha256, Digest};
+        
+        let mut hasher = Sha256::new();
+        hasher.update(&self.task_id);
+        hasher.update(&self.input_hash);
+        hasher.update(&self.pre_state_root);
+        hasher.update(&self.post_state_root);
+        
+        hasher.finalize().into()
+    }
+    
+    /// Verify that this AttestationData matches the given user_data
+    pub fn verify(&self, user_data: &[u8; 32]) -> bool {
+        self.to_user_data() == *user_data
+    }
+}
 
 /// Attestation type identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -84,6 +163,11 @@ impl std::fmt::Display for AttestationType {
 }
 
 /// TEE attestation containing proof of enclave execution
+///
+/// The attestation binds:
+/// - `attestation_data`: task_id, input_hash, pre_state_root, post_state_root
+/// - `user_data`: SHA256(attestation_data) for efficient verification
+/// - `measurement`: TEE platform measurement (PCR0 for Nitro)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attestation {
     /// Type of attestation
@@ -92,8 +176,12 @@ pub struct Attestation {
     /// Enclave measurement (PCR0 for Nitro, MRENCLAVE for SGX)
     pub measurement: [u8; 32],
     
-    /// User data (typically hash of StfOutput)
+    /// User data (hash of AttestationData)
     pub user_data: [u8; 32],
+    
+    /// Structured attestation data (task binding information)
+    /// This is included for easy verification without re-computing
+    pub attestation_data: Option<AttestationData>,
     
     /// Raw attestation document (format depends on type)
     pub document: Vec<u8>,
@@ -106,7 +194,7 @@ pub struct Attestation {
 }
 
 impl Attestation {
-    /// Create a new attestation
+    /// Create a new attestation with explicit user_data
     pub fn new(
         attestation_type: AttestationType,
         measurement: [u8; 32],
@@ -117,6 +205,7 @@ impl Attestation {
             attestation_type,
             measurement,
             user_data,
+            attestation_data: None,
             document,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -126,7 +215,30 @@ impl Attestation {
         }
     }
     
-    /// Create a mock attestation for testing
+    /// Create a new attestation from AttestationData (recommended)
+    /// This properly binds task_id, input_hash, and state roots
+    pub fn from_data(
+        attestation_type: AttestationType,
+        measurement: [u8; 32],
+        data: AttestationData,
+        document: Vec<u8>,
+    ) -> Self {
+        let user_data = data.to_user_data();
+        Self {
+            attestation_type,
+            measurement,
+            user_data,
+            attestation_data: Some(data),
+            document,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            solver_id: None,
+        }
+    }
+    
+    /// Create a mock attestation for testing (legacy, without AttestationData)
     pub fn mock(user_data: [u8; 32]) -> Self {
         use sha2::{Sha256, Digest};
         
@@ -141,10 +253,45 @@ impl Attestation {
         Self::new(AttestationType::Mock, measurement, user_data, document)
     }
     
+    /// Create a mock attestation with proper AttestationData binding
+    pub fn mock_with_data(data: AttestationData) -> Self {
+        use sha2::{Sha256, Digest};
+        
+        // Generate a mock measurement
+        let mut hasher = Sha256::new();
+        hasher.update(b"mock_enclave_v1");
+        let measurement: [u8; 32] = hasher.finalize().into();
+        
+        // Mock document is just a placeholder
+        let document = b"MOCK_ATTESTATION_DOCUMENT".to_vec();
+        
+        Self::from_data(AttestationType::Mock, measurement, data, document)
+    }
+    
     /// Set solver ID
     pub fn with_solver_id(mut self, solver_id: String) -> Self {
         self.solver_id = Some(solver_id);
         self
+    }
+    
+    /// Set attestation data (for binding after creation)
+    pub fn with_attestation_data(mut self, data: AttestationData) -> Self {
+        self.attestation_data = Some(data);
+        self
+    }
+    
+    /// Verify that the attestation data matches the user_data hash
+    /// Returns true if attestation_data is present and matches, false otherwise
+    pub fn verify_data(&self) -> bool {
+        match &self.attestation_data {
+            Some(data) => data.verify(&self.user_data),
+            None => false,
+        }
+    }
+    
+    /// Get the task_id if attestation_data is present
+    pub fn task_id(&self) -> Option<&[u8; 32]> {
+        self.attestation_data.as_ref().map(|d| &d.task_id)
     }
     
     /// Get measurement as hex string

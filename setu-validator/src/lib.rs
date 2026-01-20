@@ -7,22 +7,46 @@
 //! - Maintaining the global Foldgraph
 //! - Coordinating consensus
 //! - Providing registration service for solvers and validators
+//!
+//! ## solver-tee3 Architecture
+//!
+//! In the new architecture, Validator is responsible for:
+//! - Preparing SolverTask with coin selection and Merkle proofs
+//! - Sending SolverTask to Solver (pass-through to TEE)
+//! - Verifying Attestation from TEE execution results
+//!
+//! ## Module Structure (refactored)
+//!
+//! - `network/` - Network service (modular)
+//!   - `types` - Request/Response types and helpers
+//!   - `handlers` - HTTP route handlers  
+//!   - `service` - Core service logic
+//!   - `registration` - Registration handler (RegistrationHandler trait impl)
 
 mod verifier;
 mod dag;
 mod sampling;
 mod router_manager;
-mod network_service;
+mod network;
+pub mod task_preparer;
 mod user_handler;
 
 pub use verifier::Verifier;
 pub use dag::{DagManager, DagManagerError, DagNode, DagStats};
 pub use sampling::{SamplingVerifier, SamplingConfig, SamplingStats};
 pub use router_manager::{RouterManager, RouterError, SolverConnection};
-pub use network_service::{ValidatorNetworkService, ValidatorRegistrationHandler, NetworkServiceConfig, ValidatorInfo};
+pub use network::{
+    ValidatorNetworkService, ValidatorRegistrationHandler, NetworkServiceConfig,
+    ValidatorInfo, TransferTracker, SubmitEventRequest, SubmitEventResponse,
+    GetBalanceResponse, GetObjectResponse, current_timestamp_secs, current_timestamp_millis,
+};
+pub use task_preparer::{TaskPreparer, TaskPrepareError};
 pub use user_handler::ValidatorUserHandler;
 
-use core_types::Transfer;
+// Re-export StateProvider types from storage (canonical location)
+pub use setu_storage::{StateProvider, CoinInfo, SimpleMerkleProof, MerkleStateProvider};
+
+use setu_types::Transfer;
 use setu_core::{NodeConfig, ShardManager};
 use setu_types::event::Event;
 use std::collections::HashMap;
@@ -55,6 +79,7 @@ pub enum ValidationError {
 /// Validator node
 pub struct Validator {
     config: NodeConfig,
+    #[allow(dead_code)] // Reserved for future sharding support
     shard_manager: Arc<ShardManager>,
     /// Receives transfers from relay/clients
     transfer_rx: Option<mpsc::UnboundedReceiver<Transfer>>,
@@ -280,6 +305,7 @@ impl Validator {
     }
     
     /// Verify an event (legacy method, kept for compatibility)
+    #[allow(dead_code)] // Reserved for future detailed verification
     async fn verify_event(&self, event: &Event) -> Result<(), ValidationError> {
         info!("Verifying event: {}", event.id);
         

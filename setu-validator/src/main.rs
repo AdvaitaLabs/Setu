@@ -7,7 +7,7 @@
 //! - Coordinating consensus (simulated for now)
 //! - Providing HTTP API for registration and transfer submission
 
-use core_types::{Transfer, TransferType, Vlc};
+use setu_types::Transfer;
 use setu_core::NodeConfig;
 use setu_validator::{
     Validator, RouterManager, 
@@ -17,7 +17,9 @@ use setu_types::event::Event;
 use std::sync::Arc;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
-use tracing::{info, warn, error, Level};
+use tracing::{info, error, Level};
+#[cfg(not(debug_assertions))]
+use tracing::warn;
 use tracing_subscriber;
 
 /// Validator configuration from environment
@@ -79,11 +81,20 @@ async fn main() -> anyhow::Result<()> {
     info!("╚════════════════════════════════════════════════════════════╝");
 
     // Create channels
-    let (transfer_tx, transfer_rx) = mpsc::unbounded_channel::<Transfer>();
+    // Note: transfer_tx is currently unused - will be needed when Validator processes transfers internally
+    let (_transfer_tx, transfer_rx) = mpsc::unbounded_channel::<Transfer>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
 
     // Create router manager (shared between Validator and NetworkService)
     let router_manager = Arc::new(RouterManager::new());
+    
+    // Create task preparer (solver-tee3 architecture)
+    // Uses real MerkleStateProvider with pre-initialized test accounts
+    let task_preparer = Arc::new(setu_validator::TaskPreparer::new_for_testing(
+        config.node_config.node_id.clone(),
+    ));
+    
+    info!("✓ TaskPreparer initialized with test accounts (alice, bob, charlie)");
     
     // Create network service configuration
     let network_config = NetworkServiceConfig {
@@ -95,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
     let network_service = Arc::new(ValidatorNetworkService::new(
         config.node_config.node_id.clone(),
         router_manager.clone(),
+        task_preparer.clone(),
         network_config,
     ));
 
@@ -144,14 +156,9 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Spawn event receiver (simulates receiving events from solvers)
-    let event_tx_clone = event_tx.clone();
-    let _event_handle = tokio::spawn(async move {
-        // This channel is for receiving events back from solvers
-        // In a real implementation, this would be connected to the P2P network
-        info!("[EVENT_RX] Event receiver ready, waiting for solver events...");
-        let _ = event_tx_clone; // Keep the sender alive
-    });
+    // Keep event_tx alive for future P2P event submission
+    // TODO(Phase 7): Connect to P2P network for receiving events from other validators
+    let _event_tx = event_tx;
 
     // Log startup complete
     info!("╔════════════════════════════════════════════════════════════╗");

@@ -145,6 +145,21 @@ impl SparseMerkleProof {
         self.siblings.len()
     }
 
+    /// Get the sibling hashes (for proof conversion)
+    pub fn sibling_hashes(&self) -> &[HashValue] {
+        &self.siblings
+    }
+
+    /// Get the leaf node if this is an inclusion proof
+    pub fn leaf(&self) -> Option<&SparseMerkleLeafNode> {
+        self.leaf.as_ref()
+    }
+
+    /// Check if this is an inclusion proof (leaf exists)
+    pub fn is_inclusion(&self) -> bool {
+        self.leaf.is_some()
+    }
+
     /// Verify inclusion of a key-value pair.
     ///
     /// # Arguments

@@ -3,7 +3,7 @@
 //! This module integrates setu-router-core into the Validator,
 //! providing transfer routing and solver management capabilities.
 
-use core_types::Transfer;
+use setu_types::Transfer;
 use parking_lot::RwLock;
 use setu_router_core::{
     UnifiedRouter,
@@ -14,7 +14,7 @@ use setu_router_core::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, warn, debug, error};
+use tracing::{info, warn, debug};
 
 /// Router manager error
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +83,7 @@ impl SolverConnection {
 /// Router manager for the Validator
 pub struct RouterManager {
     /// Unified router from setu-router-core
+    #[allow(dead_code)] // Reserved for future unified router integration
     router: UnifiedRouter,
     
     /// Solver registry
@@ -411,23 +412,13 @@ impl Default for RouterManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::{TransferType, Vlc};
+    use setu_types::TransferType;
     
     fn create_test_transfer(id: &str) -> Transfer {
-        Transfer {
-            id: id.to_string(),
-            from: "alice".to_string(),
-            to: "bob".to_string(),
-            amount: 100,
-            transfer_type: TransferType::FluxTransfer,
-            resources: vec!["alice".to_string()],
-            vlc: Vlc::new(),
-            power: 10,
-            preferred_solver: None,
-            shard_id: None,
-            subnet_id: None,
-            assigned_vlc: None,
-        }
+        Transfer::new(id, "alice", "bob", 100)
+            .with_type(TransferType::FluxTransfer)
+            .with_resources(vec!["alice".to_string()])
+            .with_power(10)
     }
     
     #[test]

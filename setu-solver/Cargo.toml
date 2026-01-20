@@ -11,7 +11,6 @@ path = "src/main.rs"
 # Internal dependencies
 setu-core = { path = "../crates/setu-core" }
 setu-types = { path = "../types" }
-core-types = { path = "../crates/core-types" }
 setu-vlc = { path = "../crates/setu-vlc" }
 setu-rpc = { path = "../setu-rpc" }
 setu-enclave = { path = "../crates/setu-enclave" }
@@ -32,3 +31,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 sha2 = "0.10"
 uuid = { version = "1.0", features = ["v4"] }
+async-trait = "0.1"
+hex = "0.4"

@@ -362,6 +362,13 @@ impl GlobalStateManager {
     /// It processes all events, extracts their execution results,
     /// and applies the state changes to the appropriate subnet SMTs.
     ///
+    /// # Event Ordering (Critical for Determinism)
+    ///
+    /// Events are sorted by VLC before applying state changes.
+    /// This ensures all validators apply changes in the same order
+    /// and arrive at the same final state root.
+    /// Sort order: VLC.logical_time (ascending), then event_id (lexicographic)
+    ///
     /// # Returns
     /// A summary of all state changes applied, grouped by subnet.
     pub fn apply_committed_events(
@@ -370,7 +377,20 @@ impl GlobalStateManager {
     ) -> StateApplySummary {
         let mut summary = StateApplySummary::new();
         
-        for event in events {
+        // Sort events by VLC for deterministic ordering
+        let mut sorted_events = events.to_vec();
+        sorted_events.sort_by(|a, b| {
+            // Primary sort by VLC logical_time
+            match a.vlc_snapshot.logical_time.cmp(&b.vlc_snapshot.logical_time) {
+                std::cmp::Ordering::Equal => {
+                    // Tie-breaker: sort by event_id lexicographically
+                    a.id.cmp(&b.id)
+                }
+                other => other,
+            }
+        });
+        
+        for event in &sorted_events {
             let subnet_id = event.get_subnet_id();
             
             if let Some(result) = &event.execution_result {

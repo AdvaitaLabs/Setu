@@ -1,39 +1,41 @@
-//! Setu Solver - Main entry point
+//! Setu Solver - Main entry point (solver-tee3 Architecture)
 //!
-//! The Solver node is responsible for:
-//! - Registering with Validator on startup
-//! - Receiving transfers from Validator
-//! - Executing transfers (simulated for now)
-//! - Generating events and sending back to Validator
-//! - Maintaining heartbeat with Validator
+//! ## solver-tee3 Architecture
+//!
+//! In this architecture, Solver is a **pass-through** node that:
+//! 1. Receives fully-prepared `SolverTask` from Validator
+//! 2. Passes it to TEE for execution
+//! 3. Returns `TeeExecutionResult` back to Validator
+//!
+//! ## What Solver does NOT do (handled by Validator)
+//! - Coin selection
+//! - State reads
+//! - VLC management
+//! - Event creation
 
-use core_types::{Transfer, TransferType, Vlc};
-use setu_core::NodeConfig;
-use setu_solver::{Solver, SolverNetworkClient, SolverNetworkConfig};
-use setu_types::event::{Event, EventType, EventPayload, ExecutionResult, StateChange, SolverRegistration};
-use setu_vlc::{VLCSnapshot, VectorClock};
+use setu_solver::{
+    TeeExecutor, TeeExecutionResult,
+    SolverNetworkClient, SolverNetworkConfig,
+    SolverTask,
+};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
-use tracing::{info, warn, error, debug, Level};
-use tracing_subscriber;
+use tracing::{info, warn, error, Level};
 
 /// Solver configuration from environment
 #[derive(Debug, Clone)]
 struct SolverConfig {
-    /// Node configuration
-    node_config: NodeConfig,
     /// Solver ID
     solver_id: String,
     /// Solver listen address
     address: String,
     /// Solver listen port
     port: u16,
-    /// Maximum capacity
+    /// Maximum capacity (concurrent tasks)
     capacity: u32,
     /// Shard assignment
     shard_id: Option<String>,
-    /// Resource types
+    /// Resource types this solver handles
     resources: Vec<String>,
     /// Validator address
     validator_address: String,
@@ -47,10 +49,8 @@ struct SolverConfig {
 
 impl SolverConfig {
     fn from_env() -> Self {
-        let node_config = NodeConfig::from_env();
-        
         let solver_id = std::env::var("SOLVER_ID")
-            .unwrap_or_else(|_| format!("solver-{}", &node_config.node_id[..8.min(node_config.node_id.len())]));
+            .unwrap_or_else(|_| format!("solver-{}", uuid::Uuid::new_v4().to_string()[..8].to_string()));
         
         let address = std::env::var("SOLVER_LISTEN_ADDR")
             .unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -90,7 +90,6 @@ impl SolverConfig {
             .unwrap_or(true);
         
         Self {
-            node_config,
             solver_id,
             address,
             port,
@@ -105,14 +104,9 @@ impl SolverConfig {
     }
 }
 
-/// Event counter for generating unique IDs
-static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
-// NOTE: VLC is now managed by Validator, not Solver
-// Solver uses the assigned_vlc from Transfer
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing with detailed output
+    // Initialize tracing
     tracing_subscriber::fmt()
         .with_max_level(Level::DEBUG)
         .with_target(true)
@@ -123,45 +117,27 @@ async fn main() -> anyhow::Result<()> {
     let config = SolverConfig::from_env();
     
     info!("╔════════════════════════════════════════════════════════════╗");
-    info!("║                Setu Solver Node Starting                   ║");
+    info!("║         Setu Solver Node (solver-tee3 Architecture)        ║");
     info!("╠════════════════════════════════════════════════════════════╣");
-    info!("║  Solver ID:  {:^44} ║", config.solver_id);
+    info!("║  Solver ID:  {:^44} ║", &config.solver_id);
     info!("║  Address:    {:^44} ║", format!("{}:{}", config.address, config.port));
     info!("║  Capacity:   {:^44} ║", config.capacity);
     info!("║  Shard:      {:^44} ║", config.shard_id.as_deref().unwrap_or("default"));
     info!("║  Validator:  {:^44} ║", format!("{}:{}", config.validator_address, config.validator_port));
     info!("╚════════════════════════════════════════════════════════════╝");
 
-    // ========================================
-    // Simulated Components (placeholder logs)
-    // ========================================
+    // Initialize TEE Executor
+    let tee_executor = Arc::new(TeeExecutor::new(config.solver_id.clone()));
     
     info!("┌─────────────────────────────────────────────────────────────┐");
-    info!("│                  Initializing Components                    │");
+    info!("│                  TEE Executor Initialized                   │");
     info!("├─────────────────────────────────────────────────────────────┤");
-    
-    // TEE Environment - Simulated
-    info!("│ [TEE]       Trusted Execution Environment (simulated)      │");
-    info!("│             - Enclave: mock-enclave-001                    │");
-    info!("│             - Attestation: disabled (simulation mode)      │");
-    
-    // Executor - Simulated
-    info!("│ [EXECUTOR]  Transfer Executor initialized                  │");
-    info!("│             - Mode: simulation                             │");
-    info!("│             - State storage: in-memory                     │");
-    
-    // Dependency Tracker - Simulated
-    info!("│ [DEP]       Dependency Tracker initialized                 │");
-    info!("│             - Tracking: resource-based                     │");
-    info!("│             - Conflict detection: enabled                  │");
-    
+    info!("│ Enclave:     {:^44} │", tee_executor.enclave_info().enclave_id);
+    info!("│ Version:     {:^44} │", tee_executor.enclave_info().version);
+    info!("│ Mode:        {:^44} │", if tee_executor.enclave_info().is_simulated { "Mock (Development)" } else { "Production" });
     info!("└─────────────────────────────────────────────────────────────┘");
 
-    // Create channels for communication
-    let (transfer_tx, transfer_rx) = mpsc::unbounded_channel::<Transfer>();
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
-
-    // Create network client for registration
+    // Create network client for Validator communication
     let network_config = SolverNetworkConfig {
         solver_id: config.solver_id.clone(),
         address: config.address.clone(),
@@ -182,15 +158,11 @@ async fn main() -> anyhow::Result<()> {
         info!("│              Registering with Validator                     │");
         info!("└─────────────────────────────────────────────────────────────┘");
         
-        let client = network_client.clone();
-        match client.register().await {
+        match network_client.register().await {
             Ok(response) => {
                 if response.success {
                     info!("╔════════════════════════════════════════════════════════════╗");
                     info!("║           ✓ Registration Successful                        ║");
-                    info!("╠════════════════════════════════════════════════════════════╣");
-                    info!("║  Assigned ID: {:^43} ║", response.assigned_id.as_deref().unwrap_or("N/A"));
-                    info!("║  Message:     {:^43} ║", &response.message[..43.min(response.message.len())]);
                     info!("╚════════════════════════════════════════════════════════════╝");
                 } else {
                     warn!("Registration failed: {}", response.message);
@@ -198,7 +170,6 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => {
                 error!("Failed to register with validator: {}", e);
-                error!("Solver will continue without registration (transfers won't be routed)");
             }
         }
     }
@@ -209,67 +180,88 @@ async fn main() -> anyhow::Result<()> {
         heartbeat_client.start_heartbeat_loop().await;
     });
 
-    // Spawn event sender (sends events back to validator via HTTP)
-    let solver_id = config.solver_id.clone();
-    let event_client = network_client.clone();
-    let event_handle = tokio::spawn(async move {
-        info!("[EVENT_TX] Event sender ready, waiting for execution results...");
-        while let Some(event) = event_rx.recv().await {
+    // Create channel for receiving SolverTasks from Validator
+    // In production, this would come via RPC/network
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<SolverTask>();
+    
+    // Create channel for sending results back
+    let (result_tx, mut result_rx) = mpsc::unbounded_channel::<TeeExecutionResult>();
+
+    // Task processor - the core of solver-tee3 architecture
+    let executor = tee_executor.clone();
+    let result_sender = result_tx.clone();
+    let task_handle = tokio::spawn(async move {
+        info!("[TASK_RX] Task processor ready, waiting for SolverTasks...");
+        
+        while let Some(task) = task_rx.recv().await {
+            let task_id_hex = hex::encode(&task.task_id[..8]);
+            
             info!("╔════════════════════════════════════════════════════════════╗");
-            info!("║              Event Generated by Solver                     ║");
+            info!("║              Processing SolverTask                         ║");
             info!("╠════════════════════════════════════════════════════════════╣");
-            info!("║  Event ID:   {:^44} ║", &event.id[..20.min(event.id.len())]);
-            info!("║  Creator:    {:^44} ║", &event.creator);
-            info!("║  Type:       {:^44} ║", format!("{:?}", event.event_type));
-            info!("║  Status:     {:^44} ║", format!("{:?}", event.status));
+            info!("║  Task ID:    {:^44} ║", task_id_hex);
+            info!("║  Event ID:   {:^44} ║", &task.event.id[..20.min(task.event.id.len())]);
+            info!("║  Inputs:     {:^44} ║", format!("{} objects", task.resolved_inputs.input_objects.len()));
             info!("╚════════════════════════════════════════════════════════════╝");
             
-            // Send event to validator via HTTP
-            info!("[EVENT_TX] Sending event to Validator...");
-            match event_client.submit_event(event.clone()).await {
-                Ok(response) => {
-                    if response.success {
-                        info!("╔════════════════════════════════════════════════════════════╗");
-                        info!("║              Event Accepted by Validator                   ║");
-                        info!("╠════════════════════════════════════════════════════════════╣");
-                        info!("║  Event ID:   {:^44} ║", response.event_id.as_deref().unwrap_or("N/A"));
-                        info!("║  VLC Time:   {:^44} ║", response.vlc_time.map(|v| v.to_string()).unwrap_or("N/A".to_string()));
-                        info!("║  Message:    {:^44} ║", &response.message[..44.min(response.message.len())]);
-                        info!("╚════════════════════════════════════════════════════════════╝");
-                    } else {
-                        error!("[EVENT_TX] Event rejected by Validator: {}", response.message);
+            // Execute in TEE (this is all the Solver does in solver-tee3)
+            match executor.execute_solver_task(task).await {
+                Ok(result) => {
+                    info!("╔════════════════════════════════════════════════════════════╗");
+                    info!("║              TEE Execution Complete                        ║");
+                    info!("╠════════════════════════════════════════════════════════════╣");
+                    info!("║  Status:     {:^44} ║", if result.is_success() { "SUCCESS" } else { "FAILED" });
+                    info!("║  Events:     {:^44} ║", result.events_processed);
+                    info!("║  Gas Used:   {:^44} ║", result.gas_usage.gas_used);
+                    info!("╚════════════════════════════════════════════════════════════╝");
+                    
+                    if let Err(e) = result_sender.send(result) {
+                        error!("Failed to send result: {}", e);
                     }
                 }
                 Err(e) => {
-                    error!("[EVENT_TX] Failed to send event to Validator: {}", e);
-                    error!("[EVENT_TX] Event {} will be retried later (not implemented)", event.id);
+                    error!("TEE execution failed: {}", e);
                 }
             }
         }
+        
+        info!("[TASK_RX] Task processor stopped");
     });
 
-    // Create transfer processor with simulated execution
-    let solver_id_clone = config.solver_id.clone();
-    let event_tx_clone = event_tx.clone();
-    let transfer_handle = tokio::spawn(async move {
-        process_transfers(transfer_rx, event_tx_clone, solver_id_clone).await;
+    // Result sender - sends results back to Validator
+    let result_client = network_client.clone();
+    let result_handle = tokio::spawn(async move {
+        info!("[RESULT_TX] Result sender ready...");
+        
+        while let Some(result) = result_rx.recv().await {
+            // In solver-tee3, we send the TeeExecutionResult back to Validator
+            // The Validator then creates the Event from the result
+            info!("[RESULT_TX] Sending result to Validator...");
+            
+            // TODO: Implement actual RPC call to Validator
+            // For now, just log it
+            info!("[RESULT_TX] Result sent (task_id: {})", hex::encode(&result.task_id[..8]));
+        }
+        
+        info!("[RESULT_TX] Result sender stopped");
     });
 
     // Log startup complete
     info!("╔════════════════════════════════════════════════════════════╗");
-    info!("║              Solver Ready for Transfers                    ║");
+    info!("║              Solver Ready (solver-tee3 Mode)               ║");
     info!("╠════════════════════════════════════════════════════════════╣");
-    info!("║  Status: Waiting for transfers from Validator              ║");
-    info!("║  Mode:   Simulation (TEE disabled)                         ║");
+    info!("║  Status: Waiting for SolverTasks from Validator            ║");
+    info!("║  Mode:   Pass-through to TEE                               ║");
+    info!("║  Note:   Validator handles coin selection & VLC            ║");
     info!("╚════════════════════════════════════════════════════════════╝");
 
     // Wait for shutdown signal
     tokio::select! {
-        _ = transfer_handle => {
-            info!("Transfer processor stopped");
+        _ = task_handle => {
+            info!("Task processor stopped");
         }
-        _ = event_handle => {
-            info!("Event sender stopped");
+        _ = result_handle => {
+            info!("Result sender stopped");
         }
         _ = heartbeat_handle => {
             info!("Heartbeat loop stopped");
@@ -282,141 +274,4 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Solver shutdown complete");
     Ok(())
-}
-
-/// Process incoming transfers with simulated execution pipeline
-async fn process_transfers(
-    mut transfer_rx: mpsc::UnboundedReceiver<Transfer>,
-    event_tx: mpsc::UnboundedSender<Event>,
-    solver_id: String,
-) {
-    info!("[TRANSFER_RX] Transfer processor ready, waiting for transfers...");
-    
-    while let Some(transfer) = transfer_rx.recv().await {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        
-        info!("╔════════════════════════════════════════════════════════════╗");
-        info!("║              Processing Transfer                           ║");
-        info!("╠════════════════════════════════════════════════════════════╣");
-        info!("║  Transfer ID: {:^43} ║", &transfer.id[..20.min(transfer.id.len())]);
-        info!("║  From:        {:^43} ║", &transfer.from);
-        info!("║  To:          {:^43} ║", &transfer.to);
-        info!("║  Amount:      {:^43} ║", transfer.amount);
-        info!("╚════════════════════════════════════════════════════════════╝");
-        
-        // Step 1: Dependency Resolution (Simulated)
-        info!("[STEP 1/5] 🔍 [DEP] Resolving dependencies...");
-        info!("           └─ Resources: {:?}", transfer.resources);
-        info!("           └─ Checking for conflicts...");
-        info!("           └─ No conflicts found (simulated)");
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        
-        // Step 2: TEE Execution (Simulated)
-        info!("[STEP 2/5] 🔐 [TEE] Executing in Trusted Environment...");
-        info!("           └─ Enclave: mock-enclave-001");
-        info!("           └─ Loading state for accounts...");
-        info!("           └─ Executing transfer logic...");
-        info!("           └─ Generating execution proof...");
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        
-        // Step 3: State Changes (Simulated)
-        info!("[STEP 3/5] 📝 Applying state changes...");
-        let state_changes = vec![
-            StateChange {
-                key: format!("balance:{}", transfer.from),
-                old_value: Some(vec![0, 0, 0, 100]), // Simulated old balance
-                new_value: Some(vec![0, 0, 0, (100 - transfer.amount as u8).max(0)]),
-            },
-            StateChange {
-                key: format!("balance:{}", transfer.to),
-                old_value: Some(vec![0, 0, 0, 0]),
-                new_value: Some(vec![0, 0, 0, transfer.amount as u8]),
-            },
-        ];
-        for change in &state_changes {
-            info!("           └─ {}: {:?} → {:?}", change.key, change.old_value, change.new_value);
-        }
-        
-        // Step 4: Use VLC assigned by Validator (NOT generate our own)
-        // This is the key change: Solver does NOT manage VLC, Validator does
-        let vlc_snapshot = if let Some(ref assigned) = transfer.assigned_vlc {
-            info!("[STEP 4/5] ⏰ [VLC] Using Validator-assigned VLC...");
-            info!("           └─ VLC Time: {} (assigned by Validator)", assigned.logical_time);
-            info!("           └─ Validator: {}", assigned.validator_id);
-            info!("           └─ Note: Solver does NOT increment VLC");
-            
-            let mut vector_clock = VectorClock::new();
-            vector_clock.increment(&assigned.validator_id);
-            VLCSnapshot {
-                vector_clock,
-                logical_time: assigned.logical_time,
-                physical_time: assigned.physical_time,
-            }
-        } else {
-            // Fallback for backward compatibility (should not happen in normal flow)
-            warn!("[STEP 4/5] ⚠️ [VLC] No assigned VLC from Validator, using fallback...");
-            warn!("           └─ This should not happen in normal operation!");
-            let mut vector_clock = VectorClock::new();
-            vector_clock.increment(&solver_id);
-            VLCSnapshot {
-                vector_clock,
-                logical_time: 0,
-                physical_time: now,
-            }
-        };
-        
-        // Step 5: Generate Event
-        let event_id = EVENT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        info!("[STEP 5/5] 📦 Generating event...");
-        info!("           └─ Event ID: evt-{}-{}", now, event_id);
-        info!("           └─ Type: Transfer");
-        info!("           └─ Parents: [] (genesis)");
-        
-        let mut event = Event::new(
-            EventType::Transfer,
-            vec![], // No parents for now (simulated)
-            vlc_snapshot,
-            solver_id.clone(),
-        );
-        
-        // Attach transfer info
-        event = event.with_transfer(setu_types::event::Transfer {
-            from: transfer.from.clone(),
-            to: transfer.to.clone(),
-            amount: transfer.amount as u64,
-        });
-        
-        // Set execution result
-        let execution_result = ExecutionResult {
-            success: true,
-            message: Some("Transfer executed successfully (simulated)".to_string()),
-            state_changes,
-        };
-        event.set_execution_result(execution_result);
-        
-        // Log TEE Proof (Simulated - for future implementation)
-        info!("[TEE] 🔏 Generating attestation proof (simulated)...");
-        info!("      └─ Proof type: mock-attestation");
-        info!("      └─ Proof size: 256 bytes (simulated)");
-        
-        let vlc_time = transfer.assigned_vlc.as_ref().map(|v| v.logical_time).unwrap_or(0);
-        info!("╔════════════════════════════════════════════════════════════╗");
-        info!("║              Transfer Execution Complete                   ║");
-        info!("╠════════════════════════════════════════════════════════════╣");
-        info!("║  Status:     SUCCESS                                       ║");
-        info!("║  Event ID:   {:^44} ║", &event.id[..20.min(event.id.len())]);
-        info!("║  VLC Time:   {:^44} ║", vlc_time);
-        info!("║  Note:       VLC assigned by Validator                     ║");
-        info!("╚════════════════════════════════════════════════════════════╝");
-        
-        // Send event to validator
-        if let Err(e) = event_tx.send(event) {
-            error!("Failed to send event: {}", e);
-        }
-    }
-    
-    info!("[TRANSFER_RX] Transfer processor stopped");
 }

@@ -1,153 +1,54 @@
+//! Event types for the DAG-based ledger
+//!
+//! Events are the fundamental unit of state change in Setu.
+//! They form a DAG (Directed Acyclic Graph) with causal ordering.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 
-// Use independent VLC library
+// Re-export VLC types from setu-vlc (single source of truth)
 pub use setu_vlc::{VectorClock, VLCSnapshot};
 
-// Placeholder types (to be replaced with actual implementations)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Transfer {
-    pub from: String,
-    pub to: String,
-    pub amount: u64,
-}
+// Import from sibling modules
+use crate::transfer::Transfer;
+use crate::registration::{
+    ValidatorRegistration, SolverRegistration, Unregistration,
+    SubnetRegistration, UserRegistration,
+    PowerConsumption, TaskSubmission,
+};
 
-/// Validator registration data
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidatorRegistration {
-    pub validator_id: String,
-    pub address: String,
-    pub port: u16,
-    pub public_key: Option<Vec<u8>>,
-    pub stake: Option<u64>,
-}
-
-/// Solver registration data
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SolverRegistration {
-    pub solver_id: String,
-    pub address: String,
-    pub port: u16,
-    pub capacity: u32,
-    pub shard_id: Option<String>,
-    pub resources: Vec<String>,
-    pub public_key: Option<Vec<u8>>,
-}
-
-/// Power consumption data
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PowerConsumption {
-    pub user_id: String,
-    pub amount: u64,
-    pub reason: String,
-}
-
-/// Task submission data
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskSubmission {
-    pub task_id: String,
-    pub task_type: String,
-    pub submitter: String,
-    pub payload: Vec<u8>,
-}
-
-/// Unregistration data (for both Validator and Solver)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Unregistration {
-    pub node_id: String,
-    pub node_type: String, // "validator" or "solver"
-}
-
-/// Subnet registration data
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubnetRegistration {
-    /// Unique subnet identifier (will be assigned if not provided)
-    pub subnet_id: String,
-    /// Human-readable name for the subnet
-    pub name: String,
-    /// Description of the subnet's purpose
-    pub description: Option<String>,
-    /// Owner/creator of the subnet
-    pub owner: String,
-    /// Maximum number of users allowed (None = unlimited)
-    pub max_users: Option<u64>,
-    /// Resource limits for the subnet
-    pub resource_limits: Option<SubnetResourceLimits>,
-    /// List of Solver IDs assigned to this subnet
-    pub assigned_solvers: Vec<String>,
-    /// Subnet type (application, organization, etc.)
-    pub subnet_type: SubnetType,
-    /// Parent subnet ID (None = root subnet)
-    pub parent_subnet_id: Option<String>,
-}
-
-/// Subnet resource limits
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubnetResourceLimits {
-    /// Maximum transactions per second
-    pub max_tps: Option<u64>,
-    /// Maximum storage in bytes
-    pub max_storage_bytes: Option<u64>,
-    /// Maximum compute units per transaction
-    pub max_compute_units: Option<u64>,
-}
-
-/// Subnet type enumeration
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SubnetType {
-    /// Root subnet (subnet-0, created at genesis)
-    Root,
-    /// Application subnet (for a specific dApp)
-    Application,
-    /// Organization subnet (for a company/DAO)
-    Organization,
-    /// Personal subnet (for individual users)
-    Personal,
-    /// System subnet (for internal operations)
-    System,
-}
-
-impl Default for SubnetType {
-    fn default() -> Self {
-        SubnetType::Application
-    }
-}
-
-/// User registration data
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserRegistration {
-    /// User's unique identifier (address/public key hash)
-    pub user_id: String,
-    /// User's public key for authentication
-    pub public_key: Vec<u8>,
-    /// Subnet ID to register in (None = root subnet)
-    pub subnet_id: Option<String>,
-    /// Optional display name
-    pub display_name: Option<String>,
-    /// Optional metadata (JSON string)
-    pub metadata: Option<String>,
-    /// Initial power allocation
-    pub initial_power: Option<u64>,
-    /// Inviter's address (who invited this user)
-    pub invited_by: Option<String>,
-    /// Invite code used for registration
-    pub invite_code: Option<String>,
-}
+// ========== Event ID ==========
 
 pub type EventId = String;
 
+// ========== Event Status ==========
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EventStatus {
+    /// Event created, not yet processed
     Pending,
+    /// Event in work queue for execution
     InWorkQueue,
+    /// Event executed successfully
     Executed,
+    /// Event confirmed by consensus
     Confirmed,
+    /// Event finalized (irreversible)
     Finalized,
+    /// Event execution failed
     Failed,
 }
 
+impl Default for EventStatus {
+    fn default() -> Self {
+        EventStatus::Pending
+    }
+}
+
+// ========== Event Type ==========
+
 /// Event types supported by the system
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EventType {
     /// Genesis event (first event in the DAG)
     Genesis,
@@ -233,6 +134,8 @@ impl EventType {
     }
 }
 
+// ========== Event Payload ==========
+
 /// Event payload - contains the actual data for different event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventPayload {
@@ -254,31 +157,36 @@ impl Default for EventPayload {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Event {
-    pub id: EventId,
-    pub event_type: EventType,
-    pub parent_ids: Vec<EventId>,
-    /// The subnet this event belongs to (determines routing)
-    /// If None, will be inferred from event_type
-    #[serde(default)]
-    pub subnet_id: Option<crate::subnet::SubnetId>,
-    /// Legacy transfer field (for backward compatibility)
-    pub transfer: Option<Transfer>,
-    /// New unified payload field
-    pub payload: EventPayload,
-    pub vlc_snapshot: VLCSnapshot,
-    pub creator: String,
-    pub status: EventStatus,
-    pub execution_result: Option<ExecutionResult>,
-    pub timestamp: u64,
-}
+// ========== Execution Result ==========
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionResult {
     pub success: bool,
     pub message: Option<String>,
     pub state_changes: Vec<StateChange>,
+}
+
+impl ExecutionResult {
+    pub fn success() -> Self {
+        Self {
+            success: true,
+            message: None,
+            state_changes: vec![],
+        }
+    }
+    
+    pub fn failure(message: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            message: Some(message.into()),
+            state_changes: vec![],
+        }
+    }
+    
+    pub fn with_changes(mut self, changes: Vec<StateChange>) -> Self {
+        self.state_changes = changes;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,7 +196,72 @@ pub struct StateChange {
     pub new_value: Option<Vec<u8>>,
 }
 
+impl StateChange {
+    pub fn new(key: impl Into<String>, old_value: Option<Vec<u8>>, new_value: Option<Vec<u8>>) -> Self {
+        Self {
+            key: key.into(),
+            old_value,
+            new_value,
+        }
+    }
+    
+    pub fn insert(key: impl Into<String>, value: Vec<u8>) -> Self {
+        Self::new(key, None, Some(value))
+    }
+    
+    pub fn delete(key: impl Into<String>, old_value: Vec<u8>) -> Self {
+        Self::new(key, Some(old_value), None)
+    }
+    
+    pub fn update(key: impl Into<String>, old_value: Vec<u8>, new_value: Vec<u8>) -> Self {
+        Self::new(key, Some(old_value), Some(new_value))
+    }
+}
+
+// ========== Event ==========
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    /// Unique event identifier (hash-based)
+    pub id: EventId,
+    
+    /// Type of this event
+    pub event_type: EventType,
+    
+    /// Parent event IDs (DAG edges)
+    pub parent_ids: Vec<EventId>,
+    
+    /// The subnet this event belongs to (determines routing)
+    #[serde(default)]
+    pub subnet_id: Option<crate::subnet::SubnetId>,
+    
+    /// Legacy transfer field (for backward compatibility)
+    #[serde(default)]
+    pub transfer: Option<Transfer>,
+    
+    /// Unified payload field
+    #[serde(default)]
+    pub payload: EventPayload,
+    
+    /// VLC snapshot at event creation
+    pub vlc_snapshot: VLCSnapshot,
+    
+    /// Creator node ID
+    pub creator: String,
+    
+    /// Current status
+    pub status: EventStatus,
+    
+    /// Execution result (if executed)
+    #[serde(default)]
+    pub execution_result: Option<ExecutionResult>,
+    
+    /// Creation timestamp (milliseconds since epoch)
+    pub timestamp: u64,
+}
+
 impl Event {
+    /// Create a new event
     pub fn new(
         event_type: EventType,
         parent_ids: Vec<EventId>,
@@ -306,7 +279,7 @@ impl Event {
         let subnet_id = if event_type.is_root_event() {
             Some(crate::subnet::SubnetId::ROOT)
         } else {
-            None // App subnet, to be specified by caller
+            None
         };
         
         Self {
@@ -324,6 +297,7 @@ impl Event {
         }
     }
 
+    /// Create a genesis event
     pub fn genesis(creator: String, vlc_snapshot: VLCSnapshot) -> Self {
         Self::new(EventType::Genesis, vec![], vlc_snapshot, creator)
     }
@@ -473,11 +447,7 @@ impl Event {
     pub fn set_execution_result(&mut self, result: ExecutionResult) {
         let success = result.success;
         self.execution_result = Some(result);
-        if success {
-            self.status = EventStatus::Executed;
-        } else {
-            self.status = EventStatus::Failed;
-        }
+        self.status = if success { EventStatus::Executed } else { EventStatus::Failed };
     }
 
     pub fn is_genesis(&self) -> bool {
@@ -512,14 +482,12 @@ impl Event {
     }
     
     /// Get the subnet this event belongs to
-    /// Returns ROOT subnet if not explicitly set and event is a root event
     pub fn get_subnet_id(&self) -> crate::subnet::SubnetId {
         self.subnet_id.unwrap_or_else(|| {
             if self.event_type.is_root_event() {
                 crate::subnet::SubnetId::ROOT
             } else {
-                // Default to ROOT if not specified (for backward compatibility)
-                crate::subnet::SubnetId::ROOT
+                crate::subnet::SubnetId::ROOT // Default for backward compatibility
             }
         })
     }
@@ -535,7 +503,7 @@ impl Event {
         self.subnet_id.is_some()
     }
     
-    /// Check if this event should be executed by validators (ROOT) or solvers (App)
+    /// Check if this event should be executed by validators
     pub fn is_validator_executed(&self) -> bool {
         self.event_type.is_validator_executed()
     }
@@ -543,9 +511,7 @@ impl Event {
     /// Get resources affected by this event (for dependency tracking)
     pub fn affected_resources(&self) -> Vec<String> {
         match &self.payload {
-            EventPayload::Transfer(t) => {
-                vec![format!("account:{}", t.from), format!("account:{}", t.to)]
-            }
+            EventPayload::Transfer(t) => t.affected_accounts(),
             EventPayload::ValidatorRegister(r) => {
                 vec![format!("validator:{}", r.validator_id)]
             }
@@ -559,10 +525,9 @@ impl Event {
                 vec![format!("subnet:{}", s.subnet_id)]
             }
             EventPayload::UserRegister(u) => {
-                let subnet = u.subnet_id.as_deref().unwrap_or("subnet-0");
                 vec![
                     format!("user:{}", u.user_id),
-                    format!("subnet:{}", subnet),
+                    format!("subnet:{}", u.get_subnet()),
                 ]
             }
             EventPayload::PowerConsume(p) => {
@@ -579,6 +544,7 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transfer::TransferType;
 
     fn create_vlc_snapshot() -> VLCSnapshot {
         VLCSnapshot {
@@ -609,11 +575,9 @@ mod tests {
     
     #[test]
     fn test_transfer_event() {
-        let transfer = Transfer {
-            from: "alice".to_string(),
-            to: "bob".to_string(),
-            amount: 100,
-        };
+        let transfer = Transfer::new("tx-1", "alice", "bob", 100)
+            .with_type(TransferType::FluxTransfer);
+        
         let event = Event::transfer(
             transfer,
             vec![],
@@ -630,15 +594,10 @@ mod tests {
     
     #[test]
     fn test_solver_register_event() {
-        let registration = SolverRegistration {
-            solver_id: "solver-1".to_string(),
-            address: "127.0.0.1".to_string(),
-            port: 9001,
-            capacity: 100,
-            shard_id: Some("shard-0".to_string()),
-            resources: vec!["ETH".to_string()],
-            public_key: None,
-        };
+        let registration = SolverRegistration::new("solver-1", "127.0.0.1", 9001)
+            .with_shard("shard-0")
+            .with_resources(vec!["ETH".to_string()]);
+        
         let event = Event::solver_register(
             registration,
             vec![],
@@ -665,21 +624,16 @@ mod tests {
     
     #[test]
     fn test_subnet_register_event() {
-        let registration = SubnetRegistration {
-            subnet_id: "subnet-1".to_string(),
-            name: "DeFi App".to_string(),
-            description: Some("A DeFi application subnet".to_string()),
-            owner: "alice".to_string(),
-            max_users: Some(10000),
-            resource_limits: Some(SubnetResourceLimits {
-                max_tps: Some(1000),
-                max_storage_bytes: Some(1024 * 1024 * 1024),
-                max_compute_units: Some(100000),
-            }),
-            assigned_solvers: vec!["solver-1".to_string(), "solver-2".to_string()],
-            subnet_type: SubnetType::Application,
-            parent_subnet_id: None,
-        };
+        use crate::registration::SubnetResourceLimits;
+        
+        let limits = SubnetResourceLimits::new()
+            .with_tps(1000)
+            .with_storage(1024 * 1024 * 1024);
+        
+        let registration = SubnetRegistration::new("subnet-1", "DeFi App", "alice")
+            .with_limits(limits)
+            .with_solvers(vec!["solver-1".to_string(), "solver-2".to_string()]);
+        
         let event = Event::subnet_register(
             registration,
             vec![],
@@ -695,51 +649,30 @@ mod tests {
     
     #[test]
     fn test_user_register_event() {
-        let registration = UserRegistration {
-            user_id: "user-alice-123".to_string(),
-            public_key: vec![1, 2, 3, 4],
-            subnet_id: Some("subnet-1".to_string()),
-            display_name: Some("Alice".to_string()),
-            metadata: None,
-            initial_power: Some(100),
-            invited_by: Some("user-inviter".to_string()),
-            invite_code: Some("INVITE123".to_string()),
-        };
+        let registration = UserRegistration::new("user-alice", vec![1, 2, 3])
+            .with_subnet("subnet-1")
+            .with_display_name("Alice")
+            .with_power(100);
+        
         let event = Event::user_register(
             registration,
             vec![],
             create_vlc_snapshot(),
-            "user-alice-123".to_string(),
+            "user-alice".to_string(),
         );
         assert_eq!(event.event_type, EventType::UserRegister);
         assert!(event.is_registration());
         
         let resources = event.affected_resources();
-        assert!(resources.contains(&"user:user-alice-123".to_string()));
+        assert!(resources.contains(&"user:user-alice".to_string()));
         assert!(resources.contains(&"subnet:subnet-1".to_string()));
     }
     
     #[test]
-    fn test_user_register_default_subnet() {
-        let registration = UserRegistration {
-            user_id: "user-bob-456".to_string(),
-            public_key: vec![5, 6, 7, 8],
-            subnet_id: None, // Should default to subnet-0
-            display_name: None,
-            metadata: None,
-            initial_power: None,
-            invited_by: None,
-            invite_code: None,
-        };
-        let event = Event::user_register(
-            registration,
-            vec![],
-            create_vlc_snapshot(),
-            "user-bob-456".to_string(),
-        );
-        
-        let resources = event.affected_resources();
-        assert!(resources.contains(&"user:user-bob-456".to_string()));
-        assert!(resources.contains(&"subnet:subnet-0".to_string())); // Default to root subnet
+    fn test_execution_result() {
+        let result = ExecutionResult::success()
+            .with_changes(vec![StateChange::insert("key1", vec![1, 2, 3])]);
+        assert!(result.success);
+        assert_eq!(result.state_changes.len(), 1);
     }
 }

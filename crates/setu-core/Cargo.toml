@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 # Internal dependencies
-core-types = { path = "../core-types" }
 setu-types = { path = "../../types" }
 
 # Async runtime

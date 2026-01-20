@@ -4,6 +4,12 @@
 //! - Events Binary Merkle Tree for event commitments
 //! - Anchor Chain Binary Merkle Tree
 //! - Integration with GlobalStateManager for state roots
+//!
+//! ## Event Ordering (Critical for Determinism)
+//!
+//! Events MUST be sorted by VLC before building the Merkle tree.
+//! This ensures all validators compute the same events_root.
+//! Sort order: VLC.logical_time (ascending), then event_id (lexicographic)
 
 use setu_merkle::{BinaryMerkleTree, HashValue as MerkleHash, SubnetAggregationTree, SubnetStateEntry};
 use setu_types::{Anchor, AnchorMerkleRoots, Event, SubnetId, HashValue as TypesHash};
@@ -14,23 +20,72 @@ fn to_types_hash(h: MerkleHash) -> TypesHash {
     *h.as_bytes()
 }
 
+/// Sort events by VLC for deterministic ordering
+/// 
+/// All validators must apply events in the same order to get consistent state.
+/// Sort order:
+/// 1. Primary: VLC logical_time (ascending)
+/// 2. Secondary: event_id (lexicographic, for tie-breaking)
+fn sort_events_by_vlc(events: &mut [Event]) {
+    events.sort_by(|a, b| {
+        // Primary sort by VLC logical_time
+        match a.vlc_snapshot.logical_time.cmp(&b.vlc_snapshot.logical_time) {
+            std::cmp::Ordering::Equal => {
+                // Tie-breaker: sort by event_id lexicographically
+                a.id.cmp(&b.id)
+            }
+            other => other,
+        }
+    });
+}
+
 /// Computes the events Merkle root from a list of events
 ///
 /// According to mkt-3.md, events are committed using a Binary Merkle Tree
 /// where each leaf is the hash of an event.
+///
+/// IMPORTANT: Events are sorted by VLC before building the tree to ensure
+/// deterministic ordering across all validators.
 pub fn compute_events_root(events: &[Event]) -> MerkleHash {
     if events.is_empty() {
         return MerkleHash::zero();
     }
     
-    // Build tree directly from event ID bytes
-    let leaves: Vec<&[u8]> = events
+    // Sort events by VLC for deterministic ordering
+    let mut sorted_events = events.to_vec();
+    sort_events_by_vlc(&mut sorted_events);
+    
+    // Build tree from sorted event ID bytes
+    let leaves: Vec<&[u8]> = sorted_events
         .iter()
         .map(|e| e.id.as_bytes())
         .collect();
     
     let tree = BinaryMerkleTree::build(&leaves);
     tree.root()
+}
+
+/// Computes the events Merkle root and returns sorted events
+///
+/// This variant returns the sorted events along with the root,
+/// useful when you need to apply state changes in the same order.
+pub fn compute_events_root_with_sorted(events: &[Event]) -> (MerkleHash, Vec<Event>) {
+    if events.is_empty() {
+        return (MerkleHash::zero(), vec![]);
+    }
+    
+    // Sort events by VLC for deterministic ordering
+    let mut sorted_events = events.to_vec();
+    sort_events_by_vlc(&mut sorted_events);
+    
+    // Build tree from sorted event ID bytes
+    let leaves: Vec<&[u8]> = sorted_events
+        .iter()
+        .map(|e| e.id.as_bytes())
+        .collect();
+    
+    let tree = BinaryMerkleTree::build(&leaves);
+    (tree.root(), sorted_events)
 }
 
 /// Computes the anchor chain root from previous anchors

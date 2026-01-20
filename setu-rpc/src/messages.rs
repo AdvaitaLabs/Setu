@@ -208,8 +208,8 @@ pub struct SubmitTransferRequest {
     pub from: String,
     /// Receiver address
     pub to: String,
-    /// Amount to transfer
-    pub amount: i128,
+    /// Amount to transfer (non-negative)
+    pub amount: u64,
     /// Transfer type (flux, instant, etc.)
     pub transfer_type: String,
     /// Optional preferred solver

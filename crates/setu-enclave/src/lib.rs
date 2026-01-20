@@ -75,6 +75,7 @@
 //! ```
 
 pub mod attestation;
+pub mod solver_task;
 pub mod stf;
 pub mod traits;
 
@@ -86,12 +87,17 @@ pub mod nitro;
 
 // Re-export main types
 pub use attestation::{
-    Attestation, AttestationType, AttestationVerifier,
+    Attestation, AttestationType, AttestationVerifier, AttestationData,
     AttestationError, AttestationResult, AllowlistVerifier,
+};
+pub use solver_task::{
+    SolverTask, ResolvedInputs, OperationType, ResolvedObject,
+    GasBudget, GasUsage, MerkleProof,
 };
 pub use stf::{
     StfInput, StfOutput, StfError, StfResult,
     ReadSetEntry, WriteSetEntry, StateDiff, ExecutionStats,
+    Hash, TaskId,
 };
 pub use traits::{EnclaveRuntime, EnclaveConfig, EnclaveInfo, EnclavePlatform};
 

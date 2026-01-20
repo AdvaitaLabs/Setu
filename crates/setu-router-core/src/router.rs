@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use core_types::Transfer;
+use setu_types::Transfer;
 
 use crate::error::RouterError;
 use crate::types::DEFAULT_SHARD_ID;

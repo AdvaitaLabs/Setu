@@ -1,9 +1,17 @@
-//! Network client for Solver
+//! Network client for Solver (solver-tee3 Architecture)
 //!
 //! This module provides the network client for Solver to:
 //! - Register with Validator
 //! - Send heartbeats
-//! - Submit events to Validator
+//! - Submit execution results to Validator
+//!
+//! ## solver-tee3 Architecture Note
+//!
+//! In solver-tee3, Solver does NOT read state from Validator.
+//! All state is provided in the SolverTask prepared by Validator.
+//! This client is only for:
+//! 1. Registration and heartbeat (lifecycle management)
+//! 2. Submitting TeeExecutionResult back to Validator
 
 use serde::{Serialize, Deserialize};
 use setu_rpc::{
@@ -42,7 +50,7 @@ pub struct SolverNetworkConfig {
     pub address: String,
     /// Solver's listen port
     pub port: u16,
-    /// Maximum capacity
+    /// Maximum capacity (concurrent tasks)
     pub capacity: u32,
     /// Shard assignment
     pub shard_id: Option<String>,
@@ -73,16 +81,20 @@ impl Default for SolverNetworkConfig {
 }
 
 /// Solver network client for connecting to Validator
+///
+/// Handles:
+/// - Registration with Validator
+/// - Periodic heartbeats
+/// - Load tracking
+///
+/// Does NOT handle (in solver-tee3):
+/// - State reads (provided in SolverTask)
+/// - Balance queries (Validator prepares everything)
 pub struct SolverNetworkClient {
-    /// Configuration
     config: SolverNetworkConfig,
-    /// HTTP client for registration
     http_client: HttpRegistrationClient,
-    /// Current load counter
     current_load: Arc<AtomicU32>,
-    /// Whether registered with validator
     is_registered: Arc<AtomicBool>,
-    /// Shutdown signal
     shutdown: Arc<AtomicBool>,
 }
 
@@ -167,7 +179,6 @@ impl SolverNetworkClient {
             timestamp,
         };
         
-        // Use HTTP POST for heartbeat
         let url = format!(
             "http://{}:{}/api/v1/heartbeat",
             self.config.validator_address,
@@ -180,7 +191,7 @@ impl SolverNetworkClient {
             .json(&request)
             .send()
             .await
-            .map_err(|e| setu_rpc::RpcError::Network(e.to_string()))?;
+            .map_err(|e| RpcError::Network(e.to_string()))?;
         
         if !response.status().is_success() {
             return Ok(HeartbeatResponse {
@@ -192,12 +203,14 @@ impl SolverNetworkClient {
         let response: HeartbeatResponse = response
             .json()
             .await
-            .map_err(|e| setu_rpc::RpcError::Serialization(e.to_string()))?;
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
         
         Ok(response)
     }
     
-    /// Submit an event to the validator
+    /// Submit an event to the validator (for backward compatibility)
+    ///
+    /// In solver-tee3, prefer using `submit_execution_result` instead.
     pub async fn submit_event(&self, event: Event) -> RpcResult<SubmitEventResponse> {
         info!(
             solver_id = %self.config.solver_id,
@@ -260,7 +273,7 @@ impl SolverNetworkClient {
     }
     
     /// Start the heartbeat loop
-    pub async fn start_heartbeat_loop(self: Arc<Self>) {
+    pub async fn start_heartbeat_loop(&self) {
         let interval = Duration::from_secs(self.config.heartbeat_interval_secs);
         
         info!(
@@ -292,7 +305,6 @@ impl SolverNetworkClient {
                 }
                 Err(e) => {
                     error!(error = %e, "Heartbeat failed");
-                    // Mark as not registered to trigger re-registration
                     self.is_registered.store(false, Ordering::SeqCst);
                 }
             }

@@ -2,21 +2,48 @@
 //!
 //! The MockEnclave simulates TEE behavior without requiring actual hardware.
 //! It provides:
-//! - Simulated STF execution
+//! - Simulated STF execution via setu-runtime
 //! - Mock attestations
 //! - Deterministic behavior for testing
+//!
+//! ## Architecture
+//!
+//! ```text
+//! User Request (Transfer: from/to/amount)
+//!       │
+//!       ▼
+//! MockEnclave.execute_stf()
+//!       │
+//!       ├── execute_single_event()
+//!       │         │
+//!       │         ▼
+//!       │   setu-runtime::RuntimeExecutor  ← Object-based STF
+//!       │         • execute_simple_transfer()
+//!       │         • Manages Coin objects internally
+//!       │         • Future: MoveVM integration
+//!       │
+//!       └── generate_attestation() → Mock attestation
+//!
+//! State Model:
+//! - External: Account-based (Transfer: from/to/amount)
+//! - Internal: Object-based (Coin objects with ownership)
+//! - setu-runtime bridges the two models
+//! ```
 
 use crate::{
-    attestation::Attestation,
+    attestation::{Attestation, AttestationData},
+    solver_task::GasUsage,
     stf::{ExecutionStats, FailedEvent, StateDiff, StfError, StfInput, StfOutput, StfResult, WriteSetEntry},
     traits::{EnclaveConfig, EnclaveInfo, EnclavePlatform, EnclaveRuntime},
 };
 use async_trait::async_trait;
-use setu_types::EventId;
+use setu_runtime::{RuntimeExecutor, ExecutionContext, InMemoryStateStore, StateStore};
+use setu_types::{EventId, create_coin, Address};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{debug, info};
 
 /// Mock enclave measurement (constant for testing)
 const MOCK_MEASUREMENT: [u8; 32] = [
@@ -31,10 +58,17 @@ const MOCK_MEASUREMENT: [u8; 32] = [
 ];
 
 /// Mock enclave for development and testing
+/// 
+/// This enclave simulates TEE execution by calling setu-runtime
+/// for actual state transition logic. In production, this would be
+/// replaced with a real TEE implementation (e.g., NitroEnclave).
 pub struct MockEnclave {
     config: EnclaveConfig,
-    /// Simulated state (for testing state transitions)
-    state: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    /// Runtime executor for object-based state transitions
+    /// Uses InMemoryStateStore for testing
+    runtime: Arc<RwLock<RuntimeExecutor<InMemoryStateStore>>>,
+    /// Legacy state map (for non-transfer events and backward compatibility)
+    legacy_state: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     /// Execution counter for statistics
     execution_count: Arc<RwLock<u64>>,
 }
@@ -42,9 +76,13 @@ pub struct MockEnclave {
 impl MockEnclave {
     /// Create a new mock enclave with the given configuration
     pub fn new(config: EnclaveConfig) -> Self {
+        let store = InMemoryStateStore::new();
+        let runtime = RuntimeExecutor::new(store);
+        
         Self {
             config,
-            state: Arc::new(RwLock::new(HashMap::new())),
+            runtime: Arc::new(RwLock::new(runtime)),
+            legacy_state: Arc::new(RwLock::new(HashMap::new())),
             execution_count: Arc::new(RwLock::new(0)),
         }
     }
@@ -55,23 +93,30 @@ impl MockEnclave {
         Self::new(config)
     }
     
+    /// Initialize account with balance (for testing)
+    /// Creates a Coin object owned by the address
+    pub async fn init_account(&self, address: &str, balance: u64) {
+        let addr = Address::from(address);
+        let coin = create_coin(addr, balance);
+        let coin_id = *coin.id();
+        
+        let mut runtime = self.runtime.write().await;
+        runtime.state_mut().set_object(coin_id, coin).expect("Failed to init account");
+        
+        info!(address = %address, balance = balance, coin_id = %coin_id, "Initialized account");
+    }
+    
     /// Get the current execution count
     pub async fn execution_count(&self) -> u64 {
         *self.execution_count.read().await
     }
     
-    /// Simulate applying events to state
+    /// Simulate applying events to state using setu-runtime
     async fn simulate_execution(&self, input: &StfInput) -> StfResult<(StateDiff, Vec<EventId>, Vec<FailedEvent>)> {
         let start = std::time::Instant::now();
-        let mut state = self.state.write().await;
         let mut diff = StateDiff::new();
         let mut processed = Vec::new();
         let mut failed = Vec::new();
-        
-        // Apply read set to state (simulating initial state)
-        for entry in &input.read_set {
-            state.insert(entry.key.clone(), entry.value.clone());
-        }
         
         // Process each event
         for event in &input.events {
@@ -80,8 +125,8 @@ impl MockEnclave {
                 return Err(StfError::ExecutionTimeout);
             }
             
-            // Simulate event execution
-            match self.execute_single_event(&mut state, event, &mut diff) {
+            // Execute event using setu-runtime, passing resolved_inputs
+            match self.execute_single_event(event, &input.resolved_inputs, &mut diff).await {
                 Ok(()) => {
                     processed.push(event.id.clone());
                 }
@@ -100,17 +145,119 @@ impl MockEnclave {
         Ok((diff, processed, failed))
     }
     
-    /// Execute a single event (mock implementation)
-    fn execute_single_event(
+    /// Execute a single event using setu-runtime
+    /// 
+    /// This is the core STF (State Transition Function) execution.
+    /// For transfer events, uses resolved_inputs.primary_coin() to get the coin_id
+    /// that Validator has already selected.
+    /// For other events, records them in legacy state.
+    async fn execute_single_event(
+        &self,
+        event: &setu_types::Event,
+        resolved_inputs: &crate::solver_task::ResolvedInputs,
+        diff: &mut StateDiff,
+    ) -> Result<(), String> {
+        debug!(event_id = %event.id, event_type = ?event.event_type, "Executing event via setu-runtime");
+        
+        // Check if this is a transfer event
+        if let Some(transfer) = &event.transfer {
+            return self.execute_transfer_via_runtime(event, transfer, resolved_inputs, diff).await;
+        }
+        
+        // For non-transfer events, record in legacy state
+        let mut legacy_state = self.legacy_state.write().await;
+        self.record_event_processed(&mut legacy_state, event, diff);
+        Ok(())
+    }
+    
+    /// Execute a transfer event via setu-runtime (solver-tee3 architecture)
+    /// 
+    /// Uses resolved_inputs.primary_coin() to get the coin_id that Validator
+    /// has already selected, instead of letting runtime do coin selection.
+    /// This follows the solver-tee3 design where Validator prepares everything.
+    async fn execute_transfer_via_runtime(
+        &self,
+        event: &setu_types::Event,
+        transfer: &setu_types::Transfer,
+        resolved_inputs: &crate::solver_task::ResolvedInputs,
+        diff: &mut StateDiff,
+    ) -> Result<(), String> {
+        let ctx = ExecutionContext {
+            executor_id: self.config.solver_id.clone(),
+            timestamp: event.timestamp,
+            in_tee: false, // Mock enclave
+        };
+        
+        // Try to use resolved_inputs coin_id if available (solver-tee3 path)
+        let output = if let Some(resolved_coin) = resolved_inputs.primary_coin() {
+            debug!(
+                event_id = %event.id,
+                coin_id = %resolved_coin.object_id,
+                from = %transfer.from,
+                to = %transfer.to,
+                amount = transfer.amount,
+                "Executing transfer with resolved coin_id (solver-tee3)"
+            );
+            
+            // Use the coin_id from resolved_inputs
+            let mut runtime = self.runtime.write().await;
+            runtime.execute_transfer_with_coin(
+                resolved_coin.object_id.clone(),
+                &transfer.from,
+                &transfer.to,
+                Some(transfer.amount as u64),
+                &ctx,
+            ).map_err(|e| format!("Runtime error: {}", e))?
+        } else {
+            // Fallback to legacy behavior: let runtime select coin
+            debug!(
+                event_id = %event.id,
+                from = %transfer.from,
+                to = %transfer.to,
+                amount = transfer.amount,
+                "Executing transfer via simple_transfer (legacy fallback)"
+            );
+            
+            let mut runtime = self.runtime.write().await;
+            runtime.execute_simple_transfer(
+                &transfer.from,
+                &transfer.to,
+                transfer.amount as u64,
+                &ctx,
+            ).map_err(|e| format!("Runtime error: {}", e))?
+        };
+        
+        if !output.success {
+            return Err(output.message.unwrap_or_else(|| "Transfer failed".to_string()));
+        }
+        
+        // Convert setu-runtime StateChanges to enclave StateDiff using helper method
+        diff.add_state_changes(&output.state_changes);
+        
+        // Record event as processed
+        let mut legacy_state = self.legacy_state.write().await;
+        self.record_event_processed(&mut legacy_state, event, diff);
+        
+        info!(
+            event_id = %event.id,
+            from = %transfer.from,
+            to = %transfer.to,
+            amount = transfer.amount,
+            state_changes = output.state_changes.len(),
+            used_resolved_inputs = resolved_inputs.primary_coin().is_some(),
+            "Transfer executed successfully via setu-runtime"
+        );
+        
+        Ok(())
+    }
+    
+    /// Record that an event was processed (for non-transfer events)
+    fn record_event_processed(
         &self,
         state: &mut HashMap<String, Vec<u8>>,
         event: &setu_types::Event,
         diff: &mut StateDiff,
-    ) -> Result<(), String> {
-        // Mock execution: just record that we processed the event
-        // In real implementation, this would invoke setu-runtime
-        
-        // Generate a state change based on event
+    ) {
         let key = format!("event:{}", event.id);
         let old_value = state.get(&key).cloned();
         let new_value = format!("processed:{}", event.id).into_bytes();
@@ -122,8 +269,6 @@ impl MockEnclave {
             write_entry = write_entry.with_old_value(old);
         }
         diff.add_write(write_entry);
-        
-        Ok(())
     }
     
     /// Compute post-state root from state
@@ -165,41 +310,60 @@ impl EnclaveRuntime for MockEnclave {
     async fn execute_stf(&self, input: StfInput) -> StfResult<StfOutput> {
         let start = std::time::Instant::now();
         
-        // Simulate execution
+        // TODO (solver-tee3): Verify read_set Merkle proofs against pre_state_root
+        // For now, skip verification in mock mode
+        // self.verify_read_set(&input.read_set, &input.pre_state_root)?;
+        
+        // TODO (solver-tee3): Build temporary state from read_set instead of using persistent state
+        // This would make the enclave truly stateless:
+        // let temp_state = self.build_state_from_read_set(&input.read_set)?;
+        // let runtime = RuntimeExecutor::new(temp_state);
+        
+        // Execute using setu-runtime (current implementation uses persistent state)
         let (diff, events_processed, events_failed) = self.simulate_execution(&input).await?;
         
-        // Compute post-state root
+        // Compute post-state root from legacy state
+        // Note: For full object model, should compute from RuntimeExecutor state
         let post_state_root = {
-            let state = self.state.read().await;
+            let state = self.legacy_state.read().await;
             Self::compute_state_root(&state)
         };
         
-        // Compute output hash for attestation
-        let diff_commitment = diff.commitment();
-        let output_hash = Self::compute_output_hash(
-            &input.subnet_id,
-            &input.pre_state_root,
-            &post_state_root,
-            &diff_commitment,
+        // Compute input hash for attestation binding
+        let input_hash = input.input_hash();
+        
+        // Create AttestationData binding task_id, input_hash, and state roots
+        let attestation_data = AttestationData::new(
+            input.task_id,
+            input_hash,
+            input.pre_state_root,
+            post_state_root,
         );
         
-        // Generate mock attestation
-        let attestation = Attestation::mock(output_hash)
+        // Generate mock attestation with proper data binding
+        let attestation = Attestation::mock_with_data(attestation_data)
             .with_solver_id(self.config.solver_id.clone());
         
         let execution_time = start.elapsed();
+        let writes_count = diff.writes.len() as u64;
+        
+        // Calculate gas usage (mock: 100 gas per write, 10 gas per read)
+        let gas_used = execution_time.as_micros() as u64 / 10 + writes_count * 100 + input.read_set.len() as u64 * 10;
+        let gas_usage = GasUsage::new(gas_used, Some(1)); // mock gas_price = 1
         
         Ok(StfOutput {
+            task_id: input.task_id,
             subnet_id: input.subnet_id,
             post_state_root,
             state_diff: diff,
             events_processed,
             events_failed,
+            gas_usage,
             attestation,
             stats: ExecutionStats {
                 execution_time_us: execution_time.as_micros() as u64,
                 reads: input.read_set.len() as u64,
-                writes: 0, // Will be updated in the actual write set
+                writes: writes_count,
                 peak_memory_bytes: 0, // Not tracked in mock
             },
         })
@@ -282,11 +446,17 @@ impl MockEnclaveBuilder {
             enable_debug_logging: self.debug_logging,
         };
         
-        MockEnclave {
+        let store = InMemoryStateStore::new();
+        let runtime = RuntimeExecutor::new(store);
+        
+        let enclave = MockEnclave {
             config,
-            state: Arc::new(RwLock::new(self.initial_state)),
+            runtime: Arc::new(RwLock::new(runtime)),
+            legacy_state: Arc::new(RwLock::new(self.initial_state)),
             execution_count: Arc::new(RwLock::new(0)),
-        }
+        };
+        
+        enclave
     }
 }
 
@@ -315,14 +485,26 @@ mod tests {
     
     #[tokio::test]
     async fn test_mock_enclave_stf_execution() {
+        use crate::solver_task::{ResolvedInputs, GasBudget};
+        
         let enclave = MockEnclave::default_with_solver_id("solver1".to_string());
         
-        let input = StfInput::new(SubnetId::ROOT, [0u8; 32])
-            .with_events(vec![create_test_event("evt1")]);
+        let task_id = [1u8; 32];
+        let resolved_inputs = ResolvedInputs::new();
+        let gas_budget = GasBudget::default();
+        
+        let input = StfInput::new(
+            task_id,
+            SubnetId::ROOT,
+            [0u8; 32],
+            resolved_inputs,
+            gas_budget,
+        ).with_events(vec![create_test_event("evt1")]);
         
         let output = enclave.execute_stf(input).await.unwrap();
         
         assert_eq!(output.subnet_id, SubnetId::ROOT);
+        assert_eq!(output.task_id, task_id);
         assert_eq!(output.events_processed.len(), 1);
         assert!(output.events_failed.is_empty());
         assert!(output.attestation.is_mock());

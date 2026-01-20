@@ -12,7 +12,7 @@ pub mod state;
 pub mod transaction;
 pub mod error;
 
-pub use executor::{RuntimeExecutor, ExecutionContext, ExecutionOutput};
+pub use executor::{RuntimeExecutor, ExecutionContext, ExecutionOutput, StateChange, StateChangeType};
 pub use state::{StateStore, InMemoryStateStore};
 pub use transaction::{Transaction, TransactionType, TransferTx, QueryTx};
 pub use error::{RuntimeError, RuntimeResult};
