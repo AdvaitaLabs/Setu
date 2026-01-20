@@ -12,6 +12,11 @@ use setu_rpc::{
     HeartbeatRequest, HeartbeatResponse, RegisterSolverRequest, RegisterSolverResponse,
     RegisterValidatorRequest, RegisterValidatorResponse, RegistrationHandler,
     SubmitTransferRequest, SubmitTransferResponse,
+    // User RPC imports
+    UserRpcHandler, RegisterUserRequest, RegisterUserResponse,
+    GetAccountRequest, GetAccountResponse, GetBalanceRequest, GetBalanceResponse as UserGetBalanceResponse,
+    GetPowerRequest, GetPowerResponse, GetCreditRequest, GetCreditResponse,
+    GetCredentialsRequest, GetCredentialsResponse, TransferRequest, TransferResponse,
 };
 use std::sync::Arc;
 
@@ -157,4 +162,64 @@ pub async fn http_get_object(
     axum::extract::Path(key): axum::extract::Path<String>,
 ) -> Json<GetObjectResponse> {
     Json(service.get_object(&key))
+}
+
+// ============================================
+// User RPC Handlers
+// ============================================
+
+pub async fn http_register_user(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<RegisterUserRequest>,
+) -> Json<RegisterUserResponse> {
+    let handler = service.user_handler();
+    Json(handler.register_user(request).await)
+}
+
+pub async fn http_get_account(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<GetAccountRequest>,
+) -> Json<GetAccountResponse> {
+    let handler = service.user_handler();
+    Json(handler.get_account(request).await)
+}
+
+pub async fn http_get_user_balance(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<GetBalanceRequest>,
+) -> Json<UserGetBalanceResponse> {
+    let handler = service.user_handler();
+    Json(handler.get_balance(request).await)
+}
+
+pub async fn http_get_power(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<GetPowerRequest>,
+) -> Json<GetPowerResponse> {
+    let handler = service.user_handler();
+    Json(handler.get_power(request).await)
+}
+
+pub async fn http_get_credit(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<GetCreditRequest>,
+) -> Json<GetCreditResponse> {
+    let handler = service.user_handler();
+    Json(handler.get_credit(request).await)
+}
+
+pub async fn http_get_credentials(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<GetCredentialsRequest>,
+) -> Json<GetCredentialsResponse> {
+    let handler = service.user_handler();
+    Json(handler.get_credentials(request).await)
+}
+
+pub async fn http_user_transfer(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<TransferRequest>,
+) -> Json<TransferResponse> {
+    let handler = service.user_handler();
+    Json(handler.transfer(request).await)
 }

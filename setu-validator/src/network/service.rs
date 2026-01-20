@@ -152,6 +152,14 @@ impl ValidatorNetworkService {
     }
 
     // ============================================
+    // User Handler
+    // ============================================
+
+    pub fn user_handler(self: &Arc<Self>) -> Arc<crate::ValidatorUserHandler> {
+        Arc::new(crate::ValidatorUserHandler::new(self.clone()))
+    }
+
+    // ============================================
     // HTTP Server
     // ============================================
 
@@ -179,6 +187,14 @@ impl ValidatorNetworkService {
             .route("/api/v1/events", get(http_get_events))
             // Heartbeat
             .route("/api/v1/heartbeat", post(http_heartbeat))
+            // User RPC endpoints
+            .route("/api/v1/user/register", post(http_register_user))
+            .route("/api/v1/user/account", post(http_get_account))
+            .route("/api/v1/user/balance", post(http_get_user_balance))
+            .route("/api/v1/user/power", post(http_get_power))
+            .route("/api/v1/user/credit", post(http_get_credit))
+            .route("/api/v1/user/credentials", post(http_get_credentials))
+            .route("/api/v1/user/transfer", post(http_user_transfer))
             .with_state(service);
 
         let listener = tokio::net::TcpListener::bind(self.config.http_listen_addr).await?;
