@@ -14,19 +14,31 @@
 //! - Preparing SolverTask with coin selection and Merkle proofs
 //! - Sending SolverTask to Solver (pass-through to TEE)
 //! - Verifying Attestation from TEE execution results
+//!
+//! ## Module Structure (refactored)
+//!
+//! - `network/` - Network service (modular)
+//!   - `types` - Request/Response types and helpers
+//!   - `handlers` - HTTP route handlers  
+//!   - `service` - Core service logic
+//!   - `registration` - Registration handler (RegistrationHandler trait impl)
 
 mod verifier;
 mod dag;
 mod sampling;
 mod router_manager;
-mod network_service;
+mod network;
 pub mod task_preparer;
 
 pub use verifier::Verifier;
 pub use dag::{DagManager, DagManagerError, DagNode, DagStats};
 pub use sampling::{SamplingVerifier, SamplingConfig, SamplingStats};
 pub use router_manager::{RouterManager, RouterError, SolverConnection};
-pub use network_service::{ValidatorNetworkService, ValidatorRegistrationHandler, NetworkServiceConfig, ValidatorInfo};
+pub use network::{
+    ValidatorNetworkService, ValidatorRegistrationHandler, NetworkServiceConfig,
+    ValidatorInfo, TransferTracker, SubmitEventRequest, SubmitEventResponse,
+    GetBalanceResponse, GetObjectResponse, current_timestamp_secs, current_timestamp_millis,
+};
 pub use task_preparer::{TaskPreparer, StateProvider, MockStateProvider, CoinInfo, TaskPrepareError};
 
 use core_types::Transfer;
@@ -62,6 +74,7 @@ pub enum ValidationError {
 /// Validator node
 pub struct Validator {
     config: NodeConfig,
+    #[allow(dead_code)] // Reserved for future sharding support
     shard_manager: Arc<ShardManager>,
     /// Receives transfers from relay/clients
     transfer_rx: Option<mpsc::UnboundedReceiver<Transfer>>,
@@ -287,6 +300,7 @@ impl Validator {
     }
     
     /// Verify an event (legacy method, kept for compatibility)
+    #[allow(dead_code)] // Reserved for future detailed verification
     async fn verify_event(&self, event: &Event) -> Result<(), ValidationError> {
         info!("Verifying event: {}", event.id);
         
