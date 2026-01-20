@@ -14,7 +14,7 @@ use crate::merkle_integration::compute_events_root;
 use setu_types::{
     Anchor, ConsensusConfig, Event, EventId, SubnetId,
 };
-use setu_storage::subnet_state::{GlobalStateManager, StateApplySummary, StateApplyError};
+use setu_storage::{GlobalStateManager, StateApplySummary, StateApplyError};
 
 /// Complete Anchor creation result
 #[derive(Debug)]
@@ -251,13 +251,14 @@ impl AnchorBuilder {
             .map(|e| e.id.clone())
             .collect();
         
-        // Create anchor
+        // Create anchor - correct parameter order:
+        // (event_ids, vlc_snapshot, merkle_roots, previous_anchor, depth)
         let anchor = Anchor::with_merkle_roots(
             event_ids,
             vlc.snapshot(),
+            merkle_roots,
             self.last_anchor.as_ref().map(|a| a.id.clone()),
             to_depth,
-            merkle_roots,
         );
         
         // Update anchor chain root using chain hashing:

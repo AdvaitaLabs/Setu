@@ -60,9 +60,9 @@ impl Anchor {
     pub fn with_merkle_roots(
         event_ids: Vec<EventId>,
         vlc_snapshot: VLCSnapshot,
+        merkle_roots: AnchorMerkleRoots,
         previous_anchor: Option<AnchorId>,
         depth: u64,
-        merkle_roots: AnchorMerkleRoots,
     ) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

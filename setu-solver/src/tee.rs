@@ -32,7 +32,7 @@ use setu_enclave::{
 use setu_types::event::{Event, ExecutionResult, StateChange};
 use setu_types::SubnetId;
 use std::sync::Arc;
-use tracing::{info, debug};
+use tracing::{info, debug, warn};
 
 /// TEE Executor for Solver nodes
 ///

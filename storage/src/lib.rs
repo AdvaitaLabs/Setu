@@ -13,7 +13,7 @@ pub use state::*;
 pub use event_store::*;
 pub use anchor_store::*;
 pub use object_store::*;
-pub use subnet_state::{SubnetStateSMT, GlobalStateManager};
+pub use subnet_state::{SubnetStateSMT, GlobalStateManager, StateApplySummary, StateApplyError};
 
 // Re-export RocksDB types
 pub use rocks::{SetuDB, RocksDBConfig, ColumnFamily, StorageError};
