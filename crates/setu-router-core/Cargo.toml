@@ -6,7 +6,6 @@ description = "Core routing strategies and shard management for Setu"
 
 [dependencies]
 # Internal dependencies
-core-types = { path = "../core-types" }
 setu-types = { path = "../../types" }
 setu-core = { path = "../setu-core" }
 

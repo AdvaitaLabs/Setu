@@ -7,7 +7,7 @@
 //! - Coordinating consensus (simulated for now)
 //! - Providing HTTP API for registration and transfer submission
 
-use core_types::Transfer;
+use setu_types::Transfer;
 use setu_core::NodeConfig;
 use setu_validator::{
     Validator, RouterManager, 
@@ -89,21 +89,12 @@ async fn main() -> anyhow::Result<()> {
     let router_manager = Arc::new(RouterManager::new());
     
     // Create task preparer (solver-tee3 architecture)
-    let task_preparer = Arc::new(setu_validator::TaskPreparer::new_mock(
+    // Uses real MerkleStateProvider with pre-initialized test accounts
+    let task_preparer = Arc::new(setu_validator::TaskPreparer::new_for_testing(
         config.node_config.node_id.clone(),
     ));
     
-    // Warn about mock state in production
-    #[cfg(not(debug_assertions))]
-    {
-        warn!("⚠️  ⚠️  ⚠️  WARNING ⚠️  ⚠️  ⚠️");
-        warn!("⚠️  TaskPreparer using MOCK state provider!");
-        warn!("⚠️  This is NOT suitable for production!");
-        warn!("⚠️  Replace with real StateProvider for production deployment.");
-        warn!("⚠️  ⚠️  ⚠️  WARNING ⚠️  ⚠️  ⚠️");
-    }
-    
-    info!("✓ TaskPreparer initialized (solver-tee3 mode with mock state)");
+    info!("✓ TaskPreparer initialized with test accounts (alice, bob, charlie)");
     
     // Create network service configuration
     let network_config = NetworkServiceConfig {

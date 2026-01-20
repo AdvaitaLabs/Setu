@@ -39,9 +39,12 @@ pub use network::{
     ValidatorInfo, TransferTracker, SubmitEventRequest, SubmitEventResponse,
     GetBalanceResponse, GetObjectResponse, current_timestamp_secs, current_timestamp_millis,
 };
-pub use task_preparer::{TaskPreparer, StateProvider, MockStateProvider, CoinInfo, TaskPrepareError};
+pub use task_preparer::{TaskPreparer, TaskPrepareError};
 
-use core_types::Transfer;
+// Re-export StateProvider types from storage (canonical location)
+pub use setu_storage::{StateProvider, CoinInfo, SimpleMerkleProof, MerkleStateProvider};
+
+use setu_types::Transfer;
 use setu_core::{NodeConfig, ShardManager};
 use setu_types::event::Event;
 use std::collections::HashMap;

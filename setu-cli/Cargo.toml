@@ -9,7 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 # Workspace dependencies
-core-types = { path = "../crates/core-types" }
 setu-types = { path = "../types" }
 setu-rpc = { path = "../setu-rpc" }
 

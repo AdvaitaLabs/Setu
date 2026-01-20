@@ -36,7 +36,7 @@ use std::fmt;
 use crate::object::Address;
 
 /// Subnet type classification
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SubnetType {
     /// ROOT subnet (SubnetId = 0)
     Root,
@@ -44,8 +44,31 @@ pub enum SubnetType {
     SystemReserved,
     /// Application subnets (type byte = 0x02)
     App,
+    /// Organization subnet (for a company/DAO)
+    Organization,
+    /// Personal subnet (for individual users)
+    Personal,
     /// Unknown/invalid type
     Unknown,
+}
+
+impl Default for SubnetType {
+    fn default() -> Self {
+        SubnetType::App
+    }
+}
+
+impl std::fmt::Display for SubnetType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubnetType::Root => write!(f, "root"),
+            SubnetType::SystemReserved => write!(f, "system"),
+            SubnetType::App => write!(f, "application"),
+            SubnetType::Organization => write!(f, "organization"),
+            SubnetType::Personal => write!(f, "personal"),
+            SubnetType::Unknown => write!(f, "unknown"),
+        }
+    }
 }
 
 /// Unique identifier for a subnet (32 bytes)

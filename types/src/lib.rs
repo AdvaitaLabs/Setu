@@ -1,5 +1,7 @@
 // ========== Core Modules ==========
 pub mod event;
+pub mod transfer;       // Transfer and routing types
+pub mod registration;   // Registration types
 pub mod consensus;
 pub mod node;
 pub mod object;
@@ -12,22 +14,30 @@ pub mod profile;        // Profile & Credential (identity)
 pub mod relation;       // RelationGraph object (social)
 pub mod account_view;   // Account aggregated view
 
-// Export commonly used types
-pub use event::{
-    Event, EventId, EventStatus, EventType, EventPayload, Transfer,
-    ExecutionResult, StateChange,
-    // Registration types
-    ValidatorRegistration, SolverRegistration, Unregistration,
-    SubnetRegistration, SubnetResourceLimits,
-    UserRegistration,
-    // Other payload types
-    PowerConsumption, TaskSubmission,
+// Re-export VLC types from setu-vlc (single source of truth)
+pub use setu_vlc::{VectorClock, VLCSnapshot};
+
+// Export from transfer module
+pub use transfer::{
+    Transfer, TransferId, ClockKey, ResourceKey, TransferType, AssignedVlc,
 };
+
+// Export from registration module
+pub use registration::{
+    ValidatorRegistration, SolverRegistration, Unregistration, NodeType,
+    SubnetRegistration, SubnetResourceLimits,
+    UserRegistration, PowerConsumption, TaskSubmission,
+};
+
+// Export from event module
+pub use event::{
+    Event, EventId, EventStatus, EventType, EventPayload,
+    ExecutionResult, StateChange,
+};
+
+// Export from consensus module
 pub use consensus::{Anchor, AnchorId, ConsensusFrame, CFId, CFStatus, Vote, ConsensusConfig};
 pub use node::*;
-
-// Re-export VLC types from setu-vlc
-pub use setu_vlc::{VectorClock, VLCSnapshot};
 
 // ========== Object Model Exports ==========
 pub use object::{Object, ObjectId, Address, ObjectDigest, ObjectType, ObjectMetadata, Ownership, generate_object_id};

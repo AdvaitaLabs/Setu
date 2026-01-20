@@ -3,7 +3,7 @@
 //! This module implements probabilistic sampling verification,
 //! where validators randomly re-execute some transfers to verify correctness.
 
-use core_types::Transfer;
+use setu_types::Transfer;
 use setu_types::event::{Event, ExecutionResult};
 use tracing::{info, debug, warn};
 use rand::Rng;

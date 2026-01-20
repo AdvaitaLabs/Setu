@@ -1,7 +1,7 @@
 //! Solver RPC client and server (simplified, no protobuf)
 
 use crate::error::{Result, RpcError};
-use core_types::Transfer;
+use setu_types::Transfer;
 use anemo::{Network, PeerId};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

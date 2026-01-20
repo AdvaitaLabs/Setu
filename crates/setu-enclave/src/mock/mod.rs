@@ -205,7 +205,7 @@ impl MockEnclave {
                 resolved_coin.object_id.clone(),
                 &transfer.from,
                 &transfer.to,
-                Some(transfer.amount),
+                Some(transfer.amount as u64),
                 &ctx,
             ).map_err(|e| format!("Runtime error: {}", e))?
         } else {
@@ -222,7 +222,7 @@ impl MockEnclave {
             runtime.execute_simple_transfer(
                 &transfer.from,
                 &transfer.to,
-                transfer.amount,
+                transfer.amount as u64,
                 &ctx,
             ).map_err(|e| format!("Runtime error: {}", e))?
         };

@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 # Workspace dependencies
-core-types = { path = "../crates/core-types" }
 setu-types = { path = "../types" }
 
 # Anemo for RPC

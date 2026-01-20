@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use core_types::{Transfer, TransferType, Vlc, AssignedVlc};
+use setu_types::{Transfer, TransferType, AssignedVlc};
 use parking_lot::RwLock;
 use setu_rpc::{
     GetTransferStatusResponse, ProcessingStep, RegisterSolverRequest,
@@ -239,36 +239,34 @@ impl ValidatorNetworkService {
             timestamp: now,
         });
 
-        // Step 4: Create Transfer
-        let mut vlc = Vlc::new();
-        vlc.entries.insert(self.validator_id.clone(), vlc_time);
-
+        // Step 4: Create Transfer using builder pattern
         let transfer_type = match request.transfer_type.to_lowercase().as_str() {
             "flux" | "fluxtransfer" => TransferType::FluxTransfer,
             _ => TransferType::FluxTransfer,
         };
 
-        let transfer = Transfer {
-            id: transfer_id.clone(),
-            from: request.from.clone(),
-            to: request.to.clone(),
-            amount: request.amount,
-            transfer_type,
-            resources: if request.resources.is_empty() {
-                vec![
-                    format!("account:{}", request.from),
-                    format!("account:{}", request.to),
-                ]
-            } else {
-                request.resources.clone()
-            },
-            vlc,
-            power: 10,
-            preferred_solver: request.preferred_solver.clone(),
-            shard_id: request.shard_id.clone(),
-            subnet_id: request.subnet_id.clone(),
-            assigned_vlc: Some(assigned_vlc),
+        let resources = if request.resources.is_empty() {
+            vec![
+                format!("account:{}", request.from),
+                format!("account:{}", request.to),
+            ]
+        } else {
+            request.resources.clone()
         };
+
+        let transfer = Transfer::new(
+            &transfer_id,
+            &request.from,
+            &request.to,
+            request.amount,
+        )
+        .with_type(transfer_type)
+        .with_resources(resources)
+        .with_power(10)
+        .with_preferred_solver_opt(request.preferred_solver.clone())
+        .with_shard_id(request.shard_id.clone())
+        .with_subnet_id(request.subnet_id.clone())
+        .with_assigned_vlc(assigned_vlc);
 
         // Step 4a: Prepare SolverTask
         let subnet_id = match &transfer.subnet_id {
@@ -714,7 +712,7 @@ mod tests {
 
     fn create_test_service() -> Arc<ValidatorNetworkService> {
         let router_manager = Arc::new(RouterManager::new());
-        let task_preparer = Arc::new(TaskPreparer::new_mock("test-validator".to_string()));
+        let task_preparer = Arc::new(TaskPreparer::new_for_testing("test-validator".to_string()));
         let config = NetworkServiceConfig::default();
 
         Arc::new(ValidatorNetworkService::new(

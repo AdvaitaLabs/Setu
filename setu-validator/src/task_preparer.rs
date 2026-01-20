@@ -25,6 +25,12 @@
 //!       ▼
 //! SolverTask → Solver → TEE
 //! ```
+//!
+//! ## StateProvider
+//!
+//! The `StateProvider` trait and `MerkleStateProvider` implementation are
+//! defined in `setu_storage::state_provider`. Use `TaskPreparer::new_for_testing()`
+//! for tests, which creates a real MerkleStateProvider with pre-initialized accounts.
 
 use setu_enclave::{
     SolverTask, ResolvedInputs, ResolvedObject,
@@ -32,106 +38,18 @@ use setu_enclave::{
 };
 use setu_types::{Event, EventType, SubnetId, Transfer as SetuTransfer, ObjectId};
 use setu_types::event::VLCSnapshot;
-use sha2::{Sha256, Digest};
 use std::sync::Arc;
 use tracing::{debug, info};
 
-/// Coin data (placeholder - should match runtime's Coin struct)
-#[derive(Debug, Clone)]
-pub struct CoinInfo {
-    pub object_id: ObjectId,
-    pub owner: String,
-    pub balance: u64,
-    pub version: u64,
-}
+// Re-export StateProvider and CoinInfo from storage
+pub use setu_storage::{StateProvider, CoinInfo, SimpleMerkleProof};
 
-/// State provider trait for reading current state
-/// 
-/// In production, this would be backed by the Merkle store
-pub trait StateProvider: Send + Sync {
-    /// Get coins owned by an address
-    fn get_coins_for_address(&self, address: &str) -> Vec<CoinInfo>;
-    
-    /// Get object by ID
-    fn get_object(&self, object_id: &ObjectId) -> Option<Vec<u8>>;
-    
-    /// Get current state root
-    fn get_state_root(&self) -> [u8; 32];
-    
-    /// Get Merkle proof for object
-    fn get_merkle_proof(&self, object_id: &ObjectId) -> Option<MerkleProof>;
-    
-    /// Get the event ID that last modified this object
-    ///
-    /// This is used to derive event dependencies from input objects.
-    /// Returns None for genesis objects or if tracking is not available.
-    fn get_last_modifying_event(&self, object_id: &ObjectId) -> Option<String>;
-}
-
-/// Mock state provider for development
-pub struct MockStateProvider {
-    state_root: [u8; 32],
-    default_balance: u64,
-}
-
-impl MockStateProvider {
-    pub fn new() -> Self {
-        Self {
-            state_root: [0u8; 32],
-            default_balance: 1_000_000,
-        }
-    }
-    
-    pub fn with_state_root(mut self, root: [u8; 32]) -> Self {
-        self.state_root = root;
-        self
-    }
-}
-
-impl Default for MockStateProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl StateProvider for MockStateProvider {
-    fn get_coins_for_address(&self, address: &str) -> Vec<CoinInfo> {
-        // Mock: return a single coin with default balance
-        let mut hasher = Sha256::new();
-        hasher.update(b"coin:");
-        hasher.update(address.as_bytes());
-        let hash: [u8; 32] = hasher.finalize().into();
-        let object_id = ObjectId::new(hash);
-        
-        vec![CoinInfo {
-            object_id,
-            owner: address.to_string(),
-            balance: self.default_balance,
-            version: 1,
-        }]
-    }
-    
-    fn get_object(&self, _object_id: &ObjectId) -> Option<Vec<u8>> {
-        // Mock: return empty object
-        Some(vec![])
-    }
-    
-    fn get_state_root(&self) -> [u8; 32] {
-        self.state_root
-    }
-    
-    fn get_merkle_proof(&self, _object_id: &ObjectId) -> Option<MerkleProof> {
-        // Mock: return empty proof
-        Some(MerkleProof {
-            siblings: vec![],
-            path_bits: vec![],
-            leaf_index: Some(0),
-        })
-    }
-    
-    fn get_last_modifying_event(&self, _object_id: &ObjectId) -> Option<String> {
-        // Mock: no event tracking, objects are genesis
-        None
+/// Convert SimpleMerkleProof to setu_enclave::MerkleProof
+fn to_enclave_proof(proof: &SimpleMerkleProof) -> MerkleProof {
+    MerkleProof {
+        siblings: proof.siblings.clone(),
+        path_bits: proof.path_bits.clone(),
+        leaf_index: Some(0),
     }
 }
 
@@ -155,12 +73,38 @@ impl TaskPreparer {
         }
     }
     
-    /// Create with mock state provider
-    pub fn new_mock(validator_id: String) -> Self {
-        Self {
-            validator_id,
-            state_provider: Arc::new(MockStateProvider::new()),
+    /// Create a TaskPreparer with pre-initialized test accounts
+    /// 
+    /// This creates a real `MerkleStateProvider` backed by `GlobalStateManager`
+    /// with some test coins initialized.
+    /// 
+    /// ## Initialized accounts:
+    /// - `alice`: 10,000,000 balance
+    /// - `bob`: 5,000,000 balance  
+    /// - `charlie`: 1,000,000 balance
+    /// 
+    /// ## Example
+    /// 
+    /// ```rust,ignore
+    /// let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+    /// let task = preparer.prepare_transfer_task(&transfer)?;
+    /// ```
+    pub fn new_for_testing(validator_id: String) -> Self {
+        use setu_storage::{GlobalStateManager, MerkleStateProvider, init_coin};
+        use std::sync::RwLock;
+        
+        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
+        
+        // Initialize test accounts with real Merkle state
+        {
+            let mut manager = state_manager.write().unwrap();
+            init_coin(&mut manager, "alice", 10_000_000);
+            init_coin(&mut manager, "bob", 5_000_000);
+            init_coin(&mut manager, "charlie", 1_000_000);
         }
+        
+        let state_provider = Arc::new(MerkleStateProvider::new(state_manager));
+        Self::new(validator_id, state_provider)
     }
     
     /// Prepare a SolverTask from a Transfer request
@@ -169,10 +113,10 @@ impl TaskPreparer {
     /// Returns a fully prepared SolverTask ready for Solver execution.
     pub fn prepare_transfer_task(
         &self,
-        transfer: &core_types::Transfer,
+        transfer: &setu_types::Transfer,
         subnet_id: SubnetId,
     ) -> Result<SolverTask, TaskPrepareError> {
-        let amount = transfer.amount.unsigned_abs() as u64;
+        let amount = transfer.amount;
         
         debug!(
             transfer_id = %transfer.id,
@@ -283,7 +227,7 @@ impl TaskPreparer {
     /// Create Event from Transfer with derived parent IDs
     fn create_event_from_transfer(
         &self,
-        transfer: &core_types::Transfer,
+        transfer: &setu_types::Transfer,
         parent_ids: Vec<String>,
     ) -> Result<Event, TaskPrepareError> {
         let mut event = Event::new(
@@ -293,12 +237,8 @@ impl TaskPreparer {
             self.validator_id.clone(),
         );
         
-        // Attach transfer data
-        event = event.with_transfer(SetuTransfer {
-            from: transfer.from.clone(),
-            to: transfer.to.clone(),
-            amount: transfer.amount.unsigned_abs() as u64,
-        });
+        // Attach transfer data (clone it)
+        event = event.with_transfer(transfer.clone());
         
         Ok(event)
     }
@@ -357,29 +297,18 @@ pub enum TaskPrepareError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::{Transfer, TransferType, Vlc};
+    use setu_types::{Transfer, TransferType};
     use setu_enclave::OperationType;
     
     fn create_test_transfer() -> Transfer {
-        Transfer {
-            id: "test-tx-1".to_string(),
-            from: "alice".to_string(),
-            to: "bob".to_string(),
-            amount: 100,
-            transfer_type: TransferType::FluxTransfer,
-            resources: vec![],
-            vlc: Vlc::new(),
-            power: 10,
-            preferred_solver: None,
-            shard_id: None,
-            subnet_id: None,
-            assigned_vlc: None,
-        }
+        Transfer::new("test-tx-1", "alice", "bob", 100)
+            .with_type(TransferType::FluxTransfer)
+            .with_power(10)
     }
     
     #[test]
     fn test_prepare_transfer_task() {
-        let preparer = TaskPreparer::new_mock("validator-1".to_string());
+        let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
         let transfer = create_test_transfer();
         
         let task = preparer.prepare_transfer_task(&transfer, SubnetId::ROOT);
@@ -404,7 +333,7 @@ mod tests {
     
     #[test]
     fn test_select_smallest_sufficient_coin() {
-        let preparer = TaskPreparer::new_mock("validator-1".to_string());
+        let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
         
         let coins = vec![
             CoinInfo {
@@ -440,7 +369,7 @@ mod tests {
     
     #[test]
     fn test_insufficient_balance() {
-        let preparer = TaskPreparer::new_mock("validator-1".to_string());
+        let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
         
         let coins = vec![
             CoinInfo {

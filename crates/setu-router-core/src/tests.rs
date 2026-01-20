@@ -1,23 +1,12 @@
 //! Integration tests for setu-router
 
 use crate::{Router, RouterConfig, DEFAULT_SHARD_ID};
-use core_types::{Transfer, TransferType, Vlc};
+use setu_types::{Transfer, TransferType};
 
 fn create_test_transfer(id: &str, resources: Vec<String>) -> Transfer {
-    Transfer {
-        id: id.to_string(),
-        from: "alice".to_string(),
-        to: "bob".to_string(),
-        amount: 100,
-        transfer_type: TransferType::FluxTransfer,
-        resources,
-        vlc: Vlc::new(),
-        power: 0,
-        preferred_solver: None,
-        shard_id: None,
-        subnet_id: None,
-        assigned_vlc: None,
-    }
+    Transfer::new(id, "alice", "bob", 100)
+        .with_type(TransferType::FluxTransfer)
+        .with_resources(resources)
 }
 
 #[test]

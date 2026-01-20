@@ -11,7 +11,7 @@ use setu_rpc::{
     RegisterValidatorResponse, RegistrationHandler, SolverListItem, UnregisterRequest,
     UnregisterResponse,
 };
-use setu_types::event::{Event, SolverRegistration, ValidatorRegistration};
+use setu_types::{Event, SolverRegistration, ValidatorRegistration};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
