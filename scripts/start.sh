@@ -7,8 +7,12 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+LOG_DIR="/data/log"
 
 cd "$PROJECT_DIR"
+
+# Create log directory if it doesn't exist
+mkdir -p "$LOG_DIR"
 
 echo "╔════════════════════════════════════════════════════════════╗"
 echo "║              Setu Quick Start                              ║"
@@ -21,7 +25,7 @@ export VALIDATOR_ID=validator-1
 export VALIDATOR_HTTP_PORT=8080
 export VALIDATOR_LISTEN_ADDR=127.0.0.1
 
-cargo run --release -p setu-validator > logs/validator.log 2>&1 &
+cargo run --release -p setu-validator > "$LOG_DIR/validator.log" 2>&1 &
 VALIDATOR_PID=$!
 echo "  └─ Validator PID: $VALIDATOR_PID"
 echo "  └─ Waiting for validator to start..."
@@ -48,7 +52,7 @@ export VALIDATOR_ADDRESS=127.0.0.1
 export VALIDATOR_HTTP_PORT=8080
 export AUTO_REGISTER=true
 
-cargo run --release -p setu-solver > logs/solver.log 2>&1 &
+cargo run --release -p setu-solver > "$LOG_DIR/solver.log" 2>&1 &
 SOLVER_PID=$!
 echo "  └─ Solver PID: $SOLVER_PID"
 echo "  └─ Waiting for solver to register..."
@@ -71,7 +75,7 @@ echo "║                                                            ║"
 echo "║  Validator PID: $VALIDATOR_PID                                        ║"
 echo "║  Solver PID:    $SOLVER_PID                                        ║"
 echo "║                                                            ║"
-echo "║  Logs:          logs/validator.log, logs/solver.log       ║"
+echo "║  Logs:          /data/log/validator.log, /data/log/solver.log ║"
 echo "╚════════════════════════════════════════════════════════════╝"
 echo ""
 echo "To stop the network:"
