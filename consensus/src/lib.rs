@@ -32,6 +32,7 @@
 //! ```
 
 pub mod anchor_builder;
+pub mod broadcaster;
 pub mod dag;
 pub mod engine;
 pub mod folder;
@@ -45,6 +46,10 @@ pub mod vlc;
 
 // Re-export main types
 pub use anchor_builder::{AnchorBuilder, AnchorBuildResult, AnchorBuildError};
+pub use broadcaster::{
+    ConsensusBroadcaster, BroadcastError, BroadcastResult,
+    NoOpBroadcaster, MockBroadcaster, OptionalBroadcaster,
+};
 pub use dag::{Dag, DagError};
 pub use engine::{ConsensusEngine, ConsensusMessage, DagStats};
 pub use folder::{ConsensusManager, DagFolder};

@@ -12,6 +12,8 @@ sha2 = "0.10"
 hex = "0.4"
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 thiserror = "1.0"
+async-trait = "0.1"
+tracing = "0.1"
 
 [dev-dependencies]
 setu-types = { path = "../types", features = ["test-utils"] }

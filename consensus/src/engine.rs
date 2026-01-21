@@ -21,8 +21,10 @@ use setu_types::{ConsensusConfig, ConsensusFrame, Event, EventId, SetuResult, Vo
 use setu_vlc::VLCSnapshot;
 use setu_storage::subnet_state::GlobalStateManager;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock, Mutex};
+use tracing::{debug, info, warn};
 
+use crate::broadcaster::{ConsensusBroadcaster, BroadcastError};
 use crate::dag::Dag;
 use crate::folder::ConsensusManager;
 use crate::liveness::Round;
@@ -58,11 +60,13 @@ pub struct ConsensusEngine {
     consensus_manager: Arc<RwLock<ConsensusManager>>,
     /// This validator's ID
     local_validator_id: String,
-    /// Channel for sending consensus messages
+    /// Channel for sending consensus messages (legacy, for internal use)
     message_tx: mpsc::Sender<ConsensusMessage>,
     /// Channel for receiving consensus messages (reserved for future use)
     #[allow(dead_code)]
-    message_rx: Arc<RwLock<mpsc::Receiver<ConsensusMessage>>>,
+    message_rx: Arc<Mutex<mpsc::Receiver<ConsensusMessage>>>,
+    /// Network broadcaster for P2P message delivery (optional)
+    broadcaster: Arc<RwLock<Option<Arc<dyn ConsensusBroadcaster>>>>,
 }
 
 impl ConsensusEngine {
@@ -85,7 +89,8 @@ impl ConsensusEngine {
             ))),
             local_validator_id: validator_id,
             message_tx: tx,
-            message_rx: Arc::new(RwLock::new(rx)),
+            message_rx: Arc::new(Mutex::new(rx)),
+            broadcaster: Arc::new(RwLock::new(None)),
         }
     }
     
@@ -113,8 +118,24 @@ impl ConsensusEngine {
             ))),
             local_validator_id: validator_id,
             message_tx: tx,
-            message_rx: Arc::new(RwLock::new(rx)),
+            message_rx: Arc::new(Mutex::new(rx)),
+            broadcaster: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Set the network broadcaster for P2P message delivery
+    /// 
+    /// This should be called after the network layer is initialized.
+    /// Without a broadcaster, consensus messages are only sent to internal channels.
+    pub async fn set_broadcaster(&self, broadcaster: Arc<dyn ConsensusBroadcaster>) {
+        let mut b = self.broadcaster.write().await;
+        *b = Some(broadcaster);
+        info!("Consensus broadcaster configured");
+    }
+    
+    /// Check if a broadcaster is configured
+    pub async fn has_broadcaster(&self) -> bool {
+        self.broadcaster.read().await.is_some()
     }
 
     /// Add an event to the DAG and try to create a CF if conditions are met
@@ -231,10 +252,31 @@ impl ConsensusEngine {
         let cf = manager.try_create_cf(&dag, &vlc);
 
         if let Some(ref frame) = cf {
+            // Send to internal channel (legacy)
             let _ = self
                 .message_tx
                 .send(ConsensusMessage::ProposeFrame(frame.clone()))
                 .await;
+            
+            // Broadcast to network via broadcaster (if configured)
+            let broadcaster = self.broadcaster.read().await;
+            if let Some(ref b) = *broadcaster {
+                match b.broadcast_cf(frame).await {
+                    Ok(result) => {
+                        info!(
+                            cf_id = %frame.id,
+                            success = result.success_count,
+                            total = result.total_peers,
+                            "CF broadcasted to peers"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(cf_id = %frame.id, error = %e, "Failed to broadcast CF");
+                    }
+                }
+            } else {
+                debug!(cf_id = %frame.id, "No broadcaster configured, CF not sent to network");
+            }
         }
 
         Ok(cf)
@@ -280,8 +322,26 @@ impl ConsensusEngine {
 
         // Vote for the CF (in MVP, we always approve valid CFs)
         let vote = manager.vote_for_cf(&cf.id, true);
-        if let Some(v) = vote {
-            let _ = self.message_tx.send(ConsensusMessage::Vote(v)).await;
+        if let Some(ref v) = vote {
+            // Send to internal channel (legacy)
+            let _ = self.message_tx.send(ConsensusMessage::Vote(v.clone())).await;
+            
+            // Broadcast vote to network via broadcaster (if configured)
+            let broadcaster = self.broadcaster.read().await;
+            if let Some(ref b) = *broadcaster {
+                match b.broadcast_vote(v).await {
+                    Ok(result) => {
+                        debug!(
+                            cf_id = %cf.id,
+                            success = result.success_count,
+                            "Vote broadcasted to peers"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(cf_id = %cf.id, error = %e, "Failed to broadcast vote");
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -292,15 +352,34 @@ impl ConsensusEngine {
     /// Returns (finalized, Option<Anchor>) - the anchor is returned when finalized
     /// so the caller can persist it to storage.
     pub async fn receive_vote(&self, vote: Vote) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
+        let cf_id = vote.cf_id.clone();
         let mut manager = self.consensus_manager.write().await;
         let finalized = manager.receive_vote(vote);
 
         let anchor = if finalized {
             let finalized_anchor = if let Some(cf) = manager.last_finalized_cf() {
+                // Send to internal channel (legacy)
                 let _ = self
                     .message_tx
                     .send(ConsensusMessage::FrameFinalized(cf.clone()))
                     .await;
+
+                // Broadcast finalization to network via broadcaster (if configured)
+                let broadcaster = self.broadcaster.read().await;
+                if let Some(ref b) = *broadcaster {
+                    match b.broadcast_finalized(&cf.id).await {
+                        Ok(result) => {
+                            info!(
+                                cf_id = %cf.id,
+                                success = result.success_count,
+                                "CF finalization broadcasted to peers"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(cf_id = %cf.id, error = %e, "Failed to broadcast finalization");
+                        }
+                    }
+                }
 
                 // Get the finalized anchor for storage
                 manager.get_last_finalized_anchor()
@@ -311,6 +390,8 @@ impl ConsensusEngine {
             // Advance to the next round after finalization
             drop(manager);
             self.advance_round().await;
+            
+            info!(cf_id = %cf_id, "CF finalized and round advanced");
             finalized_anchor
         } else {
             None
