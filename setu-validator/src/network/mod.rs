@@ -1,7 +1,6 @@
 //! Network service module
 
 mod types;
-mod handlers;
 mod service;
 mod registration;
 

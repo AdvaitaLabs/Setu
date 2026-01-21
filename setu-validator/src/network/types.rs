@@ -1,8 +1,10 @@
 //! Types for network service
 
-use setu_types::event::Event;
 use setu_rpc::ProcessingStep;
 use std::net::SocketAddr;
+
+// Re-export types from api module
+pub use setu_api::{GetBalanceResponse, GetObjectResponse, SubmitEventRequest, SubmitEventResponse};
 
 /// Validator info for registration
 #[derive(Debug, Clone)]
@@ -41,37 +43,6 @@ pub struct TransferTracker {
     pub event_id: Option<String>,
     pub processing_steps: Vec<ProcessingStep>,
     pub created_at: u64,
-}
-
-/// Submit Event Request (from Solver)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SubmitEventRequest {
-    pub event: Event,
-}
-
-/// Submit Event Response
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SubmitEventResponse {
-    pub success: bool,
-    pub message: String,
-    pub event_id: Option<String>,
-    pub vlc_time: Option<u64>,
-}
-
-/// Get balance response (Scheme B state query)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GetBalanceResponse {
-    pub account: String,
-    pub balance: u128,
-    pub exists: bool,
-}
-
-/// Get object response (Scheme B state query)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GetObjectResponse {
-    pub key: String,
-    pub value: Option<Vec<u8>>,
-    pub exists: bool,
 }
 
 /// Helper to get current timestamp in seconds
