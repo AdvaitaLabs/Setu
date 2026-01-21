@@ -1,0 +1,26 @@
+[package]
+name = "setu-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = "0.7"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+
+# Internal dependencies
+setu-rpc = { path = "../setu-rpc" }
+setu-types = { path = "../types" }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
