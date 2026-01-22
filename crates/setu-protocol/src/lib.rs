@@ -3,47 +3,61 @@
 
 //! # Setu Protocol
 //!
-//! This crate defines the protocol-level message types for Setu network communication.
-//! It serves as the bridge between the transport layer (setu-network-anemo) and the
-//! application layer (setu-validator).
+//! This crate provides generic protocol utilities for Setu network communication.
+//! It serves as the foundation for any consensus implementation by providing:
+//!
+//! - Protocol versioning support
+//! - Generic message encoding/decoding traits
+//! - Common error types
 //!
 //! ## Design Goals
 //!
-//! 1. **Separation of Concerns**: Transport layer should not depend on business types
+//! 1. **Consensus-agnostic**: Core modules have no specific message types
 //! 2. **Protocol Versioning**: Support backward-compatible protocol evolution
-//! 3. **Type Safety**: Strong typing for all network messages
+//! 3. **Extensible Codecs**: Pluggable serialization formats
 //!
 //! ## Module Organization
 //!
-//! - [`message`] - Core `SetuMessage` enum and serialization
-//! - [`event`] - `NetworkEvent` for application layer notifications
-//! - [`rpc`] - RPC request/response types for state sync
+//! ### Core (Generic Tools - no setu-types dependency)
 //! - [`version`] - Protocol version management
+//! - [`codec`] - Generic message codec trait and implementations
+//! - [`error`] - Common protocol error types
 //!
 //! ## Usage
 //!
 //! ```rust,ignore
-//! use setu_protocol::{SetuMessage, NetworkEvent, MessageCodec};
+//! use setu_protocol::{GenericCodec, BincodeCodec, ProtocolVersion};
 //!
-//! // Serialize a message
-//! let msg = SetuMessage::Ping { timestamp: 123, nonce: 456 };
-//! let bytes = MessageCodec::encode(&msg)?;
+//! // Check protocol version compatibility
+//! let local = ProtocolVersion::CURRENT;
+//! let remote = ProtocolVersion::new(1, 0, 0);
+//! assert!(local.is_compatible_with(&remote));
 //!
-//! // Deserialize a message
-//! let decoded: SetuMessage = MessageCodec::decode(&bytes)?;
+//! // Encode/decode with generic codec
+//! let codec = BincodeCodec;
+//! let bytes = codec.encode(&my_message)?;
+//! let decoded: MyMessage = codec.decode(&bytes)?;
 //! ```
 
-pub mod message;
-pub mod event;
-pub mod rpc;
-pub mod version;
+// =============================================================================
+// Core Modules (Generic Protocol Tools - NO setu-types dependency)
+// =============================================================================
 
-// Re-export main types
-pub use message::{SetuMessage, MessageType, MessageCodec};
-pub use event::NetworkEvent;
+pub mod version;
+pub mod codec;
+pub mod error;
+pub mod rpc;
+
+// Re-export core types
+pub use version::ProtocolVersion;
+pub use codec::{GenericCodec, BincodeCodec};
+pub use error::ProtocolError;
+
+// Re-export RPC serialization types (these are generic wrappers)
 pub use rpc::{
     SerializedEvent, SerializedConsensusFrame, SerializedVote,
     SyncEventsRequest, SyncEventsResponse,
     SyncConsensusFramesRequest, SyncConsensusFramesResponse,
 };
-pub use version::ProtocolVersion;
+
+

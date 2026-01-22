@@ -2,7 +2,7 @@
 name = "setu-protocol"
 version.workspace = true
 edition.workspace = true
-description = "Setu protocol message definitions and serialization"
+description = "Setu protocol utilities: versioning, codecs, and error types"
 
 [dependencies]
 # Internal dependencies
