@@ -1,0 +1,72 @@
+# Dockerfile for Setu Validator
+FROM rust:1.75-slim-bookworm as builder
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    libclang-dev \
+    cmake \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY types ./types
+COPY storage ./storage
+COPY consensus ./consensus
+COPY api ./api
+COPY setu-validator ./setu-validator
+COPY setu-rpc ./setu-rpc
+COPY crates ./crates
+
+# Build the validator
+RUN cargo build --release -p setu-validator
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app user
+RUN useradd -m -u 1000 setu && \
+    mkdir -p /data/db /data/log && \
+    chown -R setu:setu /data
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /app/target/release/setu-validator /usr/local/bin/setu-validator
+
+# Switch to app user
+USER setu
+
+# Expose ports
+# 8080: HTTP API
+# 8081: P2P Network (Anemo)
+EXPOSE 8080 8081
+
+# Environment variables with defaults
+ENV VALIDATOR_ID=validator-1
+ENV VALIDATOR_HTTP_PORT=8080
+ENV VALIDATOR_LISTEN_ADDR=0.0.0.0
+ENV VALIDATOR_P2P_PORT=8081
+ENV RUST_LOG=info
+ENV DB_PATH=/data/db
+ENV LOG_PATH=/data/log
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:${VALIDATOR_HTTP_PORT}/api/v1/health || exit 1
+
+# Run the validator
+CMD ["setu-validator"]
+

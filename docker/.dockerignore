@@ -1,0 +1,56 @@
+# Build artifacts
+target/
+**/target/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+docs/
+
+# Scripts (not needed in container)
+scripts/
+
+# Docker files
+docker/
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Test files
+tests/
+**/tests/
+
+# Example data
+example_db/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+pids/
+
+# Environment files
+.env
+.env.*
+
+# Lock files (we copy Cargo.lock explicitly)
+# package-lock.json
+# yarn.lock
+

@@ -1,0 +1,72 @@
+# Dockerfile for Setu Solver
+FROM rust:1.75-slim-bookworm as builder
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    libclang-dev \
+    cmake \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY types ./types
+COPY storage ./storage
+COPY consensus ./consensus
+COPY setu-solver ./setu-solver
+COPY setu-rpc ./setu-rpc
+COPY crates ./crates
+
+# Build the solver
+RUN cargo build --release -p setu-solver
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app user
+RUN useradd -m -u 1000 setu && \
+    mkdir -p /data/log && \
+    chown -R setu:setu /data
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /app/target/release/setu-solver /usr/local/bin/setu-solver
+
+# Switch to app user
+USER setu
+
+# Expose ports
+# 9001: Solver RPC port
+EXPOSE 9001
+
+# Environment variables with defaults
+ENV SOLVER_ID=solver-1
+ENV SOLVER_PORT=9001
+ENV SOLVER_LISTEN_ADDR=0.0.0.0
+ENV SOLVER_CAPACITY=100
+ENV VALIDATOR_ADDRESS=validator
+ENV VALIDATOR_HTTP_PORT=8080
+ENV AUTO_REGISTER=true
+ENV RUST_LOG=info
+ENV LOG_PATH=/data/log
+
+# Health check (check if process is running)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD pgrep -f setu-solver || exit 1
+
+# Run the solver
+CMD ["setu-solver"]
+
