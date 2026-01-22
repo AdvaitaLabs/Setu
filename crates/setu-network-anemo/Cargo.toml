@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 # Internal dependencies
 setu-types = { path = "../../types" }
+setu-protocol = { path = "../setu-protocol" }
 
 # Anemo P2P framework (from workspace)
 anemo = { workspace = true }

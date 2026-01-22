@@ -107,6 +107,12 @@ pub use state_sync::{
     UnstartedStateSync,
 };
 
+// Re-export protocol types from setu-protocol
+pub use setu_protocol::{
+    MessageCodec, MessageType, NetworkEvent, ProtocolVersion, SetuMessage,
+    SerializedConsensusFrame, SerializedEvent, SerializedVote,
+};
+
 // Re-export commonly used Anemo types
 pub use anemo::{Network, PeerId, Request, Response};
 

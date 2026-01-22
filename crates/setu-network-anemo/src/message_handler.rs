@@ -6,9 +6,10 @@
 //! This module provides a Router handler that processes incoming `SetuMessage`
 //! requests and returns appropriate responses.
 
-use crate::{service::{SetuMessage, NetworkEvent}, state_sync::{StateSyncStore, SerializedEvent}};
+use crate::state_sync::StateSyncStore;
 use anemo::{Request, Response, Router};
 use bytes::Bytes;
+use setu_protocol::{NetworkEvent, SetuMessage, SerializedEvent};
 use setu_types::Event;
 use std::{convert::Infallible, sync::Arc};
 use tokio::sync::mpsc;
@@ -175,14 +176,15 @@ where
                 None
             }
             
-            SetuMessage::CFFinalized { cf } => {
+            SetuMessage::CFFinalized { cf, sender_id } => {
                 debug!(
-                    "Received CFFinalized: cf_id={}",
+                    "Received CFFinalized from {}: cf_id={}",
+                    sender_id,
                     cf.id
                 );
                 // Notify application layer
                 let _ = self.event_tx.try_send(NetworkEvent::CFFinalized {
-                    peer_id: "unknown".to_string(), // CF finalized doesn't have sender info
+                    peer_id: sender_id,
                     cf,
                 });
                 None
@@ -214,7 +216,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state_sync::{InMemoryStateSyncStore, SerializedEvent};
+    use crate::state_sync::InMemoryStateSyncStore;
     use setu_types::VLCSnapshot;
     
     fn create_test_handler(store: Arc<InMemoryStateSyncStore>) -> (SetuMessageHandler<InMemoryStateSyncStore>, mpsc::Receiver<NetworkEvent>) {
