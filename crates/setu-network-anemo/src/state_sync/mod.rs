@@ -6,6 +6,12 @@
 //! This module is modeled after Sui's state_sync system but adapted for Setu's
 //! Event/ConsensusFrame/VLC-based consensus model instead of checkpoints.
 //!
+//! **Note**: This module uses deprecated types from setu-protocol for backward
+//! compatibility. Future versions will use generic types defined in the
+//! application layer.
+
+#![allow(deprecated)]
+
 //! ## Key Differences from Sui's Checkpoint-based Sync
 //!
 //! - **Event Sync**: Sync individual events between nodes

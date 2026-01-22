@@ -3,10 +3,9 @@
 
 //! Peer management for Anemo network
 
-use crate::{error::Result, transport::AnemoTransport};
+use crate::{error::Result, node_info::NodeInfo, transport::AnemoTransport};
 use anemo::{types::PeerEvent, PeerId};
 use dashmap::DashMap;
-use setu_types::NodeInfo;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};

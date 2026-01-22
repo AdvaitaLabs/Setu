@@ -5,8 +5,10 @@
 //!
 //! This module provides the main network service that integrates:
 //! - Discovery: Peer discovery and connection management
-//! - StateSync: Event and ConsensusFrame synchronization
 //! - Transport: QUIC-based communication
+//!
+//! Use `with_handler()` to create a network service with a custom message handler.
+//! The message handler implementation should be provided by the application layer.
 //!
 //! The service follows Sui's patterns using the builder pattern for construction.
 
@@ -14,27 +16,25 @@ use crate::{
     config::NetworkConfig,
     discovery::{self, DiscoveryConfig, NodeType},
     error::Result,
-    message_handler,
+    generic_handler::GenericMessageHandler,
     metrics::NetworkMetrics,
     peer_manager::AnemoPeerManager,
-    state_sync::{self, StateSyncConfig, StateSyncStore},
     transport::AnemoTransport,
     AnemoError,
 };
 use anemo::PeerId;
 use bytes::Bytes;
-use setu_types::{ConsensusFrame, Event, NodeInfo, Vote};
+use crate::node_info::NodeInfo;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-// Re-export from setu-protocol for backward compatibility
-pub use setu_protocol::{NetworkEvent, SetuMessage};
 
 /// Anemo-based network service for Setu
 ///
 /// This is the main entry point for network functionality. It integrates
-/// discovery, state sync, and transport into a unified service.
+/// discovery and transport into a unified service.
+///
+/// Message handling is delegated to the application layer via `GenericMessageHandler`.
 pub struct AnemoNetworkService {
     /// Anemo transport
     transport: Arc<AnemoTransport>,
@@ -43,10 +43,8 @@ pub struct AnemoNetworkService {
     peer_manager: Arc<AnemoPeerManager>,
 
     /// Discovery handle (for controlling discovery)
+    #[allow(dead_code)]
     discovery_handle: Option<discovery::Handle>,
-
-    /// State sync handle (for controlling sync)
-    state_sync_handle: Option<state_sync::Handle>,
 
     /// Local node information
     local_node_info: NodeInfo,
@@ -54,73 +52,51 @@ pub struct AnemoNetworkService {
     /// Node type (validator or solver)
     node_type: NodeType,
 
-    /// Event sender for application
-    event_tx: mpsc::Sender<NetworkEvent>,
-
     /// Metrics (optional)
     #[allow(dead_code)]
     metrics: Option<NetworkMetrics>,
 }
 
 impl AnemoNetworkService {
-    /// Create a new Anemo network service with default in-memory store
-    pub async fn new(
+    /// Create a new network service with a custom message handler
+    ///
+    /// This is the standard constructor. It allows the application layer to 
+    /// provide its own message handler implementation.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use setu_network_anemo::{AnemoNetworkService, GenericMessageHandler};
+    /// use setu_validator::network_adapter::SetuMessageHandler;
+    ///
+    /// let handler = Arc::new(SetuMessageHandler::new(store, node_id, event_tx));
+    /// let service = AnemoNetworkService::with_handler(config, node_info, handler).await?;
+    /// ```
+    pub async fn with_handler<H>(
         config: NetworkConfig,
         local_node_info: NodeInfo,
-        event_tx: mpsc::Sender<NetworkEvent>,
-    ) -> Result<Self> {
-        Self::with_store(
-            config,
-            local_node_info,
-            event_tx,
-            state_sync::InMemoryStateSyncStore::new(),
-        ).await
-    }
-
-    /// Create a new Anemo network service with a custom store
-    pub async fn with_store<S>(
-        config: NetworkConfig,
-        local_node_info: NodeInfo,
-        event_tx: mpsc::Sender<NetworkEvent>,
-        store: S,
+        handler: Arc<H>,
     ) -> Result<Self>
     where
-        S: StateSyncStore,
+        H: GenericMessageHandler,
     {
-        info!("Creating Anemo network service for node {}", local_node_info.id);
+        info!("Creating Anemo network service with handler for node {}", local_node_info.id);
 
-        // Wrap store in Arc for sharing
-        let store = Arc::new(store);
+        // Create router from the generic handler
+        let router = crate::generic_handler::create_router_from_handler(handler);
 
-        // Create router with Setu message handler
-        let router = message_handler::create_setu_router(
-            store.clone(),
-            local_node_info.id.clone(),
-            event_tx.clone(),
-        );
-
-        // Create transport with the router (this starts the network)
+        // Create transport with the router
         let transport = Arc::new(AnemoTransport::with_router(&config.anemo, router).await?);
 
         // Create peer manager
         let peer_manager = Arc::new(AnemoPeerManager::new(transport.clone())?);
-
-        // Build state sync components (using the shared store)
-        let state_sync_config = StateSyncConfig::default();
-        let (unstarted_state_sync, _state_sync_server) = state_sync::Builder::new()
-            .store(store.clone())  // Pass Arc<S> directly
-            .config(state_sync_config)
-            .build();
-
-        // Start state sync event loop
-        let network_ref = transport.network().downgrade();
-        let (state_sync_handle, _join_handle) = unstarted_state_sync.start(network_ref.clone());
 
         // Build and start discovery
         let discovery_config = DiscoveryConfig::default();
         let (unstarted_discovery, _discovery_server) = discovery::Builder::new()
             .config(discovery_config)
             .build();
+        let network_ref = transport.network().downgrade();
         let (discovery_handle, _join_handle) = unstarted_discovery.start(network_ref);
 
         info!("Anemo network service created for node {}", local_node_info.id);
@@ -129,34 +105,15 @@ impl AnemoNetworkService {
             transport,
             peer_manager,
             discovery_handle: Some(discovery_handle),
-            state_sync_handle: Some(state_sync_handle),
             local_node_info,
             node_type: NodeType::Validator,
-            event_tx,
             metrics: None,
         })
-    }
-
-    /// Create with metrics
-    pub async fn with_metrics(
-        config: NetworkConfig,
-        local_node_info: NodeInfo,
-        event_tx: mpsc::Sender<NetworkEvent>,
-        registry: &prometheus::Registry,
-    ) -> Result<Self> {
-        let mut service = Self::new(config, local_node_info, event_tx).await?;
-        service.metrics = Some(NetworkMetrics::new(registry));
-        Ok(service)
     }
 
     /// Set the node type
     pub fn set_node_type(&mut self, node_type: NodeType) {
         self.node_type = node_type;
-    }
-
-    /// Get the state sync handle for notifications
-    pub fn state_sync_handle(&self) -> Option<&state_sync::Handle> {
-        self.state_sync_handle.as_ref()
     }
 
     /// Get local peer ID
@@ -180,11 +137,6 @@ impl AnemoNetworkService {
         // Add to peer manager
         self.peer_manager.add_peer(node_info.clone(), peer_id).await?;
 
-        // Notify state sync
-        if let Some(ref handle) = self.state_sync_handle {
-            handle.notify_new_event(0); // Will trigger sync with new peer
-        }
-
         Ok(peer_id)
     }
 
@@ -195,121 +147,41 @@ impl AnemoNetworkService {
         Ok(())
     }
 
-    /// Broadcast an event to all connected peers
-    pub async fn broadcast_event(&self, event: Event) -> Result<()> {
-        debug!("Broadcasting event: {:?}", event.id);
-
-        let message = SetuMessage::EventBroadcast {
-            event,
-            sender_id: self.local_node_info.id.clone(),
-        };
-
-        let bytes = self.serialize_message(&message)?;
-        let peers = self.peer_manager.get_connected_peers();
-
-        for peer_info in peers {
-            let mut request = anemo::Request::new(bytes.clone());
-            *request.route_mut() = "/setu".into();
-            if let Err(e) = self.transport.rpc(peer_info.peer_id, request).await {
-                tracing::warn!("Failed to send event to peer {}: {}", peer_info.peer_id, e);
-            }
-        }
-
-        Ok(())
+    /// Send raw bytes to a peer via RPC
+    ///
+    /// This is the generic send method. Message serialization should be
+    /// handled by the application layer.
+    pub async fn send_to_peer(&self, peer_id: PeerId, route: &str, data: Bytes) -> Result<Bytes> {
+        debug!("Sending {} bytes to peer {} on route {}", data.len(), peer_id, route);
+        
+        let mut request = anemo::Request::new(data);
+        *request.route_mut() = route.into();
+        let response = self.transport.rpc(peer_id, request).await?;
+        
+        Ok(response.into_body())
     }
 
-    /// Request specific events by ID from peers
-    /// 
-    /// Sends request to all connected peers and collects responses.
-    /// Returns events that were successfully fetched.
-    pub async fn request_events_by_id(&self, event_ids: &[String]) -> Result<Vec<Event>> {
-        if event_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        debug!(count = event_ids.len(), "Requesting events by ID from peers");
-
-        let message = SetuMessage::RequestEvents {
-            event_ids: event_ids.to_vec(),
-            requester_id: self.local_node_info.id.clone(),
-        };
-
-        let bytes = self.serialize_message(&message)?;
+    /// Broadcast raw bytes to all connected peers
+    ///
+    /// Message serialization should be handled by the application layer.
+    /// Returns (success_count, total_peers) for partial failure tracking.
+    pub async fn broadcast(&self, route: &str, data: Bytes) -> Result<(usize, usize)> {
+        debug!("Broadcasting {} bytes on route {}", data.len(), route);
+        
         let peers = self.peer_manager.get_connected_peers();
-        let mut fetched_events: Vec<Event> = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();
-
-        // Try each peer until we have all events (or exhausted peers)
+        let total = peers.len();
+        let mut success = 0;
+        
         for peer_info in peers {
-            // Create request with route set to "/setu" for the message handler
-            let mut request = anemo::Request::new(bytes.clone());
-            *request.route_mut() = "/setu".into();
-            
+            let mut request = anemo::Request::new(data.clone());
+            *request.route_mut() = route.into();
             match self.transport.rpc(peer_info.peer_id, request).await {
-                Ok(response) => {
-                    // Parse response
-                    if let Ok(SetuMessage::EventsResponse { events, .. }) = 
-                        self.deserialize_message(response.body()) 
-                    {
-                        for event in events {
-                            if !seen_ids.contains(&event.id) {
-                                seen_ids.insert(event.id.clone());
-                                fetched_events.push(event);
-                            }
-                        }
-                    }
-
-                    // Check if we got all requested events
-                    if fetched_events.len() >= event_ids.len() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    debug!(peer = %peer_info.peer_id, error = %e, "Failed to request events from peer");
-                }
+                Ok(_) => success += 1,
+                Err(e) => tracing::warn!("Failed to send to peer {}: {}", peer_info.peer_id, e),
             }
         }
 
-        info!(
-            requested = event_ids.len(),
-            fetched = fetched_events.len(),
-            "Event fetch completed"
-        );
-
-        Ok(fetched_events)
-    }
-
-    /// Send a consensus frame proposal
-    pub async fn send_cf_proposal(&self, peer_id_str: &str, cf: ConsensusFrame) -> Result<()> {
-        debug!("Sending CF proposal to peer {}", peer_id_str);
-
-        let peer_id = self.parse_peer_id(peer_id_str)?;
-        let message = SetuMessage::CFProposal {
-            cf,
-            proposer_id: self.local_node_info.id.clone(),
-        };
-
-        let bytes = self.serialize_message(&message)?;
-        let mut request = anemo::Request::new(bytes);
-        *request.route_mut() = "/setu".into();
-        self.transport.rpc(peer_id, request).await?;
-
-        Ok(())
-    }
-
-    /// Send a vote
-    pub async fn send_vote(&self, peer_id_str: &str, vote: Vote) -> Result<()> {
-        debug!("Sending vote to peer {}", peer_id_str);
-
-        let peer_id = self.parse_peer_id(peer_id_str)?;
-        let message = SetuMessage::CFVote { vote };
-
-        let bytes = self.serialize_message(&message)?;
-        let mut request = anemo::Request::new(bytes);
-        *request.route_mut() = "/setu".into();
-        self.transport.rpc(peer_id, request).await?;
-
-        Ok(())
+        Ok((success, total))
     }
 
     /// Get connected peer count
@@ -326,25 +198,19 @@ impl AnemoNetworkService {
             .collect()
     }
 
-    /// Notify that a new event was created locally
-    pub fn notify_new_event(&self, event_seq: u64) {
-        if let Some(ref handle) = self.state_sync_handle {
-            handle.notify_new_event(event_seq);
-        }
+    /// Get transport reference for advanced use
+    pub fn transport(&self) -> &Arc<AnemoTransport> {
+        &self.transport
     }
 
-    /// Notify that a CF was finalized
-    pub fn notify_cf_finalized(&self, cf_seq: u64) {
-        if let Some(ref handle) = self.state_sync_handle {
-            handle.notify_cf_finalized(cf_seq);
-        }
+    /// Get peer manager reference
+    pub fn peer_manager(&self) -> &Arc<AnemoPeerManager> {
+        &self.peer_manager
     }
 
-    /// Request sync with a specific peer
-    pub fn request_sync_with_peer(&self, peer_id: PeerId) {
-        if let Some(ref handle) = self.state_sync_handle {
-            handle.sync_with_peer(peer_id);
-        }
+    /// Get local node information
+    pub fn local_node_info(&self) -> &NodeInfo {
+        &self.local_node_info
     }
 
     /// Shutdown the network service
@@ -374,25 +240,29 @@ impl AnemoNetworkService {
         array.copy_from_slice(&bytes);
         Ok(PeerId(array))
     }
-
-    /// Helper: Serialize message
-    fn serialize_message(&self, message: &SetuMessage) -> Result<Bytes> {
-        let bytes = bincode::serialize(message)?;
-        Ok(Bytes::from(bytes))
-    }
-
-    /// Helper: Deserialize message
-    #[allow(dead_code)]
-    fn deserialize_message(&self, bytes: &[u8]) -> Result<SetuMessage> {
-        let message = bincode::deserialize(bytes)?;
-        Ok(message)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::AnemoConfig;
+    use crate::generic_handler::{GenericMessageHandler, HandleResult};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+
+    /// A minimal test handler for unit tests
+    struct TestHandler;
+
+    #[async_trait]
+    impl GenericMessageHandler for TestHandler {
+        async fn handle(&self, _route: &str, _body: Bytes) -> HandleResult {
+            Ok(Some(Bytes::new()))
+        }
+
+        fn routes(&self) -> Vec<&'static str> {
+            vec!["/test"]
+        }
+    }
 
     #[tokio::test]
     async fn test_network_service_creation() {
@@ -410,12 +280,12 @@ mod tests {
             9000,
         );
 
-        let (event_tx, _event_rx) = mpsc::channel(100);
-
-        let service = AnemoNetworkService::new(config, node_info, event_tx)
+        let handler = Arc::new(TestHandler);
+        let service = AnemoNetworkService::with_handler(config, node_info, handler)
             .await
             .unwrap();
 
         assert_eq!(service.get_peer_count(), 0);
     }
 }
+
