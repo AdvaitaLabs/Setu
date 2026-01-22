@@ -24,7 +24,6 @@
 //! ```
 
 use setu_types::event::{Event, ExecutionResult, StateChange};
-use setu_types::SubnetId;
 use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 

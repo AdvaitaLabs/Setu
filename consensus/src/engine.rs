@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::broadcaster::{ConsensusBroadcaster, BroadcastError};
+use crate::broadcaster::ConsensusBroadcaster;
 use crate::dag::Dag;
 use crate::folder::ConsensusManager;
 use crate::liveness::Round;
