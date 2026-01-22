@@ -192,8 +192,17 @@ impl ValidatorNetworkService {
         self.pending_events.read().len()
     }
 
-    pub fn next_vlc(&self) -> u64 {
-        self.vlc_counter.fetch_add(1, Ordering::SeqCst)
+    /// Get the next VLC time
+    /// 
+    /// If consensus is enabled, returns the current VLC logical time from ConsensusValidator.
+    /// Otherwise, uses the local vlc_counter (legacy mode).
+    pub async fn get_vlc_time(&self) -> u64 {
+        if let Some(ref consensus) = self.consensus_validator {
+            consensus.vlc_snapshot().await.logical_time
+        } else {
+            // Legacy mode: use local counter
+            self.vlc_counter.fetch_add(1, Ordering::SeqCst)
+        }
     }
 
     // ============================================
@@ -285,8 +294,8 @@ impl ValidatorNetworkService {
             timestamp: now,
         });
 
-        // Step 2: VLC Assignment
-        let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst);
+        // Step 2: VLC Assignment (from consensus if enabled, otherwise local counter)
+        let vlc_time = self.get_vlc_time().await;
         let now_millis = current_timestamp_millis();
 
         let assigned_vlc = AssignedVlc {
