@@ -155,11 +155,55 @@ impl ConsensusEngine {
         };
 
         // Broadcast the new event
-        let _ = self
-            .message_tx
-            .send(ConsensusMessage::NewEvent(event))
-            .await;
+        // We broadcast regardless of whether we are the leader, as all validators
+        // need the event for their DAGs.
+        {
+            let broadcaster = self.broadcaster.read().await;
+            if let Some(ref b) = *broadcaster {
+                // Background this to avoid blocking?
+                // For now, we await it but log errors instead of failing.
+                // Event propagation should be best-effort; state sync fixes gaps.
+                if let Err(e) = b.broadcast_event(&event).await {
+                    warn!(event_id = %event.id, error = %e, "Failed to broadcast event");
+                } else {
+                    debug!(event_id = %event.id, "Event broadcasted");
+                }
+            }
+            
+            // Still send to internal channel for backward compatibility or local monitoring
+            let _ = self
+                .message_tx
+                .send(ConsensusMessage::NewEvent(event))
+                .await;
+        }
 
+        // Try to create a ConsensusFrame if we're the leader
+        self.try_create_cf().await?;
+
+        Ok(event_id)
+    }
+
+    /// Receive an event from the network (does not broadcast again)
+    ///
+    /// This is used when receiving events from other validators.
+    /// Unlike `add_event`, this does not broadcast the event again.
+    pub async fn receive_event_from_network(&self, event: Event) -> SetuResult<EventId> {
+        // Update local VLC by merging with the event's VLC
+        {
+            let mut vlc = self.vlc.write().await;
+            vlc.merge(&event.vlc_snapshot);
+            vlc.tick();
+        }
+
+        // Add event to DAG
+        let event_id = {
+            let mut dag = self.dag.write().await;
+            dag.add_event(event.clone())
+                .map_err(|e| setu_types::SetuError::InvalidData(e.to_string()))?
+        };
+
+        // Note: We do NOT broadcast the event here since it came from the network
+        
         // Try to create a ConsensusFrame if we're the leader
         self.try_create_cf().await?;
 
@@ -285,30 +329,140 @@ impl ConsensusEngine {
     /// Receive a ConsensusFrame from another validator (Follower path)
     /// 
     /// When a follower receives a CF from the leader:
-    /// 1. Check if we've already processed this CF (idempotency)
-    /// 2. Verify the CF's merkle roots are valid
-    /// 3. Apply the state changes from the anchor's events to local SMT
-    /// 4. Verify resulting state matches the anchor's state root
-    /// 5. Vote for the CF
+    /// 1. Verify proposer is valid for current round
+    /// 2. Check if we've already processed this CF (idempotency)
+    /// 3. **Ensure all referenced events are in local DAG (fetch if missing)**
+    /// 4. Verify the CF's merkle roots are valid
+    /// 5. Apply the state changes from the anchor's events to local SMT
+    /// 6. Verify resulting state matches the anchor's state root
+    /// 7. Vote for the CF
+    /// 8. Check if our vote causes finalization
     /// 
+    /// Returns (finalized, Option<Anchor>) so the caller can persist when finalized.
     /// This ensures followers have consistent state with the leader.
-    pub async fn receive_cf(&self, cf: ConsensusFrame) -> SetuResult<()> {
+    pub async fn receive_cf(&self, cf: ConsensusFrame) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
+        // Step 1: Verify proposer is valid for current round
+        // This prevents malicious nodes from creating fake CFs
+        {
+            let validator_set = self.validator_set.read().await;
+            let current_round = validator_set.current_round();
+            if !validator_set.is_valid_proposer(&cf.proposer, current_round) {
+                return Err(setu_types::SetuError::InvalidData(
+                    format!("CF proposer {} is not valid for round {}", cf.proposer, current_round)
+                ));
+            }
+        }
+        
+        // Step 2: Idempotency check (before acquiring write lock)
+        {
+            let manager = self.consensus_manager.read().await;
+            if manager.has_cf(&cf.id) {
+                return Ok((false, None));
+            }
+        }
+        
+        // Step 3: Ensure all referenced events are available in local DAG
+        // This is critical for state consistency - we cannot verify or apply
+        // state changes without having all the events.
+        {
+            let dag = self.dag.read().await;
+            let missing_event_ids: Vec<EventId> = cf.anchor.event_ids
+                .iter()
+                .filter(|id| !dag.contains(id))
+                .cloned()
+                .collect();
+            
+            if !missing_event_ids.is_empty() {
+                // Release dag lock before network call
+                drop(dag);
+                
+                // Try to fetch missing events from peers
+                let broadcaster = self.broadcaster.read().await;
+                if let Some(ref b) = *broadcaster {
+                    info!(
+                        cf_id = %cf.id,
+                        missing_count = missing_event_ids.len(),
+                        "Fetching missing events for CF"
+                    );
+                    
+                    match b.request_events(&missing_event_ids).await {
+                        Ok(fetched_events) => {
+                            // Add fetched events to DAG
+                            let mut dag = self.dag.write().await;
+                            for event in fetched_events {
+                                // Update VLC when adding fetched events
+                                {
+                                    let mut vlc = self.vlc.write().await;
+                                    vlc.merge(&event.vlc_snapshot);
+                                }
+                                
+                                if let Err(e) = dag.add_event(event.clone()) {
+                                    // DuplicateEvent is OK (race condition), other errors are problematic
+                                    if !matches!(e, crate::dag::DagError::DuplicateEvent(_)) {
+                                        warn!(event_id = %event.id, error = %e, "Failed to add fetched event");
+                                    }
+                                }
+                            }
+                            drop(dag);
+                            
+                            // Re-check if we still have missing events
+                            let dag = self.dag.read().await;
+                            let still_missing: Vec<_> = cf.anchor.event_ids
+                                .iter()
+                                .filter(|id| !dag.contains(id))
+                                .collect();
+                            
+                            if !still_missing.is_empty() {
+                                return Err(setu_types::SetuError::InvalidData(
+                                    format!(
+                                        "CF {} references {} events not available locally after fetch attempt",
+                                        cf.id,
+                                        still_missing.len()
+                                    )
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            return Err(setu_types::SetuError::InvalidData(
+                                format!(
+                                    "CF {} references {} missing events and fetch failed: {}",
+                                    cf.id,
+                                    missing_event_ids.len(),
+                                    e
+                                )
+                            ));
+                        }
+                    }
+                } else {
+                    // No broadcaster configured - cannot fetch missing events
+                    return Err(setu_types::SetuError::InvalidData(
+                        format!(
+                            "CF {} references {} events not in local DAG (no broadcaster to fetch)",
+                            cf.id,
+                            missing_event_ids.len()
+                        )
+                    ));
+                }
+            }
+        }
+        
+        // Now we have all events, proceed with verification
         let dag = self.dag.read().await;
         let mut manager = self.consensus_manager.write().await;
         
-        // Idempotency check: skip if already processed
+        // Double-check idempotency (another thread may have processed while we fetched)
         if manager.has_cf(&cf.id) {
-            return Ok(());
+            return Ok((false, None));
         }
         
-        // First verify the CF's merkle roots are internally consistent
+        // Step 4: Verify the CF's merkle roots are internally consistent
         if !manager.verify_cf_merkle_roots(&cf) {
             return Err(setu_types::SetuError::InvalidData(
                 "CF merkle roots verification failed".to_string()
             ));
         }
         
-        // Apply state changes from the CF's events to maintain consistent state
+        // Step 5-6: Apply state changes from the CF's events to maintain consistent state
         // This also verifies the resulting state matches the anchor's state root
         let state_verified = manager.apply_cf_state_changes(&dag, &cf);
         if !state_verified {
@@ -317,34 +471,86 @@ impl ConsensusEngine {
             ));
         }
         
+        let cf_id = cf.id.clone();
+        
         // Receive the CF
         manager.receive_cf(cf.clone());
 
         // Vote for the CF (in MVP, we always approve valid CFs)
-        let vote = manager.vote_for_cf(&cf.id, true);
+        let vote = manager.vote_for_cf(&cf_id, true);
         if let Some(ref v) = vote {
-            // Send to internal channel (legacy)
-            let _ = self.message_tx.send(ConsensusMessage::Vote(v.clone())).await;
-            
             // Broadcast vote to network via broadcaster (if configured)
             let broadcaster = self.broadcaster.read().await;
             if let Some(ref b) = *broadcaster {
                 match b.broadcast_vote(v).await {
                     Ok(result) => {
                         debug!(
-                            cf_id = %cf.id,
+                            cf_id = %cf_id,
                             success = result.success_count,
                             "Vote broadcasted to peers"
                         );
                     }
                     Err(e) => {
-                        warn!(cf_id = %cf.id, error = %e, "Failed to broadcast vote");
+                        warn!(cf_id = %cf_id, error = %e, "Failed to broadcast vote");
                     }
                 }
             }
+            
+            // Check if our vote caused finalization
+            // (vote_for_cf adds vote but doesn't check finalization, so we check here)
+            let finalized = manager.check_finalization(&cf_id);
+            if finalized {
+                return self.handle_finalization(&mut manager).await;
+            }
         }
 
-        Ok(())
+        Ok((false, None))
+    }
+    
+    /// Handle CF finalization: broadcast notification and return anchor for persistence
+    /// 
+    /// Note: This method extracts data from manager before acquiring other locks
+    /// to avoid potential deadlock from holding multiple write locks.
+    async fn handle_finalization(&self, manager: &mut tokio::sync::RwLockWriteGuard<'_, ConsensusManager>) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
+        // Extract data from manager first, before acquiring other locks
+        let cf_data = manager.last_finalized_cf().map(|cf| (cf.id.clone(), cf.anchor.clone(), cf.clone()));
+        
+        let finalized_anchor = if let Some((cf_id, anchor, cf)) = cf_data {
+            // Send finalization to internal channel (for local listeners)
+            let _ = self
+                .message_tx
+                .send(ConsensusMessage::FrameFinalized(cf))
+                .await;
+
+            // Broadcast finalization to network via broadcaster (if configured)
+            let broadcaster = self.broadcaster.read().await;
+            if let Some(ref b) = *broadcaster {
+                match b.broadcast_finalized(&cf_id).await {
+                    Ok(result) => {
+                        info!(
+                            cf_id = %cf_id,
+                            success = result.success_count,
+                            "CF finalization broadcasted to peers"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(cf_id = %cf_id, error = %e, "Failed to broadcast finalization");
+                    }
+                }
+            }
+            // Release broadcaster lock before acquiring validator_set lock
+            drop(broadcaster);
+
+            // Advance to next round (ValidatorSet manages rounds)
+            let mut validator_set = self.validator_set.write().await;
+            validator_set.advance_round();
+
+            Some(anchor)
+        } else {
+            None
+        };
+
+        Ok((true, finalized_anchor))
     }
 
     /// Receive a vote from another validator
@@ -352,52 +558,14 @@ impl ConsensusEngine {
     /// Returns (finalized, Option<Anchor>) - the anchor is returned when finalized
     /// so the caller can persist it to storage.
     pub async fn receive_vote(&self, vote: Vote) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
-        let cf_id = vote.cf_id.clone();
         let mut manager = self.consensus_manager.write().await;
         let finalized = manager.receive_vote(vote);
 
-        let anchor = if finalized {
-            let finalized_anchor = if let Some(cf) = manager.last_finalized_cf() {
-                // Send to internal channel (legacy)
-                let _ = self
-                    .message_tx
-                    .send(ConsensusMessage::FrameFinalized(cf.clone()))
-                    .await;
-
-                // Broadcast finalization to network via broadcaster (if configured)
-                let broadcaster = self.broadcaster.read().await;
-                if let Some(ref b) = *broadcaster {
-                    match b.broadcast_finalized(&cf.id).await {
-                        Ok(result) => {
-                            info!(
-                                cf_id = %cf.id,
-                                success = result.success_count,
-                                "CF finalization broadcasted to peers"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(cf_id = %cf.id, error = %e, "Failed to broadcast finalization");
-                        }
-                    }
-                }
-
-                // Get the finalized anchor for storage
-                manager.get_last_finalized_anchor()
-            } else {
-                None
-            };
-            
-            // Advance to the next round after finalization
-            drop(manager);
-            self.advance_round().await;
-            
-            info!(cf_id = %cf_id, "CF finalized and round advanced");
-            finalized_anchor
+        if finalized {
+            self.handle_finalization(&mut manager).await
         } else {
-            None
-        };
-
-        Ok((finalized, anchor))
+            Ok((false, None))
+        }
     }
 
     /// Compute the state root from the DAG (legacy method)
@@ -472,6 +640,18 @@ impl ConsensusEngine {
     /// Get the current tips of the DAG
     pub async fn get_tips(&self) -> Vec<EventId> {
         self.dag.read().await.get_tips()
+    }
+
+    /// Get events by their IDs from the DAG
+    /// 
+    /// This is used to retrieve events for persistence when a CF is finalized.
+    /// Returns events that exist in the DAG.
+    pub async fn get_events_by_ids(&self, event_ids: &[EventId]) -> Vec<Event> {
+        let dag = self.dag.read().await;
+        event_ids
+            .iter()
+            .filter_map(|id| dag.get_event(id).cloned())
+            .collect()
     }
 
     /// Get the local validator ID

@@ -212,9 +212,19 @@ impl ConsensusManager {
         Some(vote)
     }
 
+    /// Receive a vote from another validator
+    /// 
+    /// Returns true if the CF is finalized after this vote.
+    /// Duplicate votes from the same validator are ignored (idempotent).
     pub fn receive_vote(&mut self, vote: Vote) -> bool {
         let cf_id = vote.cf_id.clone();
+        let voter_id = vote.validator_id.clone();
+        
         if let Some(cf) = self.pending_cfs.get_mut(&cf_id) {
+            // Skip if this validator already voted (idempotency)
+            if cf.votes.contains_key(&voter_id) {
+                return false;
+            }
             cf.add_vote(vote);
         } else {
             return false;
@@ -222,7 +232,11 @@ impl ConsensusManager {
         self.check_finalization(&cf_id)
     }
 
-    fn check_finalization(&mut self, cf_id: &str) -> bool {
+    /// Check if a CF has reached quorum and should be finalized
+    /// 
+    /// This is called after adding a vote to check if finalization should occur.
+    /// Public because engine.receive_cf() needs to check after vote_for_cf().
+    pub fn check_finalization(&mut self, cf_id: &str) -> bool {
         let should_finalize = {
             let cf = match self.pending_cfs.get(cf_id) {
                 Some(cf) => cf,
