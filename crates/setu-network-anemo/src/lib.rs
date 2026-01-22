@@ -64,12 +64,22 @@
 pub mod config;
 pub mod discovery;
 pub mod error;
-pub mod message_handler;
+pub mod generic_handler;
 pub mod metrics;
+pub mod node_info;
 pub mod peer_manager;
 pub mod service;
 pub mod state_sync;
 pub mod transport;
+
+// Re-export generic handler types
+pub use generic_handler::{
+    GenericMessageHandler, HandlerError, HandleResult,
+    create_router_from_handler,
+};
+
+// Re-export node info types
+pub use node_info::{NodeInfo as NetworkNodeInfo, NodeRole, NodeStatus};
 
 // Re-export main types
 pub use config::{AnemoConfig, NetworkConfig};
@@ -107,11 +117,8 @@ pub use state_sync::{
     UnstartedStateSync,
 };
 
-// Re-export protocol types from setu-protocol
-pub use setu_protocol::{
-    MessageCodec, MessageType, NetworkEvent, ProtocolVersion, SetuMessage,
-    SerializedConsensusFrame, SerializedEvent, SerializedVote,
-};
+// Re-export core protocol types from setu-protocol
+pub use setu_protocol::{GenericCodec, BincodeCodec, ProtocolError, ProtocolVersion};
 
 // Re-export commonly used Anemo types
 pub use anemo::{Network, PeerId, Request, Response};
