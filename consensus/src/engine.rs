@@ -166,6 +166,34 @@ impl ConsensusEngine {
         Ok(event_id)
     }
 
+    /// Receive an event from the network (without re-broadcasting)
+    /// 
+    /// This method is used when receiving events from other validators via the network.
+    /// Unlike `add_event`, it does not re-broadcast the event to avoid message loops.
+    pub async fn receive_event_from_network(&self, event: Event) -> SetuResult<EventId> {
+        // Update local VLC by merging with the event's VLC
+        {
+            let mut vlc = self.vlc.write().await;
+            vlc.merge(&event.vlc_snapshot);
+            vlc.tick();
+        }
+
+        // Add event to DAG
+        let event_id = {
+            let mut dag = self.dag.write().await;
+            dag.add_event(event.clone())
+                .map_err(|e| setu_types::SetuError::InvalidData(e.to_string()))?
+        };
+
+        // Note: We do NOT broadcast here to avoid message loops
+        // The event was already received from the network
+
+        // Try to create a ConsensusFrame if we're the leader
+        self.try_create_cf().await?;
+
+        Ok(event_id)
+    }
+
     /// Create a new event with the given parent IDs
     pub async fn create_event(&self, parent_ids: Vec<EventId>) -> SetuResult<Event> {
         let vlc_snapshot = {
