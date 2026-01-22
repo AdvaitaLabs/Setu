@@ -22,11 +22,15 @@ use consensus::{
     ValidatorSet, TeeVerifier, VerificationResult,
     liveness::Round, ConsensusBroadcaster,
 };
+use setu_protocol::NetworkEvent;
 use setu_types::{
     Anchor, ConsensusConfig, ConsensusFrame, Event, EventId, Vote,
     NodeInfo, ValidatorInfo, SetuResult, SetuError, SubnetId,
 };
 use setu_storage::subnet_state::GlobalStateManager;
+use setu_storage::{EventStore, CFStore, AnchorStore};
+use crate::network_adapter::MessageRouter;
+use crate::persistence::FinalizationPersister;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock, Mutex, broadcast};
@@ -76,6 +80,14 @@ pub struct ConsensusValidator {
     validator_set: Arc<RwLock<ValidatorSet>>,
     /// TEE verifier for attestation verification
     tee_verifier: Arc<TeeVerifier>,
+    
+    /// Persistent store for events
+    event_store: Arc<EventStore>,
+    /// Persistent store for consensus frames
+    cf_store: Arc<CFStore>,
+    /// Persistent store for anchors
+    anchor_store: Arc<AnchorStore>,
+
     /// Channel for sending consensus messages to network
     message_tx: mpsc::Sender<ConsensusMessage>,
     /// Channel for receiving consensus messages from network
@@ -114,6 +126,9 @@ impl ConsensusValidator {
             engine,
             validator_set: Arc::new(RwLock::new(validator_set)),
             tee_verifier,
+            event_store: Arc::new(EventStore::new()),
+            cf_store: Arc::new(CFStore::new()),
+            anchor_store: Arc::new(AnchorStore::new()),
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
             finalization_tx,
@@ -149,6 +164,9 @@ impl ConsensusValidator {
             engine,
             validator_set: Arc::new(RwLock::new(validator_set)),
             tee_verifier,
+            event_store: Arc::new(EventStore::new()),
+            cf_store: Arc::new(CFStore::new()),
+            anchor_store: Arc::new(AnchorStore::new()),
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
             finalization_tx,
@@ -171,6 +189,46 @@ impl ConsensusValidator {
         self.engine.has_broadcaster().await
     }
     
+    /// Start the network event handler using MessageRouter
+    ///
+    /// This creates a MessageRouter that consumes NetworkEvents from the network
+    /// layer and routes them to the appropriate ConsensusEngine methods.
+    ///
+    /// # Arguments
+    /// * `event_rx` - Receiver for NetworkEvents from the network layer
+    ///
+    /// # Returns
+    /// A JoinHandle for the spawned router task
+    pub fn start_network_event_handler(
+        &self,
+        event_rx: mpsc::Receiver<NetworkEvent>,
+    ) -> tokio::task::JoinHandle<()> {
+        // Create MessageRouter with storage for persistence on CF finalization
+        let router = Arc::new(MessageRouter::new(
+            self.engine.clone(),
+            self.event_store.clone(),
+            self.anchor_store.clone(),
+            self.config.node_info.id.clone(),
+        ));
+        
+        info!(
+            validator_id = %self.config.node_info.id,
+            "Starting network event handler with MessageRouter (events persist on CF finalization)"
+        );
+        
+        router.start(event_rx)
+    }
+    
+    /// Get the underlying consensus engine (for advanced use cases)
+    pub fn engine(&self) -> Arc<ConsensusEngine> {
+        self.engine.clone()
+    }
+    
+    /// Get the event store (for queries of finalized events)
+    pub fn event_store(&self) -> Arc<EventStore> {
+        self.event_store.clone()
+    }
+
     // =========================================================================
     // Core Operations
     // =========================================================================
@@ -183,6 +241,9 @@ impl ConsensusValidator {
     /// 3. Update VLC
     /// 4. Try to create CF if we're the leader
     /// 5. Broadcast event to other validators
+    /// 
+    /// Note: Events are NOT persisted here. They stay in DAG memory until CF is finalized.
+    /// Persistence happens in receive_vote() when quorum is reached.
     pub async fn submit_event(&self, event: Event) -> SetuResult<EventId> {
         info!(
             event_id = %event.id,
@@ -200,21 +261,23 @@ impl ConsensusValidator {
             }
         }
         
-        // Step 2: Add event to DAG (this also updates VLC)
+        // Step 2: Add event to DAG (this also updates VLC and broadcasts)
+        // Note: engine.add_event handles network broadcasting if a broadcaster is configured
+        // Event stays in DAG memory until CF is finalized
         let event_id = self.engine.add_event(event.clone()).await?;
-        
-        // Step 3: Broadcast to other validators
-        let _ = self.message_tx.send(ConsensusMessage::NewEvent(event)).await;
         
         info!(
             event_id = %event_id,
-            "Event added to DAG"
+            "Event added to DAG (pending finalization)"
         );
         
         Ok(event_id)
     }
     
     /// Receive an event from another validator
+    /// 
+    /// Note: Events are NOT persisted here. They stay in DAG memory until CF is finalized.
+    /// Persistence happens in receive_vote() when quorum is reached.
     pub async fn receive_event(&self, event: Event) -> SetuResult<EventId> {
         debug!(
             event_id = %event.id,
@@ -223,22 +286,46 @@ impl ConsensusValidator {
         );
         
         // Use the dedicated network receive method (no re-broadcast)
-        self.engine.receive_event_from_network(event).await
+        // Event stays in DAG memory until CF is finalized
+        let event_id = self.engine.receive_event_from_network(event).await?;
+        
+        Ok(event_id)
     }
     
     /// Receive a ConsensusFrame proposal from the leader
-    pub async fn receive_cf(&self, cf: ConsensusFrame) -> SetuResult<()> {
+    /// 
+    /// This processes the CF, votes for it, and checks for finalization.
+    /// If our vote causes finalization, persists the anchor and events.
+    pub async fn receive_cf(&self, cf: ConsensusFrame) -> SetuResult<(bool, Option<Anchor>)> {
         info!(
             cf_id = %cf.id,
             proposer = %cf.proposer,
             "Receiving CF proposal"
         );
         
-        // Verify and process the CF
-        self.engine.receive_cf(cf).await
+        // Verify, process, and vote for the CF
+        // Returns (finalized, anchor) if our vote causes finalization
+        let (finalized, anchor) = self.engine.receive_cf(cf).await?;
+        
+        if finalized {
+            if let Some(ref a) = anchor {
+                info!(
+                    anchor_id = %a.id,
+                    event_count = a.event_ids.len(),
+                    "CF finalized after local vote, persisting"
+                );
+                self.persist_finalized_anchor(a).await;
+            }
+        }
+        
+        Ok((finalized, anchor))
     }
     
     /// Receive a vote from another validator
+    /// 
+    /// When a CF is finalized (quorum reached), this method:
+    /// 1. Persists the finalized Anchor
+    /// 2. Batch-persists all Events included in the CF
     pub async fn receive_vote(&self, vote: Vote) -> SetuResult<(bool, Option<Anchor>)> {
         debug!(
             cf_id = %vote.cf_id,
@@ -247,7 +334,20 @@ impl ConsensusValidator {
             "Receiving vote"
         );
         
-        self.engine.receive_vote(vote).await
+        let (finalized, anchor) = self.engine.receive_vote(vote).await?;
+        
+        if finalized {
+            if let Some(ref a) = anchor {
+                info!(
+                    anchor_id = %a.id,
+                    event_count = a.event_ids.len(),
+                    "CF finalized via vote, persisting"
+                );
+                self.persist_finalized_anchor(a).await;
+            }
+        }
+        
+        Ok((finalized, anchor))
     }
     
     // =========================================================================
@@ -428,6 +528,24 @@ impl ConsensusValidator {
     }
 }
 
+/// Implement FinalizationPersister for ConsensusValidator
+/// 
+/// This provides the shared persist_finalized_anchor() implementation
+#[async_trait::async_trait]
+impl FinalizationPersister for ConsensusValidator {
+    fn engine(&self) -> &Arc<ConsensusEngine> {
+        &self.engine
+    }
+    
+    fn event_store(&self) -> &Arc<EventStore> {
+        &self.event_store
+    }
+    
+    fn anchor_store(&self) -> &Arc<AnchorStore> {
+        &self.anchor_store
+    }
+}
+
 /// Event handler for processing consensus messages in a background loop
 pub struct ConsensusMessageHandler {
     validator: Arc<ConsensusValidator>,
@@ -475,17 +593,29 @@ impl ConsensusMessageHandler {
             }
             ConsensusMessage::ProposeFrame(cf) => {
                 info!(cf_id = %cf.id, "Handling CF proposal");
-                if let Err(e) = self.validator.receive_cf(cf).await {
-                    warn!(error = %e, "Failed to receive CF");
+                match self.validator.receive_cf(cf).await {
+                    Ok((finalized, anchor)) => {
+                        if finalized {
+                            if let Some(ref a) = anchor {
+                                info!(anchor_id = %a.id, "CF finalized via local vote");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to receive CF");
+                    }
                 }
             }
             ConsensusMessage::Vote(vote) => {
-                debug!(cf_id = %vote.cf_id, "Handling vote");
+                // Note: Votes from the network are handled by MessageRouter.
+                // This handles votes received through the internal channel,
+                // which is only used for legacy compatibility.
+                debug!(cf_id = %vote.cf_id, "Handling internal vote (legacy)");
                 match self.validator.receive_vote(vote).await {
                     Ok((finalized, anchor)) => {
                         if finalized {
                             if let Some(ref a) = anchor {
-                                info!(anchor_id = %a.id, "CF finalized");
+                                info!(anchor_id = %a.id, "CF finalized via vote");
                             }
                         }
                     }
@@ -588,5 +718,43 @@ mod tests {
         assert_eq!(stats.validator_id, "test-validator");
         assert!(stats.is_leader);
         assert_eq!(stats.current_round, 0);
+    }
+    
+    #[tokio::test]
+    async fn test_network_event_handler_integration() {
+        use setu_protocol::NetworkEvent;
+        use tokio::sync::mpsc;
+        
+        let config = create_test_config();
+        let validator = ConsensusValidator::new(config);
+        
+        // Create event channel
+        let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(100);
+        
+        // Start the network event handler
+        let handle = validator.start_network_event_handler(event_rx);
+        
+        // Send a test event through the channel
+        let test_event = create_test_event("remote-solver");
+        event_tx.send(NetworkEvent::EventReceived {
+            peer_id: "peer-1".to_string(),
+            event: test_event.clone(),
+        }).await.unwrap();
+        
+        // Give some time for the event to be processed
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        
+        // Verify the event was added to DAG
+        let stats = validator.dag_stats().await;
+        assert_eq!(stats.node_count, 1, "Event should be added to DAG via network handler");
+        
+        // Clean up - drop the sender to close the channel
+        drop(event_tx);
+        
+        // Wait for the handler to finish
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            handle
+        ).await;
     }
 }

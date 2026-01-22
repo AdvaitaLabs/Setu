@@ -12,6 +12,7 @@ path = "src/main.rs"
 setu-core = { path = "../crates/setu-core" }
 setu-types = { path = "../types" }
 setu-vlc = { path = "../crates/setu-vlc" }
+setu-protocol = { path = "../crates/setu-protocol" }
 consensus = { path = "../consensus" }
 setu-router-core = { path = "../crates/setu-router-core" }
 setu-rpc = { path = "../setu-rpc" }
