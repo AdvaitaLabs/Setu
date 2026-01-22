@@ -8,6 +8,9 @@ use anemo::{Request, Response, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+// Re-export from setu-protocol
+pub use setu_protocol::{SerializedEvent, SerializedConsensusFrame, SerializedVote};
+
 /// State Sync RPC trait
 ///
 /// Defines the RPC methods for state synchronization between nodes.
@@ -68,14 +71,6 @@ pub struct GetEventsResponse {
     pub highest_seq: u64,
 }
 
-/// A serialized event for network transfer
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SerializedEvent {
-    pub seq: u64,
-    pub id: String,
-    pub data: Vec<u8>,
-}
-
 /// Request for pushing events
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PushEventsRequest {
@@ -116,16 +111,6 @@ pub struct GetConsensusFramesResponse {
     pub highest_seq: u64,
 }
 
-/// A serialized consensus frame for network transfer
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SerializedConsensusFrame {
-    pub seq: u64,
-    pub id: String,
-    pub data: Vec<u8>,
-    /// VLC state at this CF
-    pub vlc: Option<Vec<u8>>,
-}
-
 /// Request for pushing a consensus frame
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PushConsensusFrameRequest {
@@ -133,14 +118,6 @@ pub struct PushConsensusFrameRequest {
     pub frame: SerializedConsensusFrame,
     /// Votes for this frame
     pub votes: Vec<SerializedVote>,
-}
-
-/// A serialized vote
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SerializedVote {
-    pub voter_id: String,
-    pub cf_id: String,
-    pub signature: Vec<u8>,
 }
 
 /// Response for pushed consensus frame

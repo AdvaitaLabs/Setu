@@ -28,72 +28,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-/// Network events that can be sent to application
-#[derive(Debug, Clone)]
-pub enum NetworkEvent {
-    /// A new peer has connected
-    PeerConnected {
-        peer_id: String,
-        node_info: NodeInfo,
-    },
-
-    /// A peer has disconnected
-    PeerDisconnected {
-        peer_id: String,
-    },
-
-    /// Received an event broadcast
-    EventReceived {
-        peer_id: String,
-        event: Event,
-    },
-
-    /// Received a consensus frame proposal
-    CFProposal {
-        peer_id: String,
-        cf: ConsensusFrame,
-    },
-
-    /// Received a vote
-    VoteReceived {
-        peer_id: String,
-        vote: Vote,
-    },
-
-    /// Received a CF finalized notification
-    CFFinalized {
-        peer_id: String,
-        cf: ConsensusFrame,
-    },
-}
-
-/// Network messages for Setu protocol
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum SetuMessage {
-    /// Event broadcast
-    EventBroadcast { event: Event, sender_id: String },
-
-    /// Consensus frame proposal
-    CFProposal { cf: ConsensusFrame, proposer_id: String },
-
-    /// Vote for a consensus frame
-    CFVote { vote: Vote },
-
-    /// Consensus frame finalized
-    CFFinalized { cf: ConsensusFrame },
-
-    /// Request specific events by ID
-    RequestEvents { event_ids: Vec<String>, requester_id: String },
-
-    /// Response to event request
-    EventsResponse { events: Vec<Event>, responder_id: String },
-
-    /// Ping message for health check
-    Ping { timestamp: u64, nonce: u64 },
-
-    /// Pong response
-    Pong { timestamp: u64, nonce: u64 },
-}
+// Re-export from setu-protocol for backward compatibility
+pub use setu_protocol::{NetworkEvent, SetuMessage};
 
 /// Anemo-based network service for Setu
 ///

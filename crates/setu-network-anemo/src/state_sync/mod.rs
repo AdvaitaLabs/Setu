@@ -47,9 +47,11 @@ pub use server::{
     PushEventsRequest, PushEventsResponse,
     PushConsensusFrameRequest, PushConsensusFrameResponse,
     GetSyncStateRequest, GetSyncStateResponse,
-    SerializedEvent, SerializedConsensusFrame, SerializedVote,
 };
 pub use store::{InMemoryStateSyncStore, InMemoryStoreError};
+
+// Re-export from setu-protocol
+pub use setu_protocol::{SerializedEvent, SerializedConsensusFrame, SerializedVote};
 
 use anemo::PeerId;
 use async_trait::async_trait;
