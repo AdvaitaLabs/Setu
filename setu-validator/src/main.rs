@@ -3,23 +3,20 @@
 //! The Validator node is responsible for:
 //! - Receiving and routing transfers to Solvers
 //! - Verifying events from Solvers
-//! - Managing the DAG (simulated for now)
-//! - Coordinating consensus (simulated for now)
+//! - Managing the DAG with consensus
+//! - Coordinating consensus (leader election, CF voting)
 //! - Providing HTTP API for registration and transfer submission
 
-use setu_types::Transfer;
 use setu_core::NodeConfig;
 use setu_validator::{
-    Validator, RouterManager, 
+    RouterManager, 
     ValidatorNetworkService, NetworkServiceConfig,
+    ConsensusValidator, ConsensusValidatorConfig,
 };
-use setu_types::event::Event;
+use setu_types::NodeInfo;
 use std::sync::Arc;
 use std::net::SocketAddr;
-use tokio::sync::mpsc;
 use tracing::{info, error, Level};
-#[cfg(not(debug_assertions))]
-use tracing::warn;
 use tracing_subscriber;
 
 /// Validator configuration from environment
@@ -80,12 +77,7 @@ async fn main() -> anyhow::Result<()> {
     info!("║  P2P Addr:   {:^44} ║", config.p2p_addr);
     info!("╚════════════════════════════════════════════════════════════╝");
 
-    // Create channels
-    // Note: transfer_tx is currently unused - will be needed when Validator processes transfers internally
-    let (_transfer_tx, transfer_rx) = mpsc::unbounded_channel::<Transfer>();
-    let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
-
-    // Create router manager (shared between Validator and NetworkService)
+    // Create router manager (shared between NetworkService components)
     let router_manager = Arc::new(RouterManager::new());
     
     // Create task preparer (solver-tee3 architecture)
@@ -96,56 +88,65 @@ async fn main() -> anyhow::Result<()> {
     
     info!("✓ TaskPreparer initialized with test accounts (alice, bob, charlie)");
     
+    // Create ConsensusValidator for DAG + VLC + Consensus
+    let node_info = NodeInfo::new_validator(
+        config.node_config.node_id.clone(),
+        config.http_addr.ip().to_string(),
+        config.http_addr.port(),
+    );
+    let consensus_config = ConsensusValidatorConfig {
+        node_info,
+        is_leader: true, // Single node mode: always leader
+        ..Default::default()
+    };
+    let consensus_validator = Arc::new(ConsensusValidator::new(consensus_config));
+    
+    info!("✓ ConsensusValidator initialized (single node mode)");
+    
     // Create network service configuration
     let network_config = NetworkServiceConfig {
         http_listen_addr: config.http_addr,
         p2p_listen_addr: config.p2p_addr,
     };
     
-    // Create network service
-    let network_service = Arc::new(ValidatorNetworkService::new(
+    // Create network service with consensus enabled
+    let network_service = Arc::new(ValidatorNetworkService::with_consensus(
         config.node_config.node_id.clone(),
         router_manager.clone(),
         task_preparer.clone(),
+        consensus_validator.clone(),
         network_config,
     ));
 
     // ========================================
-    // Simulated Components (placeholder logs)
+    // Components Status
     // ========================================
     
     info!("┌─────────────────────────────────────────────────────────────┐");
-    info!("│                  Initializing Components                    │");
+    info!("│                  Components Initialized                     │");
     info!("├─────────────────────────────────────────────────────────────┤");
     
-    // VLC (Vector Logical Clock) - Simulated
-    info!("│ [VLC]       Vector Logical Clock initialized (simulated)   │");
-    info!("│             - Local clock: 0                               │");
-    info!("│             - Will increment on each event                 │");
+    // VLC (Vector Logical Clock) - Real implementation
+    info!("│ [VLC]       Vector Logical Clock initialized               │");
+    info!("│             - Managed by ConsensusEngine                   │");
+    info!("│             - Increments on each event                     │");
     
-    // DAG Manager - Simulated
-    info!("│ [DAG]       DAG Manager initialized (simulated)            │");
-    info!("│             - Events will be stored linearly for now       │");
+    // DAG Manager - Real implementation  
+    info!("│ [DAG]       DAG Manager initialized                        │");
+    info!("│             - Events stored in ConsensusEngine DAG         │");
     info!("│             - Parent tracking: enabled                     │");
     
-    // Consensus - Simulated
-    info!("│ [CONSENSUS] Consensus module initialized (simulated)       │");
-    info!("│             - Mode: Single validator (no consensus needed) │");
-    info!("│             - Will log consensus steps                     │");
+    // Consensus - Real implementation
+    info!("│ [CONSENSUS] Consensus module initialized                   │");
+    info!("│             - Mode: Single validator (leader)              │");
+    info!("│             - CF creation and finalization enabled         │");
     
-    // FoldGraph - Simulated
-    info!("│ [FOLDGRAPH] FoldGraph initialized (simulated)              │");
-    info!("│             - Folding disabled for MVP                     │");
-    info!("│             - Will log fold triggers                       │");
+    // AnchorBuilder
+    info!("│ [ANCHOR]    AnchorBuilder initialized                      │");
+    info!("│             - Merkle tree computation enabled              │");
+    info!("│             - State persistence ready                      │");
     
     info!("└─────────────────────────────────────────────────────────────┘");
-
-    // Create validator with transfer routing
-    let validator = Validator::with_transfer_rx(
-        config.node_config.clone(),
-        transfer_rx,
-        event_rx,
-    );
 
     // Spawn HTTP server
     let http_service = network_service.clone();
@@ -155,10 +156,6 @@ async fn main() -> anyhow::Result<()> {
             error!("HTTP server error: {}", e);
         }
     });
-
-    // Keep event_tx alive for future P2P event submission
-    // TODO(Phase 7): Connect to P2P network for receiving events from other validators
-    let _event_tx = event_tx;
 
     // Log startup complete
     info!("╔════════════════════════════════════════════════════════════╗");
@@ -175,11 +172,8 @@ async fn main() -> anyhow::Result<()> {
     info!("║    GET  /api/v1/events             - List events           ║");
     info!("╚════════════════════════════════════════════════════════════╝");
 
-    // Run validator (this will block)
+    // Wait for shutdown signal
     tokio::select! {
-        _ = validator.run() => {
-            info!("Validator stopped");
-        }
         _ = http_handle => {
             info!("HTTP server stopped");
         }
@@ -191,4 +185,3 @@ async fn main() -> anyhow::Result<()> {
     info!("Validator shutdown complete");
     Ok(())
 }
-
