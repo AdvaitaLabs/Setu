@@ -33,7 +33,7 @@
 //!
 //! ```rust,ignore
 //! use setu_validator::{ConsensusValidator, ConsensusValidatorConfig};
-//! use setu_protocol::NetworkEvent;
+//! use crate::protocol::NetworkEvent;
 //! use tokio::sync::mpsc;
 //!
 //! // Create validator
@@ -48,7 +48,10 @@
 //! ```
 
 mod router;
+mod setu_handler;
 mod sync_protocol;
 
 pub use router::{MessageRouter, NetworkEventHandler};
+pub use setu_handler::{SetuMessageHandler, MessageHandlerStore, SETU_ROUTE};
 pub use sync_protocol::{SyncProtocol, SyncStore, InMemorySyncStore};
+

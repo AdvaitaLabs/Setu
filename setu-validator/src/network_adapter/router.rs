@@ -4,7 +4,7 @@
 //! Events and CFs are stored in-memory (DAG) until finalized, then persisted.
 
 use consensus::ConsensusEngine;
-use setu_protocol::NetworkEvent;
+use crate::protocol::NetworkEvent;
 use setu_storage::{EventStore, AnchorStore};
 use setu_types::{ConsensusFrame, Event, Vote};
 use crate::persistence::FinalizationPersister;
@@ -53,8 +53,7 @@ pub struct MessageRouter {
     event_store: Arc<EventStore>,
     /// Anchor store for persisting finalized anchors
     anchor_store: Arc<AnchorStore>,
-    /// Local validator ID
-    local_validator_id: String,
+
 }
 
 impl MessageRouter {
@@ -63,13 +62,11 @@ impl MessageRouter {
         engine: Arc<ConsensusEngine>,
         event_store: Arc<EventStore>,
         anchor_store: Arc<AnchorStore>,
-        local_validator_id: String,
     ) -> Self {
         Self {
             engine,
             event_store,
             anchor_store,
-            local_validator_id,
         }
     }
     
@@ -295,15 +292,15 @@ mod tests {
     async fn test_router_creation() {
         let engine = create_test_engine();
         let (event_store, anchor_store) = create_test_stores();
-        let router = MessageRouter::new(engine, event_store, anchor_store, "v1".to_string());
-        assert_eq!(router.local_validator_id, "v1");
+        let _router = MessageRouter::new(engine, event_store, anchor_store);
+        // Router created successfully
     }
     
     #[tokio::test]
     async fn test_handle_event_adds_to_dag() {
         let engine = create_test_engine();
         let (event_store, anchor_store) = create_test_stores();
-        let router = MessageRouter::new(engine.clone(), event_store, anchor_store, "v1".to_string());
+        let router = MessageRouter::new(engine.clone(), event_store, anchor_store);
         
         let event = create_test_event();
         let event_id = event.id.clone();

@@ -5,7 +5,7 @@
 //! was previously embedded in the network layer.
 
 use async_trait::async_trait;
-use setu_protocol::{SerializedConsensusFrame, SerializedEvent};
+use crate::protocol::{SerializedConsensusFrame, SerializedEvent};
 use setu_types::{ConsensusFrame, Event, EventId};
 use setu_storage::{EventStore, CFStore};
 use std::collections::HashMap;
@@ -44,11 +44,13 @@ pub trait SyncStore: Send + Sync + 'static {
 }
 
 /// Persistent implementation of SyncStore using RocksDB
+#[allow(dead_code)]
 pub struct PersistentSyncStore {
     event_store: Arc<EventStore>,
     cf_store: Arc<CFStore>,
 }
 
+#[allow(dead_code)]
 impl PersistentSyncStore {
     pub fn new(event_store: Arc<EventStore>, cf_store: Arc<CFStore>) -> Self {
         Self {
@@ -208,14 +210,12 @@ impl SyncStore for InMemorySyncStore {
 /// business types and serialized network types.
 pub struct SyncProtocol<S: SyncStore> {
     store: Arc<S>,
-    local_validator_id: String,
 }
 
 impl<S: SyncStore> SyncProtocol<S> {
-    pub fn new(store: Arc<S>, local_validator_id: String) -> Self {
+    pub fn new(store: Arc<S>) -> Self {
         Self {
             store,
-            local_validator_id,
         }
     }
     

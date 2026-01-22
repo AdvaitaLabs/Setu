@@ -22,7 +22,7 @@ use consensus::{
     ValidatorSet, TeeVerifier, VerificationResult,
     liveness::Round, ConsensusBroadcaster,
 };
-use setu_protocol::NetworkEvent;
+use crate::protocol::NetworkEvent;
 use setu_types::{
     Anchor, ConsensusConfig, ConsensusFrame, Event, EventId, Vote,
     NodeInfo, ValidatorInfo, SetuResult, SetuError, SubnetId,
@@ -83,20 +83,24 @@ pub struct ConsensusValidator {
     
     /// Persistent store for events
     event_store: Arc<EventStore>,
-    /// Persistent store for consensus frames
+    /// Persistent store for consensus frames (reserved for future use)
+    #[allow(dead_code)]
     cf_store: Arc<CFStore>,
     /// Persistent store for anchors
     anchor_store: Arc<AnchorStore>,
 
     /// Channel for sending consensus messages to network
     message_tx: mpsc::Sender<ConsensusMessage>,
-    /// Channel for receiving consensus messages from network
+    /// Channel for receiving consensus messages from network (reserved for future use)
+    #[allow(dead_code)]
     message_rx: Arc<Mutex<mpsc::Receiver<ConsensusMessage>>>,
     /// Broadcast channel for CF finalization notifications
     finalization_tx: broadcast::Sender<ConsensusFrame>,
-    /// Pending votes awaiting quorum
+    /// Pending votes awaiting quorum (reserved for future use)
+    #[allow(dead_code)]
     pending_votes: Arc<RwLock<HashMap<String, Vec<Vote>>>>,
-    /// Running flag
+    /// Running flag (reserved for future use)
+    #[allow(dead_code)]
     running: Arc<RwLock<bool>>,
 }
 
@@ -208,7 +212,6 @@ impl ConsensusValidator {
             self.engine.clone(),
             self.event_store.clone(),
             self.anchor_store.clone(),
-            self.config.node_info.id.clone(),
         ));
         
         info!(
@@ -722,7 +725,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_network_event_handler_integration() {
-        use setu_protocol::NetworkEvent;
+        use crate::protocol::NetworkEvent;
         use tokio::sync::mpsc;
         
         let config = create_test_config();

@@ -9,15 +9,15 @@ use setu_rpc::{
     GetAccountRequest, GetAccountResponse, GetBalanceRequest, GetBalanceResponse,
     GetPowerRequest, GetPowerResponse, GetCreditRequest, GetCreditResponse,
     GetCredentialsRequest, GetCredentialsResponse, TransferRequest, TransferResponse,
-    ProfileInfo, CoinBalance, PowerChange, CreditChange, CredentialInfo,
+    ProfileInfo, CoinBalance, PowerChange, CreditChange,
     SubmitTransferRequest,
 };
-use setu_types::event::{Event, EventType};
+use setu_types::event::{Event};
 use setu_types::registration::UserRegistration;
 use setu_vlc::VLCSnapshot;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 
 /// User RPC Handler for Validator
 pub struct ValidatorUserHandler {

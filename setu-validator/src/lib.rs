@@ -40,6 +40,7 @@ pub mod consensus_integration;
 pub mod broadcaster;
 pub mod network_adapter;
 pub mod persistence;
+pub mod protocol;
 
 pub use router_manager::{RouterManager, RouterError, SolverConnection};
 pub use network::{
@@ -65,6 +66,14 @@ pub use broadcaster::{
 // Re-export network adapter types
 pub use network_adapter::{
     MessageRouter, NetworkEventHandler, SyncProtocol, SyncStore, InMemorySyncStore,
+};
+
+// Re-export protocol types (consensus-specific message definitions)
+pub use protocol::{
+    SetuMessage, MessageType, NetworkEvent, MessageCodec, MessageCodecError,
+    SerializedEvent, SerializedConsensusFrame, SerializedVote,
+    SyncEventsRequest, SyncEventsResponse,
+    SyncConsensusFramesRequest, SyncConsensusFramesResponse,
 };
 
 // Re-export consensus types from the consensus crate
