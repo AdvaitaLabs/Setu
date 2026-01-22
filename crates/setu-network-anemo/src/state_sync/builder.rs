@@ -4,7 +4,7 @@
 //! Builder pattern for StateSync service
 
 use super::{
-    Handle, Server, StateSyncConfig, StateSyncEventLoop, StateSyncMessage, SyncState,
+    Handle, Server, StateSyncConfig, StateSyncEventLoop, StateSyncMessage, StateSyncStore, SyncState,
     metrics::StateSyncMetrics,
 };
 use anemo::NetworkRef;
@@ -19,8 +19,9 @@ use tokio::sync::mpsc;
 /// # Example
 ///
 /// ```ignore
+/// let store = Arc::new(InMemoryStateSyncStore::new());
 /// let (unstarted, server) = Builder::new()
-///     .store(my_store)
+///     .store(store)
 ///     .config(StateSyncConfig::default())
 ///     .with_metrics(&prometheus_registry)
 ///     .build();
@@ -29,7 +30,7 @@ use tokio::sync::mpsc;
 /// let handle = unstarted.start(network);
 /// ```
 pub struct Builder<S> {
-    store: Option<S>,
+    store: Option<Arc<S>>,
     config: Option<StateSyncConfig>,
     metrics: Option<StateSyncMetrics>,
 }
@@ -52,8 +53,8 @@ impl Default for Builder<()> {
 }
 
 impl<S> Builder<S> {
-    /// Set the storage backend
-    pub fn store<NewStore>(self, store: NewStore) -> Builder<NewStore> {
+    /// Set the storage backend (must be wrapped in Arc)
+    pub fn store<NewStore>(self, store: Arc<NewStore>) -> Builder<NewStore> {
         Builder {
             store: Some(store),
             config: self.config,
@@ -76,13 +77,13 @@ impl<S> Builder<S> {
 
 impl<S> Builder<S>
 where
-    S: Clone + Send + Sync + 'static,
+    S: StateSyncStore,
 {
     /// Build the state sync service
     ///
     /// Returns an `UnstartedStateSync` that can be started once the network is ready,
     /// and a `Server` that should be registered with the network.
-    pub fn build(self) -> (UnstartedStateSync<S>, Server<S>) {
+    pub fn build(self) -> (UnstartedStateSync<S>, Server<Arc<S>>) {
         let store = self.store.expect("Store is required");
         let config = self.config.unwrap_or_default();
         let metrics = self.metrics.unwrap_or_else(StateSyncMetrics::disabled);
@@ -120,13 +121,13 @@ pub struct UnstartedStateSync<S> {
     #[allow(dead_code)]
     metrics: StateSyncMetrics,
     state: Arc<SyncState>,
-    store: S,
+    store: Arc<S>,
     message_rx: mpsc::Receiver<StateSyncMessage>,
 }
 
 impl<S> UnstartedStateSync<S>
 where
-    S: Clone + Send + Sync + 'static,
+    S: StateSyncStore,
 {
     /// Start the state sync service
     pub fn start(self, network: NetworkRef) -> (Handle, tokio::task::JoinHandle<()>) {

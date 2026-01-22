@@ -37,17 +37,144 @@
 mod builder;
 pub mod metrics;
 mod server;
+mod store;
 
 pub use builder::{Builder, UnstartedStateSync};
 pub use server::{StateSync, StateSyncServer, Server};
+pub use server::{
+    GetEventsRequest, GetEventsResponse,
+    GetConsensusFramesRequest, GetConsensusFramesResponse,
+    PushEventsRequest, PushEventsResponse,
+    PushConsensusFrameRequest, PushConsensusFrameResponse,
+    GetSyncStateRequest, GetSyncStateResponse,
+    SerializedEvent, SerializedConsensusFrame, SerializedVote,
+};
+pub use store::{InMemoryStateSyncStore, InMemoryStoreError};
 
 use anemo::PeerId;
+use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+
+// ============================================================================
+// StateSyncStore Trait
+// ============================================================================
+
+/// Storage trait for state synchronization
+/// 
+/// This trait abstracts the storage operations needed for state sync,
+/// allowing the sync system to work with different storage backends.
+#[async_trait]
+pub trait StateSyncStore: Clone + Send + Sync + 'static {
+    /// Error type for storage operations
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    // ===== Event Storage =====
+    
+    /// Get events starting from a sequence number
+    /// 
+    /// Returns (events, has_more, highest_seq)
+    async fn get_events_from_seq(
+        &self,
+        start_seq: u64,
+        limit: u32,
+    ) -> Result<(Vec<SerializedEvent>, bool, u64), Self::Error>;
+    
+    /// Store events received from peers
+    /// 
+    /// Returns (accepted_count, rejected_ids)
+    async fn store_events(
+        &self,
+        events: Vec<SerializedEvent>,
+    ) -> Result<(u32, Vec<String>), Self::Error>;
+    
+    /// Get events by their IDs
+    async fn get_events_by_ids(
+        &self,
+        event_ids: &[String],
+    ) -> Result<Vec<SerializedEvent>, Self::Error>;
+    
+    /// Get the highest event sequence number
+    async fn highest_event_seq(&self) -> u64;
+
+    // ===== ConsensusFrame Storage =====
+    
+    /// Get consensus frames starting from a sequence number
+    /// 
+    /// Returns (frames, has_more, highest_seq)
+    async fn get_cfs_from_seq(
+        &self,
+        start_seq: u64,
+        limit: u32,
+    ) -> Result<(Vec<SerializedConsensusFrame>, bool, u64), Self::Error>;
+    
+    /// Store a consensus frame with its votes
+    /// 
+    /// Returns whether the CF was accepted
+    async fn store_cf(
+        &self,
+        frame: SerializedConsensusFrame,
+        votes: Vec<SerializedVote>,
+    ) -> Result<(bool, Option<String>), Self::Error>;
+    
+    /// Get the highest finalized CF sequence number
+    async fn highest_finalized_cf_seq(&self) -> u64;
+}
+
+// Blanket implementation for Arc<S> to allow sharing store across components
+#[async_trait]
+impl<S: StateSyncStore> StateSyncStore for Arc<S> {
+    type Error = S::Error;
+
+    async fn get_events_from_seq(
+        &self,
+        start_seq: u64,
+        limit: u32,
+    ) -> Result<(Vec<SerializedEvent>, bool, u64), Self::Error> {
+        (**self).get_events_from_seq(start_seq, limit).await
+    }
+
+    async fn store_events(
+        &self,
+        events: Vec<SerializedEvent>,
+    ) -> Result<(u32, Vec<String>), Self::Error> {
+        (**self).store_events(events).await
+    }
+
+    async fn get_events_by_ids(
+        &self,
+        event_ids: &[String],
+    ) -> Result<Vec<SerializedEvent>, Self::Error> {
+        (**self).get_events_by_ids(event_ids).await
+    }
+
+    async fn highest_event_seq(&self) -> u64 {
+        (**self).highest_event_seq().await
+    }
+
+    async fn get_cfs_from_seq(
+        &self,
+        start_seq: u64,
+        limit: u32,
+    ) -> Result<(Vec<SerializedConsensusFrame>, bool, u64), Self::Error> {
+        (**self).get_cfs_from_seq(start_seq, limit).await
+    }
+
+    async fn store_cf(
+        &self,
+        frame: SerializedConsensusFrame,
+        votes: Vec<SerializedVote>,
+    ) -> Result<(bool, Option<String>), Self::Error> {
+        (**self).store_cf(frame, votes).await
+    }
+
+    async fn highest_finalized_cf_seq(&self) -> u64 {
+        (**self).highest_finalized_cf_seq().await
+    }
+}
 
 /// Peer synchronization state tracking
 ///
@@ -241,7 +368,7 @@ pub struct StateSyncEventLoop<S> {
 
 impl<S> StateSyncEventLoop<S>
 where
-    S: Clone + Send + Sync + 'static,
+    S: StateSyncStore,
 {
     pub(crate) fn new(
         config: StateSyncConfig,

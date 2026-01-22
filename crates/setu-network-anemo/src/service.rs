@@ -12,11 +12,12 @@
 
 use crate::{
     config::NetworkConfig,
-    discovery::{self, DiscoveryConfig, NodeType, SignedNodeInfo},
+    discovery::{self, DiscoveryConfig, NodeType},
     error::Result,
+    message_handler,
     metrics::NetworkMetrics,
     peer_manager::AnemoPeerManager,
-    state_sync::{self, StateSyncConfig},
+    state_sync::{self, StateSyncConfig, StateSyncStore},
     transport::AnemoTransport,
     AnemoError,
 };
@@ -126,27 +127,75 @@ pub struct AnemoNetworkService {
 }
 
 impl AnemoNetworkService {
-    /// Create a new Anemo network service
+    /// Create a new Anemo network service with default in-memory store
     pub async fn new(
         config: NetworkConfig,
         local_node_info: NodeInfo,
         event_tx: mpsc::Sender<NetworkEvent>,
     ) -> Result<Self> {
+        Self::with_store(
+            config,
+            local_node_info,
+            event_tx,
+            state_sync::InMemoryStateSyncStore::new(),
+        ).await
+    }
+
+    /// Create a new Anemo network service with a custom store
+    pub async fn with_store<S>(
+        config: NetworkConfig,
+        local_node_info: NodeInfo,
+        event_tx: mpsc::Sender<NetworkEvent>,
+        store: S,
+    ) -> Result<Self>
+    where
+        S: StateSyncStore,
+    {
         info!("Creating Anemo network service for node {}", local_node_info.id);
 
-        // Create transport
-        let transport = Arc::new(AnemoTransport::new(&config.anemo).await?);
+        // Wrap store in Arc for sharing
+        let store = Arc::new(store);
+
+        // Create router with Setu message handler
+        let router = message_handler::create_setu_router(
+            store.clone(),
+            local_node_info.id.clone(),
+            event_tx.clone(),
+        );
+
+        // Create transport with the router (this starts the network)
+        let transport = Arc::new(AnemoTransport::with_router(&config.anemo, router).await?);
 
         // Create peer manager
         let peer_manager = Arc::new(AnemoPeerManager::new(transport.clone())?);
 
+        // Build state sync components (using the shared store)
+        let state_sync_config = StateSyncConfig::default();
+        let (unstarted_state_sync, _state_sync_server) = state_sync::Builder::new()
+            .store(store.clone())  // Pass Arc<S> directly
+            .config(state_sync_config)
+            .build();
+
+        // Start state sync event loop
+        let network_ref = transport.network().downgrade();
+        let (state_sync_handle, _join_handle) = unstarted_state_sync.start(network_ref.clone());
+
+        // Build and start discovery
+        let discovery_config = DiscoveryConfig::default();
+        let (unstarted_discovery, _discovery_server) = discovery::Builder::new()
+            .config(discovery_config)
+            .build();
+        let (discovery_handle, _join_handle) = unstarted_discovery.start(network_ref);
+
+        info!("Anemo network service created for node {}", local_node_info.id);
+
         Ok(Self {
             transport,
             peer_manager,
-            discovery_handle: None,
-            state_sync_handle: None,
+            discovery_handle: Some(discovery_handle),
+            state_sync_handle: Some(state_sync_handle),
             local_node_info,
-            node_type: NodeType::Validator, // Default, can be configured
+            node_type: NodeType::Validator,
             event_tx,
             metrics: None,
         })
@@ -169,34 +218,9 @@ impl AnemoNetworkService {
         self.node_type = node_type;
     }
 
-    /// Start the network service with discovery and state sync
-    pub async fn start(&mut self) -> Result<()> {
-        info!("Starting Anemo network service for node {}", self.local_node_info.id);
-        
-        let network = self.transport.network();
-        let network_ref = network.downgrade();
-
-        // Build and start discovery
-        let discovery_config = DiscoveryConfig::default();
-        let (unstarted_discovery, _discovery_server) = discovery::Builder::new()
-            .config(discovery_config)
-            .build();
-        
-        let (discovery_handle, _join_handle) = unstarted_discovery.start(network_ref.clone());
-        self.discovery_handle = Some(discovery_handle);
-
-        // Build and start state sync (with a dummy store for now)
-        let state_sync_config = StateSyncConfig::default();
-        let (unstarted_state_sync, _state_sync_server) = state_sync::Builder::new()
-            .store(DummyStore)
-            .config(state_sync_config)
-            .build();
-        
-        let (state_sync_handle, _join_handle) = unstarted_state_sync.start(network_ref);
-        self.state_sync_handle = Some(state_sync_handle);
-        
-        info!("Anemo network service is ready");
-        Ok(())
+    /// Get the state sync handle for notifications
+    pub fn state_sync_handle(&self) -> Option<&state_sync::Handle> {
+        self.state_sync_handle.as_ref()
     }
 
     /// Get local peer ID
@@ -248,7 +272,8 @@ impl AnemoNetworkService {
         let peers = self.peer_manager.get_connected_peers();
 
         for peer_info in peers {
-            let request = anemo::Request::new(bytes.clone());
+            let mut request = anemo::Request::new(bytes.clone());
+            *request.route_mut() = "/setu".into();
             if let Err(e) = self.transport.rpc(peer_info.peer_id, request).await {
                 tracing::warn!("Failed to send event to peer {}: {}", peer_info.peer_id, e);
             }
@@ -280,7 +305,10 @@ impl AnemoNetworkService {
 
         // Try each peer until we have all events (or exhausted peers)
         for peer_info in peers {
-            let request = anemo::Request::new(bytes.clone());
+            // Create request with route set to "/setu" for the message handler
+            let mut request = anemo::Request::new(bytes.clone());
+            *request.route_mut() = "/setu".into();
+            
             match self.transport.rpc(peer_info.peer_id, request).await {
                 Ok(response) => {
                     // Parse response
@@ -326,7 +354,8 @@ impl AnemoNetworkService {
         };
 
         let bytes = self.serialize_message(&message)?;
-        let request = anemo::Request::new(bytes);
+        let mut request = anemo::Request::new(bytes);
+        *request.route_mut() = "/setu".into();
         self.transport.rpc(peer_id, request).await?;
 
         Ok(())
@@ -340,7 +369,8 @@ impl AnemoNetworkService {
         let message = SetuMessage::CFVote { vote };
 
         let bytes = self.serialize_message(&message)?;
-        let request = anemo::Request::new(bytes);
+        let mut request = anemo::Request::new(bytes);
+        *request.route_mut() = "/setu".into();
         self.transport.rpc(peer_id, request).await?;
 
         Ok(())
@@ -422,11 +452,6 @@ impl AnemoNetworkService {
         Ok(message)
     }
 }
-
-/// Dummy store implementation for state sync
-/// TODO: Replace with actual storage interface
-#[derive(Clone)]
-struct DummyStore;
 
 #[cfg(test)]
 mod tests {

@@ -189,7 +189,7 @@ impl AnemoConfig {
     }
 }
 
-/// Network configuration compatible with legacy Setu network interface
+/// Network configuration for Setu
 #[derive(Clone, Debug)]
 pub struct NetworkConfig {
     /// Anemo-specific configuration

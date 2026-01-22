@@ -64,6 +64,7 @@
 pub mod config;
 pub mod discovery;
 pub mod error;
+pub mod message_handler;
 pub mod metrics;
 pub mod peer_manager;
 pub mod service;

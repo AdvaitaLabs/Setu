@@ -4,7 +4,7 @@
 //! Transport layer implementation using Anemo
 
 use crate::{config::AnemoConfig, error::Result, AnemoError};
-use anemo::{Network, PeerId};
+use anemo::{Network, PeerId, Router};
 use bytes::Bytes;
 use std::net::SocketAddr;
 use tracing::{debug, info};
@@ -17,8 +17,13 @@ pub struct AnemoTransport {
 }
 
 impl AnemoTransport {
-    /// Create a new AnemoTransport
+    /// Create a new AnemoTransport with default echo service
     pub async fn new(config: &AnemoConfig) -> Result<Self> {
+        Self::with_router(config, Router::new()).await
+    }
+
+    /// Create a new AnemoTransport with a custom router
+    pub async fn with_router(config: &AnemoConfig, router: Router) -> Result<Self> {
         info!("Initializing Anemo transport on {}", config.listen_addr);
 
         // Parse listen address
@@ -38,12 +43,12 @@ impl AnemoTransport {
             key
         });
 
-        // Build the network
+        // Build the network with the router
         let network = Network::bind(listen_addr)
             .server_name(&config.server_name)
             .private_key(private_key)
             .config(anemo_config)
-            .start(Self::create_service())?;
+            .start(router)?;
 
         info!(
             "Anemo network started on {} with PeerId: {}",
@@ -52,22 +57,6 @@ impl AnemoTransport {
         );
 
         Ok(Self { network })
-    }
-
-    /// Create a simple echo service for testing
-    /// In production, this would be replaced with proper message routing
-    fn create_service() -> tower::util::BoxCloneService<
-        anemo::Request<Bytes>,
-        anemo::Response<Bytes>,
-        std::convert::Infallible,
-    > {
-        use tower::ServiceExt;
-
-        tower::service_fn(|request: anemo::Request<Bytes>| async move {
-            debug!("Received message: {} bytes", request.body().len());
-            Ok::<_, std::convert::Infallible>(anemo::Response::new(request.into_body()))
-        })
-        .boxed_clone()
     }
 
     /// Get the underlying Anemo network
