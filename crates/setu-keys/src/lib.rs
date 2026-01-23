@@ -18,6 +18,7 @@ pub mod key_derive;
 pub mod key_identity;
 pub mod keypair_file;
 pub mod keystore;
+pub mod address_derive;
 
 pub use crypto::{PublicKey, SetuAddress, SetuKeyPair, Signature, SignatureScheme};
 pub use error::KeyError;
@@ -25,3 +26,10 @@ pub use key_derive::{derive_key_pair_from_path, generate_new_key};
 pub use key_identity::KeyIdentity;
 pub use keypair_file::{read_keypair_from_file, write_keypair_to_file};
 pub use keystore::{AccountKeystore, FileBasedKeystore, InMemKeystore, Keystore};
+pub use address_derive::{
+    EthereumAddress, 
+    derive_ethereum_address_from_secp256k1,
+    derive_address_from_nostr_pubkey,
+    verify_nostr_address_derivation,
+    verify_ethereum_address_derivation,
+};
