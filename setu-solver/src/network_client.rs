@@ -131,12 +131,14 @@ impl SolverNetworkClient {
         
         let request = RegisterSolverRequest {
             solver_id: self.config.solver_id.clone(),
-            address: self.config.address.clone(),
-            port: self.config.port,
+            network_address: self.config.address.clone(),
+            network_port: self.config.port,
+            account_address: "0x0000000000000000000000000000000000000000".to_string(), // TODO: 从配置读取
+            public_key: vec![],  // TODO: 从配置读取
+            signature: vec![],   // TODO: 实现签名
             capacity: self.config.capacity,
             shard_id: self.config.shard_id.clone(),
             resources: self.config.resources.clone(),
-            public_key: None,
         };
         
         let response = self.http_client.register_solver(request).await?;
