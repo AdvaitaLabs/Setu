@@ -34,10 +34,12 @@
 pub mod anchor_builder;
 pub mod broadcaster;
 pub mod dag;
+pub mod dag_manager;
 pub mod engine;
 pub mod folder;
 pub mod liveness;
 pub mod merkle_integration;
+pub mod recent_cache;
 pub mod root_executor;
 pub mod router;
 pub mod tee_verifier;
@@ -50,7 +52,11 @@ pub use broadcaster::{
     ConsensusBroadcaster, BroadcastError, BroadcastResult,
     NoOpBroadcaster, MockBroadcaster, OptionalBroadcaster,
 };
-pub use dag::{Dag, DagError};
+pub use dag::{Dag, DagError, GCStats};
+pub use dag_manager::{
+    DagManager, DagManagerConfig, DagManagerError,
+    ParentInfo, ResolvedParents, GcStats, WarmupStats, DagStatsSnapshot,
+};
 pub use engine::{ConsensusEngine, ConsensusMessage, DagStats};
 pub use folder::{ConsensusManager, DagFolder};
 pub use merkle_integration::{
@@ -59,6 +65,7 @@ pub use merkle_integration::{
 };
 pub use root_executor::{RootSubnetExecutor, RootExecutorError, RootExecutionResult};
 pub use router::{EventRouter, RoutedEvents, SubnetExecutionBatch, create_execution_batches};
+pub use recent_cache::{RecentEventCache, FinalizedEventMeta, CacheStats, CacheStatsSnapshot};
 pub use tee_verifier::{TeeVerifier, TeeAttestation, VerificationResult, SolverRegistry, SolverInfo};
 pub use validator_set::{ElectionStrategy, ValidatorSet};
 pub use vlc::VLC;
