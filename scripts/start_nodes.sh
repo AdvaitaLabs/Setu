@@ -14,6 +14,13 @@ echo -e "${GREEN}╔════════════════════
 echo -e "${GREEN}║              Setu Node Startup Script                      ║${NC}"
 echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
 
+# Get the project root directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+CLI_BIN="${PROJECT_ROOT}/target/release/setu-cli"
+VALIDATOR_BIN="${PROJECT_ROOT}/target/release/setu-validator"
+SOLVER_BIN="${PROJECT_ROOT}/target/release/setu-solver"
+
 # Configuration
 DATA_DIR=${DATA_DIR:-/data}
 KEYS_DIR=${DATA_DIR}/keys
@@ -45,7 +52,7 @@ export VALIDATOR_LISTEN_ADDR=${VALIDATOR_LISTEN_ADDR:-0.0.0.0}
 export VALIDATOR_KEY_FILE=${KEYS_DIR}/validator-key.json
 export RUST_LOG=${RUST_LOG:-info,setu_validator=debug,consensus=debug}
 
-nohup ./target/release/setu-validator >> ${LOGS_DIR}/validator.log 2>&1 &
+nohup ${VALIDATOR_BIN} >> ${LOGS_DIR}/validator.log 2>&1 &
 echo $! > ${PIDS_DIR}/validator.pid
 
 echo -e "${GREEN}  ✓ Validator started (PID: $(cat ${PIDS_DIR}/validator.pid))${NC}"
@@ -75,7 +82,7 @@ export SOLVER_KEY_FILE=${KEYS_DIR}/solver-key.json
 export AUTO_REGISTER=${AUTO_REGISTER:-true}
 export RUST_LOG=${RUST_LOG:-info,setu_solver=debug}
 
-nohup ./target/release/setu-solver >> ${LOGS_DIR}/solver.log 2>&1 &
+nohup ${SOLVER_BIN} >> ${LOGS_DIR}/solver.log 2>&1 &
 echo $! > ${PIDS_DIR}/solver.pid
 
 echo -e "${GREEN}  ✓ Solver started (PID: $(cat ${PIDS_DIR}/solver.pid))${NC}"

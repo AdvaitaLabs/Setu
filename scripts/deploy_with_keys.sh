@@ -28,12 +28,19 @@ mkdir -p ${PIDS_DIR}
 chmod 700 ${KEYS_DIR}  # Set strict permissions for keys directory
 
 # Check if already compiled
-if [ ! -f "./target/release/setu-validator" ] || [ ! -f "./target/release/setu-solver" ] || [ ! -f "./target/release/setu-cli" ]; then
+if [ ! -f "${VALIDATOR_BIN}" ] || [ ! -f "${SOLVER_BIN}" ] || [ ! -f "${CLI_BIN}" ]; then
     echo -e "${YELLOW}[2/6] Compiling project...${NC}"
     cargo build --release
 else
     echo -e "${GREEN}[2/6] ✓ Already compiled${NC}"
 fi
+
+# Get the project root directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+CLI_BIN="${PROJECT_ROOT${CLI_BIN}"
+VALIDATOR_BIN="${PROJECT_ROOT${VALIDATOR_BIN}"
+SOLVER_BIN="${PROJECT_ROOT${SOLVER_BIN}"
 
 # ============================================
 # Generate Validator Key
@@ -49,32 +56,32 @@ if [ -f "${KEYS_DIR}/validator-key.json" ]; then
         mv ${KEYS_DIR}/validator-key.json ${KEYS_DIR}/validator-key.json.backup.$(date +%s)
         
         echo -e "${YELLOW}  Generating new key...${NC}"
-        ./target/release/setu-cli keygen generate \
+        ${CLI_BIN} keygen generate \
             --output ${KEYS_DIR}/validator-key.json \
             --words 24
         
         echo -e "${GREEN}  ✓ New key generated${NC}"
         echo -e "${RED}  ⚠️  Please backup your mnemonic phrase!${NC}"
-        ./target/release/setu-cli keygen export \
+        ${CLI_BIN} keygen export \
             --key-file ${KEYS_DIR}/validator-key.json \
             --format mnemonic
     fi
 else
     echo -e "${YELLOW}  Generating new key...${NC}"
-    ./target/release/setu-cli keygen generate \
+    ${CLI_BIN} keygen generate \
         --output ${KEYS_DIR}/validator-key.json \
         --words 24
     
     echo -e "${GREEN}  ✓ Key generated${NC}"
     echo -e "${RED}  ⚠️  Please backup your mnemonic phrase!${NC}"
-    ./target/release/setu-cli keygen export \
+    ${CLI_BIN} keygen export \
         --key-file ${KEYS_DIR}/validator-key.json \
         --format mnemonic
 fi
 
 # Display Validator address info
 echo -e "${YELLOW}  Validator address info:${NC}"
-./target/release/setu-cli keygen export \
+${CLI_BIN} keygen export \
     --key-file ${KEYS_DIR}/validator-key.json \
     --format json | grep -E "address|public_key"
 
@@ -92,32 +99,32 @@ if [ -f "${KEYS_DIR}/solver-key.json" ]; then
         mv ${KEYS_DIR}/solver-key.json ${KEYS_DIR}/solver-key.json.backup.$(date +%s)
         
         echo -e "${YELLOW}  Generating new key...${NC}"
-        ./target/release/setu-cli keygen generate \
+        ${CLI_BIN} keygen generate \
             --output ${KEYS_DIR}/solver-key.json \
             --words 24
         
         echo -e "${GREEN}  ✓ New key generated${NC}"
         echo -e "${RED}  ⚠️  Please backup your mnemonic phrase!${NC}"
-        ./target/release/setu-cli keygen export \
+        ${CLI_BIN} keygen export \
             --key-file ${KEYS_DIR}/solver-key.json \
             --format mnemonic
     fi
 else
     echo -e "${YELLOW}  Generating new key...${NC}"
-    ./target/release/setu-cli keygen generate \
+    ${CLI_BIN} keygen generate \
         --output ${KEYS_DIR}/solver-key.json \
         --words 24
     
     echo -e "${GREEN}  ✓ Key generated${NC}"
     echo -e "${RED}  ⚠️  Please backup your mnemonic phrase!${NC}"
-    ./target/release/setu-cli keygen export \
+    ${CLI_BIN} keygen export \
         --key-file ${KEYS_DIR}/solver-key.json \
         --format mnemonic
 fi
 
 # Display Solver address info
 echo -e "${YELLOW}  Solver address info:${NC}"
-./target/release/setu-cli keygen export \
+${CLI_BIN} keygen export \
     --key-file ${KEYS_DIR}/solver-key.json \
     --format json | grep -E "address|public_key"
 
@@ -152,7 +159,7 @@ if [ -z "$SKIP_VALIDATOR" ]; then
     export VALIDATOR_KEY_FILE=${KEYS_DIR}/validator-key.json
     export RUST_LOG=${RUST_LOG:-info,setu_validator=debug,consensus=debug}
 
-    nohup ./target/release/setu-validator >> ${LOGS_DIR}/validator.log 2>&1 &
+    nohup ${VALIDATOR_BIN} >> ${LOGS_DIR}/validator.log 2>&1 &
     echo $! > ${PIDS_DIR}/validator.pid
     
     echo -e "${GREEN}  ✓ Validator started (PID: $(cat ${PIDS_DIR}/validator.pid))${NC}"
@@ -204,7 +211,7 @@ if [ -z "$SKIP_SOLVER" ]; then
     export AUTO_REGISTER=${AUTO_REGISTER:-true}
     export RUST_LOG=${RUST_LOG:-info,setu_solver=debug}
 
-    nohup ./target/release/setu-solver >> ${LOGS_DIR}/solver.log 2>&1 &
+    nohup ${SOLVER_BIN} >> ${LOGS_DIR}/solver.log 2>&1 &
     echo $! > ${PIDS_DIR}/solver.pid
     
     echo -e "${GREEN}  ✓ Solver started (PID: $(cat ${PIDS_DIR}/solver.pid))${NC}"
