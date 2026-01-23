@@ -1,182 +1,275 @@
-# Setu Test Scripts
+# Setu Scripts
 
-Test scripts for quickly starting and testing Setu nodes.
+This directory contains deployment and management scripts for the Setu network.
 
-## Script Overview
+## Script List
 
-### 1. test_nodes.sh - Start Multiple Nodes Together
+### 1. Deployment Scripts
 
-Automatically builds and starts both validator and solver nodes.
+#### `deploy_with_keys.sh` - Complete Deployment Script (Recommended)
+
+Complete deployment script including key generation, node startup, and health checks.
+
+**Features:**
+- Automatically creates directory structure (/data/keys, /data/logs, /data/pids)
+- Generates Validator and Solver keypairs (BIP39 mnemonic)
+- Displays mnemonic for backup
+- Starts Validator and Solver nodes
+- Performs health checks
 
 **Usage:**
 ```bash
-./scripts/test_nodes.sh
+./scripts/deploy_with_keys.sh
 ```
 
-**Features:**
-- ✅ Auto-compile project
-- ✅ Start Validator (port 8001)
-- ✅ Start Solver (port 9001)
-- ✅ Display process PIDs
-- ✅ Auto-cleanup all processes on Ctrl+C
+**On first deployment:**
+- Generates new key files
+- Displays mnemonic (please backup!)
+- Starts all nodes
 
-**Output Example:**
-```
-==================================
-Setu Node Test Script
-==================================
+**On subsequent runs:**
+- Detects existing key files
+- Asks whether to regenerate
+- Asks whether to restart nodes
 
-Step 1: Building project...
-✓ Build successful
+---
 
-Step 2: Starting Validator node...
-Configuration:
-  NODE_ID=validator1
-  PORT=8001
+### 2. Node Management Scripts
 
-✓ Validator started (PID: 12345)
+#### `start_nodes.sh` - Start Nodes
 
-Step 3: Starting Solver node...
-Configuration:
-  NODE_ID=solver1
-  PORT=9001
-
-✓ Solver started (PID: 12346)
-
-Step 4: Monitoring nodes...
-Press Ctrl+C to stop all nodes
-```
-
-### 2. test_single.sh - Test Individual Nodes
-
-Interactive menu to choose which node(s) to start.
+Starts Validator and Solver nodes (assumes keys are already generated).
 
 **Usage:**
 ```bash
-./scripts/test_single.sh
+./scripts/start_nodes.sh
+```
+
+**Prerequisites:**
+- Key files exist (/data/keys/validator-key.json and /data/keys/solver-key.json)
+- Project is compiled (./target/release/setu-validator and ./target/release/setu-solver)
+
+#### `stop_nodes.sh` - Stop Nodes
+
+Stops all running Setu nodes.
+
+**Usage:**
+```bash
+./scripts/stop_nodes.sh
 ```
 
 **Features:**
-- ✅ Interactive menu
-- ✅ Option to start Validator only
-- ✅ Option to start Solver only
-- ✅ Option to start both
+- Gracefully stops Solver and Validator
+- Force terminates if graceful stop fails
+- Cleans up PID files
 
-**Menu Example:**
-```
-Select node to test:
-  1) Validator only
-  2) Solver only
-  3) Both (validator + solver)
+---
 
-Enter choice [1-3]:
-```
+### 3. Testing Scripts
 
-## Manual Node Startup
+#### `test_e2e.sh` - End-to-End Testing
 
-If you want to start nodes manually:
+Executes complete end-to-end test workflow.
 
-### Start Validator
+**Usage:**
 ```bash
-# Build first
-cargo build --bin setu-validator
-
-# Run
-NODE_ID=validator1 PORT=8001 ./target/debug/setu-validator
+./scripts/test_e2e.sh
 ```
 
-### Start Solver
+#### `verify_solver_tee3.sh` - TEE Architecture Verification
+
+Verifies Solver TEE3 architecture implementation.
+
+**Usage:**
 ```bash
-# Build first
-cargo build --bin setu-solver
-
-# Run
-NODE_ID=solver1 PORT=9001 ./target/debug/setu-solver
+./scripts/verify_solver_tee3.sh
 ```
+
+---
+
+## Quick Start
+
+### First Deployment
+
+```bash
+# 1. Compile project
+cargo build --release
+
+# 2. Run complete deployment script
+./scripts/deploy_with_keys.sh
+
+# 3. View logs
+tail -f /data/logs/validator.log
+tail -f /data/logs/solver.log
+```
+
+### Daily Usage
+
+```bash
+# Start nodes
+./scripts/start_nodes.sh
+
+# Stop nodes
+./scripts/stop_nodes.sh
+
+# Check status
+curl http://localhost:8080/api/v1/health
+```
+
+---
 
 ## Environment Variables
 
-Configure nodes via environment variables:
+All scripts support customization via environment variables:
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| NODE_ID | Node identifier | Random UUID |
-| PORT | Listen port | 8000 |
-| PEERS | Peer addresses | Empty |
-
-**Example:**
-```bash
-NODE_ID=my_validator \
-PORT=8001 \
-PEERS=localhost:8002,localhost:8003 \
-./target/debug/setu-validator
-```
-
-## Multi-Node Testing
-
-Start 3 Validators and 2 Solvers:
+### Validator Configuration
 
 ```bash
-# Terminal 1: Validator 1
-NODE_ID=validator1 PORT=8001 ./target/debug/setu-validator
-
-# Terminal 2: Validator 2
-NODE_ID=validator2 PORT=8002 PEERS=localhost:8001 ./target/debug/setu-validator
-
-# Terminal 3: Validator 3
-NODE_ID=validator3 PORT=8003 PEERS=localhost:8001,localhost:8002 ./target/debug/setu-validator
-
-# Terminal 4: Solver 1
-NODE_ID=solver1 PORT=9001 ./target/debug/setu-solver
-
-# Terminal 5: Solver 2
-NODE_ID=solver2 PORT=9002 ./target/debug/setu-solver
+export VALIDATOR_ID=validator-1              # Validator ID
+export VALIDATOR_HTTP_PORT=8080              # HTTP API port
+export VALIDATOR_P2P_PORT=8081               # P2P port
+export VALIDATOR_LISTEN_ADDR=0.0.0.0         # Listen address
+export VALIDATOR_KEY_FILE=/data/keys/validator-key.json  # Key file
+export RUST_LOG=info,setu_validator=debug    # Log level
 ```
 
-## Viewing Logs
+### Solver Configuration
 
-Nodes use `tracing` for logging, default level is INFO.
-
-**Change log level:**
 ```bash
-RUST_LOG=debug NODE_ID=validator1 ./target/debug/setu-validator
+export SOLVER_ID=solver-1                    # Solver ID
+export SOLVER_PORT=9001                      # Listen port
+export SOLVER_LISTEN_ADDR=0.0.0.0            # Listen address
+export SOLVER_CAPACITY=100                   # Maximum capacity
+export VALIDATOR_ADDRESS=127.0.0.1           # Validator address
+export VALIDATOR_HTTP_PORT=8080              # Validator port
+export SOLVER_KEY_FILE=/data/keys/solver-key.json  # Key file
+export AUTO_REGISTER=true                    # Auto-register
+export RUST_LOG=info,setu_solver=debug       # Log level
 ```
 
-**Log levels:**
-- `error`: Errors only
-- `warn`: Warnings and errors
-- `info`: Info, warnings and errors (default)
-- `debug`: Debug information
-- `trace`: Most detailed tracing
+### Directory Configuration
+
+```bash
+export DATA_DIR=/data                        # Data root directory
+```
+
+---
+
+## Directory Structure
+
+Scripts will create the following directory structure:
+
+```
+/data/
+├── keys/                    # Key files (permission 700)
+│   ├── validator-key.json   # Validator key
+│   └── solver-key.json      # Solver key
+├── logs/                    # Log files
+│   ├── validator.log        # Validator log
+│   └── solver.log           # Solver log
+└── pids/                    # PID files
+    ├── validator.pid        # Validator PID
+    └── solver.pid           # Solver PID
+```
+
+---
+
+## FAQ
+
+### Q: How to view node logs?
+
+```bash
+# Real-time Validator log
+tail -f /data/logs/validator.log
+
+# Real-time Solver log
+tail -f /data/logs/solver.log
+
+# Search for errors
+grep ERROR /data/logs/validator.log
+```
+
+### Q: How to check if nodes are running?
+
+```bash
+# Check processes
+ps aux | grep setu-validator
+ps aux | grep setu-solver
+
+# Health check
+curl http://localhost:8080/api/v1/health
+```
+
+### Q: How to restart nodes?
+
+```bash
+# Stop nodes
+./scripts/stop_nodes.sh
+
+# Start nodes
+./scripts/start_nodes.sh
+```
+
+### Q: What if key files are lost?
+
+If you have mnemonic backup:
+```bash
+./target/release/setu-cli keygen recover \
+  --mnemonic "your twelve or twenty four word mnemonic" \
+  --output /data/keys/recovered-key.json
+```
+
+If you don't have backup, keys cannot be recovered. **Please backup your mnemonic!**
+
+### Q: How to change ports?
+
+Set environment variables and restart:
+```bash
+export VALIDATOR_HTTP_PORT=9090
+./scripts/start_nodes.sh
+```
+
+---
+
+## Security Reminders
+
+⚠️ **Important Security Tips:**
+
+1. **Backup Mnemonic**: After key generation, mnemonic will be displayed. Please backup to a safe place
+2. **Protect Key Files**: Key files contain private keys. Do not leak or commit to Git
+3. **Set File Permissions**: Key directory should be 700, key files should be 600
+4. **Production Environment**: Use Hardware Security Module (HSM) in production
+
+---
 
 ## Troubleshooting
 
-### Port Already in Use
-```bash
-# Check port usage
-lsof -i :8001
-
-# Kill process using the port
-kill -9 <PID>
-```
-
-### Build Failed
-```bash
-# Clean and rebuild
-cargo clean
-cargo build
-```
-
 ### Node Won't Start
-Check:
-1. Is the port already in use?
-2. Is the configuration correct?
-3. Are all dependencies installed?
 
-## Next Steps
+1. Check if port is in use: `lsof -i :8080`
+2. Check if key files exist: `ls -l /data/keys/`
+3. View logs for detailed errors: `tail -100 /data/logs/validator.log`
 
-- [ ] Add inter-node communication tests
-- [ ] Add Transfer execution tests
-- [ ] Add Shard routing tests
-- [ ] Add performance tests
+### Registration Failed
 
+1. Confirm Validator is running: `curl http://localhost:8080/api/v1/health`
+2. Check if key file path is correct
+3. View Solver log: `tail -100 /data/logs/solver.log`
+
+### Network Connection Issues
+
+1. Check firewall settings
+2. Confirm port configuration is correct
+3. Verify network connectivity: `telnet localhost 8080`
+
+---
+
+## More Documentation
+
+- [Complete Deployment Guide](../docs/DEPLOYMENT_WITH_KEYS.md)
+- [API Documentation](~/setu-md/API_DOCUMENTATION.md)
+- [Key Management Guide](../docs/DEPLOYMENT_WITH_KEYS.md#key-management)
+
+---
+
+**Last Updated**: 2025-01-23
