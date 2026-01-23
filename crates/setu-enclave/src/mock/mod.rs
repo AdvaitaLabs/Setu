@@ -31,10 +31,14 @@
 //! ```
 
 use crate::{
-    attestation::{Attestation, AttestationData},
-    solver_task::GasUsage,
-    stf::{ExecutionStats, FailedEvent, StateDiff, StfError, StfInput, StfOutput, StfResult, WriteSetEntry, ReadSetEntry},
+    stf::{ExecutionStats, FailedEvent, StateDiff, StfError, StfInput, StfOutput, StfResult, WriteSetEntry},
     traits::{EnclaveConfig, EnclaveInfo, EnclavePlatform, EnclaveRuntime},
+};
+// Use types from setu-types (canonical source)
+use setu_types::task::{
+    Attestation, AttestationData,
+    ResolvedInputs, GasUsage,
+    ReadSetEntry,
 };
 use async_trait::async_trait;
 use setu_runtime::{RuntimeExecutor, ExecutionContext, InMemoryStateStore, StateStore};
@@ -43,7 +47,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// CoinState from storage layer - matches storage/src/state_provider.rs
 /// 
@@ -263,7 +267,7 @@ impl MockEnclave {
     async fn execute_single_event(
         &self,
         event: &setu_types::Event,
-        resolved_inputs: &crate::solver_task::ResolvedInputs,
+        resolved_inputs: &ResolvedInputs,
         diff: &mut StateDiff,
     ) -> Result<(), String> {
         debug!(event_id = %event.id, event_type = ?event.event_type, "Executing event via setu-runtime");
@@ -288,7 +292,7 @@ impl MockEnclave {
         &self,
         event: &setu_types::Event,
         transfer: &setu_types::Transfer,
-        resolved_inputs: &crate::solver_task::ResolvedInputs,
+        resolved_inputs: &ResolvedInputs,
         diff: &mut StateDiff,
     ) -> Result<(), String> {
         let ctx = ExecutionContext {

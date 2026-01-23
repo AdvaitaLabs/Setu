@@ -85,21 +85,30 @@ pub mod mock;
 #[cfg(feature = "nitro")]
 pub mod nitro;
 
-// Re-export main types
+// Re-export enclave-specific verification utilities
 pub use attestation::{
-    Attestation, AttestationType, AttestationVerifier, AttestationData,
-    AttestationError, AttestationResult, AllowlistVerifier,
-};
-pub use solver_task::{
-    SolverTask, ResolvedInputs, OperationType, ResolvedObject,
-    GasBudget, GasUsage, MerkleProof,
+    AttestationVerifier, AllowlistVerifier,
+    NitroAttestationDocument, NitroPcrs,
 };
 pub use stf::{
     StfInput, StfOutput, StfError, StfResult,
-    ReadSetEntry, WriteSetEntry, StateDiff, ExecutionStats,
+    WriteSetEntry, StateDiff, ExecutionStats,
     Hash, TaskId,
 };
 pub use traits::{EnclaveRuntime, EnclaveConfig, EnclaveInfo, EnclavePlatform};
+
+// === Re-export from setu-types (canonical source) ===
+// This allows setu-solver to still import from setu-enclave for backward compatibility
+pub use setu_types::task::{
+    // Attestation types
+    Attestation, AttestationType, AttestationData,
+    AttestationError, AttestationResult, VerifiedAttestation,
+    // Solver task types
+    SolverTask, ResolvedInputs, OperationType, ResolvedObject,
+    ReadSetEntry, MerkleProof,
+    // Gas types
+    GasBudget, GasUsage,
+};
 
 // Re-export implementations based on features
 #[cfg(feature = "mock")]

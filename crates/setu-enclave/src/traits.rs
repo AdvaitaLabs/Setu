@@ -3,7 +3,7 @@
 //! This module defines the core interface that all enclave implementations must satisfy.
 
 use async_trait::async_trait;
-use crate::attestation::Attestation;
+use setu_types::task::Attestation;
 use crate::stf::{StfInput, StfOutput, StfResult};
 
 /// Configuration for enclave initialization

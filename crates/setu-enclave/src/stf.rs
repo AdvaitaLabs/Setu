@@ -72,8 +72,12 @@
 use serde::{Deserialize, Serialize};
 use setu_types::{Event, EventId, SubnetId};
 use thiserror::Error;
-use crate::attestation::Attestation;
-use crate::solver_task::{ResolvedInputs, GasBudget, GasUsage};
+// Use types from setu-types (canonical source)
+use setu_types::task::{
+    Attestation,
+    ResolvedInputs, GasBudget, GasUsage,
+    ReadSetEntry,  // Use the canonical ReadSetEntry from setu-types
+};
 
 /// Hash type (32 bytes)
 pub type Hash = [u8; 32];
@@ -220,32 +224,6 @@ impl StfInput {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
         hash
-    }
-}
-
-/// An entry in the read set
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadSetEntry {
-    /// Object key (hashed to get SMT key)
-    pub key: String,
-    /// Current value (serialized object data)
-    pub value: Vec<u8>,
-    /// Merkle proof for this object (optional, for verification)
-    pub proof: Option<Vec<u8>>,
-}
-
-impl ReadSetEntry {
-    pub fn new(key: String, value: Vec<u8>) -> Self {
-        Self {
-            key,
-            value,
-            proof: None,
-        }
-    }
-    
-    pub fn with_proof(mut self, proof: Vec<u8>) -> Self {
-        self.proof = Some(proof);
-        self
     }
 }
 
