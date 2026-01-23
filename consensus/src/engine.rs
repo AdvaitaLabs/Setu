@@ -19,13 +19,14 @@
 
 use setu_types::{ConsensusConfig, ConsensusFrame, Event, EventId, SetuResult, Vote};
 use setu_vlc::VLCSnapshot;
-use setu_storage::subnet_state::GlobalStateManager;
+use setu_storage::{EventStore, subnet_state::GlobalStateManager};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::broadcaster::ConsensusBroadcaster;
 use crate::dag::Dag;
+use crate::dag_manager::{DagManager, DagManagerError};
 use crate::folder::ConsensusManager;
 use crate::liveness::Round;
 use crate::validator_set::ValidatorSet;
@@ -52,6 +53,9 @@ pub struct ConsensusEngine {
     config: ConsensusConfig,
     /// The DAG storing all events
     dag: Arc<RwLock<Dag>>,
+    /// DagManager for three-layer storage (DAG → Cache → Store)
+    /// This is the ONLY entry point for adding events to the DAG
+    dag_manager: Arc<DagManager>,
     /// Local VLC clock
     vlc: Arc<RwLock<VLC>>,
     /// Set of validators with leader election
@@ -77,10 +81,23 @@ impl ConsensusEngine {
         validator_set: ValidatorSet,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1000);
+        
+        // Create shared DAG
+        let dag = Arc::new(RwLock::new(Dag::new()));
+        
+        // Create EventStore (in-memory for now)
+        let event_store = Arc::new(EventStore::new());
+        
+        // Create DagManager with the shared DAG
+        let dag_manager = Arc::new(DagManager::with_defaults(
+            Arc::clone(&dag),
+            event_store,
+        ));
 
         Self {
             config: config.clone(),
-            dag: Arc::new(RwLock::new(Dag::new())),
+            dag,
+            dag_manager,
             vlc: Arc::new(RwLock::new(VLC::new(validator_id.clone()))),
             validator_set: Arc::new(RwLock::new(validator_set)),
             consensus_manager: Arc::new(RwLock::new(ConsensusManager::new(
@@ -105,10 +122,98 @@ impl ConsensusEngine {
         state_manager: GlobalStateManager,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1000);
+        
+        // Create shared DAG
+        let dag = Arc::new(RwLock::new(Dag::new()));
+        
+        // Create EventStore (in-memory for now)
+        let event_store = Arc::new(EventStore::new());
+        
+        // Create DagManager with the shared DAG
+        let dag_manager = Arc::new(DagManager::with_defaults(
+            Arc::clone(&dag),
+            event_store,
+        ));
 
         Self {
             config: config.clone(),
-            dag: Arc::new(RwLock::new(Dag::new())),
+            dag,
+            dag_manager,
+            vlc: Arc::new(RwLock::new(VLC::new(validator_id.clone()))),
+            validator_set: Arc::new(RwLock::new(validator_set)),
+            consensus_manager: Arc::new(RwLock::new(ConsensusManager::with_state_manager(
+                config,
+                validator_id.clone(),
+                state_manager,
+            ))),
+            local_validator_id: validator_id,
+            message_tx: tx,
+            message_rx: Arc::new(Mutex::new(rx)),
+            broadcaster: Arc::new(RwLock::new(None)),
+        }
+    }
+    
+    /// Create a new consensus engine with external EventStore
+    /// 
+    /// This constructor allows injecting a pre-configured EventStore,
+    /// enabling the DagManager to persist events with depth information.
+    pub fn with_event_store(
+        config: ConsensusConfig,
+        validator_id: String,
+        validator_set: ValidatorSet,
+        event_store: Arc<EventStore>,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel(1000);
+        
+        // Create shared DAG
+        let dag = Arc::new(RwLock::new(Dag::new()));
+        
+        // Create DagManager with the shared DAG and external EventStore
+        let dag_manager = Arc::new(DagManager::with_defaults(
+            Arc::clone(&dag),
+            event_store,
+        ));
+
+        Self {
+            config: config.clone(),
+            dag,
+            dag_manager,
+            vlc: Arc::new(RwLock::new(VLC::new(validator_id.clone()))),
+            validator_set: Arc::new(RwLock::new(validator_set)),
+            consensus_manager: Arc::new(RwLock::new(ConsensusManager::new(
+                config,
+                validator_id.clone(),
+            ))),
+            local_validator_id: validator_id,
+            message_tx: tx,
+            message_rx: Arc::new(Mutex::new(rx)),
+            broadcaster: Arc::new(RwLock::new(None)),
+        }
+    }
+    
+    /// Create with both state manager and event store
+    pub fn with_stores(
+        config: ConsensusConfig,
+        validator_id: String,
+        validator_set: ValidatorSet,
+        state_manager: GlobalStateManager,
+        event_store: Arc<EventStore>,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel(1000);
+        
+        // Create shared DAG
+        let dag = Arc::new(RwLock::new(Dag::new()));
+        
+        // Create DagManager with the shared DAG and external EventStore
+        let dag_manager = Arc::new(DagManager::with_defaults(
+            Arc::clone(&dag),
+            event_store,
+        ));
+
+        Self {
+            config: config.clone(),
+            dag,
+            dag_manager,
             vlc: Arc::new(RwLock::new(VLC::new(validator_id.clone()))),
             validator_set: Arc::new(RwLock::new(validator_set)),
             consensus_manager: Arc::new(RwLock::new(ConsensusManager::with_state_manager(
@@ -139,6 +244,9 @@ impl ConsensusEngine {
     }
 
     /// Add an event to the DAG and try to create a CF if conditions are met
+    /// 
+    /// This method uses DagManager as the single entry point for adding events,
+    /// ensuring proper depth calculation and three-layer storage management.
     pub async fn add_event(&self, event: Event) -> SetuResult<EventId> {
         // Update local VLC by merging with the event's VLC
         {
@@ -147,12 +255,25 @@ impl ConsensusEngine {
             vlc.tick();
         }
 
-        // Add event to DAG
-        let event_id = {
-            let mut dag = self.dag.write().await;
-            dag.add_event(event.clone())
-                .map_err(|e| setu_types::SetuError::InvalidData(e.to_string()))?
-        };
+        // Add event through DagManager with retry (handles TOCTOU race with GC)
+        let event_id = self.dag_manager
+            .add_event_with_retry(event.clone())
+            .await
+            .map_err(|e| match e {
+                DagManagerError::MissingParent(id) => {
+                    setu_types::SetuError::InvalidData(format!("Missing parent: {}", id))
+                }
+                DagManagerError::ParentTooOld { parent_id, depth_diff, max_allowed } => {
+                    setu_types::SetuError::InvalidData(format!(
+                        "Parent {} too old: depth_diff {} > max {}",
+                        parent_id, depth_diff, max_allowed
+                    ))
+                }
+                DagManagerError::DuplicateEvent(id) => {
+                    setu_types::SetuError::InvalidData(format!("Duplicate event: {}", id))
+                }
+                _ => setu_types::SetuError::InvalidData(e.to_string()),
+            })?;
 
         // Broadcast the new event
         // We broadcast regardless of whether we are the leader, as all validators
@@ -195,12 +316,25 @@ impl ConsensusEngine {
             vlc.tick();
         }
 
-        // Add event to DAG
-        let event_id = {
-            let mut dag = self.dag.write().await;
-            dag.add_event(event.clone())
-                .map_err(|e| setu_types::SetuError::InvalidData(e.to_string()))?
-        };
+        // Add event through DagManager with retry (handles TOCTOU race with GC)
+        let event_id = self.dag_manager
+            .add_event_with_retry(event.clone())
+            .await
+            .map_err(|e| match e {
+                DagManagerError::MissingParent(id) => {
+                    setu_types::SetuError::InvalidData(format!("Missing parent: {}", id))
+                }
+                DagManagerError::ParentTooOld { parent_id, depth_diff, max_allowed } => {
+                    setu_types::SetuError::InvalidData(format!(
+                        "Parent {} too old: depth_diff {} > max {}",
+                        parent_id, depth_diff, max_allowed
+                    ))
+                }
+                DagManagerError::DuplicateEvent(id) => {
+                    setu_types::SetuError::InvalidData(format!("Duplicate event: {}", id))
+                }
+                _ => setu_types::SetuError::InvalidData(e.to_string()),
+            })?;
 
         // Note: We do NOT broadcast the event here since it came from the network
         
@@ -387,8 +521,7 @@ impl ConsensusEngine {
                     
                     match b.request_events(&missing_event_ids).await {
                         Ok(fetched_events) => {
-                            // Add fetched events to DAG
-                            let mut dag = self.dag.write().await;
+                            // Add fetched events through DagManager with retry (handles TOCTOU)
                             for event in fetched_events {
                                 // Update VLC when adding fetched events
                                 {
@@ -396,14 +529,16 @@ impl ConsensusEngine {
                                     vlc.merge(&event.vlc_snapshot);
                                 }
                                 
-                                if let Err(e) = dag.add_event(event.clone()) {
-                                    // DuplicateEvent is OK (race condition), other errors are problematic
-                                    if !matches!(e, crate::dag::DagError::DuplicateEvent(_)) {
+                                match self.dag_manager.add_event_with_retry(event.clone()).await {
+                                    Ok(_) => {}
+                                    Err(DagManagerError::DuplicateEvent(_)) => {
+                                        // DuplicateEvent is OK (race condition)
+                                    }
+                                    Err(e) => {
                                         warn!(event_id = %event.id, error = %e, "Failed to add fetched event");
                                     }
                                 }
                             }
-                            drop(dag);
                             
                             // Re-check if we still have missing events
                             let dag = self.dag.read().await;
@@ -652,6 +787,48 @@ impl ConsensusEngine {
             .iter()
             .filter_map(|id| dag.get_event(id).cloned())
             .collect()
+    }
+    
+    /// Get events by their IDs using three-layer query (DAG → Store)
+    /// 
+    /// This method queries both the active DAG and the persistent EventStore,
+    /// ensuring events can be found even after GC.
+    /// 
+    /// Used by: Network sync handlers when responding to event requests.
+    pub async fn get_events_by_ids_three_layer(&self, event_ids: &[EventId]) -> Vec<Event> {
+        let mut results = Vec::with_capacity(event_ids.len());
+        let mut store_query_ids = Vec::new();
+        
+        // Step 1: Query DAG (hot data)
+        {
+            let dag = self.dag.read().await;
+            for id in event_ids {
+                if let Some(event) = dag.get_event(id) {
+                    results.push(event.clone());
+                } else {
+                    store_query_ids.push(id.clone());
+                }
+            }
+        }
+        
+        // Step 2: Query EventStore for DAG misses (cold data)
+        if !store_query_ids.is_empty() {
+            let store_events = self.dag_manager
+                .event_store()
+                .get_events_batch(&store_query_ids)
+                .await;
+            results.extend(store_events);
+        }
+        
+        results
+    }
+    
+    /// Get the DagManager reference
+    /// 
+    /// Used for direct access to three-layer storage operations,
+    /// such as GC triggering and cache warmup.
+    pub fn dag_manager(&self) -> &Arc<DagManager> {
+        &self.dag_manager
     }
 
     /// Get the local validator ID
