@@ -94,6 +94,26 @@ impl AnchorStore {
         output.copy_from_slice(&result);
         output
     }
+    
+    // =========================================================================
+    // Warmup support methods (for DagManager cache warmup)
+    // =========================================================================
+    
+    /// Get the N most recent finalized anchors (for cache warmup)
+    /// 
+    /// Returns anchors sorted by finalized_at descending (most recent first)
+    pub async fn get_recent_anchors(&self, count: usize) -> Vec<Anchor> {
+        let chain = self.chain.read().await;
+        let anchors = self.anchors.read().await;
+        
+        // Get the last N anchor IDs from chain (most recent are at the end)
+        let start = chain.len().saturating_sub(count);
+        chain[start..]
+            .iter()
+            .rev() // Reverse to get most recent first
+            .filter_map(|id| anchors.get(id).cloned())
+            .collect()
+    }
 }
 
 impl Clone for AnchorStore {
