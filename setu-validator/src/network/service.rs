@@ -638,8 +638,8 @@ impl ValidatorNetworkService {
         // Store TEE attestation on event (if field exists)
         // Note: May need to add tee_attestation field to Event type
 
-        // Add Event to DAG
-        self.add_event_to_dag(event);
+        // Add Event to DAG (submits to consensus if enabled)
+        self.add_event_to_dag(event).await;
 
         // Update transfer status
         if let Some(tracker) = self.transfer_status.write().values_mut().find(|t| {
@@ -990,7 +990,47 @@ impl ValidatorNetworkService {
     // DAG Management
     // ============================================
 
-    pub fn add_event_to_dag(&self, event: Event) {
+    /// Add event to DAG and submit to consensus engine if enabled
+    /// 
+    /// This is the unified entry point for adding events to the DAG.
+    /// It ensures events are:
+    /// 1. Stored locally for queries
+    /// 2. Submitted to consensus engine (if enabled) for:
+    ///    - Broadcasting to other validators
+    ///    - Inclusion in ConsensusFrames
+    ///    - Finalization into Anchor Chain
+    pub async fn add_event_to_dag(&self, event: Event) {
+        let event_id = event.id.clone();
+        
+        // If consensus is enabled, submit to consensus engine
+        if let Some(ref consensus) = self.consensus_validator {
+            match consensus.submit_event(event.clone()).await {
+                Ok(_) => {
+                    info!(
+                        event_id = %&event_id[..20.min(event_id.len())],
+                        "Event submitted to consensus DAG"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        event_id = %&event_id[..20.min(event_id.len())],
+                        error = %e,
+                        "Failed to submit event to consensus, storing locally only"
+                    );
+                }
+            }
+        }
+        
+        // Always store locally for queries
+        self.events.write().insert(event_id.clone(), event);
+        self.dag_events.write().push(event_id);
+    }
+    
+    /// Synchronous version for backward compatibility (legacy mode only)
+    /// 
+    /// WARNING: This does NOT submit to consensus. Use `add_event_to_dag` instead.
+    #[allow(dead_code)]
+    pub fn add_event_to_dag_sync(&self, event: Event) {
         let event_id = event.id.clone();
         self.events.write().insert(event_id.clone(), event);
         self.dag_events.write().push(event_id);

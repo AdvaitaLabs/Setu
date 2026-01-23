@@ -131,9 +131,9 @@ impl UserRpcHandler for ValidatorUserHandler {
         info!("           └─ Event ID: {}", &event_id[..20.min(event_id.len())]);
         info!("           └─ VLC Time: {}", vlc_time);
         
-        // Step 4: Add event to DAG
+        // Step 4: Add event to DAG (async to support consensus submission)
         info!("[REG 4/5] 🔗 Adding registration event to DAG...");
-        self.network_service.add_event_to_dag(event.clone());
+        self.network_service.add_event_to_dag(event.clone()).await;
         
         // Note: EventTracker removed in new architecture
         // Event tracking is now handled by the DAG manager
