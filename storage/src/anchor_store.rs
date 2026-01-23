@@ -55,22 +55,44 @@ impl AnchorStore {
     }
     
     /// Get the latest anchor_chain_root for recovery after restart
-    /// Returns (anchor_chain_root, depth, total_count)
-    pub async fn get_recovery_state(&self) -> Option<([u8; 32], u64, u64)> {
+    /// Returns (anchor_chain_root, depth, total_count, last_fold_vlc)
+    /// 
+    /// Note: The stored `anchor.merkle_roots.anchor_chain_root` represents the chain root
+    /// BEFORE this anchor was created. To get the chain root AFTER (including this anchor),
+    /// we recompute: final_root = chain_hash(stored_root, anchor_hash)
+    pub async fn get_recovery_state(&self) -> Option<([u8; 32], u64, u64, u64)> {
         let chain = self.chain.read().await;
         let anchors = self.anchors.read().await;
         
         chain.last().and_then(|id| {
             anchors.get(id).and_then(|anchor| {
                 anchor.merkle_roots.as_ref().map(|roots| {
+                    // The stored anchor_chain_root is the "before" state
+                    // We need to compute the "after" state by including this anchor
+                    let anchor_hash = anchor.compute_hash();
+                    let final_chain_root = Self::chain_hash(&roots.anchor_chain_root, &anchor_hash);
                     (
-                        roots.anchor_chain_root,  // HashValue is already [u8; 32]
+                        final_chain_root,
                         anchor.depth,
                         chain.len() as u64,
+                        anchor.vlc_snapshot.logical_time,
                     )
                 })
             })
         })
+    }
+    
+    /// Chain hash: combines previous chain root with new anchor hash
+    /// new_root = SHA256(prev_root || anchor_hash)
+    fn chain_hash(prev_root: &[u8; 32], anchor_hash: &[u8; 32]) -> [u8; 32] {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(prev_root);
+        hasher.update(anchor_hash);
+        let result = hasher.finalize();
+        let mut output = [0u8; 32];
+        output.copy_from_slice(&result);
+        output
     }
 }
 
