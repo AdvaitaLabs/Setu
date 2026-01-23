@@ -24,7 +24,7 @@ pub use crypto::{PublicKey, SetuAddress, SetuKeyPair, Signature, SignatureScheme
 pub use error::KeyError;
 pub use key_derive::{derive_key_pair_from_path, generate_new_key};
 pub use key_identity::KeyIdentity;
-pub use keypair_file::{read_keypair_from_file, write_keypair_to_file};
+pub use keypair_file::{read_keypair_from_file, write_keypair_to_file, read_key};
 pub use keystore::{AccountKeystore, FileBasedKeystore, InMemKeystore, Keystore};
 pub use address_derive::{
     EthereumAddress, 
@@ -33,3 +33,9 @@ pub use address_derive::{
     verify_nostr_address_derivation,
     verify_ethereum_address_derivation,
 };
+
+// Convenience alias
+pub use read_keypair_from_file as load_keypair;
+
+// Re-export KeyPair type for convenience
+pub use SetuKeyPair as KeyPair;
