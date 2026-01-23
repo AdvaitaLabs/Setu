@@ -16,7 +16,8 @@ setu-protocol = { path = "../crates/setu-protocol" }
 consensus = { path = "../consensus" }
 setu-router-core = { path = "../crates/setu-router-core" }
 setu-rpc = { path = "../setu-rpc" }
-setu-enclave = { path = "../crates/setu-enclave", features = ["mock"] }
+setu-transport = { path = "../crates/setu-transport" }
+# Note: setu-enclave dependency removed - Validator now uses setu-types::task directly
 setu-storage = { path = "../storage" }
 setu-api = { path = "../api" }
 setu-network-anemo = { path = "../crates/setu-network-anemo" }
@@ -27,6 +28,9 @@ tokio = { version = "1.35", features = ["full"] }
 # Web framework for HTTP API
 axum = { version = "0.7", features = ["macros"] }
 serde_json = "1.0"
+
+# HTTP client for sync communication with Solver (now via setu-transport)
+reqwest = { version = "0.12", features = ["json"] }
 
 # Crypto
 sha2 = "0.10"
@@ -44,6 +48,7 @@ rand = "0.8"
 parking_lot = "0.12"
 async-trait = "0.1"
 serde = { workspace = true }
+uuid = { version = "1.0", features = ["v4"] }
 
 [dev-dependencies]
 setu-solver = { path = "../setu-solver" }

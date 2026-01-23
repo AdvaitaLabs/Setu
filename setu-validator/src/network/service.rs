@@ -5,6 +5,7 @@
 
 use super::registration::ValidatorRegistrationHandler;
 use super::types::*;
+use super::solver_client::{ExecuteTaskRequest, ExecuteTaskResponse};
 use crate::{RouterManager, TaskPreparer, ConsensusValidator};
 use axum::{
     routing::{get, post},
@@ -15,7 +16,7 @@ use parking_lot::RwLock;
 use setu_rpc::{
     GetTransferStatusResponse, ProcessingStep, RegisterSolverRequest,
     SubmitTransferRequest, SubmitTransferResponse, ValidatorListItem,
-    RegistrationHandler, UserRpcHandler,
+    RegistrationHandler,
 };
 use setu_types::event::{Event, EventPayload};
 use std::collections::HashMap;
@@ -25,7 +26,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 // Import API handlers
-use setu_api::{self, ValidatorService};
+use setu_api;
 
 /// Validator network service
 ///
@@ -51,8 +52,14 @@ pub struct ValidatorNetworkService {
     /// Registered validators
     validators: Arc<RwLock<HashMap<String, ValidatorInfo>>>,
 
-    /// Solver channels for sending SolverTasks
-    solver_channels: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<setu_enclave::SolverTask>>>>,
+    /// Registered solver information (for sync HTTP calls)
+    solver_info: Arc<RwLock<HashMap<String, SolverInfo>>>,
+
+    /// Solver channels for sending SolverTasks (legacy, kept for compatibility)
+    solver_channels: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<setu_types::task::SolverTask>>>>,
+
+    /// HTTP client for sync Solver calls
+    http_client: reqwest::Client,
 
     /// Transfer tracking
     transfer_status: Arc<RwLock<HashMap<String, TransferTracker>>>,
@@ -95,13 +102,21 @@ impl ValidatorNetworkService {
             "Creating validator network service"
         );
 
+        // Create HTTP client for sync Solver calls
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))  // TEE execution may take time
+            .build()
+            .expect("Failed to create HTTP client");
+
         Self {
             validator_id,
             router_manager,
             task_preparer,
             consensus_validator: None,
             validators: Arc::new(RwLock::new(HashMap::new())),
+            solver_info: Arc::new(RwLock::new(HashMap::new())),
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
+            http_client,
             transfer_status: Arc::new(RwLock::new(HashMap::new())),
             events: Arc::new(RwLock::new(HashMap::new())),
             pending_events: Arc::new(RwLock::new(Vec::new())),
@@ -132,13 +147,21 @@ impl ValidatorNetworkService {
             "Creating validator network service with consensus"
         );
 
+        // Create HTTP client for sync Solver calls
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .expect("Failed to create HTTP client");
+
         Self {
             validator_id,
             router_manager,
             task_preparer,
             consensus_validator: Some(consensus_validator),
             validators: Arc::new(RwLock::new(HashMap::new())),
+            solver_info: Arc::new(RwLock::new(HashMap::new())),
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
+            http_client,
             transfer_status: Arc::new(RwLock::new(HashMap::new())),
             events: Arc::new(RwLock::new(HashMap::new())),
             pending_events: Arc::new(RwLock::new(Vec::new())),
@@ -491,26 +514,156 @@ impl ValidatorNetworkService {
         }
     }
 
-    /// Send SolverTask to Solver
+    /// Send SolverTask to Solver via synchronous HTTP
+    ///
+    /// This is the **sync HTTP** approach for solver-tee3:
+    /// 1. POST SolverTask to Solver
+    /// 2. Wait for TEE execution result in response
+    /// 3. Set execution_result on Event (kept in scope)
+    /// 4. Add Event to DAG
+    ///
+    /// Key benefit: No pending_tasks mapping needed!
     async fn send_solver_task_to_solver(
         &self,
         solver_id: &str,
-        task: setu_enclave::SolverTask,
+        task: setu_types::task::SolverTask,
     ) -> Result<(), String> {
+        let task_id_hex = hex::encode(&task.task_id[..8]);
+        
         debug!(
             solver_id = %solver_id,
-            task_id = ?hex::encode(&task.task_id[..8]),
-            "Sending SolverTask"
+            task_id = %task_id_hex,
+            event_id = %task.event.id,
+            "Sending SolverTask via sync HTTP"
         );
 
-        let channels = self.solver_channels.read();
-        let channel = channels
-            .get(solver_id)
-            .ok_or_else(|| format!("Solver not found: {}", solver_id))?;
+        // Get Solver address
+        let solver_url = {
+            let solvers = self.solver_info.read();
+            match solvers.get(solver_id) {
+                Some(info) => info.execute_task_url(),
+                None => {
+                    error!(solver_id = %solver_id, "Solver not found in registry");
+                    return Err(format!("Solver not found: {}", solver_id));
+                }
+            }
+        };
 
-        channel
-            .send(task)
-            .map_err(|e| format!("Failed to send: {}", e))?;
+        // Keep Event for later use (the key insight of sync approach!)
+        let mut event = task.event.clone();
+        let event_id = event.id.clone();
+
+        // Create request
+        let request = ExecuteTaskRequest {
+            solver_task: task,
+            validator_id: self.validator_id.clone(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+        };
+
+        // Send HTTP request and wait for response
+        info!(
+            solver_id = %solver_id,
+            url = %solver_url,
+            task_id = %task_id_hex,
+            "Sending sync HTTP request to Solver"
+        );
+
+        let response = self.http_client
+            .post(&solver_url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            error!(
+                solver_id = %solver_id,
+                status = %status,
+                body = %body,
+                "Solver returned error"
+            );
+            return Err(format!("Solver HTTP error: {} - {}", status, body));
+        }
+
+        // Parse response
+        let exec_response: ExecuteTaskResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse Solver response: {}", e))?;
+
+        if !exec_response.success {
+            error!(
+                task_id = %task_id_hex,
+                message = %exec_response.message,
+                "Solver execution failed"
+            );
+            return Err(format!("Solver execution failed: {}", exec_response.message));
+        }
+
+        // Get result from response
+        let result_dto = exec_response.result.ok_or_else(|| {
+            "Solver returned success but no result".to_string()
+        })?;
+
+        info!(
+            task_id = %task_id_hex,
+            events_processed = result_dto.events_processed,
+            events_failed = result_dto.events_failed,
+            execution_time_us = result_dto.execution_time_us,
+            "Received TEE execution result from Solver"
+        );
+
+        // Convert DTO to ExecutionResult and set on Event
+        let execution_result = setu_types::event::ExecutionResult {
+            success: result_dto.events_failed == 0,
+            message: Some(format!(
+                "TEE executed: {} events in {}μs",
+                result_dto.events_processed,
+                result_dto.execution_time_us
+            )),
+            state_changes: result_dto.state_changes.iter().map(|sc| {
+                setu_types::event::StateChange {
+                    key: sc.key.clone(),
+                    old_value: sc.old_value.clone(),
+                    new_value: sc.new_value.clone(),
+                }
+            }).collect(),
+        };
+
+        event.set_execution_result(execution_result);
+        event.status = setu_types::event::EventStatus::Executed;
+        
+        // Store TEE attestation on event (if field exists)
+        // Note: May need to add tee_attestation field to Event type
+
+        // Add Event to DAG
+        self.add_event_to_dag(event);
+
+        // Update transfer status
+        if let Some(tracker) = self.transfer_status.write().values_mut().find(|t| {
+            t.solver_id.as_ref() == Some(&solver_id.to_string()) && t.event_id.is_none()
+        }) {
+            tracker.status = "executed".to_string();
+            tracker.event_id = Some(event_id.clone());
+            tracker.processing_steps.push(setu_rpc::ProcessingStep {
+                step: "tee_execution".to_string(),
+                status: "completed".to_string(),
+                details: Some(format!(
+                    "TEE executed in {}μs, {} events processed",
+                    result_dto.execution_time_us,
+                    result_dto.events_processed
+                )),
+                timestamp: current_timestamp_secs(),
+            });
+        }
+
+        info!(
+            task_id = %task_id_hex,
+            event_id = %event_id,
+            "SolverTask completed, Event added to DAG"
+        );
 
         Ok(())
     }
@@ -773,8 +926,25 @@ impl ValidatorNetworkService {
     pub fn register_solver_internal(
         &self,
         request: &RegisterSolverRequest,
-    ) -> mpsc::UnboundedSender<setu_enclave::SolverTask> {
+    ) -> mpsc::UnboundedSender<setu_types::task::SolverTask> {
         let (tx, rx) = mpsc::unbounded_channel();
+
+        // Store Solver info for sync HTTP calls
+        let solver_info = SolverInfo {
+            solver_id: request.solver_id.clone(),
+            address: request.address.clone(),
+            port: request.port,
+            capacity: request.capacity,
+            shard_id: request.shard_id.clone(),
+            resources: request.resources.clone(),
+            status: "active".to_string(),
+            registered_at: current_timestamp_secs(),
+        };
+
+        self.solver_info.write().insert(
+            request.solver_id.clone(),
+            solver_info,
+        );
 
         self.solver_channels
             .write()
@@ -791,23 +961,19 @@ impl ValidatorNetworkService {
             request.resources.clone(),
         );
 
-        // TODO(Phase 6): Implement network forwarding to Solver
+        // Consume channel to avoid memory leak (sync HTTP doesn't use it)
         tokio::spawn(async move {
             let mut rx = rx;
-            let mut task_count = 0;
-            while let Some(task) = rx.recv().await {
-                task_count += 1;
-                warn!(
-                    task_id = ?hex::encode(&task.task_id[..8]),
-                    dropped_count = task_count,
-                    "⚠️ SolverTask dropped - Network forwarding not implemented"
-                );
+            while let Some(_task) = rx.recv().await {
+                // Channel consumed but not used - sync HTTP is primary
             }
         });
 
-        warn!(
+        info!(
             solver_id = %request.solver_id,
-            "⚠️ Solver registered but network forwarding not implemented"
+            address = %request.address,
+            port = request.port,
+            "Solver registered for sync HTTP communication"
         );
 
         tx
@@ -816,6 +982,8 @@ impl ValidatorNetworkService {
     pub fn unregister_solver(&self, node_id: &str) {
         self.router_manager.unregister_solver(node_id);
         self.solver_channels.write().remove(node_id);
+        self.solver_info.write().remove(node_id);
+        info!(solver_id = %node_id, "Solver unregistered");
     }
 
     // ============================================

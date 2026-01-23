@@ -45,6 +45,31 @@ pub struct TransferTracker {
     pub created_at: u64,
 }
 
+/// Registered Solver information
+#[derive(Debug, Clone)]
+pub struct SolverInfo {
+    pub solver_id: String,
+    pub address: String,
+    pub port: u16,
+    pub capacity: u32,
+    pub shard_id: Option<String>,
+    pub resources: Vec<String>,
+    pub status: String,
+    pub registered_at: u64,
+}
+
+impl SolverInfo {
+    /// Get HTTP URL for this solver
+    pub fn http_url(&self) -> String {
+        format!("http://{}:{}", self.address, self.port)
+    }
+    
+    /// Get execute-task endpoint URL
+    pub fn execute_task_url(&self) -> String {
+        format!("{}/api/v1/execute-task", self.http_url())
+    }
+}
+
 /// Helper to get current timestamp in seconds
 #[inline]
 pub fn current_timestamp_secs() -> u64 {

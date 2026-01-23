@@ -143,7 +143,17 @@ impl NetworkEventHandler for MessageRouter {
             "Routing event to consensus engine"
         );
         
-        // Add to consensus DAG (in-memory only)
+        // Step 1: Verify event ID matches content (anti-tampering)
+        if !event.verify_id() {
+            warn!(
+                event_id = %event.id,
+                from = %peer_id,
+                "Event ID verification failed - possible tampering, rejecting"
+            );
+            return;
+        }
+        
+        // Step 2: Add to consensus DAG (in-memory only)
         // Events are persisted later when CF is finalized
         match self.engine.receive_event_from_network(event.clone()).await {
             Ok(event_id) => {
@@ -153,11 +163,76 @@ impl NetworkEventHandler for MessageRouter {
                 );
             }
             Err(e) => {
-                warn!(
-                    event_id = %event.id,
-                    error = %e,
-                    "Failed to add event to DAG"
-                );
+                let error_str = e.to_string();
+                
+                // Handle duplicate events (common due to network retransmission)
+                if error_str.contains("Duplicate event") {
+                    debug!(
+                        event_id = %event.id,
+                        from = %peer_id,
+                        "Duplicate event ignored (idempotent)"
+                    );
+                    return;
+                }
+                
+                // Check if this is a MissingParent error
+                if error_str.contains("Missing parent") {
+                    warn!(
+                        event_id = %event.id,
+                        from = %peer_id,
+                        parents = ?event.parent_ids,
+                        "Event has missing parents, attempting sync"
+                    );
+                    
+                    // Attempt to fetch missing parent events from the broadcaster
+                    if let Some(broadcaster) = self.engine.get_broadcaster().await {
+                        match broadcaster.request_events(&event.parent_ids).await {
+                            Ok(fetched_events) => {
+                                debug!(
+                                    count = fetched_events.len(),
+                                    "Fetched missing parent events"
+                                );
+                                
+                                // Add fetched parents to DAG
+                                for parent_event in fetched_events {
+                                    if let Err(e) = self.engine.receive_event_from_network(parent_event).await {
+                                        debug!(error = %e, "Failed to add fetched parent (may already exist)");
+                                    }
+                                }
+                                
+                                // Retry adding the original event
+                                match self.engine.receive_event_from_network(event).await {
+                                    Ok(event_id) => {
+                                        debug!(
+                                            event_id = %event_id,
+                                            "Event added after parent sync"
+                                        );
+                                    }
+                                    Err(retry_err) => {
+                                        warn!(
+                                            error = %retry_err,
+                                            "Event still failed after parent sync"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(fetch_err) => {
+                                warn!(
+                                    error = %fetch_err,
+                                    "Failed to fetch missing parent events"
+                                );
+                            }
+                        }
+                    } else {
+                        warn!("No broadcaster available for parent sync");
+                    }
+                } else {
+                    warn!(
+                        event_id = %event.id,
+                        error = %e,
+                        "Failed to add event to DAG"
+                    );
+                }
             }
         }
     }

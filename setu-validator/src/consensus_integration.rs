@@ -254,6 +254,13 @@ impl ConsensusValidator {
             "Submitting event to consensus"
         );
         
+        // Step 0: Verify event ID matches content (anti-tampering)
+        if !event.verify_id() {
+            return Err(SetuError::InvalidData(
+                format!("Event ID verification failed - possible tampering: {}", event.id)
+            ));
+        }
+        
         // Step 1: Verify execution result is present and successful
         // TEE attestation verification is done by the TeeVerifier when enabled
         if let Some(ref exec_result) = event.execution_result {

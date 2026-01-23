@@ -11,7 +11,7 @@ use setu_network_anemo::{GenericMessageHandler, HandleResult, HandlerError};
 use setu_types::Event;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// Route path for Setu protocol messages
 pub const SETU_ROUTE: &str = "/setu";
@@ -129,13 +129,27 @@ where
                     event.id
                 );
                 
-                // Notify application layer
-                let _ = self.event_tx.try_send(NetworkEvent::EventReceived {
+                // Notify application layer with backpressure (await instead of try_send)
+                // This ensures events are not dropped during high load
+                if let Err(e) = self.event_tx.send(NetworkEvent::EventReceived {
                     peer_id: sender_id.clone(),
                     event: event.clone(),
-                });
+                }).await {
+                    // Channel closed indicates system shutdown
+                    warn!(
+                        event_id = %event.id,
+                        error = %e,
+                        "Event channel closed - system may be shutting down"
+                    );
+                }
                 
-                // Convert Event to SerializedEvent for storage
+                // TODO: Optimize storage strategy
+                // Current behavior: Store unconfirmed events for State Sync
+                // Future improvement: Only store confirmed events (after CF finalization)
+                // Keeping current behavior for backward compatibility with State Sync protocol
+                //
+                // Note: This may store events that fail consensus validation.
+                // State Sync should filter based on finalized anchors.
                 let serialized = SerializedEvent {
                     seq: 0, // Will be assigned by store
                     id: event.id.clone(),
@@ -145,7 +159,7 @@ where
                 if let Err(e) = self.store.store_events(vec![serialized]).await {
                     warn!("Failed to store broadcast event: {}", e);
                 } else {
-                    debug!("Stored event from broadcast");
+                    debug!("Stored unconfirmed event for state sync");
                 }
                 
                 Ok(None) // EventBroadcast doesn't require a response
@@ -153,28 +167,53 @@ where
             
             SetuMessage::CFProposal { cf, proposer_id } => {
                 debug!("Received CFProposal from {}: cf_id={}", proposer_id, cf.id);
-                let _ = self.event_tx.try_send(NetworkEvent::CFProposal {
-                    peer_id: proposer_id,
-                    cf,
-                });
+                // Use send().await for backpressure instead of try_send to prevent dropping CF proposals
+                // CF proposals are critical for consensus - dropping them causes consensus to stall
+                if let Err(e) = self.event_tx.send(NetworkEvent::CFProposal {
+                    peer_id: proposer_id.clone(),
+                    cf: cf.clone(),
+                }).await {
+                    error!(
+                        cf_id = %cf.id,
+                        error = %e,
+                        "CF channel closed - system may be shutting down"
+                    );
+                }
                 Ok(None)
             }
             
             SetuMessage::CFVote { vote } => {
                 debug!("Received CFVote: cf_id={}, voter={}", vote.cf_id, vote.validator_id);
-                let _ = self.event_tx.try_send(NetworkEvent::VoteReceived {
+                // Use send().await for backpressure instead of try_send to prevent dropping votes
+                // Votes are critical for reaching quorum - dropping them prevents finalization
+                if let Err(e) = self.event_tx.send(NetworkEvent::VoteReceived {
                     peer_id: vote.validator_id.clone(),
-                    vote,
-                });
+                    vote: vote.clone(),
+                }).await {
+                    error!(
+                        cf_id = %vote.cf_id,
+                        voter = %vote.validator_id,
+                        error = %e,
+                        "Vote channel closed - system may be shutting down"
+                    );
+                }
                 Ok(None)
             }
             
             SetuMessage::CFFinalized { cf, sender_id } => {
                 debug!("Received CFFinalized from {}: cf_id={}", sender_id, cf.id);
-                let _ = self.event_tx.try_send(NetworkEvent::CFFinalized {
-                    peer_id: sender_id,
-                    cf,
-                });
+                // Use send().await for backpressure instead of try_send for consistency
+                // CFFinalized notifications should not be dropped as they help with state sync
+                if let Err(e) = self.event_tx.send(NetworkEvent::CFFinalized {
+                    peer_id: sender_id.clone(),
+                    cf: cf.clone(),
+                }).await {
+                    warn!(
+                        cf_id = %cf.id,
+                        error = %e,
+                        "Finalized channel closed - system may be shutting down"
+                    );
+                }
                 Ok(None)
             }
             

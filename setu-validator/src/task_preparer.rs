@@ -32,7 +32,7 @@
 //! defined in `setu_storage::state_provider`. Use `TaskPreparer::new_for_testing()`
 //! for tests, which creates a real MerkleStateProvider with pre-initialized accounts.
 
-use setu_enclave::{
+use setu_types::task::{
     SolverTask, ResolvedInputs, ResolvedObject,
     GasBudget, ReadSetEntry, MerkleProof,
 };
@@ -44,7 +44,8 @@ use tracing::{debug, info};
 // Re-export StateProvider and CoinInfo from storage
 pub use setu_storage::{StateProvider, CoinInfo, SimpleMerkleProof};
 
-/// Convert SimpleMerkleProof to setu_enclave::MerkleProof
+/// Convert SimpleMerkleProof to MerkleProof
+#[allow(dead_code)]
 fn to_enclave_proof(proof: &SimpleMerkleProof) -> MerkleProof {
     MerkleProof {
         siblings: proof.siblings.clone(),
@@ -324,7 +325,7 @@ pub enum TaskPrepareError {
 mod tests {
     use super::*;
     use setu_types::{Transfer, TransferType};
-    use setu_enclave::OperationType;
+    use setu_types::task::OperationType;
     
     fn create_test_transfer() -> Transfer {
         Transfer::new("test-tx-1", "alice", "bob", 100)
