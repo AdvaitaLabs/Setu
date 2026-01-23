@@ -377,6 +377,9 @@ mod tests {
             validator_address: "127.0.0.1".to_string(),
             validator_port: 8080,
             heartbeat_interval_secs: 10,
+            account_address: "0x0000000000000000000000000000000000000000".to_string(),
+            public_key: vec![],
+            signature: vec![],
         };
         
         let client = SolverNetworkClient::new(config);

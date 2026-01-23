@@ -115,12 +115,12 @@ fn load_key_info(key_file: &str) -> anyhow::Result<(String, Vec<u8>, Vec<u8>)> {
     info!("Loading keypair from: {}", key_file);
     
     let keypair = load_keypair(key_file)?;
-    let account_address = keypair.address();
-    let public_key = keypair.public_key_bytes();
+    let account_address = keypair.address().to_string();
+    let public_key = keypair.public().as_bytes();
     
     // Create registration message to sign
     let message = format!("Register Solver: {}", account_address);
-    let signature = keypair.sign(message.as_bytes());
+    let signature = keypair.sign(message.as_bytes()).as_bytes();
     
     info!("Keypair loaded successfully");
     info!("  Account Address: {}", account_address);
@@ -234,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create channel for receiving SolverTasks from Validator
     // In production, this would come via RPC/network
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<SolverTask>();
+    let (_task_tx, mut task_rx) = mpsc::unbounded_channel::<SolverTask>();
     
     // Create channel for sending results back
     let (result_tx, mut result_rx) = mpsc::unbounded_channel::<TeeExecutionResult>();
@@ -281,7 +281,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Result sender - sends results back to Validator
-    let result_client = network_client.clone();
+    let _result_client = network_client.clone();
     let result_handle = tokio::spawn(async move {
         info!("[RESULT_TX] Result sender ready...");
         
