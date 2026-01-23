@@ -65,19 +65,64 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ValidatorAction {
-    /// Register a validator node
-    Register {
+    /// Generate a new validator keypair
+    Keygen {
+        /// Output file path for the keypair
+        #[arg(long, default_value = "validator-key.json")]
+        output: String,
+        
+        /// Validator ID (optional, will be derived from address if not provided)
+        #[arg(long)]
+        id: Option<String>,
+        
+        /// Stake amount in Flux
+        #[arg(long, default_value = "10000")]
+        stake: u64,
+        
+        /// Commission rate (0-100)
+        #[arg(long, default_value = "10")]
+        commission: u8,
+    },
+    
+    /// Export private key from keypair file
+    ExportKey {
+        /// Keypair file path
+        #[arg(long)]
+        key_file: String,
+        
+        /// Export format: json, mnemonic, or private-key
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+    
+    /// Recover keypair from mnemonic phrase
+    Recover {
+        /// Mnemonic phrase (12 or 24 words)
+        #[arg(long)]
+        mnemonic: String,
+        
+        /// Output file path
+        #[arg(long, default_value = "validator-key-recovered.json")]
+        output: String,
+        
         /// Validator ID
         #[arg(long)]
-        id: String,
-        
-        /// Validator address
+        id: Option<String>,
+    },
+    
+    /// Register a validator node
+    Register {
+        /// Keypair file path
         #[arg(long)]
-        address: String,
+        key_file: String,
         
-        /// Validator port
+        /// Network address (IP or hostname)
         #[arg(long)]
-        port: u16,
+        network_address: String,
+        
+        /// Network port
+        #[arg(long)]
+        network_port: u16,
         
         /// Router address to register with
         #[arg(long, default_value = "127.0.0.1:8080")]
@@ -101,19 +146,56 @@ enum ValidatorAction {
 
 #[derive(Subcommand)]
 enum SolverAction {
-    /// Register a solver node
-    Register {
+    /// Generate a new solver keypair
+    Keygen {
+        /// Output file path for the keypair
+        #[arg(long, default_value = "solver-key.json")]
+        output: String,
+        
+        /// Solver ID (optional, will be derived from address if not provided)
+        #[arg(long)]
+        id: Option<String>,
+    },
+    
+    /// Export private key from keypair file
+    ExportKey {
+        /// Keypair file path
+        #[arg(long)]
+        key_file: String,
+        
+        /// Export format: json, mnemonic, or private-key
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+    
+    /// Recover keypair from mnemonic phrase
+    Recover {
+        /// Mnemonic phrase (12 or 24 words)
+        #[arg(long)]
+        mnemonic: String,
+        
+        /// Output file path
+        #[arg(long, default_value = "solver-key-recovered.json")]
+        output: String,
+        
         /// Solver ID
         #[arg(long)]
-        id: String,
-        
-        /// Solver address
+        id: Option<String>,
+    },
+    
+    /// Register a solver node
+    Register {
+        /// Keypair file path
         #[arg(long)]
-        address: String,
+        key_file: String,
         
-        /// Solver port
+        /// Network address (IP or hostname)
         #[arg(long)]
-        port: u16,
+        network_address: String,
+        
+        /// Network port
+        #[arg(long)]
+        network_port: u16,
         
         /// Solver capacity (transfers per second)
         #[arg(long, default_value = "100")]
