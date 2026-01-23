@@ -526,7 +526,7 @@ impl Event {
             }
             EventPayload::UserRegister(u) => {
                 vec![
-                    format!("user:{}", u.user_id),
+                    format!("user:{}", u.address),
                     format!("subnet:{}", u.get_subnet()),
                 ]
             }
@@ -594,7 +594,14 @@ mod tests {
     
     #[test]
     fn test_solver_register_event() {
-        let registration = SolverRegistration::new("solver-1", "127.0.0.1", 9001)
+        let registration = SolverRegistration::new(
+            "solver-1",
+            "127.0.0.1",
+            9001,
+            "0xabcd1234",
+            vec![1, 2, 3],
+            vec![4, 5, 6],
+        )
             .with_shard("shard-0")
             .with_resources(vec!["ETH".to_string()]);
         
@@ -649,22 +656,26 @@ mod tests {
     
     #[test]
     fn test_user_register_event() {
-        let registration = UserRegistration::new("user-alice", vec![1, 2, 3])
+        let registration = UserRegistration::new(
+            "0x1234567890abcdef",  // address
+            vec![1; 32],            // nostr_pubkey (32 bytes)
+            vec![4, 5, 6],          // signature
+            1234567890,             // timestamp
+        )
             .with_subnet("subnet-1")
-            .with_display_name("Alice")
-            .with_power(100);
+            .with_display_name("Alice");
         
         let event = Event::user_register(
             registration,
             vec![],
             create_vlc_snapshot(),
-            "user-alice".to_string(),
+            "0x1234567890abcdef".to_string(),
         );
         assert_eq!(event.event_type, EventType::UserRegister);
         assert!(event.is_registration());
         
         let resources = event.affected_resources();
-        assert!(resources.contains(&"user:user-alice".to_string()));
+        assert!(resources.contains(&"user:0x1234567890abcdef".to_string()));
         assert!(resources.contains(&"subnet:subnet-1".to_string()));
     }
     

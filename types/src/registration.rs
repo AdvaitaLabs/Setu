@@ -13,37 +13,64 @@ pub use crate::subnet::SubnetType;
 /// Validator registration data
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorRegistration {
-    /// Unique validator identifier
+    // ========== Identity Layer ==========
+    /// Unique validator identifier (for logging, routing)
     pub validator_id: String,
-    /// Network address (IP or hostname)
-    pub address: String,
-    /// Network port
-    pub port: u16,
-    /// Optional public key for authentication
-    pub public_key: Option<Vec<u8>>,
-    /// Optional stake amount
-    pub stake: Option<u64>,
+    
+    // ========== Network Layer ==========
+    /// Network address (IP or hostname) for P2P communication
+    pub network_address: String,
+    /// Network port for P2P communication
+    pub network_port: u16,
+    
+    // ========== Economic Layer ==========
+    /// Ethereum-style account address (0x...) for staking and rewards
+    pub account_address: String,
+    /// Public key (secp256k1, 65 bytes uncompressed)
+    pub public_key: Vec<u8>,
+    /// Registration signature proving ownership of the account
+    pub signature: Vec<u8>,
+    
+    // ========== Economic Parameters ==========
+    /// Stake amount in Flux (minimum required for validator)
+    pub stake_amount: u64,
+    /// Commission rate (0-100, percentage)
+    pub commission_rate: u8,
 }
 
 impl ValidatorRegistration {
-    pub fn new(validator_id: impl Into<String>, address: impl Into<String>, port: u16) -> Self {
+    /// Create a new validator registration
+    pub fn new(
+        validator_id: impl Into<String>,
+        network_address: impl Into<String>,
+        network_port: u16,
+        account_address: impl Into<String>,
+        public_key: Vec<u8>,
+        signature: Vec<u8>,
+        stake_amount: u64,
+    ) -> Self {
         Self {
             validator_id: validator_id.into(),
-            address: address.into(),
-            port,
-            public_key: None,
-            stake: None,
+            network_address: network_address.into(),
+            network_port,
+            account_address: account_address.into(),
+            public_key,
+            signature,
+            stake_amount,
+            commission_rate: 10, // Default 10%
         }
     }
     
-    pub fn with_public_key(mut self, key: Vec<u8>) -> Self {
-        self.public_key = Some(key);
+    pub fn with_commission_rate(mut self, rate: u8) -> Self {
+        self.commission_rate = rate.min(100); // Cap at 100%
         self
     }
     
-    pub fn with_stake(mut self, stake: u64) -> Self {
-        self.stake = Some(stake);
-        self
+    /// Verify the registration signature
+    pub fn verify_signature(&self) -> bool {
+        // TODO: Implement actual ECDSA signature verification
+        // Message format: "Register Validator: {validator_id}:{account_address}:{timestamp}"
+        !self.signature.is_empty() && !self.public_key.is_empty()
     }
 }
 
@@ -52,32 +79,53 @@ impl ValidatorRegistration {
 /// Solver registration data
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SolverRegistration {
-    /// Unique solver identifier
+    // ========== Identity Layer ==========
+    /// Unique solver identifier (for logging, routing)
     pub solver_id: String,
-    /// Network address (IP or hostname)
-    pub address: String,
-    /// Network port
-    pub port: u16,
+    
+    // ========== Network Layer ==========
+    /// Network address (IP or hostname) for P2P communication
+    pub network_address: String,
+    /// Network port for P2P communication
+    pub network_port: u16,
+    
+    // ========== Economic Layer ==========
+    /// Ethereum-style account address (0x...) for receiving task fees
+    pub account_address: String,
+    /// Public key (secp256k1, 65 bytes uncompressed)
+    pub public_key: Vec<u8>,
+    /// Registration signature proving ownership of the account
+    pub signature: Vec<u8>,
+    
+    // ========== Capability Parameters ==========
     /// Maximum concurrent tasks capacity
     pub capacity: u32,
     /// Optional shard assignment
     pub shard_id: Option<String>,
     /// Resource types this solver can handle
     pub resources: Vec<String>,
-    /// Optional public key for authentication
-    pub public_key: Option<Vec<u8>>,
 }
 
 impl SolverRegistration {
-    pub fn new(solver_id: impl Into<String>, address: impl Into<String>, port: u16) -> Self {
+    /// Create a new solver registration
+    pub fn new(
+        solver_id: impl Into<String>,
+        network_address: impl Into<String>,
+        network_port: u16,
+        account_address: impl Into<String>,
+        public_key: Vec<u8>,
+        signature: Vec<u8>,
+    ) -> Self {
         Self {
             solver_id: solver_id.into(),
-            address: address.into(),
-            port,
+            network_address: network_address.into(),
+            network_port,
+            account_address: account_address.into(),
+            public_key,
+            signature,
             capacity: 100,
             shard_id: None,
             resources: vec![],
-            public_key: None,
         }
     }
     
@@ -94,6 +142,13 @@ impl SolverRegistration {
     pub fn with_resources(mut self, resources: Vec<String>) -> Self {
         self.resources = resources;
         self
+    }
+    
+    /// Verify the registration signature
+    pub fn verify_signature(&self) -> bool {
+        // TODO: Implement actual ECDSA signature verification
+        // Message format: "Register Solver: {solver_id}:{account_address}:{timestamp}"
+        !self.signature.is_empty() && !self.public_key.is_empty()
     }
 }
 
@@ -264,35 +319,57 @@ impl SubnetRegistration {
 // ========== User Registration ==========
 
 /// User registration data
+/// 
+/// Users register from Nostr applications. The address is derived from their Nostr public key.
+/// The middle layer converts Nostr events to Setu registration requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserRegistration {
-    /// User's unique identifier (address/public key hash)
-    pub user_id: String,
-    /// User's public key for authentication
-    pub public_key: Vec<u8>,
+    /// Ethereum-style address derived from Nostr public key
+    /// Derivation: SHA256(nostr_pubkey)[0..20] -> 0x{hex}
+    pub address: String,
+    
+    /// Nostr public key (32 bytes, Schnorr x-only public key)
+    /// Used for: 1) Verifying address derivation 2) Verifying signature
+    pub nostr_pubkey: Vec<u8>,
+    
+    /// Nostr Schnorr signature of the registration event
+    pub signature: Vec<u8>,
+    
+    /// Timestamp (for replay attack prevention)
+    pub timestamp: u64,
+    
     /// Subnet ID to register in (None = root subnet)
     pub subnet_id: Option<String>,
+    
     /// Optional display name
     pub display_name: Option<String>,
+    
     /// Optional metadata (JSON string)
     pub metadata: Option<String>,
-    /// Initial power allocation
-    pub initial_power: Option<u64>,
-    /// Inviter's address (who invited this user)
+    
+    /// Inviter's address (resolved from invite code by middle layer)
     pub invited_by: Option<String>,
+    
     /// Invite code used for registration
     pub invite_code: Option<String>,
 }
 
 impl UserRegistration {
-    pub fn new(user_id: impl Into<String>, public_key: Vec<u8>) -> Self {
+    /// Create a new user registration from Nostr credentials
+    pub fn new(
+        address: impl Into<String>,
+        nostr_pubkey: Vec<u8>,
+        signature: Vec<u8>,
+        timestamp: u64,
+    ) -> Self {
         Self {
-            user_id: user_id.into(),
-            public_key,
+            address: address.into(),
+            nostr_pubkey,
+            signature,
+            timestamp,
             subnet_id: None,
             display_name: None,
             metadata: None,
-            initial_power: None,
             invited_by: None,
             invite_code: None,
         }
@@ -308,20 +385,28 @@ impl UserRegistration {
         self
     }
     
-    pub fn with_power(mut self, power: u64) -> Self {
-        self.initial_power = Some(power);
-        self
-    }
-    
     pub fn with_invite(mut self, inviter: impl Into<String>, code: impl Into<String>) -> Self {
         self.invited_by = Some(inviter.into());
         self.invite_code = Some(code.into());
         self
     }
     
+    pub fn with_metadata(mut self, metadata: impl Into<String>) -> Self {
+        self.metadata = Some(metadata.into());
+        self
+    }
+    
     /// Get the subnet this user is registering in (defaults to root)
     pub fn get_subnet(&self) -> &str {
         self.subnet_id.as_deref().unwrap_or("subnet-0")
+    }
+    
+    /// Verify the Nostr signature and address derivation
+    pub fn verify(&self) -> bool {
+        // TODO: Implement actual Schnorr signature verification
+        // TODO: Verify address derivation from nostr_pubkey
+        // For now, just check that fields are not empty
+        !self.signature.is_empty() && !self.nostr_pubkey.is_empty() && self.nostr_pubkey.len() == 32
     }
 }
 
@@ -383,18 +468,35 @@ mod tests {
     
     #[test]
     fn test_validator_registration() {
-        let reg = ValidatorRegistration::new("v1", "127.0.0.1", 8080)
-            .with_stake(1000);
+        let reg = ValidatorRegistration::new(
+            "v1",
+            "127.0.0.1",
+            8080,
+            "0xabcd1234",
+            vec![1, 2, 3],
+            vec![4, 5, 6],
+            10000,
+        ).with_commission_rate(15);
         assert_eq!(reg.validator_id, "v1");
-        assert_eq!(reg.stake, Some(1000));
+        assert_eq!(reg.account_address, "0xabcd1234");
+        assert_eq!(reg.stake_amount, 10000);
+        assert_eq!(reg.commission_rate, 15);
     }
     
     #[test]
     fn test_solver_registration() {
-        let reg = SolverRegistration::new("s1", "127.0.0.1", 9000)
-            .with_capacity(50)
-            .with_shard("shard-0");
+        let reg = SolverRegistration::new(
+            "s1",
+            "127.0.0.1",
+            9000,
+            "0xef123456",
+            vec![1, 2, 3],
+            vec![4, 5, 6],
+        )
+        .with_capacity(50)
+        .with_shard("shard-0");
         assert_eq!(reg.solver_id, "s1");
+        assert_eq!(reg.account_address, "0xef123456");
         assert_eq!(reg.capacity, 50);
         assert_eq!(reg.shard_id, Some("shard-0".to_string()));
     }
@@ -417,16 +519,19 @@ mod tests {
     
     #[test]
     fn test_user_registration() {
-        let reg = UserRegistration::new("user-1", vec![1, 2, 3])
+        let nostr_pubkey = vec![1; 32]; // 32 bytes Nostr pubkey
+        let reg = UserRegistration::new("0x1234abcd", nostr_pubkey, vec![4, 5, 6], 1234567890)
             .with_subnet("subnet-1")
             .with_display_name("Alice");
-        assert_eq!(reg.user_id, "user-1");
+        assert_eq!(reg.address, "0x1234abcd");
         assert_eq!(reg.get_subnet(), "subnet-1");
+        assert!(reg.verify());
     }
     
     #[test]
     fn test_user_default_subnet() {
-        let reg = UserRegistration::new("user-2", vec![]);
+        let nostr_pubkey = vec![1; 32];
+        let reg = UserRegistration::new("0xabcd", nostr_pubkey, vec![2], 1234567890);
         assert_eq!(reg.get_subnet(), "subnet-0");
     }
 }
