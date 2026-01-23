@@ -170,6 +170,181 @@ impl Dag {
         }
     }
 
+    // =========================================================================
+    // GC-Related Methods (for DagManager integration)
+    // =========================================================================
+
+    /// Batch update event status to Finalized
+    ///
+    /// MUST be called BEFORE GC! has_active_children() depends on status == Finalized
+    pub fn finalize_events(&mut self, event_ids: &[EventId]) {
+        for event_id in event_ids {
+            if let Some(event) = self.events.get_mut(event_id) {
+                event.status = EventStatus::Finalized;
+            }
+            self.pending.remove(event_id);
+        }
+    }
+
+    /// Check if an event has active (non-finalized) children
+    ///
+    /// Returns true if any child event has status != Finalized
+    pub fn has_active_children(&self, event_id: &EventId) -> bool {
+        self.children
+            .get(event_id)
+            .map(|children| {
+                children.iter().any(|child_id| {
+                    self.events
+                        .get(child_id)
+                        .map(|e| e.status != EventStatus::Finalized)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Add event with pre-calculated depth (skips parent existence check)
+    ///
+    /// WARNING: This method skips parent existence check because DagManager
+    /// has already validated parents through three-layer query in Phase 1.
+    /// Parents may be in Cache/Store rather than DAG.
+    ///
+    /// Used by: DagManager.add_event() Phase 3 write stage
+    /// 
+    /// # Visibility
+    /// 
+    /// This is `pub(crate)` to prevent external crates from bypassing
+    /// DagManager's parent validation. All external callers MUST use
+    /// DagManager.add_event() or add_event_with_retry().
+    pub(crate) fn add_event_with_depth(
+        &mut self,
+        event: Event,
+        depth: u64,
+    ) -> Result<EventId, DagError> {
+        let event_id = event.id.clone();
+
+        // Check for duplicates
+        if self.events.contains_key(&event_id) {
+            return Err(DagError::DuplicateEvent(event_id));
+        }
+
+        // Update children relationships (only for parents still in DAG)
+        // Note: Parents may have been GC'd (now in Cache/Store)
+        for parent_id in &event.parent_ids {
+            // Only update if parent is still in DAG
+            if self.events.contains_key(parent_id) {
+                self.children
+                    .entry(parent_id.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(event_id.clone());
+                // Remove from tips (no longer a leaf)
+                self.tips.remove(parent_id);
+            }
+            // Parents in Cache/Store:
+            // - Don't need to update children (GC'd events don't maintain children)
+            // - This is expected behavior, cross-CF refs are safe via depth_diff limit
+        }
+
+        // Store the event
+        self.events.insert(event_id.clone(), event);
+        self.depths.insert(event_id.clone(), depth);
+        self.tips.insert(event_id.clone());
+        self.pending.insert(event_id.clone());
+        self.max_depth = self.max_depth.max(depth);
+
+        Ok(event_id)
+    }
+
+    /// Safely remove an event (only when no active children)
+    ///
+    /// Returns the removed event's parent_ids for optional cascading GC.
+    ///
+    /// Cascading GC note:
+    ///   After E5 is removed, E5's parents (E3, E4) may become removable
+    ///   (if they're also finalized with no other active children).
+    ///   
+    ///   Caller options:
+    ///   - Ignore return: Simple mode, parents handled in next GC batch
+    ///   - Recursive check: Call remove_event() on returned parent_ids
+    ///   
+    ///   Recommended: Simple mode to avoid stack overflow from recursion.
+    ///   GC is progressive; leave for next anchor finalization.
+    pub fn remove_event(&mut self, event_id: &EventId) -> Option<Vec<EventId>> {
+        // Check for active children
+        if self.has_active_children(event_id) {
+            return None; // Has active children, cannot remove
+        }
+
+        let event = self.events.remove(event_id)?;
+        self.depths.remove(event_id);
+        self.tips.remove(event_id);
+        self.pending.remove(event_id);
+
+        // Remove self from parent's children lists
+        for parent_id in &event.parent_ids {
+            if let Some(children) = self.children.get_mut(parent_id) {
+                children.remove(event_id);
+                // Note: Don't automatically add parent to tips
+                // Parent may be finalized, shouldn't become a tip
+            }
+        }
+
+        // Remove own children index
+        self.children.remove(event_id);
+
+        Some(event.parent_ids)
+    }
+
+    /// Batch remove finalized events
+    ///
+    /// Removes events and cascadingly checks their parents for removal.
+    /// This prevents memory leaks from retained parents.
+    pub fn gc_finalized_events(&mut self, event_ids: &[EventId]) -> GCStats {
+        let mut removed = 0;
+        let mut retained = 0;
+        
+        let initial_targets: HashSet<EventId> = event_ids.iter().cloned().collect();
+        let mut queue: VecDeque<EventId> = event_ids.iter().cloned().collect();
+
+        while let Some(event_id) = queue.pop_front() {
+            // Note: We do NOT track 'checked' events to prevent cycles, 
+            // because a parent might fail to remove initially (due to active children),
+            // but succeed later in the queue when those children are removed.
+            // DAG acyclic property guarantees termination.
+
+            match self.remove_event(&event_id) {
+                Some(parent_ids) => {
+                    removed += 1;
+                    // Successfully removed, now check parents
+                    for parent_id in parent_ids {
+                        // Optimization: Only queue parent if it looks removable 
+                        // (exists and is Finalized)
+                        if let Some(parent) = self.events.get(&parent_id) {
+                            if parent.status == EventStatus::Finalized {
+                                queue.push_back(parent_id.clone());
+                            }
+                        }
+                    }
+                }
+                None => {
+                    // Count as retained only if it was one of the explicitly requested events
+                    // AND it actually still exists in the DAG (has active children).
+                    // If it returned None because it was already removed (e.g. duplicate),
+                    // we shouldn't count it as retained.
+                    if initial_targets.contains(&event_id) && self.events.contains_key(&event_id) {
+                        retained += 1;
+                    }
+                }
+            }
+        }
+
+        GCStats { removed, retained }
+    }
+
+    // =========================================================================
+    // Existing Methods
+    // =========================================================================
+
     /// Mark events up to a certain depth as finalized
     pub fn finalize_up_to_depth(&mut self, depth: u64) {
         for (id, event) in &mut self.events {
@@ -285,6 +460,15 @@ pub enum DagError {
 
     #[error("Invalid event: {0}")]
     InvalidEvent(String),
+}
+
+/// Statistics from a GC operation
+#[derive(Debug, Default, Clone)]
+pub struct GCStats {
+    /// Number of events removed from DAG
+    pub removed: usize,
+    /// Number of events retained (have active children)
+    pub retained: usize,
 }
 
 #[cfg(test)]
