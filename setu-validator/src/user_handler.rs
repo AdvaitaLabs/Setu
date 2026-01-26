@@ -39,6 +39,7 @@ impl UserRpcHandler for ValidatorUserHandler {
             address = %request.address,
             subnet_id = ?request.subnet_id,
             invite_code = ?request.invite_code,
+            is_metamask = %request.nostr_pubkey.is_none(),
             "Processing user registration request"
         );
         
@@ -60,10 +61,11 @@ impl UserRpcHandler for ValidatorUserHandler {
             };
         }
         
-        if request.nostr_pubkey.is_empty() {
+        // Validate address format
+        if !request.address.starts_with("0x") || request.address.len() != 42 {
             return RegisterUserResponse {
                 success: false,
-                message: "Nostr public key cannot be empty".to_string(),
+                message: "Invalid Ethereum address format".to_string(),
                 address: request.address,
                 event_id: None,
                 initial_flux: 0,
@@ -72,38 +74,77 @@ impl UserRpcHandler for ValidatorUserHandler {
             };
         }
         
-        if request.nostr_pubkey.len() != 32 {
-            return RegisterUserResponse {
-                success: false,
-                message: "Nostr public key must be 32 bytes".to_string(),
-                address: request.address,
-                event_id: None,
-                initial_flux: 0,
-                initial_power: 0,
-                initial_credit: 0,
-            };
-        }
-        
-        if request.signature.is_empty() {
-            return RegisterUserResponse {
-                success: false,
-                message: "Signature cannot be empty".to_string(),
-                address: request.address,
-                event_id: None,
-                initial_flux: 0,
-                initial_power: 0,
-                initial_credit: 0,
-            };
+        // Validate based on registration type
+        if let Some(ref nostr_pubkey) = request.nostr_pubkey {
+            // Nostr registration
+            info!("           └─ Registration type: Nostr");
+            if nostr_pubkey.len() != 32 {
+                return RegisterUserResponse {
+                    success: false,
+                    message: "Nostr public key must be 32 bytes".to_string(),
+                    address: request.address,
+                    event_id: None,
+                    initial_flux: 0,
+                    initial_power: 0,
+                    initial_credit: 0,
+                };
+            }
+            
+            if request.signature.is_none() || request.signature.as_ref().unwrap().is_empty() {
+                return RegisterUserResponse {
+                    success: false,
+                    message: "Nostr signature cannot be empty".to_string(),
+                    address: request.address,
+                    event_id: None,
+                    initial_flux: 0,
+                    initial_power: 0,
+                    initial_credit: 0,
+                };
+            }
+        } else {
+            // MetaMask registration
+            info!("           └─ Registration type: MetaMask");
+            // Signature is optional for MetaMask (middle layer already verified)
+            // But if provided, we can do quick_check verification
         }
         
         info!("           └─ Request validation passed");
         
-        // Step 2: Verify signature
+        // Step 2: Verify signature (optional quick_check)
         info!("[REG 2/6] 🔐 Verifying signature...");
-        // TODO: Implement actual signature verification
-        // For now, just check that signature is not empty
-        // Expected message: "Register to Setu Network: {address}"
-        info!("           └─ Signature verification passed (mock)");
+        if let Some(ref signature) = request.signature {
+            if let Some(ref nostr_pubkey) = request.nostr_pubkey {
+                // Nostr signature verification
+                info!("           └─ Verifying Nostr Schnorr signature...");
+                // TODO: Implement actual Schnorr signature verification
+                // Expected: Schnorr signature (64 bytes)
+                if signature.len() != 64 {
+                    return RegisterUserResponse {
+                        success: false,
+                        message: "Invalid Nostr signature length (expected 64 bytes)".to_string(),
+                        address: request.address,
+                        event_id: None,
+                        initial_flux: 0,
+                        initial_power: 0,
+                        initial_credit: 0,
+                    };
+                }
+                info!("           └─ Nostr signature verification passed (mock)");
+            } else {
+                // MetaMask ECDSA signature verification (optional quick_check)
+                info!("           └─ Verifying MetaMask ECDSA signature...");
+                // TODO: Implement actual ECDSA signature verification
+                // Expected: ECDSA signature (65 bytes: r(32) + s(32) + v(1))
+                // Message format: "Register to Setu: {timestamp}"
+                if signature.len() != 65 {
+                    warn!("           └─ Invalid MetaMask signature length (expected 65 bytes), skipping verification");
+                } else {
+                    info!("           └─ MetaMask signature verification passed (mock)");
+                }
+            }
+        } else {
+            info!("           └─ No signature provided, trusting middle layer verification");
+        }
         
         // Step 3: Check if user already registered
         info!("[REG 3/6] 🔍 Checking if user already registered...");
@@ -141,6 +182,7 @@ impl UserRpcHandler for ValidatorUserHandler {
             address: request.address.clone(),
             nostr_pubkey: request.nostr_pubkey.clone(),
             signature: request.signature.clone(),
+            message: request.message.clone(),
             timestamp: request.timestamp,
             subnet_id: request.subnet_id.clone(),
             display_name: request.display_name.clone(),

@@ -20,23 +20,44 @@ use serde::{Deserialize, Serialize};
 
 /// Request to register a new user
 /// 
-/// Users register from Nostr applications. The address is derived from their Nostr public key.
+/// Supports two registration methods:
+/// 1. MetaMask (Ethereum wallet): address + ECDSA signature
+/// 2. Nostr: nostr_pubkey + Schnorr signature (address derived from pubkey)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterUserRequest {
-    /// Ethereum-style address derived from Nostr public key
+    /// User's Ethereum-style address (0x...)
+    /// - For MetaMask: directly from wallet
+    /// - For Nostr: derived from nostr_pubkey
     pub address: String,
-    /// Nostr public key (32 bytes, Schnorr x-only public key)
-    pub nostr_pubkey: Vec<u8>,
-    /// Nostr Schnorr signature of the registration event
-    pub signature: Vec<u8>,
+    
+    /// Optional: Nostr public key (32 bytes, Schnorr x-only public key)
+    /// Only present for Nostr-based registrations
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nostr_pubkey: Option<Vec<u8>>,
+    
+    /// Optional: Signature proving ownership
+    /// - For MetaMask: ECDSA signature (65 bytes)
+    /// - For Nostr: Schnorr signature (64 bytes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Vec<u8>>,
+    
+    /// Optional: Signed message (for verification)
+    /// Format: "Register to Setu: {timestamp}"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    
     /// Timestamp (for replay attack prevention)
     pub timestamp: u64,
+    
     /// Subnet ID to register in (None = root subnet)
     pub subnet_id: Option<String>,
+    
     /// Optional display name
     pub display_name: Option<String>,
+    
     /// Optional metadata (JSON string)
     pub metadata: Option<String>,
+    
     /// Invite code used for registration
     pub invite_code: Option<String>,
 }
@@ -386,10 +407,12 @@ mod tests {
     
     #[test]
     fn test_register_user_request_serialization() {
-        let request = RegisterUserRequest {
+        // Test MetaMask registration
+        let metamask_request = RegisterUserRequest {
             address: "0x1234567890abcdef".to_string(),
-            nostr_pubkey: vec![1; 32],
-            signature: vec![5, 6, 7, 8],
+            nostr_pubkey: None,
+            signature: Some(vec![1; 65]), // ECDSA signature
+            message: Some("Register to Setu: 1234567890".to_string()),
             timestamp: 1234567890,
             subnet_id: Some("subnet-1".to_string()),
             display_name: Some("Alice".to_string()),
@@ -397,17 +420,45 @@ mod tests {
             invite_code: Some("INVITE123".to_string()),
         };
         
-        let wrapped = UserRpcRequest::RegisterUser(request);
+        let wrapped = UserRpcRequest::RegisterUser(metamask_request);
         let bytes = wrapped.to_bytes().unwrap();
         let decoded = UserRpcRequest::from_bytes(&bytes).unwrap();
         
         match decoded {
             UserRpcRequest::RegisterUser(req) => {
                 assert_eq!(req.address, "0x1234567890abcdef");
-                assert_eq!(req.nostr_pubkey.len(), 32);
+                assert!(req.nostr_pubkey.is_none());
+                assert_eq!(req.signature.as_ref().unwrap().len(), 65);
                 assert_eq!(req.timestamp, 1234567890);
                 assert_eq!(req.display_name, Some("Alice".to_string()));
                 assert_eq!(req.invite_code, Some("INVITE123".to_string()));
+            }
+            _ => panic!("Wrong request type"),
+        }
+        
+        // Test Nostr registration
+        let nostr_request = RegisterUserRequest {
+            address: "0xabcdef1234567890".to_string(),
+            nostr_pubkey: Some(vec![1; 32]),
+            signature: Some(vec![5; 64]), // Schnorr signature
+            message: None,
+            timestamp: 1234567890,
+            subnet_id: None,
+            display_name: Some("Bob".to_string()),
+            metadata: None,
+            invite_code: None,
+        };
+        
+        let wrapped = UserRpcRequest::RegisterUser(nostr_request);
+        let bytes = wrapped.to_bytes().unwrap();
+        let decoded = UserRpcRequest::from_bytes(&bytes).unwrap();
+        
+        match decoded {
+            UserRpcRequest::RegisterUser(req) => {
+                assert_eq!(req.address, "0xabcdef1234567890");
+                assert_eq!(req.nostr_pubkey.as_ref().unwrap().len(), 32);
+                assert_eq!(req.signature.as_ref().unwrap().len(), 64);
+                assert_eq!(req.display_name, Some("Bob".to_string()));
             }
             _ => panic!("Wrong request type"),
         }
