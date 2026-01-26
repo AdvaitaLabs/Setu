@@ -52,7 +52,17 @@ pub fn generate_keypair(
     
     // Get public key bytes (uncompressed, 65 bytes)
     let public_key = keypair.public();
-    let public_key_bytes = public_key.as_bytes();
+    
+    // For secp256k1, we need to get the uncompressed format (65 bytes)
+    let public_key_bytes = match &public_key {
+        setu_keys::PublicKey::Secp256k1(vk) => {
+            // Get uncompressed point (65 bytes: 0x04 || x || y)
+            use k256::elliptic_curve::sec1::ToEncodedPoint;
+            let point = vk.to_encoded_point(false); // false = uncompressed
+            point.as_bytes().to_vec()
+        }
+        _ => public_key.as_bytes(),
+    };
     
     // Derive Ethereum-style address
     let eth_address = derive_ethereum_address_from_secp256k1(&public_key_bytes)
@@ -123,7 +133,17 @@ pub fn recover_from_mnemonic(
     
     // Get public key bytes
     let public_key = keypair.public();
-    let public_key_bytes = public_key.as_bytes();
+    
+    // For secp256k1, we need to get the uncompressed format (65 bytes)
+    let public_key_bytes = match &public_key {
+        setu_keys::PublicKey::Secp256k1(vk) => {
+            // Get uncompressed point (65 bytes: 0x04 || x || y)
+            use k256::elliptic_curve::sec1::ToEncodedPoint;
+            let point = vk.to_encoded_point(false); // false = uncompressed
+            point.as_bytes().to_vec()
+        }
+        _ => public_key.as_bytes(),
+    };
     
     // Derive Ethereum-style address
     let eth_address = derive_ethereum_address_from_secp256k1(&public_key_bytes)
