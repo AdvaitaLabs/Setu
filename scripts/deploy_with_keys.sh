@@ -57,34 +57,30 @@ if [ -f "${KEYS_DIR}/validator-key.json" ]; then
         mv ${KEYS_DIR}/validator-key.json ${KEYS_DIR}/validator-key.json.backup.$(date +%s)
         
         echo -e "${YELLOW}  Generating new key...${NC}"
-        ${CLI_BIN} keygen generate \
+        ${CLI_BIN} validator keygen \
             --output ${KEYS_DIR}/validator-key.json \
-            --words 24
+            --stake 10000 \
+            --commission 10
         
         echo -e "${GREEN}  ✓ New key generated${NC}"
-        echo -e "${RED}  ⚠️  Please backup your mnemonic phrase!${NC}"
-        ${CLI_BIN} keygen export \
-            --key-file ${KEYS_DIR}/validator-key.json \
-            --format mnemonic
+        echo -e "${RED}  ⚠️  Please backup your key file: ${KEYS_DIR}/validator-key.json${NC}"
     fi
 else
     echo -e "${YELLOW}  Generating new key...${NC}"
-    ${CLI_BIN} keygen generate \
+    ${CLI_BIN} validator keygen \
         --output ${KEYS_DIR}/validator-key.json \
-        --words 24
+        --stake 10000 \
+        --commission 10
     
     echo -e "${GREEN}  ✓ Key generated${NC}"
-    echo -e "${RED}  ⚠️  Please backup your mnemonic phrase!${NC}"
-    ${CLI_BIN} keygen export \
-        --key-file ${KEYS_DIR}/validator-key.json \
-        --format mnemonic
+    echo -e "${RED}  ⚠️  Please backup your key file: ${KEYS_DIR}/validator-key.json${NC}"
 fi
 
 # Display Validator address info
 echo -e "${YELLOW}  Validator address info:${NC}"
-${CLI_BIN} keygen export \
+${CLI_BIN} validator export-key \
     --key-file ${KEYS_DIR}/validator-key.json \
-    --format json | grep -E "address|public_key"
+    --format json 2>/dev/null | head -10 || echo "  (Key info available in ${KEYS_DIR}/validator-key.json)"
 
 # ============================================
 # Generate Solver Key
@@ -100,34 +96,26 @@ if [ -f "${KEYS_DIR}/solver-key.json" ]; then
         mv ${KEYS_DIR}/solver-key.json ${KEYS_DIR}/solver-key.json.backup.$(date +%s)
         
         echo -e "${YELLOW}  Generating new key...${NC}"
-        ${CLI_BIN} keygen generate \
-            --output ${KEYS_DIR}/solver-key.json \
-            --words 24
+        ${CLI_BIN} solver keygen \
+            --output ${KEYS_DIR}/solver-key.json
         
         echo -e "${GREEN}  ✓ New key generated${NC}"
-        echo -e "${RED}  ⚠️  Please backup your mnemonic phrase!${NC}"
-        ${CLI_BIN} keygen export \
-            --key-file ${KEYS_DIR}/solver-key.json \
-            --format mnemonic
+        echo -e "${RED}  ⚠️  Please backup your key file: ${KEYS_DIR}/solver-key.json${NC}"
     fi
 else
     echo -e "${YELLOW}  Generating new key...${NC}"
-    ${CLI_BIN} keygen generate \
-        --output ${KEYS_DIR}/solver-key.json \
-        --words 24
+    ${CLI_BIN} solver keygen \
+        --output ${KEYS_DIR}/solver-key.json
     
     echo -e "${GREEN}  ✓ Key generated${NC}"
-    echo -e "${RED}  ⚠️  Please backup your mnemonic phrase!${NC}"
-    ${CLI_BIN} keygen export \
-        --key-file ${KEYS_DIR}/solver-key.json \
-        --format mnemonic
+    echo -e "${RED}  ⚠️  Please backup your key file: ${KEYS_DIR}/solver-key.json${NC}"
 fi
 
 # Display Solver address info
 echo -e "${YELLOW}  Solver address info:${NC}"
-${CLI_BIN} keygen export \
+${CLI_BIN} solver export-key \
     --key-file ${KEYS_DIR}/solver-key.json \
-    --format json | grep -E "address|public_key"
+    --format json 2>/dev/null | head -10 || echo "  (Key info available in ${KEYS_DIR}/solver-key.json)"
 
 # ============================================
 # Start Validator
