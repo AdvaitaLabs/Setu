@@ -320,20 +320,33 @@ impl SubnetRegistration {
 
 /// User registration data
 /// 
-/// Users register from Nostr applications. The address is derived from their Nostr public key.
-/// The middle layer converts Nostr events to Setu registration requests.
+/// Supports two registration methods:
+/// 1. MetaMask (Ethereum wallet): address + ECDSA signature
+/// 2. Nostr: nostr_pubkey + Schnorr signature (address derived from pubkey)
+/// 
+/// The middle layer (Nostr Relay adapter) converts events to registration requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserRegistration {
-    /// Ethereum-style address derived from Nostr public key
-    /// Derivation: SHA256(nostr_pubkey)[0..20] -> 0x{hex}
+    /// User's Ethereum-style address (0x...)
+    /// - For MetaMask: directly from wallet
+    /// - For Nostr: derived from nostr_pubkey via Keccak256
     pub address: String,
     
-    /// Nostr public key (32 bytes, Schnorr x-only public key)
-    /// Used for: 1) Verifying address derivation 2) Verifying signature
-    pub nostr_pubkey: Vec<u8>,
+    /// Optional: Nostr public key (32 bytes, Schnorr x-only public key)
+    /// Only present for Nostr-based registrations
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nostr_pubkey: Option<Vec<u8>>,
     
-    /// Nostr Schnorr signature of the registration event
-    pub signature: Vec<u8>,
+    /// Signature proving ownership
+    /// - For MetaMask: ECDSA signature (65 bytes)
+    /// - For Nostr: Schnorr signature (64 bytes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Vec<u8>>,
+    
+    /// Signed message (for verification)
+    /// Format: "Register to Setu: {timestamp}"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     
     /// Timestamp (for replay attack prevention)
     pub timestamp: u64,
@@ -355,17 +368,16 @@ pub struct UserRegistration {
 }
 
 impl UserRegistration {
-    /// Create a new user registration from Nostr credentials
-    pub fn new(
+    /// Create a new user registration from MetaMask (Ethereum wallet)
+    pub fn from_metamask(
         address: impl Into<String>,
-        nostr_pubkey: Vec<u8>,
-        signature: Vec<u8>,
         timestamp: u64,
     ) -> Self {
         Self {
             address: address.into(),
-            nostr_pubkey,
-            signature,
+            nostr_pubkey: None,
+            signature: None,
+            message: None,
             timestamp,
             subnet_id: None,
             display_name: None,
@@ -373,6 +385,37 @@ impl UserRegistration {
             invited_by: None,
             invite_code: None,
         }
+    }
+    
+    /// Create a new user registration from Nostr credentials
+    pub fn from_nostr(
+        address: impl Into<String>,
+        nostr_pubkey: Vec<u8>,
+        signature: Vec<u8>,
+        timestamp: u64,
+    ) -> Self {
+        Self {
+            address: address.into(),
+            nostr_pubkey: Some(nostr_pubkey),
+            signature: Some(signature),
+            message: None,
+            timestamp,
+            subnet_id: None,
+            display_name: None,
+            metadata: None,
+            invited_by: None,
+            invite_code: None,
+        }
+    }
+    
+    pub fn with_signature(mut self, signature: Vec<u8>) -> Self {
+        self.signature = Some(signature);
+        self
+    }
+    
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
     }
     
     pub fn with_subnet(mut self, subnet_id: impl Into<String>) -> Self {
@@ -401,12 +444,29 @@ impl UserRegistration {
         self.subnet_id.as_deref().unwrap_or("subnet-0")
     }
     
-    /// Verify the Nostr signature and address derivation
+    /// Check if this is a Nostr-based registration
+    pub fn is_nostr(&self) -> bool {
+        self.nostr_pubkey.is_some()
+    }
+    
+    /// Check if this is a MetaMask-based registration
+    pub fn is_metamask(&self) -> bool {
+        self.nostr_pubkey.is_none()
+    }
+    
+    /// Verify the signature and address derivation
     pub fn verify(&self) -> bool {
-        // TODO: Implement actual Schnorr signature verification
-        // TODO: Verify address derivation from nostr_pubkey
-        // For now, just check that fields are not empty
-        !self.signature.is_empty() && !self.nostr_pubkey.is_empty() && self.nostr_pubkey.len() == 32
+        if let Some(nostr_pubkey) = &self.nostr_pubkey {
+            // Nostr registration: verify Schnorr signature and address derivation
+            // TODO: Implement actual Schnorr signature verification
+            // TODO: Verify address derivation from nostr_pubkey
+            !nostr_pubkey.is_empty() && nostr_pubkey.len() == 32
+        } else {
+            // MetaMask registration: verify ECDSA signature
+            // TODO: Implement actual ECDSA signature verification
+            // For now, just check address format
+            self.address.starts_with("0x") && self.address.len() == 42
+        }
     }
 }
 
@@ -493,8 +553,8 @@ mod tests {
             vec![1, 2, 3],
             vec![4, 5, 6],
         )
-        .with_capacity(50)
-        .with_shard("shard-0");
+            .with_capacity(50)
+            .with_shard("shard-0");
         assert_eq!(reg.solver_id, "s1");
         assert_eq!(reg.account_address, "0xef123456");
         assert_eq!(reg.capacity, 50);
@@ -518,20 +578,35 @@ mod tests {
     }
     
     #[test]
-    fn test_user_registration() {
+    fn test_user_registration_metamask() {
+        let reg = UserRegistration::from_metamask("0x1234abcd", 1234567890)
+            .with_subnet("subnet-1")
+            .with_display_name("Alice")
+            .with_signature(vec![1, 2, 3])
+            .with_message("Register to Setu: 1234567890");
+        assert_eq!(reg.address, "0x1234abcd");
+        assert_eq!(reg.get_subnet(), "subnet-1");
+        assert!(reg.is_metamask());
+        assert!(!reg.is_nostr());
+        assert!(reg.verify());
+    }
+    
+    #[test]
+    fn test_user_registration_nostr() {
         let nostr_pubkey = vec![1; 32]; // 32 bytes Nostr pubkey
-        let reg = UserRegistration::new("0x1234abcd", nostr_pubkey, vec![4, 5, 6], 1234567890)
+        let reg = UserRegistration::from_nostr("0x1234abcd", nostr_pubkey, vec![4, 5, 6], 1234567890)
             .with_subnet("subnet-1")
             .with_display_name("Alice");
         assert_eq!(reg.address, "0x1234abcd");
         assert_eq!(reg.get_subnet(), "subnet-1");
+        assert!(reg.is_nostr());
+        assert!(!reg.is_metamask());
         assert!(reg.verify());
     }
     
     #[test]
     fn test_user_default_subnet() {
-        let nostr_pubkey = vec![1; 32];
-        let reg = UserRegistration::new("0xabcd", nostr_pubkey, vec![2], 1234567890);
+        let reg = UserRegistration::from_metamask("0xabcd", 1234567890);
         assert_eq!(reg.get_subnet(), "subnet-0");
     }
 }

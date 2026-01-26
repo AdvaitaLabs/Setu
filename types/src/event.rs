@@ -656,7 +656,7 @@ mod tests {
     
     #[test]
     fn test_user_register_event() {
-        let registration = UserRegistration::new(
+        let registration = UserRegistration::from_nostr(
             "0x1234567890abcdef",  // address
             vec![1; 32],            // nostr_pubkey (32 bytes)
             vec![4, 5, 6],          // signature
