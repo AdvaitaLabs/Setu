@@ -224,22 +224,82 @@ impl MockEnclave {
         Ok(store)
     }
     
-    /// Simulate applying events to state using setu-runtime
-    async fn simulate_execution(&self, input: &StfInput) -> StfResult<(StateDiff, Vec<EventId>, Vec<FailedEvent>)> {
+    /// Simulate applying events to state using self.runtime (LEGACY mode)
+    /// 
+    /// WARNING: This uses the shared self.runtime which can cause race conditions
+    /// in concurrent execution. For solver-tee3 mode, use simulate_execution_isolated().
+    /// 
+    /// This method is kept for backward compatibility with non-read_set executions.
+    #[allow(dead_code)]
+    async fn simulate_execution(
+        &self, 
+        input: &StfInput,
+        _local_runtime: Option<RuntimeExecutor<InMemoryStateStore>>,
+    ) -> StfResult<(StateDiff, Vec<EventId>, Vec<FailedEvent>)> {
         let start = std::time::Instant::now();
         let mut diff = StateDiff::new();
         let mut processed = Vec::new();
         let mut failed = Vec::new();
         
-        // Process each event
+        // Process each event using shared self.runtime (legacy mode)
         for event in &input.events {
             // Check timeout
             if start.elapsed().as_millis() as u64 > self.config.max_execution_time_ms {
                 return Err(StfError::ExecutionTimeout);
             }
             
-            // Execute event using setu-runtime, passing resolved_inputs
-            match self.execute_single_event(event, &input.resolved_inputs, &mut diff).await {
+            // Execute event using self.runtime (shared)
+            let result = self.execute_single_event(event, &input.resolved_inputs, &mut diff).await;
+            
+            match result {
+                Ok(()) => {
+                    processed.push(event.id.clone());
+                }
+                Err(reason) => {
+                    failed.push(FailedEvent {
+                        event_id: event.id.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+        
+        // Increment execution counter
+        *self.execution_count.write().await += 1;
+        
+        Ok((diff, processed, failed))
+    }
+    
+    /// Execute events with an isolated local runtime (solver-tee3 mode)
+    /// 
+    /// This method takes ownership of a local RuntimeExecutor, ensuring complete
+    /// isolation from concurrent tasks. Each task gets its own state snapshot.
+    async fn simulate_execution_isolated(
+        &self,
+        input: &StfInput,
+        mut local_runtime: RuntimeExecutor<InMemoryStateStore>,
+    ) -> StfResult<(StateDiff, Vec<EventId>, Vec<FailedEvent>)> {
+        let start = std::time::Instant::now();
+        let mut diff = StateDiff::new();
+        let mut processed = Vec::new();
+        let mut failed = Vec::new();
+        
+        // Process each event with the isolated local runtime
+        for event in &input.events {
+            // Check timeout
+            if start.elapsed().as_millis() as u64 > self.config.max_execution_time_ms {
+                return Err(StfError::ExecutionTimeout);
+            }
+            
+            // Execute event using the LOCAL runtime (not self.runtime!)
+            let result = self.execute_single_event_with_runtime(
+                event, 
+                &input.resolved_inputs, 
+                &mut diff,
+                &mut local_runtime,
+            ).await;
+            
+            match result {
                 Ok(()) => {
                     processed.push(event.id.clone());
                 }
@@ -264,6 +324,9 @@ impl MockEnclave {
     /// For transfer events, uses resolved_inputs.primary_coin() to get the coin_id
     /// that Validator has already selected.
     /// For other events, records them in legacy state.
+    /// 
+    /// NOTE: This method uses self.runtime (shared). For concurrent execution,
+    /// use execute_single_event_with_runtime() instead.
     async fn execute_single_event(
         &self,
         event: &setu_types::Event,
@@ -283,11 +346,40 @@ impl MockEnclave {
         Ok(())
     }
     
+    /// Execute a single event with an isolated local runtime (solver-tee3 mode)
+    /// 
+    /// This variant takes a mutable reference to a LOCAL RuntimeExecutor,
+    /// ensuring complete isolation from concurrent tasks.
+    async fn execute_single_event_with_runtime(
+        &self,
+        event: &setu_types::Event,
+        resolved_inputs: &ResolvedInputs,
+        diff: &mut StateDiff,
+        local_runtime: &mut RuntimeExecutor<InMemoryStateStore>,
+    ) -> Result<(), String> {
+        debug!(event_id = %event.id, event_type = ?event.event_type, "Executing event via isolated runtime");
+        
+        // Check if this is a transfer event
+        if let Some(transfer) = &event.transfer {
+            return self.execute_transfer_with_local_runtime(
+                event, transfer, resolved_inputs, diff, local_runtime
+            ).await;
+        }
+        
+        // For non-transfer events, record in legacy state
+        let mut legacy_state = self.legacy_state.write().await;
+        self.record_event_processed(&mut legacy_state, event, diff);
+        Ok(())
+    }
+    
     /// Execute a transfer event via setu-runtime (solver-tee3 architecture)
     /// 
     /// Uses resolved_inputs.primary_coin() to get the coin_id that Validator
     /// has already selected. This follows the solver-tee3 design where 
     /// Validator prepares everything - if coin_id is missing, it's an error.
+    /// 
+    /// NOTE: This uses self.runtime (shared). For concurrent execution,
+    /// use execute_transfer_with_local_runtime() instead.
     async fn execute_transfer_via_runtime(
         &self,
         event: &setu_types::Event,
@@ -344,6 +436,69 @@ impl MockEnclave {
             amount = transfer.amount,
             state_changes = output.state_changes.len(),
             "Transfer executed successfully via setu-runtime"
+        );
+        
+        Ok(())
+    }
+    
+    /// Execute a transfer event with an isolated local runtime (solver-tee3 mode)
+    /// 
+    /// This variant takes a mutable reference to a LOCAL RuntimeExecutor,
+    /// ensuring complete isolation from concurrent tasks.
+    async fn execute_transfer_with_local_runtime(
+        &self,
+        event: &setu_types::Event,
+        transfer: &setu_types::Transfer,
+        resolved_inputs: &ResolvedInputs,
+        diff: &mut StateDiff,
+        local_runtime: &mut RuntimeExecutor<InMemoryStateStore>,
+    ) -> Result<(), String> {
+        let ctx = ExecutionContext {
+            executor_id: self.config.solver_id.clone(),
+            timestamp: event.timestamp,
+            in_tee: false, // Mock enclave
+        };
+        
+        // solver-tee3: resolved_inputs MUST have primary_coin
+        let resolved_coin = resolved_inputs.primary_coin()
+            .ok_or_else(|| "Missing resolved_inputs.primary_coin - TaskPreparer error".to_string())?;
+        
+        debug!(
+            event_id = %event.id,
+            coin_id = %resolved_coin.object_id,
+            from = %transfer.from,
+            to = %transfer.to,
+            amount = transfer.amount,
+            "Executing transfer with isolated runtime (solver-tee3)"
+        );
+        
+        // Use the LOCAL runtime (not self.runtime!)
+        let output = local_runtime.execute_transfer_with_coin(
+            resolved_coin.object_id.clone(),
+            &transfer.from,
+            &transfer.to,
+            Some(transfer.amount as u64),
+            &ctx,
+        ).map_err(|e| format!("Runtime error: {}", e))?;
+        
+        if !output.success {
+            return Err(output.message.unwrap_or_else(|| "Transfer failed".to_string()));
+        }
+        
+        // Convert setu-runtime StateChanges to enclave StateDiff
+        diff.add_state_changes(&output.state_changes);
+        
+        // Record event as processed
+        let mut legacy_state = self.legacy_state.write().await;
+        self.record_event_processed(&mut legacy_state, event, diff);
+        
+        info!(
+            event_id = %event.id,
+            from = %transfer.from,
+            to = %transfer.to,
+            amount = transfer.amount,
+            state_changes = output.state_changes.len(),
+            "Transfer executed successfully via isolated runtime"
         );
         
         Ok(())
@@ -412,27 +567,30 @@ impl EnclaveRuntime for MockEnclave {
         // For now, skip verification in mock mode
         // self.verify_read_set(&input.read_set, &input.pre_state_root)?;
         
-        // ========== solver-tee3: Build temporary state from read_set ==========
-        // If read_set is non-empty, build a fresh state store from it.
-        // This makes the TEE execution truly stateless - it only sees what Validator provided.
+        // ========== solver-tee3: Build ISOLATED state from read_set ==========
+        // CRITICAL FIX: Each task gets its own local RuntimeExecutor.
+        // This prevents concurrent tasks from overwriting each other's state.
+        // 
+        // Previous bug: We replaced self.runtime with a new temp_store, causing
+        // race conditions where concurrent tasks would see each other's (or empty) state.
         let use_read_set_state = !input.read_set.is_empty();
         
-        if use_read_set_state {
-            // Build temporary state from read_set
-            let temp_store = self.build_state_from_read_set(&input.read_set)?;
-            
-            // Replace the runtime's state with the temporary state
-            let mut runtime = self.runtime.write().await;
-            *runtime = RuntimeExecutor::new(temp_store);
+        let (diff, events_processed, events_failed) = if use_read_set_state {
+            // Build temporary state from read_set into a LOCAL store
+            let local_store = self.build_state_from_read_set(&input.read_set)?;
+            let local_runtime = RuntimeExecutor::new(local_store);
             
             info!(
                 read_set_entries = input.read_set.len(),
-                "Using read_set state for execution (solver-tee3 mode)"
+                "Using isolated read_set state for execution (solver-tee3 mode)"
             );
-        }
-        
-        // Execute using setu-runtime
-        let (diff, events_processed, events_failed) = self.simulate_execution(&input).await?;
+            
+            // Execute using the ISOLATED local runtime (not self.runtime!)
+            self.simulate_execution_isolated(&input, local_runtime).await?
+        } else {
+            // Legacy mode: use shared self.runtime (only for backward compatibility)
+            self.simulate_execution(&input, None).await?
+        };
         
         // Compute post-state root from legacy state
         // Note: For full object model, should compute from RuntimeExecutor state

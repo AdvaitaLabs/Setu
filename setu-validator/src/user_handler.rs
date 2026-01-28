@@ -169,7 +169,7 @@ impl UserRpcHandler for ValidatorUserHandler {
             .unwrap()
             .as_millis() as u64;
         
-        let vlc_time = self.network_service.get_vlc_time().await;
+        let vlc_time = self.network_service.get_vlc_time();
         let mut vlc = setu_vlc::VectorClock::new();
         vlc.increment(self.network_service.validator_id());
         let vlc_snapshot = VLCSnapshot {

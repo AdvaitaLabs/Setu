@@ -47,7 +47,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         let _channel = self.service.register_solver_internal(&request);
 
         // Create registration event
-        let vlc_time = self.service.get_vlc_time().await;
+        let vlc_time = self.service.get_vlc_time();
         let mut vlc = setu_vlc::VectorClock::new();
         vlc.increment(self.service.validator_id());
         let vlc_snapshot = setu_vlc::VLCSnapshot {
@@ -116,7 +116,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         );
 
         // Create registration event
-        let vlc_time = self.service.get_vlc_time().await;
+        let vlc_time = self.service.get_vlc_time();
         let mut vlc = setu_vlc::VectorClock::new();
         vlc.increment(self.service.validator_id());
         let vlc_snapshot = setu_vlc::VLCSnapshot {

@@ -2,6 +2,13 @@
 //!
 //! This is the main service handling network operations for the Validator.
 //! Now with integrated consensus support.
+//!
+//! ## TPS Optimizations
+//! 
+//! This module implements several optimizations for high throughput:
+//! - DashMap for lock-free concurrent access to transfer_status, events, solver_info
+//! - Reverse index (solver_pending_transfers) to avoid O(n) scans
+//! - Lock-free VLC allocation via atomic counter
 
 use super::registration::ValidatorRegistrationHandler;
 use super::types::*;
@@ -11,6 +18,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use dashmap::DashMap;
 use setu_types::{Transfer, TransferType, AssignedVlc};
 use parking_lot::RwLock;
 use setu_rpc::{
@@ -22,7 +30,8 @@ use setu_types::event::{Event, EventPayload};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
 
 // Import API handlers
@@ -53,7 +62,8 @@ pub struct ValidatorNetworkService {
     validators: Arc<RwLock<HashMap<String, ValidatorInfo>>>,
 
     /// Registered solver information (for sync HTTP calls)
-    solver_info: Arc<RwLock<HashMap<String, SolverInfo>>>,
+    /// Uses DashMap for lock-free concurrent access
+    solver_info: Arc<DashMap<String, SolverInfo>>,
 
     /// Solver channels for sending SolverTasks (legacy, kept for compatibility)
     solver_channels: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<setu_types::task::SolverTask>>>>,
@@ -61,11 +71,15 @@ pub struct ValidatorNetworkService {
     /// HTTP client for sync Solver calls
     http_client: reqwest::Client,
 
-    /// Transfer tracking
-    transfer_status: Arc<RwLock<HashMap<String, TransferTracker>>>,
+    /// Transfer tracking - uses DashMap for lock-free concurrent access
+    transfer_status: Arc<DashMap<String, TransferTracker>>,
+    
+    /// Reverse index: solver_id -> pending transfer_ids (for O(1) lookup)
+    /// This avoids the O(n) full table scan in execute_tee_task completion
+    solver_pending_transfers: Arc<DashMap<String, Vec<String>>>,
 
-    /// Event storage
-    events: Arc<RwLock<HashMap<String, Event>>>,
+    /// Event storage - uses DashMap for lock-free concurrent access
+    events: Arc<DashMap<String, Event>>,
 
     /// Pending event queue
     pending_events: Arc<RwLock<Vec<String>>>,
@@ -83,6 +97,12 @@ pub struct ValidatorNetworkService {
     transfer_counter: AtomicU64,
     vlc_counter: AtomicU64,
     event_counter: AtomicU64,
+
+    /// TEE concurrency limiter (default: 100 concurrent TEE calls)
+    tee_semaphore: Arc<Semaphore>,
+
+    /// Count of pending TEE tasks (for graceful shutdown)
+    pending_tee_count: Arc<AtomicU64>,
 }
 
 impl ValidatorNetworkService {
@@ -114,11 +134,12 @@ impl ValidatorNetworkService {
             task_preparer,
             consensus_validator: None,
             validators: Arc::new(RwLock::new(HashMap::new())),
-            solver_info: Arc::new(RwLock::new(HashMap::new())),
+            solver_info: Arc::new(DashMap::new()),
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
             http_client,
-            transfer_status: Arc::new(RwLock::new(HashMap::new())),
-            events: Arc::new(RwLock::new(HashMap::new())),
+            transfer_status: Arc::new(DashMap::new()),
+            solver_pending_transfers: Arc::new(DashMap::new()),
+            events: Arc::new(DashMap::new()),
             pending_events: Arc::new(RwLock::new(Vec::new())),
             dag_events: Arc::new(RwLock::new(Vec::new())),
             config,
@@ -126,6 +147,8 @@ impl ValidatorNetworkService {
             transfer_counter: AtomicU64::new(0),
             vlc_counter: AtomicU64::new(0),
             event_counter: AtomicU64::new(0),
+            tee_semaphore: Arc::new(Semaphore::new(100)),  // Default: 100 concurrent TEE calls
+            pending_tee_count: Arc::new(AtomicU64::new(0)),
         }
     }
     
@@ -159,11 +182,12 @@ impl ValidatorNetworkService {
             task_preparer,
             consensus_validator: Some(consensus_validator),
             validators: Arc::new(RwLock::new(HashMap::new())),
-            solver_info: Arc::new(RwLock::new(HashMap::new())),
+            solver_info: Arc::new(DashMap::new()),
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
             http_client,
-            transfer_status: Arc::new(RwLock::new(HashMap::new())),
-            events: Arc::new(RwLock::new(HashMap::new())),
+            transfer_status: Arc::new(DashMap::new()),
+            solver_pending_transfers: Arc::new(DashMap::new()),
+            events: Arc::new(DashMap::new()),
             pending_events: Arc::new(RwLock::new(Vec::new())),
             dag_events: Arc::new(RwLock::new(Vec::new())),
             config,
@@ -171,6 +195,8 @@ impl ValidatorNetworkService {
             transfer_counter: AtomicU64::new(0),
             vlc_counter: AtomicU64::new(0),
             event_counter: AtomicU64::new(0),
+            tee_semaphore: Arc::new(Semaphore::new(100)),  // Default: 100 concurrent TEE calls
+            pending_tee_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -215,13 +241,22 @@ impl ValidatorNetworkService {
         self.pending_events.read().len()
     }
 
-    /// Get the next VLC time
+    /// Get the next VLC time (FAST PATH - lock-free)
     /// 
-    /// If consensus is enabled, returns the current VLC logical time from ConsensusValidator.
+    /// If consensus is enabled, uses atomic counter for O(1) performance.
     /// Otherwise, uses the local vlc_counter (legacy mode).
-    pub async fn get_vlc_time(&self) -> u64 {
+    /// 
+    /// This is optimized for high-throughput scenarios by avoiding the
+    /// VLC write lock contention that was a bottleneck in TPS tests.
+    /// 
+    /// IMPORTANT: This method must be used for event creation to ensure each
+    /// event gets a unique logical time. Do NOT use vlc_snapshot() for this purpose.
+    #[inline]
+    pub fn get_vlc_time(&self) -> u64 {
         if let Some(ref consensus) = self.consensus_validator {
-            consensus.vlc_snapshot().await.logical_time
+            // FAST PATH: Use lock-free atomic counter
+            // This avoids the tokio::sync::RwLock write lock contention
+            consensus.allocate_logical_time()
         } else {
             // Legacy mode: use local counter
         self.vlc_counter.fetch_add(1, Ordering::SeqCst)
@@ -318,7 +353,8 @@ impl ValidatorNetworkService {
         });
 
         // Step 2: VLC Assignment (from consensus if enabled, otherwise local counter)
-        let vlc_time = self.get_vlc_time().await;
+        // Uses lock-free atomic counter for high performance
+        let vlc_time = self.get_vlc_time();
         let now_millis = current_timestamp_millis();
 
         let assigned_vlc = AssignedVlc {
@@ -415,61 +451,38 @@ impl ValidatorNetworkService {
             }
         };
 
-        // Step 5: Send SolverTask
-        if let Some(ref sid) = solver_id {
-            match self.send_solver_task_to_solver(sid, solver_task).await {
-                Ok(()) => {
-                    steps.push(ProcessingStep {
-                        step: "dispatch".to_string(),
-                        status: "completed".to_string(),
-                        details: Some("SolverTask dispatched".to_string()),
-                        timestamp: now,
-                    });
-                }
-                Err(e) => {
-                    steps.push(ProcessingStep {
-                        step: "dispatch".to_string(),
-                        status: "failed".to_string(),
-                        details: Some(format!("Dispatch error: {}", e)),
-                        timestamp: now,
-                    });
-                }
-            }
-        }
-
-        // Step 6-7: Simulated steps
-        steps.push(ProcessingStep {
-            step: "consensus_prepare".to_string(),
-            status: "completed".to_string(),
-            details: Some("Single validator mode".to_string()),
-            timestamp: now,
-        });
-
-        steps.push(ProcessingStep {
-            step: "awaiting_tee_result".to_string(),
-            status: "pending".to_string(),
-            details: Some("Waiting for TEE execution".to_string()),
-            timestamp: now,
-        });
-
-        // Store status
-        self.transfer_status.write().insert(
+        // Step 5: [FIX BUG] Store status FIRST, BEFORE spawning TEE task
+        // This fixes the bug where status update in execute_tee_task couldn't find the tracker
+        self.transfer_status.insert(
             transfer_id.clone(),
             TransferTracker {
                 transfer_id: transfer_id.clone(),
-                status: "pending_execution".to_string(),
+                status: "pending_tee_execution".to_string(),
                 solver_id: solver_id.clone(),
                 event_id: None,
                 processing_steps: steps.clone(),
                 created_at: now,
             },
         );
+        
+        // Add to reverse index for O(1) lookup during TEE completion
+        if let Some(ref sid) = solver_id {
+            self.solver_pending_transfers
+                .entry(sid.clone())
+                .or_insert_with(Vec::new)
+                .push(transfer_id.clone());
+        }
 
-        info!(transfer_id = %transfer_id, solver_id = ?solver_id, "Transfer submitted");
+        // Step 6: Spawn async TEE task (non-blocking!)
+        if let Some(ref sid) = solver_id {
+            self.spawn_tee_task(transfer_id.clone(), sid.clone(), solver_task);
+        }
+
+        info!(transfer_id = %transfer_id, solver_id = ?solver_id, "Transfer submitted (TEE execution spawned)");
 
         SubmitTransferResponse {
             success: true,
-            message: "Transfer submitted successfully".to_string(),
+            message: "Transfer submitted, awaiting TEE execution".to_string(),
             transfer_id: Some(transfer_id),
             solver_id,
             processing_steps: steps,
@@ -493,7 +506,7 @@ impl ValidatorNetworkService {
             timestamp: now,
         });
 
-        self.transfer_status.write().insert(
+        self.transfer_status.insert(
             transfer_id.clone(),
             TransferTracker {
                 transfer_id: transfer_id.clone(),
@@ -514,15 +527,286 @@ impl ValidatorNetworkService {
         }
     }
 
+    // ============================================
+    // Parallel TEE Execution (TPS Optimization)
+    // ============================================
+
+    /// Spawn an async TEE task (non-blocking)
+    /// 
+    /// This is the key optimization for TPS:
+    /// - submit_transfer returns immediately after spawning
+    /// - TEE execution happens in background with Semaphore-controlled concurrency
+    /// - Status is updated via transfer_id lookup (not find())
+    fn spawn_tee_task(
+        &self,
+        transfer_id: String,
+        solver_id: String,
+        task: setu_types::task::SolverTask,
+    ) {
+        // Clone Arc-wrapped fields for the spawned task
+        let semaphore = Arc::clone(&self.tee_semaphore);
+        let pending_count = Arc::clone(&self.pending_tee_count);
+        let http_client = self.http_client.clone();
+        let solver_info = Arc::clone(&self.solver_info);
+        let transfer_status = Arc::clone(&self.transfer_status);
+        let events = Arc::clone(&self.events);
+        let dag_events = Arc::clone(&self.dag_events);
+        let consensus = self.consensus_validator.clone();
+        let validator_id = self.validator_id.clone();
+
+        tokio::spawn(async move {
+            Self::execute_tee_task(
+                transfer_id,
+                solver_id,
+                task,
+                semaphore,
+                pending_count,
+                http_client,
+                solver_info,
+                transfer_status,
+                events,
+                dag_events,
+                consensus,
+                validator_id,
+            ).await;
+        });
+    }
+
+    /// Execute TEE task with concurrency control
+    /// 
+    /// This is a static method to avoid lifetime issues with spawn.
+    /// All shared state is passed explicitly as Arc-wrapped parameters.
+    async fn execute_tee_task(
+        transfer_id: String,
+        solver_id: String,
+        task: setu_types::task::SolverTask,
+        semaphore: Arc<Semaphore>,
+        pending_count: Arc<AtomicU64>,
+        http_client: reqwest::Client,
+        solver_info: Arc<DashMap<String, SolverInfo>>,
+        transfer_status: Arc<DashMap<String, TransferTracker>>,
+        events: Arc<DashMap<String, Event>>,
+        dag_events: Arc<RwLock<Vec<String>>>,
+        consensus: Option<Arc<ConsensusValidator>>,
+        validator_id: String,
+    ) {
+        let task_id_hex = hex::encode(&task.task_id[..8]);
+        
+        // 1. Acquire semaphore permit (backpressure control)
+        let _permit = match semaphore.acquire().await {
+            Ok(p) => {
+                // Only increment pending_count AFTER successfully acquiring permit
+                // This ensures we don't have a mismatch if acquire fails
+                pending_count.fetch_add(1, Ordering::Relaxed);
+                p
+            }
+            Err(_) => {
+                // Semaphore closed - service shutting down
+                // Note: pending_count was NOT incremented, so no need to decrement
+                Self::update_tracker_failed(&transfer_status, &transfer_id, "Service shutting down");
+                return;
+            }
+        };
+
+        debug!(
+            transfer_id = %transfer_id,
+            solver_id = %solver_id,
+            task_id = %task_id_hex,
+            "Executing TEE task (permit acquired)"
+        );
+
+        // 2. Get Solver address
+        let solver_url = {
+            match solver_info.get(&solver_id) {
+                Some(info) => info.execute_task_url(),
+                None => {
+                    Self::update_tracker_failed(&transfer_status, &transfer_id, &format!("Solver not found: {}", solver_id));
+                    pending_count.fetch_sub(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        };
+
+        // Keep Event for later use
+        let mut event = task.event.clone();
+        let event_id = event.id.clone();
+
+        // 3. Create HTTP request
+        let request = ExecuteTaskRequest {
+            solver_task: task,
+            validator_id: validator_id.clone(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+        };
+
+        // 4. Execute HTTP call with timeout
+        let result = http_client
+            .post(&solver_url)
+            .json(&request)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await;
+
+        match result {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<ExecuteTaskResponse>().await {
+                    Ok(exec_resp) if exec_resp.success => {
+                        if let Some(result_dto) = exec_resp.result {
+                            // 5a. Success: Build ExecutionResult and set on Event
+                            let execution_result = setu_types::event::ExecutionResult {
+                                success: result_dto.events_failed == 0,
+                                message: Some(format!(
+                                    "TEE executed: {} events in {}μs",
+                                    result_dto.events_processed,
+                                    result_dto.execution_time_us
+                                )),
+                                state_changes: result_dto.state_changes.iter().map(|sc| {
+                                    setu_types::event::StateChange {
+                                        key: sc.key.clone(),
+                                        old_value: sc.old_value.clone(),
+                                        new_value: sc.new_value.clone(),
+                                    }
+                                }).collect(),
+                            };
+
+                            event.set_execution_result(execution_result);
+                            event.status = setu_types::event::EventStatus::Executed;
+
+                            // 6. Submit to consensus (if enabled)
+                            if let Some(ref consensus_validator) = consensus {
+                                match consensus_validator.submit_event(event.clone()).await {
+                                    Ok(_) => {
+                                        info!(
+                                            event_id = %&event_id[..20.min(event_id.len())],
+                                            "Event submitted to consensus DAG"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            event_id = %&event_id[..20.min(event_id.len())],
+                                            error = %e,
+                                            "Failed to submit event to consensus"
+                                        );
+                                    }
+                                }
+                            }
+
+                            // 7. Store locally
+                            events.insert(event_id.clone(), event);
+                            dag_events.write().push(event_id.clone());
+
+                            // 8. Update tracker to success (using get_mut, not find!)
+                            Self::update_tracker_success(
+                                &transfer_status, 
+                                &transfer_id, 
+                                &event_id,
+                                result_dto.execution_time_us,
+                                result_dto.events_processed,
+                            );
+
+                            info!(
+                                transfer_id = %transfer_id,
+                                task_id = %task_id_hex,
+                                event_id = %&event_id[..20.min(event_id.len())],
+                                "TEE task completed successfully"
+                            );
+                        } else {
+                            Self::update_tracker_failed(&transfer_status, &transfer_id, "No result in response");
+                        }
+                    }
+                    Ok(exec_resp) => {
+                        Self::update_tracker_failed(&transfer_status, &transfer_id, &exec_resp.message);
+                    }
+                    Err(e) => {
+                        Self::update_tracker_failed(&transfer_status, &transfer_id, &format!("JSON parse error: {}", e));
+                    }
+                }
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                Self::update_tracker_failed(&transfer_status, &transfer_id, &format!("HTTP {}: {}", status, body));
+            }
+            Err(e) => {
+                Self::update_tracker_failed(&transfer_status, &transfer_id, &format!("Network error: {}", e));
+            }
+        }
+
+        pending_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Update tracker to success status
+    fn update_tracker_success(
+        transfer_status: &Arc<DashMap<String, TransferTracker>>,
+        transfer_id: &str,
+        event_id: &str,
+        execution_time_us: u64,
+        events_processed: usize,
+    ) {
+        if let Some(mut tracker) = transfer_status.get_mut(transfer_id) {
+            tracker.status = "executed".to_string();
+            tracker.event_id = Some(event_id.to_string());
+            tracker.processing_steps.push(setu_rpc::ProcessingStep {
+                step: "tee_execution".to_string(),
+                status: "completed".to_string(),
+                details: Some(format!(
+                    "TEE executed in {}μs, {} events processed",
+                    execution_time_us,
+                    events_processed
+                )),
+                timestamp: current_timestamp_secs(),
+            });
+        }
+    }
+
+    /// Update tracker to failed status
+    fn update_tracker_failed(
+        transfer_status: &Arc<DashMap<String, TransferTracker>>,
+        transfer_id: &str,
+        error: &str,
+    ) {
+        error!(transfer_id = %transfer_id, error = %error, "TEE task failed");
+        if let Some(mut tracker) = transfer_status.get_mut(transfer_id) {
+            tracker.status = "failed".to_string();
+            tracker.processing_steps.push(setu_rpc::ProcessingStep {
+                step: "tee_execution".to_string(),
+                status: "failed".to_string(),
+                details: Some(error.to_string()),
+                timestamp: current_timestamp_secs(),
+            });
+        }
+    }
+
+    /// Get count of pending TEE tasks
+    pub fn pending_tee_count(&self) -> u64 {
+        self.pending_tee_count.load(Ordering::Relaxed)
+    }
+
+    /// Wait for all pending TEE tasks to complete (for graceful shutdown)
+    pub async fn wait_for_pending_tee_tasks(&self, timeout: Duration) -> Result<(), &'static str> {
+        let start = std::time::Instant::now();
+        
+        while self.pending_tee_count.load(Ordering::Relaxed) > 0 {
+            if start.elapsed() > timeout {
+                let remaining = self.pending_tee_count.load(Ordering::Relaxed);
+                warn!("Shutdown timeout, {} TEE tasks still pending", remaining);
+                return Err("Shutdown timeout");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        
+        info!("All TEE tasks completed");
+        Ok(())
+    }
+
+    // ============================================
+    // Legacy Sync TEE Call (kept for reference)
+    // ============================================
+
     /// Send SolverTask to Solver via synchronous HTTP
     ///
-    /// This is the **sync HTTP** approach for solver-tee3:
-    /// 1. POST SolverTask to Solver
-    /// 2. Wait for TEE execution result in response
-    /// 3. Set execution_result on Event (kept in scope)
-    /// 4. Add Event to DAG
-    ///
-    /// Key benefit: No pending_tasks mapping needed!
+    /// **DEPRECATED**: Use spawn_tee_task for parallel execution.
+    /// This method is kept for backward compatibility and testing.
+    #[allow(dead_code)]
     async fn send_solver_task_to_solver(
         &self,
         solver_id: &str,
@@ -539,8 +823,7 @@ impl ValidatorNetworkService {
 
         // Get Solver address
         let solver_url = {
-            let solvers = self.solver_info.read();
-            match solvers.get(solver_id) {
+            match self.solver_info.get(solver_id) {
                 Some(info) => info.execute_task_url(),
                 None => {
                     error!(solver_id = %solver_id, "Solver not found in registry");
@@ -641,22 +924,29 @@ impl ValidatorNetworkService {
         // Add Event to DAG (submits to consensus if enabled)
         self.add_event_to_dag(event).await;
 
-        // Update transfer status
-        if let Some(tracker) = self.transfer_status.write().values_mut().find(|t| {
-            t.solver_id.as_ref() == Some(&solver_id.to_string()) && t.event_id.is_none()
-        }) {
-            tracker.status = "executed".to_string();
-            tracker.event_id = Some(event_id.clone());
-            tracker.processing_steps.push(setu_rpc::ProcessingStep {
-                step: "tee_execution".to_string(),
-                status: "completed".to_string(),
-                details: Some(format!(
-                    "TEE executed in {}μs, {} events processed",
-                    result_dto.execution_time_us,
-                    result_dto.events_processed
-                )),
-                timestamp: current_timestamp_secs(),
-            });
+        // Update transfer status using reverse index (O(1) instead of O(n) scan!)
+        // This is a critical TPS optimization - avoids full table scan
+        // Note: Using remove(0) for FIFO order to match submission order
+        let solver_id_str = solver_id.to_string();
+        if let Some(mut pending) = self.solver_pending_transfers.get_mut(&solver_id_str) {
+            if !pending.is_empty() {
+                // FIFO: remove first element (oldest pending transfer)
+                let transfer_id = pending.remove(0);
+                if let Some(mut tracker) = self.transfer_status.get_mut(&transfer_id) {
+                    tracker.status = "executed".to_string();
+                    tracker.event_id = Some(event_id.clone());
+                    tracker.processing_steps.push(setu_rpc::ProcessingStep {
+                        step: "tee_execution".to_string(),
+                        status: "completed".to_string(),
+                        details: Some(format!(
+                            "TEE executed in {}μs, {} events processed",
+                            result_dto.execution_time_us,
+                            result_dto.events_processed
+                        )),
+                        timestamp: current_timestamp_secs(),
+                    });
+                }
+            }
         }
 
         info!(
@@ -669,7 +959,7 @@ impl ValidatorNetworkService {
     }
 
     pub fn get_transfer_status(&self, transfer_id: &str) -> GetTransferStatusResponse {
-        if let Some(tracker) = self.transfer_status.read().get(transfer_id) {
+        if let Some(tracker) = self.transfer_status.get(transfer_id) {
             GetTransferStatusResponse {
                 found: true,
                 transfer_id: tracker.transfer_id.clone(),
@@ -737,7 +1027,7 @@ impl ValidatorNetworkService {
                     let vlc_time = vlc.logical_time;
                     
                     // Store event locally
-                    self.events.write().insert(event_id.clone(), event);
+                    self.events.insert(event_id.clone(), event);
                     self.pending_events.write().retain(|id| id != &event_id);
                     self.dag_events.write().push(event_id.clone());
                     
@@ -778,7 +1068,7 @@ impl ValidatorNetworkService {
         let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
         // Store event and add to DAG
-        self.events.write().insert(event_id.clone(), event);
+        self.events.insert(event_id.clone(), event);
         self.pending_events.write().retain(|id| id != &event_id);
         self.dag_events.write().push(event_id.clone());
 
@@ -830,7 +1120,7 @@ impl ValidatorNetworkService {
     }
 
     pub async fn apply_event_side_effects(&self, event_id: &str) {
-        let event = match self.events.read().get(event_id).cloned() {
+        let event = match self.events.get(event_id).map(|e| e.clone()) {
             Some(e) => e,
             None => return,
         };
@@ -857,7 +1147,7 @@ impl ValidatorNetworkService {
     }
 
     pub fn get_events(&self) -> Vec<Event> {
-        self.events.read().values().cloned().collect()
+        self.events.iter().map(|e| e.value().clone()).collect()
     }
 
     // ============================================
@@ -942,7 +1232,7 @@ impl ValidatorNetworkService {
             registered_at: current_timestamp_secs(),
         };
 
-        self.solver_info.write().insert(
+        self.solver_info.insert(
             request.solver_id.clone(),
             solver_info,
         );
@@ -983,7 +1273,7 @@ impl ValidatorNetworkService {
     pub fn unregister_solver(&self, node_id: &str) {
         self.router_manager.unregister_solver(node_id);
         self.solver_channels.write().remove(node_id);
-        self.solver_info.write().remove(node_id);
+        self.solver_info.remove(node_id);
         info!(solver_id = %node_id, "Solver unregistered");
     }
 
@@ -1023,7 +1313,7 @@ impl ValidatorNetworkService {
         }
         
         // Always store locally for queries
-        self.events.write().insert(event_id.clone(), event);
+        self.events.insert(event_id.clone(), event);
         self.dag_events.write().push(event_id);
     }
     
@@ -1033,7 +1323,7 @@ impl ValidatorNetworkService {
     #[allow(dead_code)]
     pub fn add_event_to_dag_sync(&self, event: Event) {
         let event_id = event.id.clone();
-        self.events.write().insert(event_id.clone(), event);
+        self.events.insert(event_id.clone(), event);
         self.dag_events.write().push(event_id);
     }
 }

@@ -155,6 +155,7 @@ impl NetworkEventHandler for MessageRouter {
         
         // Step 2: Add to consensus DAG (in-memory only)
         // Events are persisted later when CF is finalized
+        // Note: receive_event_from_network is idempotent - duplicate events return Ok
         match self.engine.receive_event_from_network(event.clone()).await {
             Ok(event_id) => {
                 debug!(
@@ -164,16 +165,6 @@ impl NetworkEventHandler for MessageRouter {
             }
             Err(e) => {
                 let error_str = e.to_string();
-                
-                // Handle duplicate events (common due to network retransmission)
-                if error_str.contains("Duplicate event") {
-                    debug!(
-                        event_id = %event.id,
-                        from = %peer_id,
-                        "Duplicate event ignored (idempotent)"
-                    );
-                    return;
-                }
                 
                 // Check if this is a MissingParent error
                 if error_str.contains("Missing parent") {

@@ -21,6 +21,7 @@ use setu_types::{ConsensusConfig, ConsensusFrame, Event, EventId, SetuResult, Vo
 use setu_vlc::VLCSnapshot;
 use setu_storage::{EventStore, subnet_state::GlobalStateManager};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, RwLock, Mutex};
 use tracing::{debug, info, warn};
 
@@ -56,8 +57,12 @@ pub struct ConsensusEngine {
     /// DagManager for three-layer storage (DAG → Cache → Store)
     /// This is the ONLY entry point for adding events to the DAG
     dag_manager: Arc<DagManager>,
-    /// Local VLC clock
+    /// Local VLC clock (full VLC, used for merge operations with other validators)
     vlc: Arc<RwLock<VLC>>,
+    /// Fast path logical time counter (lock-free, for local event creation)
+    /// This provides O(1) atomic increment for get_vlc_time() calls.
+    /// The full VLC is still used for merge() operations in add_event().
+    logical_time_counter: AtomicU64,
     /// Set of validators with leader election
     validator_set: Arc<RwLock<ValidatorSet>>,
     /// ConsensusFrame manager (folder)
@@ -102,6 +107,7 @@ impl ConsensusEngine {
             dag,
             dag_manager,
             vlc: Arc::new(RwLock::new(VLC::new(validator_id.clone()))),
+            logical_time_counter: AtomicU64::new(0),
             validator_set: Arc::new(RwLock::new(validator_set)),
             consensus_manager: Arc::new(RwLock::new(ConsensusManager::new(
                 config,
@@ -144,6 +150,7 @@ impl ConsensusEngine {
             dag,
             dag_manager,
             vlc: Arc::new(RwLock::new(VLC::new(validator_id.clone()))),
+            logical_time_counter: AtomicU64::new(0),
             validator_set: Arc::new(RwLock::new(validator_set)),
             consensus_manager: Arc::new(RwLock::new(ConsensusManager::with_state_manager(
                 config,
@@ -184,6 +191,7 @@ impl ConsensusEngine {
             dag,
             dag_manager,
             vlc: Arc::new(RwLock::new(VLC::new(validator_id.clone()))),
+            logical_time_counter: AtomicU64::new(0),
             validator_set: Arc::new(RwLock::new(validator_set)),
             consensus_manager: Arc::new(RwLock::new(ConsensusManager::new(
                 config,
@@ -221,6 +229,7 @@ impl ConsensusEngine {
             dag,
             dag_manager,
             vlc: Arc::new(RwLock::new(VLC::new(validator_id.clone()))),
+            logical_time_counter: AtomicU64::new(0),
             validator_set: Arc::new(RwLock::new(validator_set)),
             consensus_manager: Arc::new(RwLock::new(ConsensusManager::with_state_manager(
                 config,
@@ -285,24 +294,27 @@ impl ConsensusEngine {
         }
 
         // Add event through DagManager with retry (handles TOCTOU race with GC)
-        let event_id = self.dag_manager
-            .add_event_with_retry(event.clone())
-            .await
-            .map_err(|e| match e {
-                DagManagerError::MissingParent(id) => {
-                    setu_types::SetuError::InvalidData(format!("Missing parent: {}", id))
-                }
-                DagManagerError::ParentTooOld { parent_id, depth_diff, max_allowed } => {
-                    setu_types::SetuError::InvalidData(format!(
-                        "Parent {} too old: depth_diff {} > max {}",
-                        parent_id, depth_diff, max_allowed
-                    ))
-                }
-                DagManagerError::DuplicateEvent(id) => {
-                    setu_types::SetuError::InvalidData(format!("Duplicate event: {}", id))
-                }
-                _ => setu_types::SetuError::InvalidData(e.to_string()),
-            })?;
+        // DuplicateEvent is treated as success (idempotent operation)
+        let event_id = match self.dag_manager.add_event_with_retry(event.clone()).await {
+            Ok(id) => id,
+            Err(DagManagerError::DuplicateEvent(id)) => {
+                // Idempotent: event already exists, treat as success
+                debug!(event_id = %id, "Event already exists in DAG (idempotent)");
+                return Ok(id);
+            }
+            Err(DagManagerError::MissingParent(id)) => {
+                return Err(setu_types::SetuError::InvalidData(format!("Missing parent: {}", id)));
+            }
+            Err(DagManagerError::ParentTooOld { parent_id, depth_diff, max_allowed }) => {
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Parent {} too old: depth_diff {} > max {}",
+                    parent_id, depth_diff, max_allowed
+                )));
+            }
+            Err(e) => {
+                return Err(setu_types::SetuError::InvalidData(e.to_string()));
+            }
+        };
 
         // Broadcast the new event
         // We broadcast regardless of whether we are the leader, as all validators
@@ -346,24 +358,27 @@ impl ConsensusEngine {
         }
 
         // Add event through DagManager with retry (handles TOCTOU race with GC)
-        let event_id = self.dag_manager
-            .add_event_with_retry(event.clone())
-            .await
-            .map_err(|e| match e {
-                DagManagerError::MissingParent(id) => {
-                    setu_types::SetuError::InvalidData(format!("Missing parent: {}", id))
-                }
-                DagManagerError::ParentTooOld { parent_id, depth_diff, max_allowed } => {
-                    setu_types::SetuError::InvalidData(format!(
-                        "Parent {} too old: depth_diff {} > max {}",
-                        parent_id, depth_diff, max_allowed
-                    ))
-                }
-                DagManagerError::DuplicateEvent(id) => {
-                    setu_types::SetuError::InvalidData(format!("Duplicate event: {}", id))
-                }
-                _ => setu_types::SetuError::InvalidData(e.to_string()),
-            })?;
+        // DuplicateEvent is treated as success (idempotent operation)
+        let event_id = match self.dag_manager.add_event_with_retry(event.clone()).await {
+            Ok(id) => id,
+            Err(DagManagerError::DuplicateEvent(id)) => {
+                // Idempotent: event already exists (common during network sync)
+                debug!(event_id = %id, "Event already exists in DAG (idempotent, from network)");
+                return Ok(id);
+            }
+            Err(DagManagerError::MissingParent(id)) => {
+                return Err(setu_types::SetuError::InvalidData(format!("Missing parent: {}", id)));
+            }
+            Err(DagManagerError::ParentTooOld { parent_id, depth_diff, max_allowed }) => {
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Parent {} too old: depth_diff {} > max {}",
+                    parent_id, depth_diff, max_allowed
+                )));
+            }
+            Err(e) => {
+                return Err(setu_types::SetuError::InvalidData(e.to_string()));
+            }
+        };
 
         // Note: We do NOT broadcast the event here since it came from the network
         
@@ -929,6 +944,37 @@ impl ConsensusEngine {
     /// Get the current VLC snapshot
     pub async fn get_vlc_snapshot(&self) -> VLCSnapshot {
         self.vlc.read().await.snapshot()
+    }
+
+    /// Allocate a logical time using lock-free atomic counter (FAST PATH)
+    /// 
+    /// This is the preferred method for local event creation where only
+    /// the logical_time is needed. It avoids acquiring the VLC write lock
+    /// and provides O(1) performance even under high concurrency.
+    /// 
+    /// Use this instead of `tick_and_get_vlc()` when:
+    /// - Creating local events (submit_transfer)
+    /// - Only logical_time is needed (not full VLCSnapshot)
+    /// 
+    /// The full VLC with `tick_and_get_vlc()` is still needed for:
+    /// - Receiving events from other validators (merge operation)
+    /// - Multi-validator consensus scenarios
+    #[inline]
+    pub fn allocate_logical_time(&self) -> u64 {
+        self.logical_time_counter.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Atomically increment VLC and return the new snapshot
+    /// 
+    /// This is the correct method to use when assigning VLC to events,
+    /// as it ensures each event gets a unique logical time.
+    /// 
+    /// NOTE: For high-performance local event creation, prefer `allocate_logical_time()`
+    /// which uses a lock-free atomic counter.
+    pub async fn tick_and_get_vlc(&self) -> VLCSnapshot {
+        let mut vlc = self.vlc.write().await;
+        vlc.tick();  // VLC::tick() uses the node_id internally
+        vlc.snapshot()
     }
 
     /// Get the current tips of the DAG

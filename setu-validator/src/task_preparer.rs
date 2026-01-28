@@ -39,7 +39,7 @@ use setu_types::task::{
 use setu_types::{Event, EventType, SubnetId, ObjectId};
 use setu_types::event::VLCSnapshot;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // Re-export StateProvider and CoinInfo from storage
 pub use setu_storage::{StateProvider, CoinInfo, SimpleMerkleProof};
@@ -79,10 +79,9 @@ impl TaskPreparer {
     /// This creates a real `MerkleStateProvider` backed by `GlobalStateManager`
     /// with some test coins initialized.
     /// 
-    /// ## Initialized accounts:
-    /// - `alice`: 10,000,000 balance
-    /// - `bob`: 5,000,000 balance  
-    /// - `charlie`: 1,000,000 balance
+    /// ## Initialized accounts (20 total):
+    /// - `alice`, `bob`, `charlie`: 10,000,000 balance each
+    /// - `user_01` to `user_17`: 5,000,000 balance each
     /// 
     /// ## Example
     /// 
@@ -97,11 +96,18 @@ impl TaskPreparer {
         let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
         
         // Initialize test accounts with real Merkle state
+        // 20 accounts with sufficient balance for large-scale benchmarks
+        // This reduces state lock contention compared to just 3 accounts
         {
             let mut manager = state_manager.write().unwrap();
+            // Primary accounts with higher balance
             init_coin(&mut manager, "alice", 10_000_000);
-            init_coin(&mut manager, "bob", 5_000_000);
-            init_coin(&mut manager, "charlie", 1_000_000);
+            init_coin(&mut manager, "bob", 10_000_000);
+            init_coin(&mut manager, "charlie", 10_000_000);
+            // Additional test accounts (user_01 to user_17)
+            for i in 1..=17 {
+                init_coin(&mut manager, &format!("user_{:02}", i), 5_000_000);
+            }
         }
         
         let state_provider = Arc::new(MerkleStateProvider::new(state_manager));
@@ -257,10 +263,39 @@ impl TaskPreparer {
         transfer: &setu_types::Transfer,
         parent_ids: Vec<String>,
     ) -> Result<Event, TaskPrepareError> {
+        // Use the VLC assigned by Validator (from transfer) to ensure unique event_id
+        // If no assigned_vlc, fall back to timestamp-based VLC (but this shouldn't happen in production)
+        let vlc_snapshot = match &transfer.assigned_vlc {
+            Some(vlc) => {
+                // Create VLCSnapshot with proper vector clock for the assigning validator
+                let mut snapshot = VLCSnapshot::for_node(vlc.validator_id.clone());
+                snapshot.logical_time = vlc.logical_time;
+                snapshot.physical_time = vlc.physical_time;
+                snapshot
+            },
+            None => {
+                // Fallback: use current timestamp to ensure uniqueness
+                // This is safer than default() which would use logical_time=0
+                let now_nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                warn!(
+                    transfer_id = %transfer.id,
+                    fallback_logical_time = now_nanos,
+                    "Transfer missing assigned_vlc, using timestamp-based fallback"
+                );
+                let mut snapshot = VLCSnapshot::for_node(self.validator_id.clone());
+                snapshot.logical_time = now_nanos;
+                snapshot.physical_time = now_nanos / 1_000_000; // Convert to milliseconds
+                snapshot
+            }
+        };
+        
         let mut event = Event::new(
             EventType::Transfer,
             parent_ids,  // Dependencies derived from input objects
-            VLCSnapshot::default(),
+            vlc_snapshot,
             self.validator_id.clone(),
         );
         
