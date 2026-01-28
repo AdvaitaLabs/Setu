@@ -42,9 +42,9 @@ pub struct RegisterSolverRequest {
     /// Unique solver identifier
     pub solver_id: String,
     /// Network address (IP or hostname)
-    pub network_address: String,
+    pub address: String,
     /// Port number
-    pub network_port: u16,
+    pub port: u16,
     /// Ethereum-style account address for receiving fees
     pub account_address: String,
     /// Public key (secp256k1, 65 bytes uncompressed)
@@ -76,9 +76,9 @@ pub struct RegisterValidatorRequest {
     /// Unique validator identifier
     pub validator_id: String,
     /// Network address (IP or hostname)
-    pub network_address: String,
+    pub address: String,
     /// Port number
-    pub network_port: u16,
+    pub port: u16,
     /// Ethereum-style account address for staking and rewards
     pub account_address: String,
     /// Public key (secp256k1, 65 bytes uncompressed)
@@ -153,8 +153,8 @@ pub struct GetSolverListRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolverListItem {
     pub solver_id: String,
-    pub network_address: String,
-    pub network_port: u16,
+    pub address: String,
+    pub port: u16,
     pub account_address: Option<String>,
     pub capacity: u32,
     pub current_load: u32,
@@ -179,8 +179,8 @@ pub struct GetValidatorListRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidatorListItem {
     pub validator_id: String,
-    pub network_address: String,
-    pub network_port: u16,
+    pub address: String,
+    pub port: u16,
     pub account_address: Option<String>,
     pub status: String,
 }

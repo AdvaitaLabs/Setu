@@ -25,8 +25,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
     async fn register_solver(&self, request: RegisterSolverRequest) -> RegisterSolverResponse {
         info!(
             solver_id = %request.solver_id,
-            network_address = %request.network_address,
-            network_port = request.network_port,
+            address = %request.address,
+            port = request.port,
             account_address = %request.account_address,
             capacity = request.capacity,
             shard_id = ?request.shard_id,
@@ -58,8 +58,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
 
         let registration = SolverRegistration::new(
             request.solver_id.clone(),
-            request.network_address.clone(),
-            request.network_port,
+            request.address.clone(),
+            request.port,
             request.account_address.clone(),
             request.public_key.clone(),
             request.signature.clone(),
@@ -82,7 +82,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
                 key: format!("solver:{}", request.solver_id),
                 old_value: None,
                 new_value: Some(
-                    format!("registered:{}:{}", request.network_address, request.network_port).into_bytes(),
+                    format!("registered:{}:{}", request.address, request.port).into_bytes(),
                 ),
             }],
         });
@@ -108,8 +108,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
     async fn register_validator(&self, request: RegisterValidatorRequest) -> RegisterValidatorResponse {
         info!(
             validator_id = %request.validator_id,
-            network_address = %request.network_address,
-            network_port = request.network_port,
+            address = %request.address,
+            port = request.port,
             account_address = %request.account_address,
             stake_amount = request.stake_amount,
             "Processing validator registration"
@@ -127,8 +127,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
 
         let registration = ValidatorRegistration::new(
             request.validator_id.clone(),
-            request.network_address.clone(),
-            request.network_port,
+            request.address.clone(),
+            request.port,
             request.account_address.clone(),
             request.public_key.clone(),
             request.signature.clone(),
@@ -150,7 +150,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
                 key: format!("validator:{}", request.validator_id),
                 old_value: None,
                 new_value: Some(
-                    format!("registered:{}:{}", request.network_address, request.network_port).into_bytes(),
+                    format!("registered:{}:{}", request.address, request.port).into_bytes(),
                 ),
             }],
         });
@@ -159,8 +159,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         let now = current_timestamp_secs();
         let validator_info = ValidatorInfo {
             validator_id: request.validator_id.clone(),
-            address: request.network_address.clone(),
-            port: request.network_port,
+            address: request.address.clone(),
+            port: request.port,
             status: "online".to_string(),
             registered_at: now,
         };
@@ -239,8 +239,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             })
             .map(|s| SolverListItem {
                 solver_id: s.id,
-                network_address: s.address.split(':').next().unwrap_or("").to_string(),
-                network_port: s
+                address: s.address.split(':').next().unwrap_or("").to_string(),
+                port: s
                     .address
                     .split(':')
                     .nth(1)

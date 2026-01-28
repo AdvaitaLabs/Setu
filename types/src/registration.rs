@@ -19,9 +19,9 @@ pub struct ValidatorRegistration {
     
     // ========== Network Layer ==========
     /// Network address (IP or hostname) for P2P communication
-    pub network_address: String,
+    pub address: String,
     /// Network port for P2P communication
-    pub network_port: u16,
+    pub port: u16,
     
     // ========== Economic Layer ==========
     /// Ethereum-style account address (0x...) for staking and rewards
@@ -42,8 +42,8 @@ impl ValidatorRegistration {
     /// Create a new validator registration
     pub fn new(
         validator_id: impl Into<String>,
-        network_address: impl Into<String>,
-        network_port: u16,
+        address: impl Into<String>,
+        port: u16,
         account_address: impl Into<String>,
         public_key: Vec<u8>,
         signature: Vec<u8>,
@@ -51,8 +51,8 @@ impl ValidatorRegistration {
     ) -> Self {
         Self {
             validator_id: validator_id.into(),
-            network_address: network_address.into(),
-            network_port,
+            address: address.into(),
+            port,
             account_address: account_address.into(),
             public_key,
             signature,
@@ -85,9 +85,9 @@ pub struct SolverRegistration {
     
     // ========== Network Layer ==========
     /// Network address (IP or hostname) for P2P communication
-    pub network_address: String,
+    pub address: String,
     /// Network port for P2P communication
-    pub network_port: u16,
+    pub port: u16,
     
     // ========== Economic Layer ==========
     /// Ethereum-style account address (0x...) for receiving task fees
@@ -110,16 +110,16 @@ impl SolverRegistration {
     /// Create a new solver registration
     pub fn new(
         solver_id: impl Into<String>,
-        network_address: impl Into<String>,
-        network_port: u16,
+        address: impl Into<String>,
+        port: u16,
         account_address: impl Into<String>,
         public_key: Vec<u8>,
         signature: Vec<u8>,
     ) -> Self {
         Self {
             solver_id: solver_id.into(),
-            network_address: network_address.into(),
-            network_port,
+            address: address.into(),
+            port,
             account_address: account_address.into(),
             public_key,
             signature,

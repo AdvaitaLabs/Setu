@@ -106,8 +106,8 @@ pub async fn handle(action: crate::RouterAction, _config: &Config) -> Result<()>
                             
                             println!("  {:<15} {:<15} {:<8} {:<10} {:<10} {:<10} {:<10}", 
                                 s.solver_id.cyan(),
-                                s.network_address,
-                                s.network_port,
+                                s.address,
+                                s.port,
                                 s.capacity,
                                 load_pct,
                                 status_colored,

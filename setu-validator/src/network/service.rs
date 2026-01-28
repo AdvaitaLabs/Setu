@@ -1131,8 +1131,8 @@ impl ValidatorNetworkService {
                     reg.validator_id.clone(),
                     ValidatorInfo {
                         validator_id: reg.validator_id.clone(),
-                        address: reg.network_address.clone(),
-                        port: reg.network_port,
+                        address: reg.address.clone(),
+                        port: reg.port,
                         status: "online".to_string(),
                         registered_at: event.timestamp / 1000,
                     },
@@ -1202,8 +1202,8 @@ impl ValidatorNetworkService {
             .values()
             .map(|v| ValidatorListItem {
                 validator_id: v.validator_id.clone(),
-                network_address: v.address.clone(),
-                network_port: v.port,
+                address: v.address.clone(),
+                port: v.port,
                 account_address: None,  // TODO: 从 ValidatorInfo 中获取
                 status: v.status.clone(),
             })
@@ -1223,8 +1223,8 @@ impl ValidatorNetworkService {
         // Store Solver info for sync HTTP calls
         let solver_info = SolverInfo {
             solver_id: request.solver_id.clone(),
-            address: request.network_address.clone(),
-            port: request.network_port,
+            address: request.address.clone(),
+            port: request.port,
             capacity: request.capacity,
             shard_id: request.shard_id.clone(),
             resources: request.resources.clone(),
@@ -1245,7 +1245,7 @@ impl ValidatorNetworkService {
         let (router_tx, _router_rx) = mpsc::unbounded_channel::<Transfer>();
         self.router_manager.register_solver_with_affinity(
             request.solver_id.clone(),
-            format!("{}:{}", request.network_address, request.network_port),
+            format!("{}:{}", request.address, request.port),
             request.capacity,
             router_tx,
             request.shard_id.clone(),
@@ -1262,8 +1262,8 @@ impl ValidatorNetworkService {
 
         info!(
             solver_id = %request.solver_id,
-            address = %request.network_address,
-            port = request.network_port,
+            address = %request.address,
+            port = request.port,
             "Solver registered for sync HTTP communication"
         );
 
@@ -1421,8 +1421,8 @@ mod tests {
 
         let request = setu_rpc::RegisterSolverRequest {
             solver_id: "solver-1".to_string(),
-            network_address: "127.0.0.1".to_string(),
-            network_port: 9001,
+            address: "127.0.0.1".to_string(),
+            port: 9001,
             account_address: "0xtest".to_string(),
             public_key: vec![],
             signature: vec![],
@@ -1444,8 +1444,8 @@ mod tests {
 
         let request = setu_rpc::RegisterValidatorRequest {
             validator_id: "validator-2".to_string(),
-            network_address: "127.0.0.1".to_string(),
-            network_port: 9002,
+            address: "127.0.0.1".to_string(),
+            port: 9002,
             account_address: "0xtest".to_string(),
             public_key: vec![],
             signature: vec![],

@@ -121,8 +121,8 @@ pub async fn handle(action: crate::SolverAction, _config: &Config) -> Result<()>
             // Create registration request
             let request = RegisterSolverRequest {
                 solver_id: keypair.node_id.clone(),
-                network_address: network_address.clone(),
-                network_port,
+                address: network_address.clone(),
+                port: network_port,
                 account_address: keypair.account_address.clone(),
                 public_key: public_key_bytes,
                 signature,
@@ -211,7 +211,7 @@ pub async fn handle(action: crate::SolverAction, _config: &Config) -> Result<()>
                                 "offline" => s.status.red(),
                                 _ => s.status.yellow(),
                             };
-                            let network = format!("{}:{}", s.network_address, s.network_port);
+                            let network = format!("{}:{}", s.address, s.port);
                             println!("  {:<20} {:<42} {:<20} {:<10} {:<10}", 
                                 s.solver_id.cyan(),
                                 s.account_address.unwrap_or_else(|| "N/A".to_string()),

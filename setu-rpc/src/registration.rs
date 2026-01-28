@@ -141,8 +141,8 @@ impl RegistrationClient {
     pub async fn register_solver(&self, request: RegisterSolverRequest) -> Result<RegisterSolverResponse> {
         info!(
             solver_id = %request.solver_id,
-            network_address = %request.network_address,
-            network_port = request.network_port,
+            address = %request.address,
+            port = request.port,
             account_address = %request.account_address,
             "Registering solver"
         );
@@ -160,8 +160,8 @@ impl RegistrationClient {
     pub async fn register_validator(&self, request: RegisterValidatorRequest) -> Result<RegisterValidatorResponse> {
         info!(
             validator_id = %request.validator_id,
-            network_address = %request.network_address,
-            network_port = request.network_port,
+            address = %request.address,
+            port = request.port,
             account_address = %request.account_address,
             "Registering validator"
         );
@@ -378,8 +378,8 @@ mod tests {
     fn test_request_serialization() {
         let request = RegisterSolverRequest {
             solver_id: "solver-1".to_string(),
-            network_address: "127.0.0.1".to_string(),
-            network_port: 9001,
+            address: "127.0.0.1".to_string(),
+            port: 9001,
             account_address: "0xabcd1234".to_string(),
             public_key: vec![1, 2, 3],
             signature: vec![4, 5, 6],
@@ -395,7 +395,7 @@ mod tests {
         match decoded {
             RpcRequest::RegisterSolver(req) => {
                 assert_eq!(req.solver_id, "solver-1");
-                assert_eq!(req.network_port, 9001);
+                assert_eq!(req.port, 9001);
             }
             _ => panic!("Wrong request type"),
         }

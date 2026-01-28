@@ -140,8 +140,8 @@ impl SolverNetworkClient {
         
         let request = RegisterSolverRequest {
             solver_id: self.config.solver_id.clone(),
-            network_address: self.config.address.clone(),
-            network_port: self.config.port,
+            address: self.config.address.clone(),
+            port: self.config.port,
             account_address: self.config.account_address.clone(),
             public_key: self.config.public_key.clone(),
             signature: self.config.signature.clone(),
