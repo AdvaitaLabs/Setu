@@ -224,7 +224,7 @@ impl ValidatorNetworkService {
             consensus.vlc_snapshot().await.logical_time
         } else {
             // Legacy mode: use local counter
-            self.vlc_counter.fetch_add(1, Ordering::SeqCst)
+        self.vlc_counter.fetch_add(1, Ordering::SeqCst)
         }
     }
 
