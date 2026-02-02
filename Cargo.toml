@@ -19,6 +19,7 @@ members = [
     "setu-rpc",               # RPC layer
     "setu-cli",               # CLI tool
     "setu-benchmark",         # TPS benchmark tool
+    "setu-explorer",          # Blockchain explorer service
 ]
 resolver = "2"
 
