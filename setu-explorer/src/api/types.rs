@@ -191,7 +191,6 @@ pub struct DagNode {
     pub vlc_time: u64,
     pub label: String,
     pub size: usize,
-    pub color: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

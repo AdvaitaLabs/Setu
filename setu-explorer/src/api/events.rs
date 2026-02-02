@@ -141,7 +141,7 @@ pub async fn get_event_detail(
         },
         parent_ids: event.parent_ids.iter().map(|id| id.to_string()).collect(),
         children_ids,
-        subnet_id: event.subnet_id.clone(),
+        subnet_id: event.subnet_id.as_ref().map(|id| id.to_string()),
         anchor_id: None, // TODO: Track event->anchor mapping
         anchor_depth: None,
         payload,

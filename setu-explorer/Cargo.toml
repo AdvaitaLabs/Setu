@@ -4,3 +4,25 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# Web framework
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = "1.0"
+
+# Storage
+rocksdb = "0.22"
+
+# Utilities
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0"
+
+# Internal dependencies
+setu-types = { path = "../types" }
+setu-storage = { path = "../storage" }

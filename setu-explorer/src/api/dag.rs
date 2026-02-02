@@ -81,7 +81,6 @@ pub async fn get_dag_live(
             vlc_time: event.vlc_snapshot.logical_time,
             label: short_id.clone(),
             size: calculate_node_size(&event.event_type),
-            color: get_event_color(&event.event_type),
         });
     }
     
@@ -109,13 +108,15 @@ pub async fn get_dag_live(
     };
     
     let latest_event_id = events.last().map(|e| e.id.to_string()).unwrap_or_default();
+    let total_edges = edges.len();
+    let total_nodes = events.len();
     
     Ok(Json(DagLiveResponse {
         nodes,
         edges,
         metadata: DagMetadata {
-            total_nodes: events.len(),
-            total_edges: edges.len(),
+            total_nodes,
+            total_edges,
             depth_range,
             latest_event_id,
             anchor_id: params.anchor_id,
@@ -151,7 +152,8 @@ pub async fn get_causal_path(
         let ancestor_event = storage.get_event(&ancestor.event_id).await;
         if let Some(ae) = ancestor_event {
             for parent_id in &ae.parent_ids {
-                if let Some(parent) = ancestors.iter().find(|a| a.event_id == parent_id.to_string()) {
+                let parent_id_str = parent_id.to_string();
+                if let Some(parent) = ancestors.iter().find(|a| a.event_id == parent_id_str) {
                     path_edges.push(DagEdge {
                         from: parent.id.clone(),
                         to: ancestor.id.clone(),
@@ -201,7 +203,6 @@ async fn trace_ancestors(
                 vlc_time: event.vlc_snapshot.logical_time,
                 label: format!("ev_{}", ancestors.len()),
                 size: calculate_node_size(&event.event_type),
-                color: get_event_color(&event.event_type),
             });
             
             // Add parents to queue
@@ -225,21 +226,6 @@ fn calculate_node_size(event_type: &EventType) -> usize {
         EventType::TaskSubmit => 12,
         EventType::ValidatorRegister | EventType::SolverRegister => 14,
         _ => 8,
-    }
-}
-
-/// Get color for event type
-fn get_event_color(event_type: &EventType) -> String {
-    match event_type {
-        EventType::Genesis => "#8B5CF6".to_string(),           // Purple
-        EventType::System => "#6366F1".to_string(),            // Indigo
-        EventType::Transfer => "#3B82F6".to_string(),          // Blue
-        EventType::TaskSubmit => "#10B981".to_string(),        // Green
-        EventType::ValidatorRegister => "#F59E0B".to_string(), // Orange
-        EventType::SolverRegister => "#EF4444".to_string(),    // Red
-        EventType::UserRegister => "#8B5CF6".to_string(),      // Purple
-        EventType::PowerConsume => "#EC4899".to_string(),      // Pink
-        _ => "#6B7280".to_string(),                            // Gray
     }
 }
 

@@ -85,7 +85,7 @@ pub async fn get_anchor_detail(
     let merkle_roots = anchor.merkle_roots.as_ref().map(|roots| {
         let mut subnet_roots = std::collections::HashMap::new();
         for (subnet_id, root) in &roots.subnet_roots {
-            subnet_roots.insert(subnet_id.clone(), hex::encode(root));
+            subnet_roots.insert(subnet_id.to_string(), hex::encode(root));
         }
         
         MerkleRootsInfo {

@@ -51,8 +51,8 @@ impl ExplorerStorage {
     // Convenience methods
     
     /// Get event by ID
-    pub async fn get_event(&self, event_id: &EventId) -> Option<Event> {
-        self.event_store.get(event_id).await
+    pub async fn get_event(&self, event_id: &str) -> Option<Event> {
+        self.event_store.get(&event_id.to_string()).await
     }
     
     /// Get multiple events
@@ -81,8 +81,8 @@ impl ExplorerStorage {
     }
     
     /// Get anchor by ID
-    pub async fn get_anchor(&self, anchor_id: &AnchorId) -> Option<Anchor> {
-        self.anchor_store.get(anchor_id).await
+    pub async fn get_anchor(&self, anchor_id: &str) -> Option<Anchor> {
+        self.anchor_store.get(&anchor_id.to_string()).await
     }
     
     /// Get latest anchor
