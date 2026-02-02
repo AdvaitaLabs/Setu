@@ -1,0 +1,6 @@
+[package]
+name = "setu-explorer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
