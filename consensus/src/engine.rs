@@ -19,7 +19,7 @@
 
 use setu_types::{ConsensusConfig, ConsensusFrame, Event, EventId, SetuResult, Vote};
 use setu_vlc::VLCSnapshot;
-use setu_storage::{EventStore, subnet_state::GlobalStateManager};
+use setu_storage::{EventStore, EventStoreBackend, subnet_state::GlobalStateManager};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, RwLock, Mutex};
@@ -173,7 +173,7 @@ impl ConsensusEngine {
         config: ConsensusConfig,
         validator_id: String,
         validator_set: ValidatorSet,
-        event_store: Arc<EventStore>,
+        event_store: Arc<dyn EventStoreBackend>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1000);
         
@@ -211,7 +211,7 @@ impl ConsensusEngine {
         validator_id: String,
         validator_set: ValidatorSet,
         state_manager: GlobalStateManager,
-        event_store: Arc<EventStore>,
+        event_store: Arc<dyn EventStoreBackend>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1000);
         
@@ -1034,6 +1034,20 @@ impl ConsensusEngine {
     /// such as GC triggering and cache warmup.
     pub fn dag_manager(&self) -> &Arc<DagManager> {
         &self.dag_manager
+    }
+    
+    /// Get the VLC reference (for recovery)
+    /// 
+    /// Used by ConsensusValidator for restoring VLC state after restart.
+    pub fn vlc(&self) -> &Arc<RwLock<VLC>> {
+        &self.vlc
+    }
+    
+    /// Get the ConsensusManager reference (for recovery)
+    /// 
+    /// Used by ConsensusValidator for restoring AnchorBuilder state after restart.
+    pub fn consensus_manager(&self) -> &Arc<RwLock<ConsensusManager>> {
+        &self.consensus_manager
     }
 
     /// Get the local validator ID

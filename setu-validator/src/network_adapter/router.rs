@@ -5,7 +5,7 @@
 
 use consensus::ConsensusEngine;
 use crate::protocol::NetworkEvent;
-use setu_storage::{EventStore, AnchorStore};
+use setu_storage::{EventStoreBackend, AnchorStoreBackend};
 use setu_types::{ConsensusFrame, Event, Vote};
 use crate::persistence::FinalizationPersister;
 use std::sync::Arc;
@@ -50,9 +50,9 @@ pub struct MessageRouter {
     /// The consensus engine to route messages to
     engine: Arc<ConsensusEngine>,
     /// Event store for persisting finalized events
-    event_store: Arc<EventStore>,
+    event_store: Arc<dyn EventStoreBackend>,
     /// Anchor store for persisting finalized anchors
-    anchor_store: Arc<AnchorStore>,
+    anchor_store: Arc<dyn AnchorStoreBackend>,
 
 }
 
@@ -60,8 +60,8 @@ impl MessageRouter {
     /// Create a new message router with storage for persistence
     pub fn new(
         engine: Arc<ConsensusEngine>,
-        event_store: Arc<EventStore>,
-        anchor_store: Arc<AnchorStore>,
+        event_store: Arc<dyn EventStoreBackend>,
+        anchor_store: Arc<dyn AnchorStoreBackend>,
     ) -> Self {
         Self {
             engine,
@@ -125,11 +125,11 @@ impl FinalizationPersister for MessageRouter {
         &self.engine
     }
     
-    fn event_store(&self) -> &Arc<EventStore> {
+    fn event_store(&self) -> &Arc<dyn EventStoreBackend> {
         &self.event_store
     }
     
-    fn anchor_store(&self) -> &Arc<AnchorStore> {
+    fn anchor_store(&self) -> &Arc<dyn AnchorStoreBackend> {
         &self.anchor_store
     }
 }

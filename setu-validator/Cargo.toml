@@ -54,3 +54,4 @@ dashmap = "5.5"  # Lock-free concurrent HashMap for TPS optimization
 
 [dev-dependencies]
 setu-solver = { path = "../setu-solver" }
+tempfile = "3.10"

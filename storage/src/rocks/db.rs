@@ -216,6 +216,53 @@ impl SetuDB {
         Ok(())
     }
     
+    /// Add a put operation to a write batch using raw byte key
+    pub fn batch_put_raw<V>(
+        &self,
+        batch: &mut WriteBatch,
+        cf: ColumnFamily,
+        key: &[u8],
+        value: &V,
+    ) -> Result<()>
+    where
+        V: Serialize,
+    {
+        let cf_handle = self.cf_handle(cf)?;
+        let value_bytes = Self::encode_value(value)?;
+        batch.put_cf(cf_handle, key, value_bytes);
+        Ok(())
+    }
+    
+    /// Add a delete operation to a write batch using raw byte key
+    pub fn batch_delete_raw(
+        &self,
+        batch: &mut WriteBatch,
+        cf: ColumnFamily,
+        key: &[u8],
+    ) -> Result<()> {
+        let cf_handle = self.cf_handle(cf)?;
+        batch.delete_cf(cf_handle, key);
+        Ok(())
+    }
+    
+    /// Check if a raw byte key exists in a column family
+    pub fn exists_raw(&self, cf: ColumnFamily, key: &[u8]) -> Result<bool> {
+        let cf_handle = self.cf_handle(cf)?;
+        Ok(self.db.get_cf(cf_handle, key)?.is_some())
+    }
+    
+    /// Scan all keys with a prefix (returns raw keys)
+    pub fn prefix_scan_keys(&self, cf: ColumnFamily, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let cf_handle = self.cf_handle(cf)?;
+        
+        let keys: Vec<Vec<u8>> = self.db
+            .prefix_iterator_cf(cf_handle, prefix)
+            .filter_map(|result| result.ok().map(|(k, _)| k.to_vec()))
+            .collect();
+        
+        Ok(keys)
+    }
+    
     /// Write a batch atomically
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         self.db.write(batch)?;
