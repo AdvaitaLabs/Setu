@@ -14,6 +14,7 @@ pub mod anchors;
 pub mod events;
 pub mod dag;
 pub mod search;
+pub mod nodes;
 
 pub use types::*;
 
@@ -41,6 +42,12 @@ pub fn create_explorer_router(storage: Arc<ExplorerStorage>) -> Router {
         // DAG visualization
         .route("/api/v1/explorer/dag/live", get(dag::get_dag_live))
         .route("/api/v1/explorer/dag/path/:event_id", get(dag::get_causal_path))
+        
+        // Validators and Solvers
+        .route("/api/v1/explorer/validators", get(nodes::get_validators))
+        .route("/api/v1/explorer/validator/:id", get(nodes::get_validator))
+        .route("/api/v1/explorer/solvers", get(nodes::get_solvers))
+        .route("/api/v1/explorer/solver/:id", get(nodes::get_solver))
         
         // Search
         .route("/api/v1/explorer/search", get(search::search))
