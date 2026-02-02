@@ -64,6 +64,34 @@ pub async fn search(
         });
     }
     
+    // Try to find validator (if query starts with "validator-" or looks like validator ID)
+    if query.starts_with("validator-") || query.contains("validator") {
+        // TODO: Check if validator exists in storage
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("status".to_string(), serde_json::json!("active"));
+        
+        results.push(SearchResult {
+            result_type: "validator".to_string(),
+            id: query.to_string(),
+            url: format!("/validator/{}", query),
+            extra,
+        });
+    }
+    
+    // Try to find solver (if query starts with "solver-" or looks like solver ID)
+    if query.starts_with("solver-") || query.contains("solver") {
+        // TODO: Check if solver exists in storage
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("status".to_string(), serde_json::json!("active"));
+        
+        results.push(SearchResult {
+            result_type: "solver".to_string(),
+            id: query.to_string(),
+            url: format!("/solver/{}", query),
+            extra,
+        });
+    }
+    
     Json(SearchResponse { results })
 }
 
