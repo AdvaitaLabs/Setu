@@ -227,6 +227,74 @@ pub struct CausalPathResponse {
 }
 
 // ============================================================================
+// Validator and Solver Types
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorListItem {
+    pub id: String,
+    pub address: String,
+    pub status: String,
+    pub stake: u64,
+    pub registered_at: u64,
+    pub last_active: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorListResponse {
+    pub validators: Vec<ValidatorListItem>,
+    pub pagination: PaginationInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorDetail {
+    pub id: String,
+    pub address: String,
+    pub status: String,
+    pub stake: u64,
+    pub registered_at: u64,
+    pub last_active: u64,
+    pub total_anchors_proposed: u64,
+    pub total_events_validated: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolverListItem {
+    pub id: String,
+    pub address: String,
+    pub status: String,
+    pub registered_at: u64,
+    pub last_active: u64,
+    pub total_events_created: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolverListResponse {
+    pub solvers: Vec<SolverListItem>,
+    pub pagination: PaginationInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolverDetail {
+    pub id: String,
+    pub address: String,
+    pub status: String,
+    pub registered_at: u64,
+    pub last_active: u64,
+    pub total_events_created: u64,
+    pub total_transfers: u64,
+    pub total_tasks: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginationInfo {
+    pub page: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub total_pages: usize,
+}
+
+// ============================================================================
 // Search Types
 // ============================================================================
 
