@@ -587,6 +587,7 @@ pub struct DagStatsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use setu_storage::EventStore;
     use setu_types::{EventType, VectorClock, VLCSnapshot};
 
     fn create_event(id: &str, parents: Vec<&str>, creator: &str) -> Event {
@@ -607,7 +608,7 @@ mod tests {
 
     async fn create_manager() -> DagManager {
         let dag = Arc::new(RwLock::new(Dag::new()));
-        let event_store = Arc::new(EventStore::new());
+        let event_store: Arc<dyn EventStoreBackend> = Arc::new(EventStore::new());
         DagManager::with_defaults(dag, event_store)
     }
 
