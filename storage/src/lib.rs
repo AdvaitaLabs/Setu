@@ -1,7 +1,10 @@
+pub mod storage_types;  // Storage-specific types (BatchStoreResult, etc.)
 pub mod state;
 pub mod event_store;
 pub mod anchor_store;
+pub mod cf_store;  // CFStore now in dedicated module
 pub mod object_store;
+pub mod memory_object_store;  // In-memory ObjectStore implementation
 pub mod subnet_state;
 pub mod state_provider;
 
@@ -18,10 +21,13 @@ pub mod event_store_backend;
 pub mod anchor_store_backend;
 pub mod cf_store_backend;
 
+pub use storage_types::*;  // Export storage-specific types
 pub use state::*;
 pub use event_store::*;
 pub use anchor_store::*;
+pub use cf_store::*;  // Export CFStore from dedicated module
 pub use object_store::*;
+pub use memory_object_store::MemoryObjectStore;  // In-memory ObjectStore
 pub use subnet_state::{SubnetStateSMT, GlobalStateManager, StateApplySummary, StateApplyError};
 
 // Backend traits
