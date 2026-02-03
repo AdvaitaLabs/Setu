@@ -2,6 +2,7 @@
 
 use crate::object_store::ObjectStore;
 use crate::rocks::{SetuDB, ColumnFamily};
+use rocksdb::WriteBatch;
 use setu_types::{
     ObjectId, Address, SubnetId, CoinType,
     Coin, Profile, Credential, RelationGraph, AccountView,
@@ -147,6 +148,10 @@ impl RocksObjectStore {
     }
     
     /// Remove coin from (owner, coin_type) index
+    /// 
+    /// Note: This non-batch version is kept for potential use in index rebuild operations.
+    /// For normal operations, use batch_remove_from_owner_type_index for atomicity.
+    #[allow(dead_code)]
     fn remove_from_owner_type_index(&self, owner: &Address, coin_type: &CoinType, object_id: &ObjectId) -> SetuResult<()> {
         let key = Self::make_owner_cointype_key(owner, coin_type);
         let mut ids: Vec<ObjectId> = self.db.get_raw(ColumnFamily::CoinsByOwnerAndType, &key)
@@ -214,6 +219,87 @@ impl RocksObjectStore {
         self.db.get_raw(ColumnFamily::CoinsByOwnerAndType, &key)
             .map_err(|e| SetuError::StorageError(e.to_string()))
             .map(|opt| opt.unwrap_or_default())
+    }
+    
+    // ========== Batched Index Operations (for atomic writes) ==========
+    
+    /// Add to index in batch (for atomic writes)
+    fn batch_add_to_index(&self, batch: &mut WriteBatch, cf: ColumnFamily, key: &Address, object_id: &ObjectId) -> SetuResult<()> {
+        let mut ids: Vec<ObjectId> = self.db.get(cf, key)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?
+            .unwrap_or_default();
+        if !ids.contains(object_id) {
+            ids.push(*object_id);
+            self.db.batch_put(batch, cf, key, &ids)
+                .map_err(|e| SetuError::StorageError(e.to_string()))?;
+        }
+        Ok(())
+    }
+    
+    /// Remove from index in batch (for atomic writes)
+    fn batch_remove_from_index(&self, batch: &mut WriteBatch, cf: ColumnFamily, key: &Address, object_id: &ObjectId) -> SetuResult<()> {
+        let mut ids: Vec<ObjectId> = self.db.get(cf, key)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?
+            .unwrap_or_default();
+        let original_len = ids.len();
+        ids.retain(|id| id != object_id);
+        if ids.len() < original_len {
+            if ids.is_empty() {
+                self.db.batch_delete(batch, cf, key)
+                    .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            } else {
+                self.db.batch_put(batch, cf, key, &ids)
+                    .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+    
+    /// Add coin to (owner, coin_type) index in batch (for atomic writes)
+    fn batch_add_to_owner_type_index(&self, batch: &mut WriteBatch, owner: &Address, coin_type: &CoinType, object_id: &ObjectId) -> SetuResult<()> {
+        let key = Self::make_owner_cointype_key(owner, coin_type);
+        let mut ids: Vec<ObjectId> = self.db.get_raw(ColumnFamily::CoinsByOwnerAndType, &key)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?
+            .unwrap_or_default();
+        if !ids.contains(object_id) {
+            ids.push(*object_id);
+            self.db.batch_put_raw(batch, ColumnFamily::CoinsByOwnerAndType, &key, &ids)
+                .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            debug!(
+                owner = %owner,
+                coin_type = %coin_type,
+                object_id = %object_id,
+                "Added coin to owner+type index (batch)"
+            );
+        }
+        Ok(())
+    }
+    
+    /// Remove coin from (owner, coin_type) index in batch (for atomic writes)
+    fn batch_remove_from_owner_type_index(&self, batch: &mut WriteBatch, owner: &Address, coin_type: &CoinType, object_id: &ObjectId) -> SetuResult<()> {
+        let key = Self::make_owner_cointype_key(owner, coin_type);
+        let mut ids: Vec<ObjectId> = self.db.get_raw(ColumnFamily::CoinsByOwnerAndType, &key)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?
+            .unwrap_or_default();
+        let original_len = ids.len();
+        ids.retain(|id| id != object_id);
+        if ids.len() < original_len {
+            if ids.is_empty() {
+                self.db.batch_delete_raw(batch, ColumnFamily::CoinsByOwnerAndType, &key)
+                    .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            } else {
+                self.db.batch_put_raw(batch, ColumnFamily::CoinsByOwnerAndType, &key, &ids)
+                    .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            }
+            debug!(
+                owner = %owner,
+                coin_type = %coin_type,
+                object_id = %object_id,
+                remaining_count = ids.len(),
+                "Removed coin from owner+type index (batch)"
+            );
+        }
+        Ok(())
     }
     
     // ========== Index Rebuild Tools ==========
@@ -375,14 +461,28 @@ impl std::fmt::Display for RebuildIndexResult {
 }
 
 impl ObjectStore for RocksObjectStore {
+    /// Store a coin with atomic index updates
+    /// 
+    /// Uses WriteBatch to ensure the coin data and all indexes are updated atomically.
+    /// If any operation fails, all changes are rolled back.
     fn store_coin(&self, coin: &Coin) -> SetuResult<ObjectId> {
         let id = coin.metadata.id;
-        self.db.put(ColumnFamily::Coins, &id, coin).map_err(|e| SetuError::StorageError(e.to_string()))?;
+        let mut batch = self.db.batch();
+        
+        // Add coin data to batch
+        self.db.batch_put(&mut batch, ColumnFamily::Coins, &id, coin)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?;
+        
+        // Add index entries to batch
         if let Some(owner) = &coin.metadata.owner {
-            self.add_to_index(ColumnFamily::CoinsByOwner, owner, &id)?;
-            // Also add to (owner, coin_type) index
-            self.add_to_owner_type_index(owner, &coin.data.coin_type, &id)?;
+            self.batch_add_to_index(&mut batch, ColumnFamily::CoinsByOwner, owner, &id)?;
+            self.batch_add_to_owner_type_index(&mut batch, owner, &coin.data.coin_type, &id)?;
         }
+        
+        // Commit all changes atomically
+        self.db.write_batch(batch)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?;
+        
         Ok(id)
     }
     
@@ -405,38 +505,55 @@ impl ObjectStore for RocksObjectStore {
     }
     
     fn update_coin(&self, coin: &Coin) -> SetuResult<()> {
+        let mut batch = self.db.batch();
+        
         if let Some(old_coin) = self.get_coin(&coin.metadata.id)? {
             // Handle owner change
             if old_coin.metadata.owner != coin.metadata.owner {
                 if let Some(old_owner) = &old_coin.metadata.owner {
-                    self.remove_from_index(ColumnFamily::CoinsByOwner, old_owner, &coin.metadata.id)?;
-                    self.remove_from_owner_type_index(old_owner, &old_coin.data.coin_type, &coin.metadata.id)?;
+                    self.batch_remove_from_index(&mut batch, ColumnFamily::CoinsByOwner, old_owner, &coin.metadata.id)?;
+                    self.batch_remove_from_owner_type_index(&mut batch, old_owner, &old_coin.data.coin_type, &coin.metadata.id)?;
                 }
                 if let Some(new_owner) = &coin.metadata.owner {
-                    self.add_to_index(ColumnFamily::CoinsByOwner, new_owner, &coin.metadata.id)?;
-                    self.add_to_owner_type_index(new_owner, &coin.data.coin_type, &coin.metadata.id)?;
+                    self.batch_add_to_index(&mut batch, ColumnFamily::CoinsByOwner, new_owner, &coin.metadata.id)?;
+                    self.batch_add_to_owner_type_index(&mut batch, new_owner, &coin.data.coin_type, &coin.metadata.id)?;
                 }
             }
             // Handle coin_type change (rare but possible)
             else if old_coin.data.coin_type != coin.data.coin_type {
                 if let Some(owner) = &coin.metadata.owner {
-                    self.remove_from_owner_type_index(owner, &old_coin.data.coin_type, &coin.metadata.id)?;
-                    self.add_to_owner_type_index(owner, &coin.data.coin_type, &coin.metadata.id)?;
+                    self.batch_remove_from_owner_type_index(&mut batch, owner, &old_coin.data.coin_type, &coin.metadata.id)?;
+                    self.batch_add_to_owner_type_index(&mut batch, owner, &coin.data.coin_type, &coin.metadata.id)?;
                 }
             }
         }
-        self.db.put(ColumnFamily::Coins, &coin.metadata.id, coin).map_err(|e| SetuError::StorageError(e.to_string()))
+        
+        // Add coin update to batch
+        self.db.batch_put(&mut batch, ColumnFamily::Coins, &coin.metadata.id, coin)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?;
+        
+        // Commit all changes atomically
+        self.db.write_batch(batch)
+            .map_err(|e| SetuError::StorageError(e.to_string()))
     }
     
     fn delete_coin(&self, id: &ObjectId) -> SetuResult<()> {
+        let mut batch = self.db.batch();
+        
         if let Some(coin) = self.get_coin(id)? {
             if let Some(owner) = &coin.metadata.owner {
-                self.remove_from_index(ColumnFamily::CoinsByOwner, owner, id)?;
-                // Also remove from (owner, coin_type) index
-                self.remove_from_owner_type_index(owner, &coin.data.coin_type, id)?;
+                self.batch_remove_from_index(&mut batch, ColumnFamily::CoinsByOwner, owner, id)?;
+                self.batch_remove_from_owner_type_index(&mut batch, owner, &coin.data.coin_type, id)?;
             }
         }
-        self.db.delete(ColumnFamily::Coins, id).map_err(|e| SetuError::StorageError(e.to_string()))
+        
+        // Add coin deletion to batch
+        self.db.batch_delete(&mut batch, ColumnFamily::Coins, id)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?;
+        
+        // Commit all changes atomically
+        self.db.write_batch(batch)
+            .map_err(|e| SetuError::StorageError(e.to_string()))
     }
     
     fn store_profile(&self, profile: &Profile) -> SetuResult<ObjectId> {
