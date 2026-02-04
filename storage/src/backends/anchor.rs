@@ -61,7 +61,7 @@ pub trait AnchorStoreBackend: Send + Sync + Debug {
 // Implement trait for in-memory AnchorStore
 // ============================================================================
 
-use crate::AnchorStore;
+use crate::memory::AnchorStore;
 
 #[async_trait]
 impl AnchorStoreBackend for AnchorStore {

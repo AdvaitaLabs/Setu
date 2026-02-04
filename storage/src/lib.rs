@@ -1,49 +1,66 @@
-pub mod state;
-pub mod event_store;
-pub mod anchor_store;
-pub mod object_store;
-pub mod subnet_state;
-pub mod state_provider;
+//! Setu Storage Layer
+//!
+//! This crate provides the storage abstraction and implementations for Setu.
+//!
+//! ## Module Structure
+//!
+//! - `types`: Storage-specific types (BatchStoreResult, etc.)
+//! - `backends`: Storage backend traits (EventStoreBackend, etc.)
+//! - `memory`: In-memory implementations using DashMap
+//! - `rocks`: RocksDB persistent implementations
+//! - `state`: State management (GlobalStateManager, StateProvider)
+//!
+//! ## Usage
+//!
+//! ```rust,ignore
+//! use setu_storage::{EventStore, EventStoreBackend};  // Memory impl + trait
+//! use setu_storage::{RocksDBEventStore, SetuDB};      // RocksDB impl
+//! use setu_storage::{GlobalStateManager, StateProvider};  // State management
+//! ```
 
-// RocksDB storage implementation
+// Module declarations
+pub mod types;
+pub mod backends;
+pub mod memory;
 pub mod rocks;
-pub mod rocks_object_store;
-pub mod rocks_merkle_store;
-pub mod rocks_event_store;
-pub mod rocks_anchor_store;
-pub mod rocks_cf_store;
+pub mod state;
 
-// Backend traits for storage abstraction
-pub mod event_store_backend;
-pub mod anchor_store_backend;
-pub mod cf_store_backend;
+// ============================================================================
+// Re-exports for backward compatibility (100% API compatible)
+// ============================================================================
 
-pub use state::*;
-pub use event_store::*;
-pub use anchor_store::*;
-pub use object_store::*;
-pub use subnet_state::{SubnetStateSMT, GlobalStateManager, StateApplySummary, StateApplyError};
+// Storage types
+pub use types::*;
 
 // Backend traits
-pub use event_store_backend::EventStoreBackend;
-pub use anchor_store_backend::AnchorStoreBackend;
-pub use cf_store_backend::CFStoreBackend;
+pub use backends::{EventStoreBackend, AnchorStoreBackend, CFStoreBackend, ObjectStore};
 
-// StateProvider trait and implementations
-pub use state_provider::{
-    StateProvider, MerkleStateProvider, 
-    CoinInfo, CoinState, SimpleMerkleProof,
-    init_coin, get_coin_state,
-};
+// Memory implementations
+pub use memory::{EventStore, AnchorStore, CFStore, MemoryObjectStore};
 
-// Re-export RocksDB types
+// RocksDB types and implementations
 pub use rocks::{SetuDB, RocksDBConfig, ColumnFamily, StorageError};
-pub use rocks_object_store::{RocksObjectStore, RebuildIndexResult};
-pub use rocks_merkle_store::RocksDBMerkleStore;
-pub use rocks_event_store::RocksDBEventStore;
-pub use rocks_anchor_store::RocksDBAnchorStore;
-pub use rocks_cf_store::RocksDBCFStore;
+pub use rocks::{RocksDBEventStore, RocksDBAnchorStore, RocksDBCFStore};
+pub use rocks::{RocksObjectStore, RebuildIndexResult, RocksDBMerkleStore};
+
+// State management
+pub use state::{SubnetStateSMT, GlobalStateManager, StateApplySummary, StateApplyError};
+pub use state::{StateProvider, MerkleStateProvider, CoinInfo, CoinState, SimpleMerkleProof};
+pub use state::{init_coin, get_coin_state};
 
 // Re-export MerkleStore trait from setu-merkle for convenience
 pub use setu_merkle::storage::MerkleStore;
 
+// ============================================================================
+// Backward compatibility: module path aliases
+// ============================================================================
+
+/// Backward compatibility alias for `state::manager`
+pub mod subnet_state {
+    pub use crate::state::manager::*;
+}
+
+/// Backward compatibility alias for `state::provider`
+pub mod state_provider {
+    pub use crate::state::provider::*;
+}

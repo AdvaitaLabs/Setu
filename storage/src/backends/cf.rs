@@ -50,7 +50,7 @@ pub trait CFStoreBackend: Send + Sync + Debug {
 // Implement trait for in-memory CFStore
 // ============================================================================
 
-use crate::CFStore;
+use crate::memory::CFStore;
 
 #[async_trait]
 impl CFStoreBackend for CFStore {
@@ -91,7 +91,7 @@ impl CFStoreBackend for CFStore {
 // Implement trait for RocksDBCFStore
 // ============================================================================
 
-use crate::rocks_cf_store::RocksDBCFStore;
+use crate::rocks::RocksDBCFStore;
 
 #[async_trait]
 impl CFStoreBackend for RocksDBCFStore {

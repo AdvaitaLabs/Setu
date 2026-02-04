@@ -32,7 +32,7 @@
 //! let root = store.get_latest_subnet_root(&subnet_id)?;
 //! ```
 
-use crate::rocks::{ColumnFamily, SetuDB, StorageError};
+use crate::rocks::core::{ColumnFamily, SetuDB, StorageError};
 use setu_merkle::error::{MerkleError, MerkleResult};
 use setu_merkle::storage::{AnchorId, MerkleNodeStore, MerkleRootStore, MerkleStore, SubnetId};
 use setu_merkle::sparse::SparseMerkleNode;

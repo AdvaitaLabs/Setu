@@ -334,12 +334,13 @@ impl NetworkEventHandler for MessageRouter {
 mod tests {
     use super::*;
     use consensus::{ConsensusEngine, ValidatorSet};
+    use setu_storage::{EventStore, AnchorStore};
     use setu_types::{ConsensusConfig, ValidatorInfo, NodeInfo, VLCSnapshot};
     use setu_vlc::VectorClock;
     
-    fn create_test_stores() -> (Arc<EventStore>, Arc<AnchorStore>) {
-        let event_store = Arc::new(EventStore::new());
-        let anchor_store = Arc::new(AnchorStore::new());
+    fn create_test_stores() -> (Arc<dyn EventStoreBackend>, Arc<dyn AnchorStoreBackend>) {
+        let event_store: Arc<dyn EventStoreBackend> = Arc::new(EventStore::new());
+        let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(AnchorStore::new());
         (event_store, anchor_store)
     }
     

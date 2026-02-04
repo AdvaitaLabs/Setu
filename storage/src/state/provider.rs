@@ -22,7 +22,7 @@
 //! let provider = MerkleStateProvider::new(state_manager);
 //! ```
 
-use crate::subnet_state::GlobalStateManager;
+use crate::state::manager::GlobalStateManager;
 use setu_merkle::{HashValue, SparseMerkleProof};
 use setu_types::{ObjectId, SubnetId};
 use sha2::{Digest, Sha256};

@@ -3,7 +3,7 @@
 //! This trait allows switching between in-memory (EventStore) and
 //! persistent (RocksDBEventStore) implementations at runtime.
 
-use crate::event_store::BatchStoreResult;
+use crate::types::BatchStoreResult;
 use async_trait::async_trait;
 use setu_types::{Event, EventId, EventStatus, SetuResult};
 use std::collections::HashMap;
@@ -111,7 +111,7 @@ pub trait EventStoreBackend: Send + Sync + Debug {
 // Implement trait for in-memory EventStore
 // ============================================================================
 
-use crate::EventStore;
+use crate::memory::EventStore;
 
 #[async_trait]
 impl EventStoreBackend for EventStore {

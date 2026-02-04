@@ -18,8 +18,8 @@
 //! - `creator:{creator}:{event_id}` -> () (creator index)
 //! - `status:{status}:{event_id}` -> () (status index)
 
-use crate::event_store::BatchStoreResult;
-use crate::rocks::{SetuDB, ColumnFamily};
+use crate::types::BatchStoreResult;
+use crate::rocks::core::{SetuDB, ColumnFamily};
 use setu_types::{Event, EventId, EventStatus, SetuResult, SetuError};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -458,7 +458,7 @@ impl std::fmt::Debug for RocksDBEventStore {
 // Implement EventStoreBackend trait
 // ============================================================================
 
-use crate::event_store_backend::EventStoreBackend;
+use crate::backends::event::EventStoreBackend;
 use async_trait::async_trait;
 
 #[async_trait]

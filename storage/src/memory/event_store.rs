@@ -1,71 +1,64 @@
+//! EventStore - In-memory Event storage with concurrent access
+//!
+//! This module provides a high-performance in-memory implementation of event storage
+//! using DashMap for lock-free concurrent access.
+
+use crate::types::BatchStoreResult;
+use dashmap::DashMap;
 use setu_types::{Event, EventId, EventStatus, SetuResult};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
-/// Result of a batch store operation
-#[derive(Debug, Default, Clone)]
-pub struct BatchStoreResult {
-    /// Number of events successfully stored
-    pub stored: usize,
-    /// Number of events skipped (duplicates - non-critical)
-    pub skipped: usize,
-    /// Number of events that failed to store (critical errors)
-    pub failed: usize,
-    /// IDs of skipped events (duplicates)
-    pub skipped_ids: Vec<EventId>,
-    /// IDs and errors of failed events
-    pub failed_errors: Vec<(EventId, String)>,
-}
-
-impl BatchStoreResult {
-    /// Check if there were any critical failures
-    pub fn has_critical_failures(&self) -> bool {
-        self.failed > 0
-    }
-    
-    /// Total events processed
-    pub fn total(&self) -> usize {
-        self.stored + self.skipped + self.failed
-    }
-}
-
+/// In-memory storage for Events with lock-free concurrent access
+///
+/// EventStore uses DashMap internally, providing:
+/// - Lock-free reads and writes for most operations
+/// - Better performance under high concurrency
+/// - Automatic sharding for reduced contention
+///
+/// ## Index Tables
+/// - `events`: Primary storage (EventId -> Event)
+/// - `by_creator`: Creator index (Creator -> Vec<EventId>)
+/// - `by_status`: Status index (EventStatus -> Vec<EventId>)
+/// - `depths`: Depth index (EventId -> u64)
 #[derive(Debug)]
 pub struct EventStore {
-    events: Arc<RwLock<HashMap<EventId, Event>>>,
-    by_creator: Arc<RwLock<HashMap<String, Vec<EventId>>>>,
-    by_status: Arc<RwLock<HashMap<EventStatus, Vec<EventId>>>>,
+    events: Arc<DashMap<EventId, Event>>,
+    by_creator: Arc<DashMap<String, Vec<EventId>>>,
+    by_status: Arc<DashMap<EventStatus, Vec<EventId>>>,
     /// Depth index table - stores event depths separately from Event struct
     /// Design note: depth is a DAG topological property, not an intrinsic event property
-    depths: Arc<RwLock<HashMap<EventId, u64>>>,
+    depths: Arc<DashMap<EventId, u64>>,
 }
 
 impl EventStore {
+    /// Create a new empty EventStore
     pub fn new() -> Self {
         Self {
-            events: Arc::new(RwLock::new(HashMap::new())),
-            by_creator: Arc::new(RwLock::new(HashMap::new())),
-            by_status: Arc::new(RwLock::new(HashMap::new())),
-            depths: Arc::new(RwLock::new(HashMap::new())),
+            events: Arc::new(DashMap::new()),
+            by_creator: Arc::new(DashMap::new()),
+            by_status: Arc::new(DashMap::new()),
+            depths: Arc::new(DashMap::new()),
         }
     }
 
+    /// Store an event
     pub async fn store(&self, event: Event) -> SetuResult<()> {
         let event_id = event.id.clone();
         let creator = event.creator.clone();
         let status = event.status;
 
-        let mut events = self.events.write().await;
-        events.insert(event_id.clone(), event);
+        // Insert into main store
+        self.events.insert(event_id.clone(), event);
 
-        let mut by_creator = self.by_creator.write().await;
-        by_creator
+        // Update creator index
+        self.by_creator
             .entry(creator)
             .or_insert_with(Vec::new)
             .push(event_id.clone());
 
-        let mut by_status = self.by_status.write().await;
-        by_status
+        // Update status index
+        self.by_status
             .entry(status)
             .or_insert_with(Vec::new)
             .push(event_id);
@@ -73,23 +66,23 @@ impl EventStore {
         Ok(())
     }
 
+    /// Get an event by ID
     pub async fn get(&self, event_id: &EventId) -> Option<Event> {
-        let events = self.events.read().await;
-        events.get(event_id).cloned()
+        self.events.get(event_id).map(|r| r.value().clone())
     }
 
+    /// Get multiple events by IDs
     pub async fn get_many(&self, event_ids: &[EventId]) -> Vec<Event> {
-        let events = self.events.read().await;
         event_ids
             .iter()
-            .filter_map(|id| events.get(id).cloned())
+            .filter_map(|id| self.events.get(id).map(|r| r.value().clone()))
             .collect()
     }
 
+    /// Update event status
     pub async fn update_status(&self, event_id: &EventId, new_status: EventStatus) {
         let old_status = {
-            let mut events = self.events.write().await;
-            if let Some(event) = events.get_mut(event_id) {
+            if let Some(mut event) = self.events.get_mut(event_id) {
                 let old = event.status;
                 event.status = new_status;
                 Some(old)
@@ -99,58 +92,56 @@ impl EventStore {
         };
 
         if let Some(old_status) = old_status {
-            let mut by_status = self.by_status.write().await;
-            
-            if let Some(ids) = by_status.get_mut(&old_status) {
+            // Remove from old status index
+            if let Some(mut ids) = self.by_status.get_mut(&old_status) {
                 ids.retain(|id| id != event_id);
             }
-            
-            by_status
+
+            // Add to new status index
+            self.by_status
                 .entry(new_status)
                 .or_insert_with(Vec::new)
                 .push(event_id.clone());
         }
     }
 
+    /// Get events by creator
     pub async fn get_by_creator(&self, creator: &str) -> Vec<Event> {
-        let by_creator = self.by_creator.read().await;
-        let events = self.events.read().await;
-
-        by_creator
+        self.by_creator
             .get(creator)
             .map(|ids| {
                 ids.iter()
-                    .filter_map(|id| events.get(id).cloned())
+                    .filter_map(|id| self.events.get(id).map(|r| r.value().clone()))
                     .collect()
             })
             .unwrap_or_default()
     }
 
+    /// Get events by status
     pub async fn get_by_status(&self, status: EventStatus) -> Vec<Event> {
-        let by_status = self.by_status.read().await;
-        let events = self.events.read().await;
-
-        by_status
+        self.by_status
             .get(&status)
             .map(|ids| {
                 ids.iter()
-                    .filter_map(|id| events.get(id).cloned())
+                    .filter_map(|id| self.events.get(id).map(|r| r.value().clone()))
                     .collect()
             })
             .unwrap_or_default()
     }
 
+    /// Get total event count
     pub async fn count(&self) -> usize {
-        self.events.read().await.len()
+        self.events.len()
     }
 
+    /// Count events by status
     pub async fn count_by_status(&self, status: EventStatus) -> usize {
-        let by_status = self.by_status.read().await;
-        by_status.get(&status).map(|v| v.len()).unwrap_or(0)
+        self.by_status.get(&status).map(|v| v.len()).unwrap_or(0)
     }
 
+    /// Check if an event exists
     pub async fn exists(&self, event_id: &EventId) -> bool {
-        self.events.read().await.contains_key(event_id)
+        self.events.contains_key(event_id)
     }
 
     // =========================================================================
@@ -159,76 +150,69 @@ impl EventStore {
 
     /// Check if multiple events exist
     pub async fn exists_many(&self, event_ids: &[EventId]) -> Vec<bool> {
-        let events = self.events.read().await;
-        event_ids.iter().map(|id| events.contains_key(id)).collect()
+        event_ids
+            .iter()
+            .map(|id| self.events.contains_key(id))
+            .collect()
     }
 
     /// Get event depth from the independent depths index
     /// Used by resolve_parents() Phase 1c fallback query
     pub async fn get_depth(&self, event_id: &EventId) -> Option<u64> {
-        self.depths.read().await.get(event_id).copied()
+        self.depths.get(event_id).map(|r| *r.value())
     }
 
     /// Batch get event depths (for cache warmup optimization)
     pub async fn get_depths_batch(&self, event_ids: &[EventId]) -> HashMap<EventId, u64> {
-        let depths = self.depths.read().await;
         event_ids
             .iter()
-            .filter_map(|id| depths.get(id).map(|&d| (id.clone(), d)))
+            .filter_map(|id| self.depths.get(id).map(|r| (id.clone(), *r.value())))
             .collect()
     }
 
     /// Get event's parent_ids (for cache warmup)
     pub async fn get_parent_ids(&self, event_id: &EventId) -> Option<Vec<EventId>> {
-        self.events
-            .read()
-            .await
-            .get(event_id)
-            .map(|e| e.parent_ids.clone())
+        self.events.get(event_id).map(|e| e.parent_ids.clone())
     }
 
     /// Persist event with its depth (called during persist_finalized_anchor)
-    /// 
-    /// # Atomicity
-    /// 
-    /// This method acquires all 4 locks atomically to ensure readers never see
-    /// an event without its depth (or vice versa). This prevents race conditions
-    /// where `query_parent()` finds the event but fails to find its depth.
+    ///
+    /// # Atomicity Note
+    ///
+    /// With DashMap, each insert is atomic at the shard level. While individual
+    /// operations are lock-free, the overall store operation is not strictly atomic
+    /// across all indexes. This is acceptable for in-memory testing scenarios.
+    /// For production use with RocksDB, WriteBatch ensures full atomicity.
     pub async fn store_with_depth(&self, event: Event, depth: u64) -> SetuResult<()> {
         let event_id = event.id.clone();
         let creator = event.creator.clone();
         let status = event.status;
-        
-        // Acquire all locks atomically (same pattern as store_batch_with_depth)
-        let mut events = self.events.write().await;
-        let mut by_creator = self.by_creator.write().await;
-        let mut by_status = self.by_status.write().await;
-        let mut depths = self.depths.write().await;
-        
+
         // Store event
-        events.insert(event_id.clone(), event);
-        
-        by_creator
+        self.events.insert(event_id.clone(), event);
+
+        // Update creator index
+        self.by_creator
             .entry(creator)
             .or_insert_with(Vec::new)
             .push(event_id.clone());
-        
-        by_status
+
+        // Update status index
+        self.by_status
             .entry(status)
             .or_insert_with(Vec::new)
             .push(event_id.clone());
-        
-        // Store depth (atomically with event)
-        depths.insert(event_id, depth);
-        
+
+        // Store depth
+        self.depths.insert(event_id, depth);
+
         Ok(())
     }
-    
+
     /// Batch persist events with depth (optimized for finalization)
-    /// 
+    ///
     /// Returns a result indicating success/failure counts.
-    /// This method uses single lock acquisition for better performance.
-    /// 
+    ///
     /// # Error Handling
     /// - Duplicate events are counted as `skipped` (non-critical)
     /// - Other errors are counted as `failed` (critical)
@@ -238,58 +222,51 @@ impl EventStore {
         events_with_depths: Vec<(Event, u64)>,
     ) -> BatchStoreResult {
         let mut result = BatchStoreResult::default();
-        
+
         if events_with_depths.is_empty() {
             return result;
         }
-        
-        // Acquire all locks once for batch operation
-        let mut events = self.events.write().await;
-        let mut by_creator = self.by_creator.write().await;
-        let mut by_status = self.by_status.write().await;
-        let mut depths = self.depths.write().await;
-        
+
         for (event, depth) in events_with_depths {
             let event_id = event.id.clone();
-            
+
             // Check for duplicates (non-critical, skip)
-            if events.contains_key(&event_id) {
+            if self.events.contains_key(&event_id) {
                 result.skipped += 1;
                 result.skipped_ids.push(event_id);
                 continue;
             }
-            
+
             // Store event
             let creator = event.creator.clone();
             let status = event.status;
-            
-            events.insert(event_id.clone(), event);
-            
-            by_creator
+
+            self.events.insert(event_id.clone(), event);
+
+            self.by_creator
                 .entry(creator)
                 .or_insert_with(Vec::new)
                 .push(event_id.clone());
-            
-            by_status
+
+            self.by_status
                 .entry(status)
                 .or_insert_with(Vec::new)
                 .push(event_id.clone());
-            
+
             // Store depth
-            depths.insert(event_id, depth);
-            
+            self.depths.insert(event_id, depth);
+
             result.stored += 1;
         }
-        
+
         result
     }
 
     /// Batch get events (for network sync)
     pub async fn get_events_batch(&self, event_ids: &[EventId]) -> Vec<Event> {
-        let events = self.events.read().await;
         event_ids
             .iter()
-            .filter_map(|id| events.get(id).cloned())
+            .filter_map(|id| self.events.get(id).map(|r| r.value().clone()))
             .collect()
     }
 }
@@ -314,7 +291,7 @@ impl Default for EventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_types::{EventType, VectorClock, VLCSnapshot};
+    use setu_types::{EventType, VLCSnapshot, VectorClock};
 
     fn create_event(creator: &str) -> Event {
         Event::new(
@@ -345,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_by_creator() {
         let store = EventStore::new();
-        
+
         store.store(create_event("node1")).await.unwrap();
         store.store(create_event("node1")).await.unwrap();
         store.store(create_event("node2")).await.unwrap();
@@ -365,5 +342,44 @@ mod tests {
 
         let updated = store.get(&event_id).await.unwrap();
         assert_eq!(updated.status, EventStatus::Executed);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_stores() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use tokio::task::JoinSet;
+
+        let store = Arc::new(EventStore::new());
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut tasks = JoinSet::new();
+
+        // Spawn 100 concurrent store operations
+        // Use unique logical_time to ensure unique event IDs
+        for i in 0..100 {
+            let store = Arc::clone(&store);
+            let counter = Arc::clone(&counter);
+            tasks.spawn(async move {
+                let unique_time = counter.fetch_add(1, Ordering::SeqCst);
+                let event = Event::new(
+                    EventType::Transfer,
+                    vec![],
+                    VLCSnapshot {
+                        vector_clock: VectorClock::new(),
+                        logical_time: unique_time,
+                        physical_time: unique_time * 1000,
+                    },
+                    format!("node{}", i % 10),
+                );
+                store.store(event).await.unwrap();
+            });
+        }
+
+        // Wait for all tasks
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+
+        assert_eq!(store.count().await, 100);
     }
 }

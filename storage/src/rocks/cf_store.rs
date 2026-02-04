@@ -18,7 +18,7 @@
 //! - `meta:pending_seq` -> u64 (next pending sequence number)
 //! - `meta:finalized_seq` -> u64 (next finalized sequence number)
 
-use crate::rocks::{SetuDB, ColumnFamily};
+use crate::rocks::core::{SetuDB, ColumnFamily};
 use setu_types::{ConsensusFrame, CFId, CFStatus, SetuResult, SetuError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
