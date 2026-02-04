@@ -1,7 +1,7 @@
 //! RocksDB implementation of ObjectStore
 
 use crate::object_store::ObjectStore;
-use crate::rocks::{SetuDB, ColumnFamily};
+use crate::rocks::{SetuDB, ColumnFamily, StorageOperation, IntoSetuResult};
 use rocksdb::WriteBatch;
 use setu_types::{
     ObjectId, Address, SubnetId, CoinType,
@@ -21,33 +21,42 @@ impl RocksObjectStore {
     }
     
     pub fn open(path: impl AsRef<std::path::Path>) -> SetuResult<Self> {
-        let db = SetuDB::open_default(path)
-            .map_err(|e| SetuError::StorageError(format!("Failed to open database: {}", e)))?;
+        let db = SetuDB::open_default(&path)
+            .map_err(|e| e.with_operation(StorageOperation::Open))
+            .into_setu_result()?;
         Ok(Self::new(db))
     }
     
     fn add_to_index(&self, cf: ColumnFamily, key: &Address, object_id: &ObjectId) -> SetuResult<()> {
         let mut ids: Vec<ObjectId> = self.db.get(cf, key)
-            .map_err(|e| SetuError::StorageError(e.to_string()))?
+            .map_err(|e| e.with_operation(StorageOperation::Get).with_cf(cf.name()))
+            .into_setu_result()?
             .unwrap_or_default();
         if !ids.contains(object_id) {
             ids.push(*object_id);
-            self.db.put(cf, key, &ids).map_err(|e| SetuError::StorageError(e.to_string()))?;
+            self.db.put(cf, key, &ids)
+                .map_err(|e| e.with_operation(StorageOperation::Put).with_cf(cf.name()))
+                .into_setu_result()?;
         }
         Ok(())
     }
     
     fn remove_from_index(&self, cf: ColumnFamily, key: &Address, object_id: &ObjectId) -> SetuResult<()> {
         let mut ids: Vec<ObjectId> = self.db.get(cf, key)
-            .map_err(|e| SetuError::StorageError(e.to_string()))?
+            .map_err(|e| e.with_operation(StorageOperation::Get).with_cf(cf.name()))
+            .into_setu_result()?
             .unwrap_or_default();
         let original_len = ids.len();
         ids.retain(|id| id != object_id);
         if ids.len() < original_len {
             if ids.is_empty() {
-                self.db.delete(cf, key).map_err(|e| SetuError::StorageError(e.to_string()))?;
+                self.db.delete(cf, key)
+                    .map_err(|e| e.with_operation(StorageOperation::Delete).with_cf(cf.name()))
+                    .into_setu_result()?;
             } else {
-                self.db.put(cf, key, &ids).map_err(|e| SetuError::StorageError(e.to_string()))?;
+                self.db.put(cf, key, &ids)
+                    .map_err(|e| e.with_operation(StorageOperation::Put).with_cf(cf.name()))
+                    .into_setu_result()?;
             }
         }
         Ok(())
@@ -55,7 +64,8 @@ impl RocksObjectStore {
     
     fn get_index(&self, cf: ColumnFamily, key: &Address) -> SetuResult<Vec<ObjectId>> {
         self.db.get(cf, key)
-            .map_err(|e| SetuError::StorageError(e.to_string()))
+            .map_err(|e| e.with_operation(StorageOperation::Get).with_cf(cf.name()))
+            .into_setu_result()
             .map(|opt| opt.unwrap_or_default())
     }
     
@@ -69,31 +79,38 @@ impl RocksObjectStore {
     
     /// Add a subnet to user's activity index
     fn add_subnet_to_user_index(&self, user: &Address, subnet_id: &SubnetId) -> SetuResult<()> {
-        let mut subnet_ids: Vec<SubnetId> = self.db.get(ColumnFamily::UserSubnetActivitiesByUser, user)
-            .map_err(|e| SetuError::StorageError(e.to_string()))?
+        let cf = ColumnFamily::UserSubnetActivitiesByUser;
+        let mut subnet_ids: Vec<SubnetId> = self.db.get(cf, user)
+            .map_err(|e| e.with_operation(StorageOperation::Get).with_cf(cf.name()))
+            .into_setu_result()?
             .unwrap_or_default();
         if !subnet_ids.contains(subnet_id) {
             subnet_ids.push(*subnet_id);
-            self.db.put(ColumnFamily::UserSubnetActivitiesByUser, user, &subnet_ids)
-                .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            self.db.put(cf, user, &subnet_ids)
+                .map_err(|e| e.with_operation(StorageOperation::Put).with_cf(cf.name()))
+                .into_setu_result()?;
         }
         Ok(())
     }
     
     /// Remove a subnet from user's activity index
     fn remove_subnet_from_user_index(&self, user: &Address, subnet_id: &SubnetId) -> SetuResult<()> {
-        let mut subnet_ids: Vec<SubnetId> = self.db.get(ColumnFamily::UserSubnetActivitiesByUser, user)
-            .map_err(|e| SetuError::StorageError(e.to_string()))?
+        let cf = ColumnFamily::UserSubnetActivitiesByUser;
+        let mut subnet_ids: Vec<SubnetId> = self.db.get(cf, user)
+            .map_err(|e| e.with_operation(StorageOperation::Get).with_cf(cf.name()))
+            .into_setu_result()?
             .unwrap_or_default();
         let original_len = subnet_ids.len();
         subnet_ids.retain(|id| id != subnet_id);
         if subnet_ids.len() < original_len {
             if subnet_ids.is_empty() {
-                self.db.delete(ColumnFamily::UserSubnetActivitiesByUser, user)
-                    .map_err(|e| SetuError::StorageError(e.to_string()))?;
+                self.db.delete(cf, user)
+                    .map_err(|e| e.with_operation(StorageOperation::Delete).with_cf(cf.name()))
+                    .into_setu_result()?;
             } else {
-                self.db.put(ColumnFamily::UserSubnetActivitiesByUser, user, &subnet_ids)
-                    .map_err(|e| SetuError::StorageError(e.to_string()))?;
+                self.db.put(cf, user, &subnet_ids)
+                    .map_err(|e| e.with_operation(StorageOperation::Put).with_cf(cf.name()))
+                    .into_setu_result()?;
             }
         }
         Ok(())

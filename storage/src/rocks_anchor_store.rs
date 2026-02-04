@@ -9,6 +9,7 @@
 //! 2. **Depth Index**: Uses `depth:{depth}` keys for depth-based lookups
 //! 3. **Latest Tracking**: Uses `meta:latest` for quick latest anchor access
 //! 4. **Atomic Batch Writes**: Uses WriteBatch for atomic store operations
+//! 5. **Async-safe I/O**: Uses `spawn_blocking` for disk operations
 //!
 //! ## Column Family Layout
 //!
@@ -19,7 +20,7 @@
 //! - `meta:latest` -> AnchorId (latest anchor ID)
 //! - `meta:count` -> u64 (total anchor count)
 
-use crate::rocks::{SetuDB, ColumnFamily};
+use crate::rocks::{SetuDB, ColumnFamily, spawn_db_op};
 use setu_types::{Anchor, AnchorId, SetuResult, SetuError};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -89,44 +90,50 @@ impl RocksDBAnchorStore {
     // =========================================================================
 
     /// Store an anchor (adds to chain)
+    /// 
+    /// Uses spawn_blocking for the disk write to avoid blocking the async runtime.
     pub async fn store(&self, anchor: Anchor) -> SetuResult<()> {
+        let db = self.db.clone();
         let anchor_id = anchor.id.clone();
         let depth = anchor.depth;
         
         // Get current count for chain index
         let count = self.count().await as u64;
         
-        let mut batch = self.db.batch();
-        
-        // Store anchor
-        let anchor_key = Self::anchor_key(&anchor_id);
-        self.db.batch_put_raw(&mut batch, ColumnFamily::Anchors, &anchor_key, &anchor)
-            .map_err(|e| SetuError::StorageError(e.to_string()))?;
-        
-        // Store chain index
-        let chain_key = Self::chain_key(count);
-        self.db.batch_put_raw(&mut batch, ColumnFamily::Anchors, &chain_key, &anchor_id)
-            .map_err(|e| SetuError::StorageError(e.to_string()))?;
-        
-        // Store depth index
-        let depth_key = Self::depth_key(depth);
-        self.db.batch_put_raw(&mut batch, ColumnFamily::Anchors, &depth_key, &anchor_id)
-            .map_err(|e| SetuError::StorageError(e.to_string()))?;
-        
-        // Update latest
-        self.db.batch_put_raw(&mut batch, ColumnFamily::Anchors, meta_key::LATEST, &anchor_id)
-            .map_err(|e| SetuError::StorageError(e.to_string()))?;
-        
-        // Update count
-        let new_count = count + 1;
-        self.db.batch_put_raw(&mut batch, ColumnFamily::Anchors, meta_key::COUNT, &new_count)
-            .map_err(|e| SetuError::StorageError(e.to_string()))?;
-        
-        self.db.write_batch(batch)
-            .map_err(|e| SetuError::StorageError(e.to_string()))?;
-        
-        debug!(anchor_id = %anchor_id, depth = depth, index = count, "Persisted anchor to RocksDB");
-        Ok(())
+        // Perform the blocking batch write on the blocking thread pool
+        spawn_db_op(move || {
+            let mut batch = db.batch();
+            
+            // Store anchor
+            let anchor_key = Self::anchor_key(&anchor_id);
+            db.batch_put_raw(&mut batch, ColumnFamily::Anchors, &anchor_key, &anchor)
+                .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            
+            // Store chain index
+            let chain_key = Self::chain_key(count);
+            db.batch_put_raw(&mut batch, ColumnFamily::Anchors, &chain_key, &anchor_id)
+                .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            
+            // Store depth index
+            let depth_key = Self::depth_key(depth);
+            db.batch_put_raw(&mut batch, ColumnFamily::Anchors, &depth_key, &anchor_id)
+                .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            
+            // Update latest
+            db.batch_put_raw(&mut batch, ColumnFamily::Anchors, meta_key::LATEST, &anchor_id)
+                .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            
+            // Update count
+            let new_count = count + 1;
+            db.batch_put_raw(&mut batch, ColumnFamily::Anchors, meta_key::COUNT, &new_count)
+                .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            
+            db.write_batch(batch)
+                .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            
+            debug!(anchor_id = %anchor_id, depth = depth, index = count, "Persisted anchor to RocksDB");
+            Ok(())
+        }).await
     }
     
     // =========================================================================
