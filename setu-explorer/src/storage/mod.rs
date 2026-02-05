@@ -3,8 +3,8 @@
 //! Provides unified interface for accessing blockchain data,
 //! supporting both direct RocksDB access and RPC mode.
 
-use setu_storage::{SetuDB, EventStore, AnchorStore};
-use setu_types::{Event, EventId, Anchor, AnchorId, EventStatus};
+use setu_storage::{SetuDB, EventStore, AnchorStore, RocksObjectStore, ObjectStore};
+use setu_types::{Event, EventId, Anchor, AnchorId, EventStatus, Address, Coin, CoinType};
 use std::sync::Arc;
 use std::path::Path;
 
@@ -14,22 +14,27 @@ pub struct ExplorerStorage {
     db: Arc<SetuDB>,
     event_store: EventStore,
     anchor_store: AnchorStore,
+    object_store: Arc<RocksObjectStore>,
 }
 
 impl ExplorerStorage {
     /// Open storage in read-only mode
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         // Open RocksDB in read-only mode
-        let db = Arc::new(SetuDB::open_default(path)?);
+        let db = Arc::new(SetuDB::open_default(path.as_ref())?);
         
         // Create stores (they will use the read-only DB)
         let event_store = EventStore::new();
         let anchor_store = AnchorStore::new();
         
+        // Create object store
+        let object_store = Arc::new(RocksObjectStore::open(path)?);
+        
         Ok(Self {
             db,
             event_store,
             anchor_store,
+            object_store,
         })
     }
     
@@ -103,6 +108,20 @@ impl ExplorerStorage {
     /// Count anchors
     pub async fn count_anchors(&self) -> usize {
         self.anchor_store.count().await
+    }
+    
+    // Object store methods
+    
+    /// Get coins by owner address
+    pub fn get_coins_by_owner(&self, owner: &Address) -> anyhow::Result<Vec<Coin>> {
+        self.object_store.get_coins_by_owner(owner)
+            .map_err(|e| anyhow::anyhow!("Failed to get coins: {}", e))
+    }
+    
+    /// Get coins by owner and coin type
+    pub fn get_coins_by_owner_and_type(&self, owner: &Address, coin_type: &CoinType) -> anyhow::Result<Vec<Coin>> {
+        self.object_store.get_coins_by_owner_and_type(owner, coin_type)
+            .map_err(|e| anyhow::anyhow!("Failed to get coins: {}", e))
     }
 }
 

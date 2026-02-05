@@ -15,6 +15,7 @@ pub mod events;
 pub mod dag;
 pub mod search;
 pub mod nodes;
+pub mod account;
 
 pub use types::*;
 
@@ -51,6 +52,12 @@ pub fn create_explorer_router(storage: Arc<ExplorerStorage>) -> Router {
         
         // Search
         .route("/api/v1/explorer/search", get(search::search))
+        
+        // Account APIs (for wallet)
+        .route("/api/v1/account/:address/balance", get(account::get_account_balance))
+        .route("/api/v1/account/:address/coins", get(account::get_account_coins))
+        .route("/api/v1/account/:address/activity", get(account::get_account_activity))
+        .route("/api/v1/transaction/:event_id", get(account::get_transaction_detail))
         
         .with_state(storage)
 }
