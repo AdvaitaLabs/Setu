@@ -25,6 +25,12 @@ impl RocksObjectStore {
         Ok(Self::new(db))
     }
     
+    pub fn open_readonly(path: impl AsRef<std::path::Path>) -> SetuResult<Self> {
+        let db = SetuDB::open_readonly(path)
+            .map_err(|e| SetuError::StorageError(format!("Failed to open database: {}", e)))?;
+        Ok(Self::new(db))
+    }
+    
     fn add_to_index(&self, cf: ColumnFamily, key: &Address, object_id: &ObjectId) -> SetuResult<()> {
         let mut ids: Vec<ObjectId> = self.db.get(cf, key)
             .map_err(|e| SetuError::StorageError(e.to_string()))?

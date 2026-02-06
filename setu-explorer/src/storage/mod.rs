@@ -20,15 +20,15 @@ pub struct ExplorerStorage {
 impl ExplorerStorage {
     /// Open storage in read-only mode
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        // Open RocksDB in read-only mode
-        let db = Arc::new(SetuDB::open_default(path.as_ref())?);
+        // Open RocksDB in read-only mode (won't conflict with validator)
+        let db = Arc::new(SetuDB::open_readonly(path.as_ref())?);
         
         // Create stores (they will use the read-only DB)
         let event_store = EventStore::new();
         let anchor_store = AnchorStore::new();
         
-        // Create object store
-        let object_store = Arc::new(RocksObjectStore::open(path)?);
+        // Create object store (also read-only)
+        let object_store = Arc::new(RocksObjectStore::open_readonly(path)?);
         
         Ok(Self {
             db,

@@ -31,6 +31,20 @@ impl SetuDB {
         Self::open(config)
     }
     
+    /// Open a database in read-only mode (for explorer)
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
+        let config = RocksDBConfig::new(path.as_ref());
+        let opts = config.to_options();
+        let cfs = ColumnFamily::descriptors();
+        
+        // Open in read-only mode with error_if_log_file_exist = false
+        let db = DB::open_cf_descriptors_read_only(&opts, &config.path, cfs, false)?;
+        
+        Ok(Self {
+            db: Arc::new(db),
+        })
+    }
+    
     /// Get a reference to the underlying RocksDB instance
     pub fn inner(&self) -> &DB {
         &self.db
