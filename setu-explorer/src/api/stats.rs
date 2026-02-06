@@ -23,12 +23,32 @@ pub async fn get_stats(
     // Get event store stats
     let event_count = storage.count_events().await;
     
+    // Count validators and solvers from events
+    let mut validator_count = 0;
+    let mut solver_count = 0;
+    let mut registered_validators = std::collections::HashSet::new();
+    let mut registered_solvers = std::collections::HashSet::new();
+    
+    // Get all events and count registrations
+    let all_events = storage.get_events_by_status(setu_types::EventStatus::Finalized).await;
+    
+    for event in &all_events {
+        match &event.payload {
+            setu_types::EventPayload::ValidatorRegister(reg) => {
+                registered_validators.insert(reg.validator_id.clone());
+            }
+            setu_types::EventPayload::SolverRegister(reg) => {
+                registered_solvers.insert(reg.solver_id.clone());
+            }
+            _ => {}
+        }
+    }
+    
+    validator_count = registered_validators.len();
+    solver_count = registered_solvers.len();
+    
     // Calculate TPS (placeholder - need time-series data)
     let tps = 0.0;
-    
-    // Get validator and solver counts (placeholder - need registry)
-    let validator_count = 1;
-    let solver_count = 0;
     
     // Calculate average anchor time (placeholder)
     let avg_anchor_time = if anchor_count > 1 {
@@ -46,11 +66,34 @@ pub async fn get_stats(
         vlc_time: anchor.vlc_snapshot.logical_time,
     });
     
-    // Calculate recent activity (placeholder)
+    // Calculate recent activity (last 24 hours)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let day_ago = now.saturating_sub(24 * 60 * 60 * 1000);
+    
+    let mut last_24h_events = 0;
+    let mut last_24h_transfers = 0;
+    let mut last_24h_registrations = 0;
+    
+    for event in &all_events {
+        if event.timestamp >= day_ago {
+            last_24h_events += 1;
+            match event.event_type {
+                setu_types::EventType::Transfer => last_24h_transfers += 1,
+                setu_types::EventType::ValidatorRegister
+                | setu_types::EventType::SolverRegister
+                | setu_types::EventType::UserRegister => last_24h_registrations += 1,
+                _ => {}
+            }
+        }
+    }
+    
     let recent_activity = RecentActivity {
-        last_24h_events: 0,
-        last_24h_transfers: 0,
-        last_24h_registrations: 0,
+        last_24h_events,
+        last_24h_transfers,
+        last_24h_registrations,
     };
     
     Json(StatsResponse {

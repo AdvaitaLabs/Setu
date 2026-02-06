@@ -30,12 +30,68 @@ impl ExplorerStorage {
         // Create object store (also read-only)
         let object_store = Arc::new(RocksObjectStore::open_readonly(path)?);
         
-        Ok(Self {
+        let storage = Self {
             db,
             event_store,
             anchor_store,
             object_store,
-        })
+        };
+        
+        // Load data from RocksDB into memory caches
+        storage.load_from_db()?;
+        
+        Ok(storage)
+    }
+    
+    /// Load events and anchors from RocksDB into memory caches
+    fn load_from_db(&self) -> anyhow::Result<()> {
+        use setu_storage::ColumnFamily;
+        
+        // Load events
+        let events_iter = self.db.iter_values::<Event>(ColumnFamily::Events)?;
+        let mut event_count = 0;
+        
+        for event_result in events_iter {
+            match event_result {
+                Ok(event) => {
+                    // Store in memory cache (depth will be 0 for now)
+                    // TODO: Calculate depth from parent relationships
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let _ = self.event_store.store_with_depth(event, 0).await;
+                        })
+                    });
+                    event_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("Failed to load event: {}", e);
+                }
+            }
+        }
+        
+        // Load anchors
+        let anchors_iter = self.db.iter_values::<Anchor>(ColumnFamily::Anchors)?;
+        let mut anchor_count = 0;
+        
+        for anchor_result in anchors_iter {
+            match anchor_result {
+                Ok(anchor) => {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let _ = self.anchor_store.store(anchor).await;
+                        })
+                    });
+                    anchor_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("Failed to load anchor: {}", e);
+                }
+            }
+        }
+        
+        println!("✓ Loaded {} events and {} anchors from RocksDB", event_count, anchor_count);
+        
+        Ok(())
     }
     
     /// Get event store
