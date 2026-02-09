@@ -103,23 +103,27 @@ async fn get_node_counts_from_rpc() -> Option<(usize, usize)> {
         .unwrap_or_else(|_| "http://localhost:8080".to_string());
     
     // Try to get validators
-    let validators_url = format!("{}/validators", rpc_addr);
+    let validators_url = format!("{}/api/v1/validators", rpc_addr);
     let validator_count = reqwest::get(&validators_url)
         .await
         .ok()?
-        .json::<Vec<serde_json::Value>>()
+        .json::<serde_json::Value>()
         .await
         .ok()?
+        .get("validators")?
+        .as_array()?
         .len();
     
     // Try to get solvers
-    let solvers_url = format!("{}/solvers", rpc_addr);
+    let solvers_url = format!("{}/api/v1/solvers", rpc_addr);
     let solver_count = reqwest::get(&solvers_url)
         .await
         .ok()?
-        .json::<Vec<serde_json::Value>>()
+        .json::<serde_json::Value>()
         .await
         .ok()?
+        .get("solvers")?
+        .as_array()?
         .len();
     
     Some((validator_count, solver_count))
