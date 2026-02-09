@@ -13,7 +13,7 @@
 
 use crate::dag::{Dag, DagError};
 use crate::recent_cache::{FinalizedEventMeta, RecentEventCache, CacheStatsSnapshot};
-use setu_storage::EventStore;
+use setu_storage::EventStoreBackend;
 use setu_types::{Anchor, AnchorId, Event, EventId};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -138,7 +138,7 @@ const MAX_RETRY: usize = 3;
 /// # Thread Safety
 /// - Active DAG: Arc<RwLock<Dag>>
 /// - Recent Cache: Arc<Mutex<RecentEventCache>>
-/// - Event Store: Arc<EventStore> (internally synchronized)
+/// - Event Store: Arc<dyn EventStoreBackend> (internally synchronized)
 pub struct DagManager {
     /// Active DAG - stores pending events
     dag: Arc<RwLock<Dag>>,
@@ -147,7 +147,8 @@ pub struct DagManager {
     recent_cache: Arc<Mutex<RecentEventCache>>,
     
     /// Event Store - persistent storage (accessed via reference)
-    event_store: Arc<EventStore>,
+    /// Uses trait object to support both in-memory and RocksDB backends
+    event_store: Arc<dyn EventStoreBackend>,
     
     /// Configuration
     config: DagManagerConfig,
@@ -163,7 +164,7 @@ impl DagManager {
     /// Create a new DagManager
     pub fn new(
         dag: Arc<RwLock<Dag>>,
-        event_store: Arc<EventStore>,
+        event_store: Arc<dyn EventStoreBackend>,
         config: DagManagerConfig,
     ) -> Self {
         let recent_cache = Arc::new(Mutex::new(
@@ -181,7 +182,7 @@ impl DagManager {
     }
     
     /// Create with default configuration
-    pub fn with_defaults(dag: Arc<RwLock<Dag>>, event_store: Arc<EventStore>) -> Self {
+    pub fn with_defaults(dag: Arc<RwLock<Dag>>, event_store: Arc<dyn EventStoreBackend>) -> Self {
         Self::new(dag, event_store, DagManagerConfig::default())
     }
     
@@ -196,7 +197,7 @@ impl DagManager {
     }
     
     /// Get reference to the event store
-    pub fn event_store(&self) -> &Arc<EventStore> {
+    pub fn event_store(&self) -> &Arc<dyn EventStoreBackend> {
         &self.event_store
     }
     
@@ -586,6 +587,7 @@ pub struct DagStatsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use setu_storage::EventStore;
     use setu_types::{EventType, VectorClock, VLCSnapshot};
 
     fn create_event(id: &str, parents: Vec<&str>, creator: &str) -> Event {
@@ -606,7 +608,7 @@ mod tests {
 
     async fn create_manager() -> DagManager {
         let dag = Arc::new(RwLock::new(Dag::new()));
-        let event_store = Arc::new(EventStore::new());
+        let event_store: Arc<dyn EventStoreBackend> = Arc::new(EventStore::new());
         DagManager::with_defaults(dag, event_store)
     }
 

@@ -26,6 +26,8 @@ pub enum ColumnFamily {
     // Merkle tree storage
     MerkleNodes,
     MerkleRoots,
+    // ConsensusFrame storage
+    ConsensusFrames,
 }
 
 impl ColumnFamily {
@@ -51,6 +53,7 @@ impl ColumnFamily {
             Self::Checkpoints => "checkpoints",
             Self::MerkleNodes => "merkle_nodes",
             Self::MerkleRoots => "merkle_roots",
+            Self::ConsensusFrames => "consensus_frames",
         }
     }
     
@@ -76,6 +79,7 @@ impl ColumnFamily {
             Self::Checkpoints,
             Self::MerkleNodes,
             Self::MerkleRoots,
+            Self::ConsensusFrames,
         ]
     }
     
@@ -123,6 +127,12 @@ impl ColumnFamily {
                         // Merkle roots: smaller, historical data
                         opts.set_write_buffer_size(16 * 1024 * 1024);
                         opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+                    }
+                    Self::ConsensusFrames => {
+                        // Consensus frames: moderate size, frequent read/write during consensus
+                        opts.set_write_buffer_size(32 * 1024 * 1024);
+                        opts.set_max_write_buffer_number(4);
+                        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
                     }
                 }
                 rocksdb::ColumnFamilyDescriptor::new(cf.name(), opts)

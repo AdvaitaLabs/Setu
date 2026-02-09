@@ -54,25 +54,25 @@ impl SetuDB {
     fn cf_handle(&self, cf: ColumnFamily) -> Result<&rocksdb::ColumnFamily> {
         self.db
             .cf_handle(cf.name())
-            .ok_or_else(|| StorageError::ColumnFamilyNotFound(cf.name().to_string()))
+            .ok_or_else(|| StorageError::cf_not_found(cf.name()))
     }
     
     /// Serialize a key using bincode
     fn encode_key<K: Encode>(key: &K) -> Result<Vec<u8>> {
         bincode::encode_to_vec(key, bincode::config::standard())
-            .map_err(|e| StorageError::Serialization(e.to_string()))
+            .map_err(|e| StorageError::serialization(e.to_string()))
     }
     
     /// Serialize a value using BCS (Binary Canonical Serialization)
     fn encode_value<V: Serialize>(value: &V) -> Result<Vec<u8>> {
         bcs::to_bytes(value)
-            .map_err(|e| StorageError::Serialization(e.to_string()))
+            .map_err(|e| StorageError::serialization(e.to_string()))
     }
     
     /// Deserialize a value using BCS
     fn decode_value<V: DeserializeOwned>(bytes: &[u8]) -> Result<V> {
         bcs::from_bytes(bytes)
-            .map_err(|e| StorageError::Deserialization(e.to_string()))
+            .map_err(|e| StorageError::deserialization(e.to_string()))
     }
     
     /// Put a key-value pair into a column family
@@ -230,6 +230,53 @@ impl SetuDB {
         Ok(())
     }
     
+    /// Add a put operation to a write batch using raw byte key
+    pub fn batch_put_raw<V>(
+        &self,
+        batch: &mut WriteBatch,
+        cf: ColumnFamily,
+        key: &[u8],
+        value: &V,
+    ) -> Result<()>
+    where
+        V: Serialize,
+    {
+        let cf_handle = self.cf_handle(cf)?;
+        let value_bytes = Self::encode_value(value)?;
+        batch.put_cf(cf_handle, key, value_bytes);
+        Ok(())
+    }
+    
+    /// Add a delete operation to a write batch using raw byte key
+    pub fn batch_delete_raw(
+        &self,
+        batch: &mut WriteBatch,
+        cf: ColumnFamily,
+        key: &[u8],
+    ) -> Result<()> {
+        let cf_handle = self.cf_handle(cf)?;
+        batch.delete_cf(cf_handle, key);
+        Ok(())
+    }
+    
+    /// Check if a raw byte key exists in a column family
+    pub fn exists_raw(&self, cf: ColumnFamily, key: &[u8]) -> Result<bool> {
+        let cf_handle = self.cf_handle(cf)?;
+        Ok(self.db.get_cf(cf_handle, key)?.is_some())
+    }
+    
+    /// Scan all keys with a prefix (returns raw keys)
+    pub fn prefix_scan_keys(&self, cf: ColumnFamily, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let cf_handle = self.cf_handle(cf)?;
+        
+        let keys: Vec<Vec<u8>> = self.db
+            .prefix_iterator_cf(cf_handle, prefix)
+            .filter_map(|result| result.ok().map(|(k, _)| k.to_vec()))
+            .collect();
+        
+        Ok(keys)
+    }
+    
     /// Write a batch atomically
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         self.db.write(batch)?;
@@ -250,7 +297,7 @@ impl SetuDB {
             .map(|result| {
                 let (key_bytes, value_bytes) = result?;
                 let key = bincode::decode_from_slice(&key_bytes, bincode::config::standard())
-                    .map_err(|e| StorageError::Deserialization(e.to_string()))?
+                    .map_err(|e| StorageError::deserialization(e.to_string()))?
                     .0;
                 let value = Self::decode_value(&value_bytes)?;
                 Ok((key, value))
@@ -295,7 +342,7 @@ impl SetuDB {
             .map(|result| {
                 let (key_bytes, value_bytes) = result?;
                 let key = bincode::decode_from_slice(&key_bytes, bincode::config::standard())
-                    .map_err(|e| StorageError::Deserialization(e.to_string()))?
+                    .map_err(|e| StorageError::deserialization(e.to_string()))?
                     .0;
                 let value = Self::decode_value(&value_bytes)?;
                 Ok((key, value))

@@ -13,6 +13,8 @@ tracing = "0.1"
 thiserror = "1.0"
 sha2 = "0.10"
 hex = "0.4"
+async-trait = "0.1"
+dashmap = "5.5"  # Lock-free concurrent HashMap for in-memory stores
 
 # RocksDB dependencies
 rocksdb = "0.22"

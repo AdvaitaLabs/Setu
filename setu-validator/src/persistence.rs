@@ -19,7 +19,7 @@
 //! - On recovery, missing anchor indicates incomplete persistence → retry
 
 use consensus::ConsensusEngine;
-use setu_storage::{AnchorStore, EventStore};
+use setu_storage::{AnchorStoreBackend, EventStoreBackend};
 use setu_types::Anchor;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -70,10 +70,10 @@ pub trait FinalizationPersister: Send + Sync {
     fn engine(&self) -> &Arc<ConsensusEngine>;
     
     /// Get the event store (for persisting events)
-    fn event_store(&self) -> &Arc<EventStore>;
+    fn event_store(&self) -> &Arc<dyn EventStoreBackend>;
     
     /// Get the anchor store (for persisting anchors)
-    fn anchor_store(&self) -> &Arc<AnchorStore>;
+    fn anchor_store(&self) -> &Arc<dyn AnchorStoreBackend>;
 
     /// Persist a finalized anchor and its events to storage
     /// 

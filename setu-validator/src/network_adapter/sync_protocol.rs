@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use crate::protocol::{SerializedConsensusFrame, SerializedEvent};
 use setu_types::{ConsensusFrame, Event, EventId};
-use setu_storage::{EventStore, CFStore};
+use setu_storage::{EventStoreBackend, CFStore};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -46,13 +46,13 @@ pub trait SyncStore: Send + Sync + 'static {
 /// Persistent implementation of SyncStore using RocksDB
 #[allow(dead_code)]
 pub struct PersistentSyncStore {
-    event_store: Arc<EventStore>,
+    event_store: Arc<dyn EventStoreBackend>,
     cf_store: Arc<CFStore>,
 }
 
 #[allow(dead_code)]
 impl PersistentSyncStore {
-    pub fn new(event_store: Arc<EventStore>, cf_store: Arc<CFStore>) -> Self {
+    pub fn new(event_store: Arc<dyn EventStoreBackend>, cf_store: Arc<CFStore>) -> Self {
         Self {
             event_store,
             cf_store,

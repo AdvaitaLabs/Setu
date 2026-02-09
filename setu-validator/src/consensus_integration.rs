@@ -28,7 +28,7 @@ use setu_types::{
     NodeInfo, ValidatorInfo, SetuResult, SetuError, SubnetId,
 };
 use setu_storage::subnet_state::GlobalStateManager;
-use setu_storage::{EventStore, CFStore, AnchorStore};
+use setu_storage::{EventStore, CFStore, AnchorStore, EventStoreBackend, AnchorStoreBackend, CFStoreBackend};
 use crate::network_adapter::MessageRouter;
 use crate::persistence::FinalizationPersister;
 use std::collections::HashMap;
@@ -81,13 +81,13 @@ pub struct ConsensusValidator {
     /// TEE verifier for attestation verification
     tee_verifier: Arc<TeeVerifier>,
     
-    /// Persistent store for events
-    event_store: Arc<EventStore>,
-    /// Persistent store for consensus frames (reserved for future use)
+    /// Persistent store for events (supports both in-memory and RocksDB backends)
+    event_store: Arc<dyn EventStoreBackend>,
+    /// Persistent store for consensus frames (supports both in-memory and RocksDB backends)
     #[allow(dead_code)]
-    cf_store: Arc<CFStore>,
-    /// Persistent store for anchors
-    anchor_store: Arc<AnchorStore>,
+    cf_store: Arc<dyn CFStoreBackend>,
+    /// Persistent store for anchors (supports both in-memory and RocksDB backends)
+    anchor_store: Arc<dyn AnchorStoreBackend>,
 
     /// Channel for sending consensus messages to network
     message_tx: mpsc::Sender<ConsensusMessage>,
@@ -106,6 +106,10 @@ pub struct ConsensusValidator {
 
 impl ConsensusValidator {
     /// Create a new consensus validator
+    /// 
+    /// Note: This creates a shared EventStore instance that is used by both
+    /// ConsensusValidator and ConsensusEngine.dag_manager, ensuring the three-layer
+    /// storage design works correctly (Layer3 fallback to EventStore).
     pub fn new(config: ConsensusValidatorConfig) -> Self {
         let (msg_tx, msg_rx) = mpsc::channel(config.message_buffer_size);
         let (finalization_tx, _) = broadcast::channel(100);
@@ -115,11 +119,22 @@ impl ConsensusValidator {
         let validator_info = ValidatorInfo::new(config.node_info.clone(), config.is_leader);
         validator_set.add_validator(validator_info);
         
-        // Create consensus engine
-        let engine = Arc::new(ConsensusEngine::new(
+        // CRITICAL: Create shared EventStore FIRST
+        // This same instance is used by both ConsensusValidator and ConsensusEngine.dag_manager
+        // to ensure three-layer storage works correctly (Layer3 fallback)
+        // Using Arc<dyn EventStoreBackend> to support both in-memory and RocksDB backends
+        let event_store: Arc<dyn EventStoreBackend> = Arc::new(EventStore::new());
+        let cf_store: Arc<dyn CFStoreBackend> = Arc::new(CFStore::new());
+        let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(AnchorStore::new());
+        
+        // Create consensus engine with shared EventStore
+        // Using with_stores() to inject the shared EventStore instance
+        let engine = Arc::new(ConsensusEngine::with_stores(
             config.consensus.clone(),
             config.node_info.id.clone(),
             validator_set.clone(),
+            GlobalStateManager::default(),  // Use default state manager
+            Arc::clone(&event_store),        // Share the same EventStore!
         ));
         
         // Create TEE verifier with empty registry (permissive mode for now)
@@ -130,9 +145,9 @@ impl ConsensusValidator {
             engine,
             validator_set: Arc::new(RwLock::new(validator_set)),
             tee_verifier,
-            event_store: Arc::new(EventStore::new()),
-            cf_store: Arc::new(CFStore::new()),
-            anchor_store: Arc::new(AnchorStore::new()),
+            event_store,  // Use the shared instance
+            cf_store,
+            anchor_store,
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
             finalization_tx,
@@ -142,6 +157,10 @@ impl ConsensusValidator {
     }
     
     /// Create with a persistent state manager for Merkle tree persistence
+    /// 
+    /// Note: This creates a shared EventStore instance that is used by both
+    /// ConsensusValidator and ConsensusEngine.dag_manager, ensuring the three-layer
+    /// storage design works correctly (Layer3 fallback to EventStore).
     pub fn with_state_manager(
         config: ConsensusValidatorConfig,
         state_manager: GlobalStateManager,
@@ -153,11 +172,21 @@ impl ConsensusValidator {
         let validator_info = ValidatorInfo::new(config.node_info.clone(), config.is_leader);
         validator_set.add_validator(validator_info);
         
-        let engine = Arc::new(ConsensusEngine::with_state_manager(
+        // CRITICAL: Create shared EventStore FIRST
+        // This same instance is used by both ConsensusValidator and ConsensusEngine.dag_manager
+        // to ensure three-layer storage works correctly (Layer3 fallback)
+        // Using Arc<dyn EventStoreBackend> to support both in-memory and RocksDB backends
+        let event_store: Arc<dyn EventStoreBackend> = Arc::new(EventStore::new());
+        let cf_store: Arc<dyn CFStoreBackend> = Arc::new(CFStore::new());
+        let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(AnchorStore::new());
+        
+        // Create consensus engine with shared EventStore
+        let engine = Arc::new(ConsensusEngine::with_stores(
             config.consensus.clone(),
             config.node_info.id.clone(),
             validator_set.clone(),
             state_manager,
+            Arc::clone(&event_store),  // Share the same EventStore!
         ));
         
         // Create TEE verifier with empty registry (permissive mode for now)
@@ -168,9 +197,132 @@ impl ConsensusValidator {
             engine,
             validator_set: Arc::new(RwLock::new(validator_set)),
             tee_verifier,
-            event_store: Arc::new(EventStore::new()),
-            cf_store: Arc::new(CFStore::new()),
-            anchor_store: Arc::new(AnchorStore::new()),
+            event_store,  // Use the shared instance
+            cf_store,
+            anchor_store,
+            message_tx: msg_tx,
+            message_rx: Arc::new(Mutex::new(msg_rx)),
+            finalization_tx,
+            pending_votes: Arc::new(RwLock::new(HashMap::new())),
+            running: Arc::new(RwLock::new(false)),
+        }
+    }
+    
+    /// Create with a custom EventStoreBackend (for RocksDB persistence)
+    /// 
+    /// This constructor allows injecting any EventStoreBackend implementation,
+    /// enabling full persistence with RocksDB.
+    /// 
+    /// # Example
+    /// ```ignore
+    /// let db = Arc::new(SetuDB::open_default(&db_path)?);
+    /// let event_store: Arc<dyn EventStoreBackend> = Arc::new(RocksDBEventStore::from_shared(db.clone()));
+    /// let validator = ConsensusValidator::with_event_store_backend(config, state_manager, event_store);
+    /// ```
+    pub fn with_event_store_backend(
+        config: ConsensusValidatorConfig,
+        state_manager: GlobalStateManager,
+        event_store: Arc<dyn EventStoreBackend>,
+    ) -> Self {
+        let (msg_tx, msg_rx) = mpsc::channel(config.message_buffer_size);
+        let (finalization_tx, _) = broadcast::channel(100);
+        
+        let mut validator_set = ValidatorSet::new();
+        let validator_info = ValidatorInfo::new(config.node_info.clone(), config.is_leader);
+        validator_set.add_validator(validator_info);
+        
+        let cf_store: Arc<dyn CFStoreBackend> = Arc::new(CFStore::new());
+        let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(AnchorStore::new());
+        
+        // Create consensus engine with the provided EventStore backend
+        let engine = Arc::new(ConsensusEngine::with_stores(
+            config.consensus.clone(),
+            config.node_info.id.clone(),
+            validator_set.clone(),
+            state_manager,
+            Arc::clone(&event_store),  // Share the same EventStore!
+        ));
+        
+        // Create TEE verifier with empty registry (permissive mode for now)
+        let tee_verifier = Arc::new(TeeVerifier::permissive());
+        
+        Self {
+            config,
+            engine,
+            validator_set: Arc::new(RwLock::new(validator_set)),
+            tee_verifier,
+            event_store,
+            cf_store,
+            anchor_store,
+            message_tx: msg_tx,
+            message_rx: Arc::new(Mutex::new(msg_rx)),
+            finalization_tx,
+            pending_votes: Arc::new(RwLock::new(HashMap::new())),
+            running: Arc::new(RwLock::new(false)),
+        }
+    }
+    
+    /// Create with all custom backends for full RocksDB persistence
+    /// 
+    /// This constructor allows injecting all store backends, enabling complete
+    /// persistence with RocksDB for events, consensus frames, anchors, and
+    /// Merkle tree nodes (via GlobalStateManager).
+    /// 
+    /// # Example
+    /// ```ignore
+    /// use setu_storage::{SetuDB, RocksDBEventStore, RocksDBCFStore, RocksDBAnchorStore, RocksDBMerkleStore};
+    /// use setu_storage::subnet_state::GlobalStateManager;
+    /// use setu_merkle::MerkleStore;
+    /// 
+    /// let db = Arc::new(SetuDB::open_default(&db_path)?);
+    /// let event_store: Arc<dyn EventStoreBackend> = Arc::new(RocksDBEventStore::from_shared(db.clone()));
+    /// let cf_store: Arc<dyn CFStoreBackend> = Arc::new(RocksDBCFStore::from_shared(db.clone()));
+    /// let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(RocksDBAnchorStore::from_shared(db.clone()));
+    /// let merkle_store: Arc<dyn MerkleStore> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
+    /// let state_manager = GlobalStateManager::with_store(merkle_store);
+    /// 
+    /// let validator = ConsensusValidator::with_all_backends(
+    ///     config,
+    ///     state_manager,
+    ///     event_store,
+    ///     cf_store,
+    ///     anchor_store,
+    /// );
+    /// ```
+    pub fn with_all_backends(
+        config: ConsensusValidatorConfig,
+        state_manager: GlobalStateManager,
+        event_store: Arc<dyn EventStoreBackend>,
+        cf_store: Arc<dyn CFStoreBackend>,
+        anchor_store: Arc<dyn AnchorStoreBackend>,
+    ) -> Self {
+        let (msg_tx, msg_rx) = mpsc::channel(config.message_buffer_size);
+        let (finalization_tx, _) = broadcast::channel(100);
+        
+        let mut validator_set = ValidatorSet::new();
+        let validator_info = ValidatorInfo::new(config.node_info.clone(), config.is_leader);
+        validator_set.add_validator(validator_info);
+        
+        // Create consensus engine with the provided EventStore backend
+        let engine = Arc::new(ConsensusEngine::with_stores(
+            config.consensus.clone(),
+            config.node_info.id.clone(),
+            validator_set.clone(),
+            state_manager,
+            Arc::clone(&event_store),  // Share the same EventStore!
+        ));
+        
+        // Create TEE verifier with empty registry (permissive mode for now)
+        let tee_verifier = Arc::new(TeeVerifier::permissive());
+        
+        Self {
+            config,
+            engine,
+            validator_set: Arc::new(RwLock::new(validator_set)),
+            tee_verifier,
+            event_store,
+            cf_store,
+            anchor_store,
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
             finalization_tx,
@@ -228,8 +380,76 @@ impl ConsensusValidator {
     }
     
     /// Get the event store (for queries of finalized events)
-    pub fn event_store(&self) -> Arc<EventStore> {
-        self.event_store.clone()
+    pub fn event_store(&self) -> Arc<dyn EventStoreBackend> {
+        Arc::clone(&self.event_store)
+    }
+    
+    /// Get the anchor store (for queries of finalized anchors)
+    pub fn anchor_store(&self) -> Arc<dyn AnchorStoreBackend> {
+        Arc::clone(&self.anchor_store)
+    }
+    
+    /// Recover state from persistent storage after restart
+    /// 
+    /// This method should be called after ConsensusValidator is created and
+    /// before starting the network event handler. It restores:
+    /// 
+    /// 1. DagManager's RecentCache - pre-warms with recent finalized events
+    /// 2. AnchorBuilder state - restores chain root, depth, count
+    /// 3. VLC state - restores logical time from latest anchor
+    /// 
+    /// # Returns
+    /// - `Ok(())` if recovery succeeded or no data to recover
+    /// - `Err(...)` if critical failure occurred
+    /// 
+    /// # Notes
+    /// - Safe to call even with empty storage (fresh start)
+    /// - Idempotent - can be called multiple times safely
+    pub async fn recover_from_storage(&self) -> SetuResult<()> {
+        info!("Starting recovery from storage...");
+        
+        // 1. Load recent anchors for cache warmup
+        let recent_anchors = self.anchor_store.get_recent_anchors(10).await;
+        if recent_anchors.is_empty() {
+            info!("No anchors found in storage, starting fresh");
+            return Ok(());
+        }
+        
+        info!("Found {} recent anchors for recovery", recent_anchors.len());
+        
+        // 2. Warm up DagManager's RecentCache with finalized event metadata
+        let warmup_stats = self.engine.dag_manager()
+            .warmup_from_anchors(&recent_anchors).await;
+        info!(
+            "Cache warmup complete: {} events loaded (took {}ms)",
+            warmup_stats.events_loaded,
+            warmup_stats.duration_ms
+        );
+        
+        // 3. Restore AnchorBuilder state (chain root, depth, count)
+        if let Some((chain_root, depth, count, vlc_time)) = 
+            self.anchor_store.get_recovery_state().await 
+        {
+            let mut cm = self.engine.consensus_manager().write().await;
+            cm.anchor_builder_mut().restore_state(chain_root, depth, count, vlc_time);
+            info!(
+                "AnchorBuilder restored: depth={}, anchor_count={}, vlc_time={}",
+                depth, count, vlc_time
+            );
+        }
+        
+        // 4. Restore VLC state from latest anchor
+        if let Some(latest_anchor) = self.anchor_store.get_latest().await {
+            let mut vlc = self.engine.vlc().write().await;
+            vlc.restore_from_snapshot(&latest_anchor.vlc_snapshot);
+            info!(
+                "VLC restored: logical_time={}",
+                latest_anchor.vlc_snapshot.logical_time
+            );
+        }
+        
+        info!("Recovery from storage completed successfully");
+        Ok(())
     }
 
     // =========================================================================
@@ -581,11 +801,11 @@ impl FinalizationPersister for ConsensusValidator {
         &self.engine
     }
     
-    fn event_store(&self) -> &Arc<EventStore> {
+    fn event_store(&self) -> &Arc<dyn EventStoreBackend> {
         &self.event_store
     }
     
-    fn anchor_store(&self) -> &Arc<AnchorStore> {
+    fn anchor_store(&self) -> &Arc<dyn AnchorStoreBackend> {
         &self.anchor_store
     }
 }

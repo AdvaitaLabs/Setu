@@ -13,6 +13,10 @@ use setu_validator::{
     ValidatorNetworkService, NetworkServiceConfig,
     ConsensusValidator, ConsensusValidatorConfig,
 };
+use setu_storage::{
+    SetuDB, RocksDBEventStore, RocksDBCFStore, RocksDBAnchorStore, RocksDBMerkleStore,
+    GlobalStateManager, EventStoreBackend, CFStoreBackend, AnchorStoreBackend, MerkleStore,
+};
 use setu_types::NodeInfo;
 use setu_keys::{load_keypair};
 use std::sync::Arc;
@@ -31,6 +35,9 @@ struct ValidatorConfig {
     p2p_addr: SocketAddr,
     /// Key file path (optional)
     key_file: Option<String>,
+    /// Database path for RocksDB persistence (optional)
+    /// If not set, runs in pure memory mode
+    db_path: Option<String>,
 }
 
 impl ValidatorConfig {
@@ -54,11 +61,16 @@ impl ValidatorConfig {
         
         let key_file = std::env::var("VALIDATOR_KEY_FILE").ok();
         
+        // Database path for persistence (optional)
+        // If set, enables RocksDB persistence for Events and Anchors
+        let db_path = std::env::var("VALIDATOR_DB_PATH").ok();
+        
         Self {
             node_config,
             http_addr: format!("{}:{}", listen_addr, http_port).parse().unwrap(),
             p2p_addr: format!("{}:{}", listen_addr, p2p_port).parse().unwrap(),
             key_file,
+            db_path,
         }
     }
 }
@@ -100,7 +112,20 @@ async fn main() -> anyhow::Result<()> {
     info!("║  Node ID:    {:^44} ║", config.node_config.node_id);
     info!("║  HTTP API:   {:^44} ║", config.http_addr);
     info!("║  P2P Addr:   {:^44} ║", config.p2p_addr);
+    if let Some(ref db_path) = config.db_path {
+        info!("║  DB Path:    {:^44} ║", db_path);
+    } else {
+        info!("║  DB Path:    {:^44} ║", "(memory mode)");
+    }
     info!("╚════════════════════════════════════════════════════════════╝");
+
+    // Log persistence mode
+    if config.db_path.is_some() {
+        info!("✓ Persistence mode: RocksDB enabled");
+    } else {
+        info!("⚠ Persistence mode: Memory only (data lost on restart)");
+        info!("  Set VALIDATOR_DB_PATH to enable persistence");
+    }
 
     // Load key info if key file is provided
     let _key_info = if let Some(ref key_file) = config.key_file {
@@ -143,9 +168,49 @@ async fn main() -> anyhow::Result<()> {
         is_leader: true, // Single node mode: always leader
         ..Default::default()
     };
-    let consensus_validator = Arc::new(ConsensusValidator::new(consensus_config));
+    
+    // Create ConsensusValidator with appropriate storage backend
+    let consensus_validator = if let Some(ref db_path) = config.db_path {
+        // RocksDB persistence mode - open database and create all backends
+        info!("Opening RocksDB at: {}", db_path);
+        let db = match SetuDB::open_default(db_path) {
+            Ok(db) => Arc::new(db),
+            Err(e) => {
+                error!("Failed to open RocksDB at {}: {}", db_path, e);
+                return Err(anyhow::anyhow!("Database open failed: {}", e));
+            }
+        };
+        
+        // Create all RocksDB-backed stores from shared database
+        let event_store: Arc<dyn EventStoreBackend> = Arc::new(RocksDBEventStore::from_shared(db.clone()));
+        let cf_store: Arc<dyn CFStoreBackend> = Arc::new(RocksDBCFStore::from_shared(db.clone()));
+        let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(RocksDBAnchorStore::from_shared(db.clone()));
+        let merkle_store: Arc<dyn MerkleStore> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
+        
+        // Create GlobalStateManager with Merkle persistence
+        let state_manager = GlobalStateManager::with_store(merkle_store);
+        
+        info!("✓ RocksDB backends initialized (Events, CF, Anchors, Merkle)");
+        
+        Arc::new(ConsensusValidator::with_all_backends(
+            consensus_config,
+            state_manager,
+            event_store,
+            cf_store,
+            anchor_store,
+        ))
+    } else {
+        // Memory mode - use default in-memory stores
+        Arc::new(ConsensusValidator::new(consensus_config))
+    };
     
     info!("✓ ConsensusValidator initialized (single node mode)");
+    
+    // Attempt to recover state from storage (if any)
+    // This is safe to call even with empty storage (fresh start)
+    if let Err(e) = consensus_validator.recover_from_storage().await {
+        warn!("Recovery from storage failed: {}, starting fresh", e);
+    }
     
     // Create network service configuration
     let network_config = NetworkServiceConfig {

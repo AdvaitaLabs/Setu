@@ -1,18 +1,24 @@
-use setu_types::{Anchor, AnchorId, ConsensusFrame, CFId, CFStatus, SetuResult};
-use std::collections::HashMap;
+use dashmap::DashMap;
+use setu_types::{Anchor, AnchorId, SetuResult};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// In-memory storage for Anchors with concurrent access
+///
+/// AnchorStore uses DashMap for the main anchor storage, providing
+/// lock-free concurrent access. The chain (ordered list of anchor IDs)
+/// uses RwLock since it requires ordered operations.
 #[derive(Debug)]
 pub struct AnchorStore {
-    anchors: Arc<RwLock<HashMap<AnchorId, Anchor>>>,
+    anchors: Arc<DashMap<AnchorId, Anchor>>,
+    /// Chain maintains insertion order, requires RwLock for ordered access
     chain: Arc<RwLock<Vec<AnchorId>>>,
 }
 
 impl AnchorStore {
     pub fn new() -> Self {
         Self {
-            anchors: Arc::new(RwLock::new(HashMap::new())),
+            anchors: Arc::new(DashMap::new()),
             chain: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -20,9 +26,10 @@ impl AnchorStore {
     pub async fn store(&self, anchor: Anchor) -> SetuResult<()> {
         let anchor_id = anchor.id.clone();
 
-        let mut anchors = self.anchors.write().await;
-        anchors.insert(anchor_id.clone(), anchor);
+        // Insert into DashMap (lock-free)
+        self.anchors.insert(anchor_id.clone(), anchor);
 
+        // Update chain (requires lock for ordering)
         let mut chain = self.chain.write().await;
         chain.push(anchor_id);
 
@@ -30,24 +37,26 @@ impl AnchorStore {
     }
 
     pub async fn get(&self, anchor_id: &AnchorId) -> Option<Anchor> {
-        let anchors = self.anchors.read().await;
-        anchors.get(anchor_id).cloned()
+        self.anchors.get(anchor_id).map(|r| r.value().clone())
     }
 
     pub async fn get_latest(&self) -> Option<Anchor> {
         let chain = self.chain.read().await;
-        let anchors = self.anchors.read().await;
-
-        chain.last().and_then(|id| anchors.get(id).cloned())
+        chain
+            .last()
+            .and_then(|id| self.anchors.get(id).map(|r| r.value().clone()))
     }
 
     pub async fn get_by_depth(&self, depth: u64) -> Option<Anchor> {
-        let anchors = self.anchors.read().await;
-        anchors.values().find(|a| a.depth == depth).cloned()
+        // Iterate over all anchors to find by depth
+        self.anchors
+            .iter()
+            .find(|r| r.value().depth == depth)
+            .map(|r| r.value().clone())
     }
 
     pub async fn count(&self) -> usize {
-        self.anchors.read().await.len()
+        self.anchors.len()
     }
 
     pub async fn get_chain(&self) -> Vec<AnchorId> {
@@ -62,10 +71,10 @@ impl AnchorStore {
     /// we recompute: final_root = chain_hash(stored_root, anchor_hash)
     pub async fn get_recovery_state(&self) -> Option<([u8; 32], u64, u64, u64)> {
         let chain = self.chain.read().await;
-        let anchors = self.anchors.read().await;
-        
+
         chain.last().and_then(|id| {
-            anchors.get(id).and_then(|anchor| {
+            self.anchors.get(id).and_then(|anchor_ref| {
+                let anchor = anchor_ref.value();
                 anchor.merkle_roots.as_ref().map(|roots| {
                     // The stored anchor_chain_root is the "before" state
                     // We need to compute the "after" state by including this anchor
@@ -100,18 +109,17 @@ impl AnchorStore {
     // =========================================================================
     
     /// Get the N most recent finalized anchors (for cache warmup)
-    /// 
+    ///
     /// Returns anchors sorted by finalized_at descending (most recent first)
     pub async fn get_recent_anchors(&self, count: usize) -> Vec<Anchor> {
         let chain = self.chain.read().await;
-        let anchors = self.anchors.read().await;
-        
+
         // Get the last N anchor IDs from chain (most recent are at the end)
         let start = chain.len().saturating_sub(count);
         chain[start..]
             .iter()
             .rev() // Reverse to get most recent first
-            .filter_map(|id| anchors.get(id).cloned())
+            .filter_map(|id| self.anchors.get(id).map(|r| r.value().clone()))
             .collect()
     }
 }
@@ -126,112 +134,6 @@ impl Clone for AnchorStore {
 }
 
 impl Default for AnchorStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug)]
-pub struct CFStore {
-    frames: Arc<RwLock<HashMap<CFId, ConsensusFrame>>>,
-    pending: Arc<RwLock<Vec<CFId>>>,
-    finalized: Arc<RwLock<Vec<CFId>>>,
-}
-
-impl CFStore {
-    pub fn new() -> Self {
-        Self {
-            frames: Arc::new(RwLock::new(HashMap::new())),
-            pending: Arc::new(RwLock::new(Vec::new())),
-            finalized: Arc::new(RwLock::new(Vec::new())),
-        }
-    }
-
-    pub async fn store(&self, cf: ConsensusFrame) -> SetuResult<()> {
-        let cf_id = cf.id.clone();
-        let is_finalized = cf.status == CFStatus::Finalized;
-
-        let mut frames = self.frames.write().await;
-        frames.insert(cf_id.clone(), cf);
-
-        if is_finalized {
-            let mut finalized = self.finalized.write().await;
-            finalized.push(cf_id);
-        } else {
-            let mut pending = self.pending.write().await;
-            pending.push(cf_id);
-        }
-
-        Ok(())
-    }
-
-    pub async fn get(&self, cf_id: &CFId) -> Option<ConsensusFrame> {
-        let frames = self.frames.read().await;
-        frames.get(cf_id).cloned()
-    }
-
-    pub async fn mark_finalized(&self, cf_id: &CFId) {
-        {
-            let mut frames = self.frames.write().await;
-            if let Some(cf) = frames.get_mut(cf_id) {
-                cf.finalize();
-            }
-        }
-
-        let mut pending = self.pending.write().await;
-        pending.retain(|id| id != cf_id);
-
-        let mut finalized = self.finalized.write().await;
-        finalized.push(cf_id.clone());
-    }
-
-    pub async fn get_pending(&self) -> Vec<ConsensusFrame> {
-        let pending = self.pending.read().await;
-        let frames = self.frames.read().await;
-
-        pending
-            .iter()
-            .filter_map(|id| frames.get(id).cloned())
-            .collect()
-    }
-
-    pub async fn get_finalized(&self) -> Vec<ConsensusFrame> {
-        let finalized = self.finalized.read().await;
-        let frames = self.frames.read().await;
-
-        finalized
-            .iter()
-            .filter_map(|id| frames.get(id).cloned())
-            .collect()
-    }
-
-    pub async fn latest_finalized(&self) -> Option<ConsensusFrame> {
-        let finalized = self.finalized.read().await;
-        let frames = self.frames.read().await;
-
-        finalized.last().and_then(|id| frames.get(id).cloned())
-    }
-
-    pub async fn finalized_count(&self) -> usize {
-        self.finalized.read().await.len()
-    }
-
-    pub async fn pending_count(&self) -> usize {
-        self.pending.read().await.len()
-    }
-}
-
-impl Clone for CFStore {
-    fn clone(&self) -> Self {
-        Self {
-            frames: Arc::clone(&self.frames),
-            pending: Arc::clone(&self.pending),
-            finalized: Arc::clone(&self.finalized),
-        }
-    }
-}
-
-impl Default for CFStore {
     fn default() -> Self {
         Self::new()
     }
@@ -270,21 +172,5 @@ mod tests {
         
         let latest = store.get_latest().await.unwrap();
         assert_eq!(latest.depth, 1);
-    }
-
-    #[tokio::test]
-    async fn test_cf_store() {
-        let store = CFStore::new();
-        
-        let anchor = create_anchor(0);
-        let cf = ConsensusFrame::new(anchor, "validator1".to_string());
-        let cf_id = cf.id.clone();
-
-        store.store(cf).await.unwrap();
-        assert_eq!(store.pending_count().await, 1);
-
-        store.mark_finalized(&cf_id).await;
-        assert_eq!(store.pending_count().await, 0);
-        assert_eq!(store.finalized_count().await, 1);
     }
 }
