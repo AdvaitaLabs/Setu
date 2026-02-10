@@ -72,7 +72,7 @@ pub struct ActivityQueryParams {
 #[derive(Debug, Serialize)]
 pub struct ActivityResponse {
     pub address: String,
-    pub activities: Vec<ActivityItem>,
+    pub transactions: Vec<ActivityItem>,  // Changed from 'activities' to 'transactions' to match API doc
     pub pagination: Pagination,
 }
 
@@ -90,6 +90,7 @@ pub struct ActivityItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relative_time: Option<String>,
     pub subnet_id: String,
+    pub event_id: String,  // Add event_id field to match API doc
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anchor_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -300,6 +301,7 @@ pub async fn get_account_activity(
                 subnet_id: event.subnet_id.as_ref()
                     .map(|id| id.to_string())
                     .unwrap_or_else(|| "subnet-0".to_string()),
+                event_id: event.id.to_string(),  // Add event_id field
                 anchor_id: None, // TODO: 从 EventStore 获取
                 anchor_depth: None,
             });
@@ -308,7 +310,7 @@ pub async fn get_account_activity(
     
     Ok(Json(ActivityResponse {
         address: address.clone(),
-        activities,
+        transactions: activities,  // Changed from 'activities' to 'transactions'
         pagination: Pagination {
             page,
             limit,
