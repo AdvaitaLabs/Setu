@@ -133,13 +133,25 @@ pub async fn get_account_balance(
     Path(address): Path<String>,
     State(storage): State<Arc<ExplorerStorage>>,
 ) -> Result<Json<BalanceResponse>, StatusCode> {
+    tracing::info!("GET /account/{}/balance", address);
+    
     // Parse address
     let addr = Address::from_hex(&address)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|e| {
+            tracing::error!("Failed to parse address {}: {:?}", address, e);
+            StatusCode::BAD_REQUEST
+        })?;
+    
+    tracing::debug!("Parsed address: {:?}", addr);
     
     // Get all coins owned by this address
     let coins = storage.get_coins_by_owner(&addr)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!("Failed to get coins for {}: {:?}", address, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    
+    tracing::info!("Found {} coins for address {}", coins.len(), address);
     
     // Filter only FLUX coins from subnet-0
     let flux_coins: Vec<_> = coins
@@ -157,6 +169,8 @@ pub async fn get_account_balance(
         subnet_id: "subnet-0".to_string(),
         usd_value: None,
     };
+    
+    tracing::info!("Returning balance response for {}: {} FLUX", address, total_balance);
     
     Ok(Json(BalanceResponse {
         address: address.clone(),
