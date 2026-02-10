@@ -28,6 +28,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use tower_http::cors::{CorsLayer, Any};
 use dashmap::DashMap;
 use setu_types::Transfer;
 use parking_lot::RwLock;
@@ -331,6 +332,13 @@ impl ValidatorNetworkService {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let service = self.clone();
 
+        // Configure CORS to allow all origins (for development)
+        // In production, you should restrict this to specific origins
+        let cors = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any);
+
         let app = Router::new()
             // Registration endpoints
             .route("/api/v1/register/solver", post(setu_api::http_register_solver::<ValidatorNetworkService>))
@@ -358,6 +366,7 @@ impl ValidatorNetworkService {
             .route("/api/v1/user/credit", post(setu_api::http_get_credit::<ValidatorNetworkService>))
             .route("/api/v1/user/credentials", post(setu_api::http_get_credentials::<ValidatorNetworkService>))
             .route("/api/v1/user/transfer", post(setu_api::http_user_transfer::<ValidatorNetworkService>))
+            .layer(cors)  // Add CORS middleware
             .with_state(service);
 
         let listener = tokio::net::TcpListener::bind(self.config.http_listen_addr).await?;

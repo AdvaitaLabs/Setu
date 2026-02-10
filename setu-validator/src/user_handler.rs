@@ -210,26 +210,71 @@ impl UserRpcHandler for ValidatorUserHandler {
             self.network_service.validator_id().to_string(),
         );
         
-        // Set execution result (simulated successful execution)
+        // Create Coin Objects for Flux and Power (Scheme A)
+        use setu_types::coin::{Coin, CoinType};
+        use setu_types::Address;
+        
+        // Parse address - Ethereum address is 20 bytes, pad to 32 bytes for Setu Address
+        let addr_str = request.address.strip_prefix("0x").unwrap_or(&request.address);
+        let mut addr_bytes = [0u8; 32];
+        if let Ok(decoded) = hex::decode(addr_str) {
+            // Copy the decoded bytes (up to 32 bytes)
+            let len = decoded.len().min(32);
+            addr_bytes[..len].copy_from_slice(&decoded[..len]);
+        }
+        let owner_address = Address::new(addr_bytes);
+        
+        // Create Flux Coin Object (initial balance: 0)
+        let flux_coin = Coin::new_with_type(
+            owner_address.clone(),
+            initial_flux,
+            CoinType::new("FLUX"),
+        );
+        
+        // Create Power Coin Object (initial balance: 21 million)
+        let power_coin = Coin::new_with_type(
+            owner_address.clone(),
+            initial_power,
+            CoinType::new("POWER"),
+        );
+        
+        // Serialize Coin Objects
+        let flux_coin_bytes = bcs::to_bytes(&flux_coin)
+            .expect("Failed to serialize Flux coin");
+        let power_coin_bytes = bcs::to_bytes(&power_coin)
+            .expect("Failed to serialize Power coin");
+        
+        // Get object IDs for storage keys
+        let flux_object_id = hex::encode(flux_coin.id().as_bytes());
+        let power_object_id = hex::encode(power_coin.id().as_bytes());
+        
+        info!("           └─ Created Flux Coin Object: {}", &flux_object_id[..16]);
+        info!("           └─ Created Power Coin Object: {}", &power_object_id[..16]);
+        
+        // Set execution result with Coin Object creation
         event.set_execution_result(setu_types::event::ExecutionResult {
             success: true,
-            message: Some("User registration executed successfully".to_string()),
+            message: Some("User registration executed successfully with Coin Objects".to_string()),
             state_changes: vec![
+                // User registration marker
                 setu_types::event::StateChange {
                     key: format!("user:{}", request.address),
                     old_value: None,
                     new_value: Some(format!("registered").into_bytes()),
                 },
+                // Create Flux Coin Object
                 setu_types::event::StateChange {
-                    key: format!("balance:{}:flux", request.address),
+                    key: format!("object:{}", flux_object_id),
                     old_value: None,
-                    new_value: Some(initial_flux.to_string().into_bytes()),
+                    new_value: Some(flux_coin_bytes),
                 },
+                // Create Power Coin Object
                 setu_types::event::StateChange {
-                    key: format!("power:{}", request.address),
+                    key: format!("object:{}", power_object_id),
                     old_value: None,
-                    new_value: Some(initial_power.to_string().into_bytes()),
+                    new_value: Some(power_coin_bytes),
                 },
+                // Credit score (not a Coin Object, just a value)
                 setu_types::event::StateChange {
                     key: format!("credit:{}", request.address),
                     old_value: None,
