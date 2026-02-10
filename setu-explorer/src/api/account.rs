@@ -10,6 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use setu_types::{EventType, EventStatus, EventPayload, Address};
+use hex;
 
 // ========== Request/Response Types ==========
 
@@ -135,8 +136,8 @@ pub async fn get_account_balance(
 ) -> Result<Json<BalanceResponse>, StatusCode> {
     tracing::info!("GET /account/{}/balance", address);
     
-    // Parse address
-    let addr = Address::from_hex(&address)
+    // Parse address (support both 20-byte and 32-byte addresses)
+    let addr = parse_address(&address)
         .map_err(|e| {
             tracing::error!("Failed to parse address {}: {:?}", address, e);
             StatusCode::BAD_REQUEST
@@ -188,7 +189,7 @@ pub async fn get_account_coins(
     State(storage): State<Arc<ExplorerStorage>>,
 ) -> Result<Json<CoinsResponse>, StatusCode> {
     // Parse address
-    let addr = Address::from_hex(&address)
+    let addr = parse_address(&address)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     
     // Get coins
@@ -369,6 +370,26 @@ pub async fn get_transaction_detail(
 }
 
 // ========== Helper Functions ==========
+
+/// Parse address from hex string (supports both 20-byte and 32-byte addresses)
+fn parse_address(hex_str: &str) -> Result<Address, &'static str> {
+    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let bytes = hex::decode(hex_str).map_err(|_| "Invalid hex string")?;
+    
+    match bytes.len() {
+        20 => {
+            // Ethereum-style 20-byte address: pad with zeros to 32 bytes
+            let mut padded = [0u8; 32];
+            padded[12..32].copy_from_slice(&bytes);
+            Address::from_bytes(&padded)
+        }
+        32 => {
+            // Native 32-byte address
+            Address::from_bytes(&bytes)
+        }
+        _ => Err("Address must be 20 or 32 bytes")
+    }
+}
 
 /// Format relative time (e.g., "2 hours ago")
 fn format_relative_time(timestamp: u64) -> String {
