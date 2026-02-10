@@ -60,6 +60,9 @@ pub fn create_explorer_router(storage: Arc<ExplorerStorage>) -> Router {
         .route("/api/v1/explorer/account/:address/transactions", get(account::get_account_activity))  // Alias for activity
         .route("/api/v1/explorer/transaction/:event_id", get(account::get_transaction_detail))
         
+        // Token info (optional)
+        .route("/api/v1/explorer/token/:coin_type", get(account::get_token_info))
+        
         .with_state(storage)
 }
 

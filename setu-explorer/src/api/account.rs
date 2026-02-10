@@ -378,6 +378,75 @@ pub async fn get_transaction_detail(
     }
 }
 
+/// GET /api/v1/explorer/token/:coin_type
+/// 
+/// Query token information (optional endpoint)
+pub async fn get_token_info(
+    Path(coin_type): Path<String>,
+    State(_storage): State<Arc<ExplorerStorage>>,
+) -> Result<Json<TokenInfoResponse>, StatusCode> {
+    // For now, return hardcoded info for FLUX and POWER
+    match coin_type.to_uppercase().as_str() {
+        "FLUX" => {
+            Ok(Json(TokenInfoResponse {
+                coin_type: "FLUX".to_string(),
+                name: "Flux Token".to_string(),
+                symbol: "FLUX".to_string(),
+                decimals: 8,
+                subnet_id: "subnet-0".to_string(),
+                total_supply: "1000000000".to_string(),
+                description: "Native token of Setu Network for compute work".to_string(),
+                icon: None,
+                price_info: Some(PriceInfo {
+                    usd_price: "1.00".to_string(),
+                    change_24h: "0.0".to_string(),
+                    market_cap: None,
+                    volume_24h: None,
+                }),
+            }))
+        }
+        "POWER" => {
+            Ok(Json(TokenInfoResponse {
+                coin_type: "POWER".to_string(),
+                name: "Power Token".to_string(),
+                symbol: "POWER".to_string(),
+                decimals: 0,
+                subnet_id: "subnet-0".to_string(),
+                total_supply: "21000000".to_string(),
+                description: "Non-renewable, non-transferable power token for system participation".to_string(),
+                icon: None,
+                price_info: None,
+            }))
+        }
+        _ => Err(StatusCode::NOT_FOUND)
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct TokenInfoResponse {
+    pub coin_type: String,
+    pub name: String,
+    pub symbol: String,
+    pub decimals: u8,
+    pub subnet_id: String,
+    pub total_supply: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_info: Option<PriceInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PriceInfo {
+    pub usd_price: String,
+    pub change_24h: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market_cap: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_24h: Option<String>,
+}
+
 // ========== Helper Functions ==========
 
 /// Parse address from hex string (supports both 20-byte and 32-byte addresses)
