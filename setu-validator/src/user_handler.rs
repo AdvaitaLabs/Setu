@@ -192,9 +192,16 @@ impl UserRpcHandler for ValidatorUserHandler {
         };
         
         // Initial allocations
-        let initial_flux = 1000u64;  // Initial Flux balance
-        let initial_power = 100u64;  // Initial Power
-        let initial_credit = 50u64;  // Initial Credit
+        // Flux: Starts at 0, can only be minted by paying USDC or earned through POCW
+        let initial_flux = 0u64;
+        
+        // Power: Fixed initial allocation of 21 million (non-renewable, non-transferable)
+        // Power is consumed by any system event participation
+        // Note: 1 Flux = 10^32 in actual value representation
+        let initial_power = 21_000_000u64;
+        
+        // Credit: Initial reputation score
+        let initial_credit = 50u64;
         
         let mut event = Event::user_register(
             registration,

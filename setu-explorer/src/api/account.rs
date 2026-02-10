@@ -160,8 +160,15 @@ pub async fn get_account_balance(
         .filter(|coin| coin.coin_type().as_str() == "FLUX")
         .collect();
     
-    // Calculate total balance
+    // Calculate total balance from coins
     let total_balance: u64 = flux_coins.iter().map(|c| c.value()).sum();
+    
+    // Note: Flux starts at 0 for new users
+    // Flux can only be obtained through:
+    // 1. Minting by paying USDC
+    // 2. Earning through POCW (Proof of Compute Work)
+    // Flux is non-transferable and can only be minted/burned
+    // 1 Flux = 10^32 in actual value representation
     
     let balance_info = BalanceInfo {
         coin_type: "FLUX".to_string(),
