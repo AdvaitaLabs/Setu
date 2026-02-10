@@ -126,7 +126,7 @@ pub struct EventInfo {
 
 // ========== API Handlers ==========
 
-/// GET /api/v1/account/:address/balance
+/// GET /api/v1/explorer/account/:address/balance
 /// 
 /// Query account balance (aggregated by coin type)
 pub async fn get_account_balance(
@@ -165,7 +165,7 @@ pub async fn get_account_balance(
     }))
 }
 
-/// GET /api/v1/account/:address/coins
+/// GET /api/v1/explorer/account/:address/coins
 /// 
 /// Query account's Coin Objects
 pub async fn get_account_coins(
@@ -211,7 +211,7 @@ pub async fn get_account_coins(
     }))
 }
 
-/// GET /api/v1/account/:address/activity
+/// GET /api/v1/explorer/account/:address/activity
 /// 
 /// Query account's transaction history (activity)
 pub async fn get_account_activity(
@@ -296,7 +296,7 @@ pub async fn get_account_activity(
     }))
 }
 
-/// GET /api/v1/transaction/:event_id
+/// GET /api/v1/explorer/transaction/:event_id
 /// 
 /// Query transaction details
 pub async fn get_transaction_detail(

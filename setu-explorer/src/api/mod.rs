@@ -54,10 +54,10 @@ pub fn create_explorer_router(storage: Arc<ExplorerStorage>) -> Router {
         .route("/api/v1/explorer/search", get(search::search))
         
         // Account APIs (for wallet)
-        .route("/api/v1/account/:address/balance", get(account::get_account_balance))
-        .route("/api/v1/account/:address/coins", get(account::get_account_coins))
-        .route("/api/v1/account/:address/activity", get(account::get_account_activity))
-        .route("/api/v1/transaction/:event_id", get(account::get_transaction_detail))
+        .route("/api/v1/explorer/account/:address/balance", get(account::get_account_balance))
+        .route("/api/v1/explorer/account/:address/coins", get(account::get_account_coins))
+        .route("/api/v1/explorer/account/:address/activity", get(account::get_account_activity))
+        .route("/api/v1/explorer/transaction/:event_id", get(account::get_transaction_detail))
         
         .with_state(storage)
 }

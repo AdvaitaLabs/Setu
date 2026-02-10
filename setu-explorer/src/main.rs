@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
     info!("╔════════════════════════════════════════════════════════════╗");
     info!("║              Explorer API Ready                            ║");
     info!("╠════════════════════════════════════════════════════════════╣");
-    info!("║  Endpoints:                                                ║");
+    info!("║  Explorer Endpoints:                                       ║");
     info!("║    GET  /api/v1/explorer/stats                             ║");
     info!("║    GET  /api/v1/explorer/anchors                           ║");
     info!("║    GET  /api/v1/explorer/anchor/:id                        ║");
@@ -94,6 +94,12 @@ async fn main() -> anyhow::Result<()> {
     info!("║    GET  /api/v1/explorer/dag/live                          ║");
     info!("║    GET  /api/v1/explorer/dag/path/:event_id                ║");
     info!("║    GET  /api/v1/explorer/search                            ║");
+    info!("║                                                            ║");
+    info!("║  Account Endpoints (Wallet):                               ║");
+    info!("║    GET  /api/v1/explorer/account/:address/balance          ║");
+    info!("║    GET  /api/v1/explorer/account/:address/coins            ║");
+    info!("║    GET  /api/v1/explorer/account/:address/activity         ║");
+    info!("║    GET  /api/v1/explorer/transaction/:event_id             ║");
     info!("╚════════════════════════════════════════════════════════════╝");
     
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
