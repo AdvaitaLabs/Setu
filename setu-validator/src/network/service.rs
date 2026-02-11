@@ -23,6 +23,7 @@ use super::types::*;
 use super::transfer_handler::TransferHandler;
 use super::tee_executor::TeeExecutor;
 use super::event_handler::EventHandler;
+use super::network_info::{get_network_info, get_chain_id, NetworkInfoProvider};
 use crate::{RouterManager, TaskPreparer, ConsensusValidator};
 use axum::{
     routing::{get, post},
@@ -340,6 +341,9 @@ impl ValidatorNetworkService {
             .allow_headers(Any);
 
         let app = Router::new()
+            // Network info endpoints (for wallet integration)
+            .route("/api/v1/network/info", get(get_network_info::<ValidatorNetworkService>))
+            .route("/api/v1/network/chainId", get(get_chain_id))
             // Registration endpoints
             .route("/api/v1/register/solver", post(setu_api::http_register_solver::<ValidatorNetworkService>))
             .route("/api/v1/register/validator", post(setu_api::http_register_validator::<ValidatorNetworkService>))
@@ -576,6 +580,24 @@ impl ValidatorNetworkService {
             }
             _ => {}
         }
+    }
+}
+
+// ============================================
+// Implement NetworkInfoProvider trait
+// ============================================
+
+impl NetworkInfoProvider for ValidatorNetworkService {
+    fn dag_events_count(&self) -> usize {
+        self.dag_events.read().len()
+    }
+
+    fn validator_count(&self) -> usize {
+        self.validators.read().len()
+    }
+
+    fn solver_count(&self) -> usize {
+        self.router_manager.solver_count()
     }
 }
 

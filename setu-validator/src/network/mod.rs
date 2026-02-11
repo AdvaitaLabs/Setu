@@ -16,10 +16,12 @@ mod solver_client;
 mod transfer_handler;
 mod tee_executor;
 mod event_handler;
+mod network_info;
 
 pub use types::*;
 pub use service::*;
 pub use registration::ValidatorRegistrationHandler;
+pub use network_info::{get_network_info, get_chain_id, NetworkInfoProvider};
 
 // Internal modules - not re-exported as they are implementation details
 // pub use solver_client::*;
