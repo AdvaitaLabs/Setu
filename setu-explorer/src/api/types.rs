@@ -318,10 +318,43 @@ pub struct SearchResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaginationParams {
-    #[serde(default = "default_page")]
+    #[serde(default = "default_page", deserialize_with = "deserialize_number_from_string")]
     pub page: usize,
-    #[serde(default = "default_limit")]
+    #[serde(default = "default_limit", deserialize_with = "deserialize_number_from_string")]
     pub limit: usize,
+}
+
+fn deserialize_number_from_string<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Deserialize};
+    
+    struct UsizeVisitor;
+    
+    impl<'de> de::Visitor<'de> for UsizeVisitor {
+        type Value = usize;
+        
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a positive integer")
+        }
+        
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value as usize)
+        }
+        
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            value.parse::<usize>().map_err(de::Error::custom)
+        }
+    }
+    
+    deserializer.deserialize_any(UsizeVisitor)
 }
 
 fn default_page() -> usize {
