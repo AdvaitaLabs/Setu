@@ -191,14 +191,14 @@ export VALIDATOR_HTTP_PORT=8080
 ./target/release/setu-solver
 ```
 
-#### 3. Submit Transactions (CLI)
+#### 3. Interact with the Network
 
 ```bash
-# Check balance
-./target/release/setu balance --address <ADDRESS>
+# Check balance (via HTTP API)
+curl http://localhost:8080/api/v1/state/balance/<ADDRESS>
 
-# Transfer
-./target/release/setu transfer --from <FROM> --to <TO> --amount 100
+# Submit a transfer
+./target/release/setu transfer submit --from <FROM> --to <TO> --amount 100
 ```
 
 ### Docker Deployment
