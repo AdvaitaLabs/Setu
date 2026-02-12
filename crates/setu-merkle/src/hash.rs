@@ -1,7 +1,13 @@
 //! Hash utilities and types for merkle trees.
+//!
+//! Uses BLAKE3 for high-performance hashing (3-5x faster than SHA256).
+//! BLAKE3 provides:
+//! - 128-bit security (same as SHA256)
+//! - SIMD acceleration on modern CPUs
+//! - Incremental hashing support
+//! - No length extension attacks
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fmt;
 
 use crate::{MerkleError, MerkleResult, HASH_LENGTH};
@@ -132,42 +138,77 @@ pub mod prefix {
     pub const SPARSE_INTERNAL: &[u8] = &[0x03];
 }
 
-/// Hash data using SHA-256
-pub fn sha256(data: &[u8]) -> HashValue {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let result = hasher.finalize();
+// ============================================================================
+// BLAKE3 Hashing Functions (optimized replacement for SHA256)
+// ============================================================================
+
+/// Hash data using BLAKE3 (general purpose)
+/// 
+/// BLAKE3 is ~3-5x faster than SHA256 for small inputs and supports SIMD acceleration.
+#[inline]
+pub fn blake3_hash(data: &[u8]) -> HashValue {
     let mut bytes = [0u8; HASH_LENGTH];
-    bytes.copy_from_slice(&result);
+    bytes.copy_from_slice(blake3::hash(data).as_bytes());
     HashValue(bytes)
 }
 
-/// Hash data with a domain separation prefix
-pub fn sha256_with_prefix(prefix: &[u8], data: &[u8]) -> HashValue {
-    let mut hasher = Sha256::new();
+/// Hash data with a domain separation prefix using BLAKE3
+#[inline]
+pub fn blake3_with_prefix(prefix: &[u8], data: &[u8]) -> HashValue {
+    let mut hasher = blake3::Hasher::new();
     hasher.update(prefix);
     hasher.update(data);
-    let result = hasher.finalize();
     let mut bytes = [0u8; HASH_LENGTH];
-    bytes.copy_from_slice(&result);
+    bytes.copy_from_slice(hasher.finalize().as_bytes());
     HashValue(bytes)
 }
 
 /// Hash two child hashes to create parent hash (for binary merkle tree)
+#[inline]
 pub fn hash_internal(left: &HashValue, right: &HashValue) -> HashValue {
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(prefix::INTERNAL);
     hasher.update(left.as_bytes());
     hasher.update(right.as_bytes());
-    let result = hasher.finalize();
     let mut bytes = [0u8; HASH_LENGTH];
-    bytes.copy_from_slice(&result);
+    bytes.copy_from_slice(hasher.finalize().as_bytes());
     HashValue(bytes)
 }
 
 /// Hash leaf data (for binary merkle tree)
+#[inline]
 pub fn hash_leaf(data: &[u8]) -> HashValue {
-    sha256_with_prefix(prefix::LEAF, data)
+    blake3_with_prefix(prefix::LEAF, data)
+}
+
+/// Hash for sparse merkle tree internal nodes
+#[inline]
+pub fn hash_sparse_internal(left: &HashValue, right: &HashValue) -> HashValue {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(prefix::SPARSE_INTERNAL);
+    hasher.update(left.as_bytes());
+    hasher.update(right.as_bytes());
+    let mut bytes = [0u8; HASH_LENGTH];
+    bytes.copy_from_slice(hasher.finalize().as_bytes());
+    HashValue(bytes)
+}
+
+/// Hash for sparse merkle tree leaf nodes
+#[inline]
+pub fn hash_sparse_leaf(key: &HashValue, value_hash: &HashValue) -> HashValue {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(prefix::SPARSE_LEAF);
+    hasher.update(key.as_bytes());
+    hasher.update(value_hash.as_bytes());
+    let mut bytes = [0u8; HASH_LENGTH];
+    bytes.copy_from_slice(hasher.finalize().as_bytes());
+    HashValue(bytes)
+}
+
+/// Hash a value for storage in the sparse merkle tree
+#[inline]
+pub fn hash_value(value: &[u8]) -> HashValue {
+    blake3_hash(value)
 }
 
 #[cfg(test)]

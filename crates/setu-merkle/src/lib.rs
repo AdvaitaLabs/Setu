@@ -37,7 +37,7 @@ pub mod storage;
 pub use aggregation::{SubnetAggregationProof, SubnetAggregationTree, SubnetStateEntry};
 pub use binary::{BinaryMerkleProof, BinaryMerkleTree};
 pub use error::{MerkleError, MerkleResult};
-pub use hash::{HashValue, sha256};
+pub use hash::{HashValue, blake3_hash};
 pub use sparse::{IncrementalSparseMerkleTree, SparseMerkleProof, SparseMerkleTree};
 pub use storage::{InMemoryMerkleStore, MerkleNodeStore, MerkleRootStore, MerkleStore};
 

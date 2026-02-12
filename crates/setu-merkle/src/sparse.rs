@@ -9,6 +9,7 @@
 //! - Efficient empty subtree handling (lazy evaluation)
 //! - Non-inclusion proofs
 //! - Version/snapshot support for state history
+//! - **BLAKE3 hashing** for 3-5x performance improvement over SHA256
 //!
 //! # Design
 //!
@@ -33,15 +34,14 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use crate::error::{MerkleError, MerkleResult};
-use crate::hash::{prefix, HashValue};
+use crate::hash::{blake3_hash, hash_sparse_internal, hash_sparse_leaf, HashValue};
 use crate::HASH_LENGTH;
 
 /// Placeholder hash for empty subtrees.
-/// This is the hash of an empty node, computed as SHA256("SPARSE_EMPTY").
+/// This is the hash of an empty node, computed as BLAKE3("SPARSE_EMPTY").
 fn empty_hash() -> HashValue {
     lazy_static::initialize(&EMPTY_HASH);
     *EMPTY_HASH
@@ -49,11 +49,8 @@ fn empty_hash() -> HashValue {
 
 lazy_static::lazy_static! {
     static ref EMPTY_HASH: HashValue = {
-        let mut hasher = Sha256::new();
-        hasher.update(b"SPARSE_EMPTY");
-        let result = hasher.finalize();
         let mut bytes = [0u8; HASH_LENGTH];
-        bytes.copy_from_slice(&result);
+        bytes.copy_from_slice(blake3::hash(b"SPARSE_EMPTY").as_bytes());
         HashValue::new(bytes)
     };
 }
@@ -81,24 +78,10 @@ impl SparseMerkleNode {
         match self {
             SparseMerkleNode::Empty => empty_hash(),
             SparseMerkleNode::Leaf { key, value_hash } => {
-                let mut hasher = Sha256::new();
-                hasher.update(prefix::SPARSE_LEAF);
-                hasher.update(key.as_bytes());
-                hasher.update(value_hash.as_bytes());
-                let result = hasher.finalize();
-                let mut bytes = [0u8; HASH_LENGTH];
-                bytes.copy_from_slice(&result);
-                HashValue::new(bytes)
+                hash_sparse_leaf(key, value_hash)
             }
             SparseMerkleNode::Internal { left, right } => {
-                let mut hasher = Sha256::new();
-                hasher.update(prefix::SPARSE_INTERNAL);
-                hasher.update(left.as_bytes());
-                hasher.update(right.as_bytes());
-                let result = hasher.finalize();
-                let mut bytes = [0u8; HASH_LENGTH];
-                bytes.copy_from_slice(&result);
-                HashValue::new(bytes)
+                hash_sparse_internal(left, right)
             }
         }
     }
@@ -123,14 +106,7 @@ pub struct SparseMerkleLeafNode {
 impl SparseMerkleLeafNode {
     /// Compute the hash of this leaf
     pub fn hash(&self) -> HashValue {
-        let mut hasher = Sha256::new();
-        hasher.update(prefix::SPARSE_LEAF);
-        hasher.update(self.key.as_bytes());
-        hasher.update(self.value_hash.as_bytes());
-        let result = hasher.finalize();
-        let mut bytes = [0u8; HASH_LENGTH];
-        bytes.copy_from_slice(&result);
-        HashValue::new(bytes)
+        hash_sparse_leaf(&self.key, &self.value_hash)
     }
 }
 
@@ -284,26 +260,17 @@ impl SparseMerkleProof {
         Ok(current)
     }
 }
-/// Hash a value for storage in the tree
+
+/// Hash a value for storage in the tree (using BLAKE3)
+#[inline]
 fn hash_value(value: &[u8]) -> HashValue {
-    let mut hasher = Sha256::new();
-    hasher.update(value);
-    let result = hasher.finalize();
-    let mut bytes = [0u8; HASH_LENGTH];
-    bytes.copy_from_slice(&result);
-    HashValue::new(bytes)
+    blake3_hash(value)
 }
 
-/// Hash two children to create internal node hash
+/// Hash two children to create internal node hash (using BLAKE3)
+#[inline]
 fn hash_internal(left: &HashValue, right: &HashValue) -> HashValue {
-    let mut hasher = Sha256::new();
-    hasher.update(prefix::SPARSE_INTERNAL);
-    hasher.update(left.as_bytes());
-    hasher.update(right.as_bytes());
-    let result = hasher.finalize();
-    let mut bytes = [0u8; HASH_LENGTH];
-    bytes.copy_from_slice(&result);
-    HashValue::new(bytes)
+    hash_sparse_internal(left, right)
 }
 
 /// A sparse Merkle tree for key-value storage.
@@ -888,16 +855,7 @@ impl TreeNode {
     }
 
     fn new_leaf(key: HashValue, value_hash: HashValue) -> Self {
-        let node_hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(prefix::SPARSE_LEAF);
-            hasher.update(key.as_bytes());
-            hasher.update(value_hash.as_bytes());
-            let result = hasher.finalize();
-            let mut bytes = [0u8; HASH_LENGTH];
-            bytes.copy_from_slice(&result);
-            HashValue::new(bytes)
-        };
+        let node_hash = hash_sparse_leaf(&key, &value_hash);
         TreeNode::Leaf { key, value_hash, node_hash }
     }
 

@@ -10,9 +10,8 @@ license = "Apache-2.0"
 serde = { workspace = true }
 bincode = "2.0.0-rc.3"
 
-# Cryptography
-sha2 = "0.10"
-blake2 = "0.10"
+# Cryptography - BLAKE3 for high-performance hashing (3-5x faster than SHA256)
+blake3 = "1.5"
 
 # Utilities
 thiserror = "1.0"
