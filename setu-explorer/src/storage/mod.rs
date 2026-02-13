@@ -69,7 +69,7 @@ impl ExplorerStorage {
     /// Get event by ID (query RocksDB directly for real-time data)
     pub async fn get_event(&self, event_id: &str) -> Option<Event> {
         use setu_storage::ColumnFamily;
-        self.db.get::<Event>(ColumnFamily::Events, event_id.as_bytes()).ok().flatten()
+        self.db.get_raw::<Event>(ColumnFamily::Events, event_id.as_bytes()).ok().flatten()
     }
     
     /// Get multiple events
@@ -136,7 +136,7 @@ impl ExplorerStorage {
     /// Get anchor by ID (query RocksDB directly for real-time data)
     pub async fn get_anchor(&self, anchor_id: &str) -> Option<Anchor> {
         use setu_storage::ColumnFamily;
-        self.db.get::<Anchor>(ColumnFamily::Anchors, anchor_id.as_bytes()).ok().flatten()
+        self.db.get_raw::<Anchor>(ColumnFamily::Anchors, anchor_id.as_bytes()).ok().flatten()
     }
     
     /// Get latest anchor
