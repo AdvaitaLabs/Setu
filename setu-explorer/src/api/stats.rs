@@ -16,15 +16,28 @@ use std::sync::Arc;
 pub async fn get_stats(
     State(storage): State<Arc<ExplorerStorage>>,
 ) -> Json<StatsResponse> {
+    use std::time::Instant;
+    
+    let start = Instant::now();
+    
     // Get anchor store stats (fast)
+    let t1 = Instant::now();
     let anchor_count = storage.count_anchors().await;
+    tracing::info!("count_anchors took: {:?}", t1.elapsed());
+    
+    let t2 = Instant::now();
     let latest_anchor = storage.get_latest_anchor().await;
+    tracing::info!("get_latest_anchor took: {:?}", t2.elapsed());
     
     // Get event store stats (fast - uses metadata or prefix count)
+    let t3 = Instant::now();
     let event_count = storage.count_events().await;
+    tracing::info!("count_events took: {:?}", t3.elapsed());
     
-    // Count validators and solvers by scanning only registration events (fast)
-    let (validator_count, solver_count) = count_registered_nodes(&storage).await;
+    // Count validators and solvers from /validators and /solvers APIs
+    let t4 = Instant::now();
+    let (validator_count, solver_count) = count_nodes_fast(&storage).await;
+    tracing::info!("count_nodes_fast took: {:?}", t4.elapsed());
     
     // Calculate TPS (placeholder - need time-series data)
     let tps = 0.0;
@@ -46,18 +59,22 @@ pub async fn get_stats(
     });
     
     // Calculate recent activity from latest anchor only (fast approximation)
+    let t5 = Instant::now();
     let (last_24h_events, last_24h_transfers, last_24h_registrations) = 
         if let Some(anchor) = latest_anchor {
             calculate_recent_activity_from_anchor(&storage, &anchor).await
         } else {
             (0, 0, 0)
         };
+    tracing::info!("calculate_recent_activity took: {:?}", t5.elapsed());
     
     let recent_activity = RecentActivity {
         last_24h_events,
         last_24h_transfers,
         last_24h_registrations,
     };
+    
+    tracing::info!("Total stats endpoint took: {:?}", start.elapsed());
     
     Json(StatsResponse {
         network: NetworkStats {
@@ -73,12 +90,13 @@ pub async fn get_stats(
     })
 }
 
-/// Count registered nodes by scanning only registration events (fast)
-async fn count_registered_nodes(storage: &ExplorerStorage) -> (usize, usize) {
+/// Count nodes quickly by only checking event types (no deserialization of payload)
+async fn count_nodes_fast(storage: &ExplorerStorage) -> (usize, usize) {
     use setu_storage::ColumnFamily;
+    use setu_types::EventType;
     
-    let mut registered_validators = std::collections::HashSet::new();
-    let mut registered_solvers = std::collections::HashSet::new();
+    let mut validator_registrations: usize = 0;
+    let mut solver_registrations: usize = 0;
     
     // Catch up with primary
     let _ = storage.db().try_catch_up_with_primary();
@@ -95,27 +113,19 @@ async fn count_registered_nodes(storage: &ExplorerStorage) -> (usize, usize) {
         if let Ok((_key, value_bytes)) = result {
             // Deserialize event
             if let Ok(event) = bcs::from_bytes::<setu_types::Event>(&value_bytes) {
-                // Only process registration events
-                match &event.payload {
-                    setu_types::EventPayload::ValidatorRegister(reg) => {
-                        registered_validators.insert(reg.validator_id.clone());
-                    }
-                    setu_types::EventPayload::SolverRegister(reg) => {
-                        registered_solvers.insert(reg.solver_id.clone());
-                    }
-                    setu_types::EventPayload::ValidatorUnregister(unreg) => {
-                        registered_validators.remove(&unreg.node_id);
-                    }
-                    setu_types::EventPayload::SolverUnregister(unreg) => {
-                        registered_solvers.remove(&unreg.node_id);
-                    }
+                // Only count by event type (fast - no payload deserialization needed)
+                match event.event_type {
+                    EventType::ValidatorRegister => validator_registrations += 1,
+                    EventType::SolverRegister => solver_registrations += 1,
+                    EventType::ValidatorUnregister => validator_registrations = validator_registrations.saturating_sub(1),
+                    EventType::SolverUnregister => solver_registrations = solver_registrations.saturating_sub(1),
                     _ => {}
                 }
             }
         }
     }
     
-    (registered_validators.len(), registered_solvers.len())
+    (validator_registrations, solver_registrations)
 }
 
 /// Calculate recent activity from anchor events (fast approximation)
