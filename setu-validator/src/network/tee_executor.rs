@@ -214,6 +214,7 @@ impl TeeExecutor {
                             };
 
                             event.set_execution_result(execution_result);
+                            event.executed_by = Some(solver_id.clone());
                             event.status = setu_types::event::EventStatus::Executed;
 
                             // 6. Submit to consensus (if enabled)
@@ -484,6 +485,7 @@ pub async fn send_solver_task_sync(
     };
 
     event.set_execution_result(execution_result);
+    event.executed_by = Some(solver_id.to_string());
     event.status = setu_types::event::EventStatus::Executed;
 
     Ok((event, exec_response))

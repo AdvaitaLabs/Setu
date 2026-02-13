@@ -3,6 +3,7 @@ use setu_types::{
 };
 use crate::anchor_builder::{AnchorBuilder, AnchorBuildResult, AnchorBuildError, PendingAnchorBuild};
 use crate::dag::Dag;
+use crate::pocw::fold_observer::FoldObserver;
 use crate::vlc::VLC;
 use setu_storage::subnet_state::GlobalStateManager;
 use std::collections::HashMap;
@@ -117,11 +118,16 @@ pub struct ConsensusManager {
     local_validator_id: String,
     /// Last build result for diagnostics
     last_build_result: Option<AnchorBuildResult>,
+    /// PoCW fold observer (active when PoCWConfig::enabled)
+    fold_observer: Option<FoldObserver>,
 }
 
 impl ConsensusManager {
     /// Create a new ConsensusManager with AnchorBuilder
     pub fn new(config: ConsensusConfig, validator_id: String) -> Self {
+        let fold_observer = config.pocw
+            .filter(|p| p.enabled)
+            .map(FoldObserver::new);
         Self {
             config: config.clone(),
             anchor_builder: AnchorBuilder::new(config.clone()),
@@ -132,15 +138,19 @@ impl ConsensusManager {
             persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
             last_build_result: None,
+            fold_observer,
         }
     }
     
     /// Create with an existing GlobalStateManager (for state persistence)
     pub fn with_state_manager(
-        config: ConsensusConfig, 
+        config: ConsensusConfig,
         validator_id: String,
         state_manager: GlobalStateManager,
     ) -> Self {
+        let fold_observer = config.pocw
+            .filter(|p| p.enabled)
+            .map(FoldObserver::new);
         Self {
             config: config.clone(),
             anchor_builder: AnchorBuilder::with_state_manager(config.clone(), state_manager),
@@ -151,6 +161,7 @@ impl ConsensusManager {
             persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
             last_build_result: None,
+            fold_observer,
         }
     }
 
@@ -304,6 +315,12 @@ impl ConsensusManager {
                         // Leader path: commit the pending build
                         match self.anchor_builder.commit_build(pending_build.clone()) {
                             Ok(state_summary) => {
+                                // PoCW: observe the committed fold
+                                if let Some(ref mut observer) = self.fold_observer {
+                                    let fold_events = pending_build.all_events();
+                                    observer.on_fold_committed(&fold_events);
+                                }
+
                                 // Store result for diagnostics
                                 self.last_build_result = Some(AnchorBuildResult {
                                     anchor: cf.anchor.clone(),

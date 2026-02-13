@@ -55,6 +55,7 @@ fn create_test_event(id: &str, creator: &str, parent_ids: Vec<String>) -> Event 
         execution_result: None,
         status: EventStatus::Pending,
         vlc_snapshot: VLCSnapshot::new(),
+        executed_by: None,
     }
 }
 
