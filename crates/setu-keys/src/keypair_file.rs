@@ -54,7 +54,21 @@ pub fn read_key<P: AsRef<Path>>(path: P) -> Result<SetuKeyPair, KeyError> {
     let contents = std::fs::read_to_string(path)?;
     let contents = contents.trim();
     
-    // Try hex encoded private key first (64 hex chars = 32 bytes, most common for CLI-generated keys)
+    // Try JSON format first (from CLI keygen) - check before Base64 to avoid false positives
+    if contents.starts_with('{') {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(contents) {
+            if let Some(private_key_str) = json.get("private_key").and_then(|v| v.as_str()) {
+                if let Ok(bytes) = hex::decode(private_key_str) {
+                    // Raw 32-byte private key from JSON - use Secp256k1 for validator keys
+                    if bytes.len() == 32 {
+                        return SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::Secp256k1, &bytes);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Try hex encoded private key (64 hex chars = 32 bytes, most common for CLI-generated keys)
     if contents.len() == 64 && contents.chars().all(|c| c.is_ascii_hexdigit()) {
         if let Ok(bytes) = hex::decode(contents) {
             if bytes.len() == 32 {
@@ -68,23 +82,9 @@ pub fn read_key<P: AsRef<Path>>(path: P) -> Result<SetuKeyPair, KeyError> {
         }
     }
     
-    // Try Base64 encoded SetuKeyPair
+    // Try Base64 encoded SetuKeyPair (last resort)
     if let Ok(kp) = SetuKeyPair::decode_base64(contents) {
         return Ok(kp);
-    }
-    
-    // Try JSON format (from CLI keygen)
-    if contents.starts_with('{') {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(contents) {
-            if let Some(private_key_str) = json.get("private_key").and_then(|v| v.as_str()) {
-                if let Ok(bytes) = hex::decode(private_key_str) {
-                    // Raw 32-byte private key from JSON - use Secp256k1 for validator keys
-                    if bytes.len() == 32 {
-                        return SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::Secp256k1, &bytes);
-                    }
-                }
-            }
-        }
     }
     
     Err(KeyError::InvalidKeyFormat(
