@@ -503,6 +503,11 @@ impl ConsensusEngine {
 
         Ok(cf)
     }
+    
+    /// Try to create a ConsensusFrame if we're the leader (public version for periodic tasks)
+    pub async fn try_create_cf_if_leader(&self) -> SetuResult<Option<ConsensusFrame>> {
+        self.try_create_cf().await
+    }
 
     /// Receive a ConsensusFrame from another validator (Follower path)
     /// 

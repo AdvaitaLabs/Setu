@@ -374,6 +374,99 @@ impl ConsensusValidator {
         router.start(event_rx)
     }
     
+    /// Start periodic anchor creation task (for single-node mode)
+    ///
+    /// In single-node mode, there's no network to trigger CF creation.
+    /// This task periodically checks if conditions are met and creates anchors.
+    ///
+    /// # Arguments
+    /// * `interval_secs` - How often to check (default: 10 seconds)
+    ///
+    /// # Returns
+    /// A JoinHandle for the spawned task
+    pub fn start_periodic_anchor_task(&self, interval_secs: u64) -> tokio::task::JoinHandle<()> {
+        let engine = self.engine.clone();
+        let event_store = self.event_store.clone();
+        let anchor_store = self.anchor_store.clone();
+        let validator_id = self.config.node_info.id.clone();
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+            
+            info!(
+                validator_id = %validator_id,
+                interval_secs = interval_secs,
+                "Starting periodic anchor creation task (single-node mode)"
+            );
+            
+            loop {
+                interval.tick().await;
+                
+                // Try to create CF if we're the leader and conditions are met
+                match engine.try_create_cf_if_leader().await {
+                    Ok(Some(cf)) => {
+                        info!(
+                            cf_id = %cf.id,
+                            event_count = cf.anchor.event_ids.len(),
+                            "CF created by periodic task"
+                        );
+                        
+                        // In single-node mode, immediately finalize (no voting needed)
+                        match engine.receive_cf(cf.clone()).await {
+                            Ok((finalized, Some(anchor))) if finalized => {
+                                info!(
+                                    anchor_id = %anchor.id,
+                                    depth = anchor.depth,
+                                    "Anchor finalized (single-node mode)"
+                                );
+                                
+                                // Persist anchor
+                                if let Err(e) = anchor_store.store(anchor.clone()).await {
+                                    warn!(
+                                        anchor_id = %anchor.id,
+                                        error = %e,
+                                        "Failed to persist anchor"
+                                    );
+                                }
+                                
+                                // Persist all events in the anchor
+                                for event_id in &anchor.event_ids {
+                                    if let Some(event) = engine.get_events_by_ids(&[event_id.clone()]).await.into_iter().next() {
+                                        if let Err(e) = event_store.store(event.clone()).await {
+                                            warn!(
+                                                event_id = %event_id,
+                                                error = %e,
+                                                "Failed to persist event"
+                                            );
+                                        }
+                                    }
+                                }
+                                
+                                info!(
+                                    anchor_id = %anchor.id,
+                                    event_count = anchor.event_ids.len(),
+                                    "Anchor and events persisted to RocksDB"
+                                );
+                            }
+                            Ok(_) => {
+                                debug!("CF received but not finalized yet");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to receive CF");
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Conditions not met, skip
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to create CF");
+                    }
+                }
+            }
+        })
+    }
+    
     /// Get the underlying consensus engine (for advanced use cases)
     pub fn engine(&self) -> Arc<ConsensusEngine> {
         self.engine.clone()
@@ -464,9 +557,10 @@ impl ConsensusValidator {
     /// 3. Update VLC
     /// 4. Try to create CF if we're the leader
     /// 5. Broadcast event to other validators
+    /// 6. In single-node mode: persist immediately to RocksDB
     /// 
-    /// Note: Events are NOT persisted here. They stay in DAG memory until CF is finalized.
-    /// Persistence happens in receive_vote() when quorum is reached.
+    /// Note: In multi-node mode, events stay in DAG memory until CF is finalized.
+    /// In single-node mode, events are persisted immediately for durability.
     pub async fn submit_event(&self, event: Event) -> SetuResult<EventId> {
         info!(
             event_id = %event.id,
@@ -493,8 +587,26 @@ impl ConsensusValidator {
         
         // Step 2: Add event to DAG (this also updates VLC and broadcasts)
         // Note: engine.add_event handles network broadcasting if a broadcaster is configured
-        // Event stays in DAG memory until CF is finalized
         let event_id = self.engine.add_event(event.clone()).await?;
+        
+        // Step 3: In single-node mode, persist immediately to RocksDB for durability
+        // This ensures events survive restarts without waiting for finalization
+        let validator_count = self.validator_count().await;
+        if validator_count == 1 {
+            // Single-node mode: persist immediately
+            if let Err(e) = self.event_store.store(event.clone()).await {
+                warn!(
+                    event_id = %event_id,
+                    error = %e,
+                    "Failed to persist event in single-node mode"
+                );
+            } else {
+                debug!(
+                    event_id = %event_id,
+                    "Event persisted immediately (single-node mode)"
+                );
+            }
+        }
         
         info!(
             event_id = %event_id,

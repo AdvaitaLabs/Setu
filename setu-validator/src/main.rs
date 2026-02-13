@@ -257,6 +257,11 @@ async fn main() -> anyhow::Result<()> {
     
     info!("└─────────────────────────────────────────────────────────────┘");
 
+    // Start periodic anchor creation task (for single-node mode)
+    // This ensures events are finalized and persisted to RocksDB
+    let _anchor_task_handle = consensus_validator.start_periodic_anchor_task(10);
+    info!("✓ Periodic anchor creation task started (interval: 10s)");
+    
     // Spawn HTTP server
     let http_service = network_service.clone();
     let http_handle = tokio::spawn(async move {
