@@ -564,7 +564,7 @@ impl ConsensusValidator {
     /// 
     /// Note: In multi-node mode, events stay in DAG memory until CF is finalized.
     /// In single-node mode, events are persisted immediately for durability.
-    pub async fn submit_event(&self, event: Event) -> SetuResult<EventId> {
+    pub async fn submit_event(&self, mut event: Event) -> SetuResult<EventId> {
         info!(
             event_id = %event.id,
             creator = %event.creator,
@@ -585,6 +585,22 @@ impl ConsensusValidator {
                 return Err(SetuError::InvalidData(
                     "Event execution result is not successful".to_string()
                 ));
+            }
+        }
+        
+        // Step 1.5: If event has no parents, use DAG tips as parents
+        // This ensures events always have proper depth in the DAG
+        if event.parent_ids.is_empty() {
+            let tips = self.engine.get_tips().await;
+            if !tips.is_empty() {
+                debug!(
+                    event_id = %event.id,
+                    tip_count = tips.len(),
+                    "Event has no parents, using DAG tips"
+                );
+                event.parent_ids = tips;
+                // Recompute event ID after modifying parent_ids
+                event.recompute_id();
             }
         }
         

@@ -457,6 +457,7 @@ impl ConsensusEngine {
 
             // Check if we are the valid proposer for the current round
             if !validator_set.is_valid_proposer(&self.local_validator_id, round) {
+                debug!("Not valid proposer for round {}", round);
                 return Ok(None);
             }
             round
@@ -466,10 +467,23 @@ impl ConsensusEngine {
         let mut manager = self.consensus_manager.write().await;
 
         if !manager.should_fold(&vlc) {
+            let last_fold_vlc = manager.anchor_builder().last_fold_vlc();
+            let current_vlc = vlc.logical_time();
+            let delta = current_vlc.saturating_sub(last_fold_vlc);
+            debug!(
+                "Should not fold: last_fold_vlc={}, current_vlc={}, delta={}, threshold={}",
+                last_fold_vlc, current_vlc, delta, self.config.vlc_delta_threshold
+            );
             return Ok(None);
         }
 
         let dag = self.dag.read().await;
+        info!(
+            "Attempting to create CF: dag_nodes={}, dag_max_depth={}, anchor_depth={}",
+            dag.node_count(),
+            dag.max_depth(),
+            manager.anchor_builder().anchor_depth()
+        );
         // AnchorBuilder now handles all Merkle tree computation internally
         let cf = manager.try_create_cf(&dag, &vlc);
 

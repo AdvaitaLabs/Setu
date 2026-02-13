@@ -427,6 +427,19 @@ impl Event {
         hex::encode(hasher.finalize())
     }
     
+    /// Recompute the event ID after modifying parent_ids or other fields
+    /// 
+    /// This should be called after modifying parent_ids to ensure the ID
+    /// remains consistent with the event content.
+    pub fn recompute_id(&mut self) {
+        self.id = Self::compute_id(
+            &self.parent_ids,
+            &self.vlc_snapshot,
+            &self.creator,
+            self.timestamp,
+        );
+    }
+    
     /// Verify that the event ID matches the content (anti-tampering check)
     /// 
     /// This should be called when receiving events from untrusted sources

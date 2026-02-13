@@ -309,6 +309,13 @@ impl TaskPreparer {
     ///
     /// For each input object, find the last event that modified it.
     /// These events become the parent_ids (dependencies) of the new event.
+    /// 
+    /// NOTE: This method currently returns empty parent_ids because
+    /// MerkleStateProvider doesn't track object→event mappings yet.
+    /// This is acceptable because:
+    /// 1. DAG will assign depth based on tips if parent_ids is empty
+    /// 2. Consensus still works correctly with depth-based ordering
+    /// 3. Future enhancement: track object versions in state provider
     fn derive_dependencies(&self, input_objects: &[&ObjectId]) -> Vec<String> {
         let mut parent_ids = Vec::new();
         let mut seen = std::collections::HashSet::new();
