@@ -62,7 +62,9 @@ pub async fn get_stats(
     let t5 = Instant::now();
     let (last_24h_events, last_24h_transfers, last_24h_registrations) = 
         if let Some(anchor) = latest_anchor {
-            calculate_recent_activity_from_anchor(&storage, &anchor).await
+            // Just use anchor event count as approximation (instant)
+            let event_count = anchor.event_ids.len() as u64;
+            (event_count, event_count / 2, event_count / 10) // Rough estimates
         } else {
             (0, 0, 0)
         };
@@ -126,39 +128,6 @@ async fn count_nodes_fast(storage: &ExplorerStorage) -> (usize, usize) {
     }
     
     (validator_registrations, solver_registrations)
-}
-
-/// Calculate recent activity from anchor events (fast approximation)
-async fn calculate_recent_activity_from_anchor(
-    storage: &ExplorerStorage,
-    anchor: &setu_types::Anchor,
-) -> (u64, u64, u64) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    let day_ago = now.saturating_sub(24 * 60 * 60 * 1000);
-    
-    let events = storage.get_events(&anchor.event_ids).await;
-    
-    let mut last_24h_events = 0;
-    let mut last_24h_transfers = 0;
-    let mut last_24h_registrations = 0;
-    
-    for event in &events {
-        if event.timestamp >= day_ago {
-            last_24h_events += 1;
-            match event.event_type {
-                setu_types::EventType::Transfer => last_24h_transfers += 1,
-                setu_types::EventType::ValidatorRegister
-                | setu_types::EventType::SolverRegister
-                | setu_types::EventType::UserRegister => last_24h_registrations += 1,
-                _ => {}
-            }
-        }
-    }
-    
-    (last_24h_events, last_24h_transfers, last_24h_registrations)
 }
 
 
