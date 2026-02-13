@@ -384,6 +384,8 @@ pub struct ConsensusConfig {
     pub max_events_per_cf: usize,
     pub cf_timeout_ms: u64,
     pub validator_count: usize,
+    #[serde(default)]
+    pub pocw: Option<crate::pocw::PoCWConfig>,
 }
 
 impl Default for ConsensusConfig {
@@ -394,6 +396,7 @@ impl Default for ConsensusConfig {
             max_events_per_cf: 1000,
             cf_timeout_ms: 5000,
             validator_count: 3,
+            pocw: None,
         }
     }
 }

@@ -8,6 +8,7 @@ pub mod object;
 pub mod subnet;          // Subnet (sub-application) types
 pub mod merkle;          // Merkle tree types for state commitment
 pub mod task;            // Task types for Validator → Solver communication
+pub mod pocw;            // PoCW economic types
 
 // ========== Object Model ==========
 pub mod coin;           // Coin object (transferable asset)
@@ -80,6 +81,8 @@ pub use merkle::{
 pub use account_view::AccountView;
 
 // Task types for Validator → Solver communication
+pub use pocw::PoCWConfig;
+
 pub use task::{
     SolverTask, ResolvedInputs, OperationType, ResolvedObject,
     ReadSetEntry, MerkleProof,
