@@ -178,8 +178,6 @@ impl ExplorerStorage {
             tracing::warn!("Failed to catch up with primary: {}", e);
         }
         
-        use setu_storage::ColumnFamily;
-        
         // Use prefix_iterator to scan only "evt:" keys efficiently
         let cf_handle = match self.db.inner().cf_handle("events") {
             Some(cf) => cf,
@@ -195,7 +193,7 @@ impl ExplorerStorage {
         for result in self.db.inner().prefix_iterator_cf(cf_handle, prefix) {
             match result {
                 Ok((_key, value_bytes)) => {
-                    // Deserialize value using BCS
+                    // Deserialize value using BCS (same as SetuDB)
                     match bcs::from_bytes::<Event>(&value_bytes) {
                         Ok(event) => events.push(event),
                         Err(e) => {
