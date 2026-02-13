@@ -80,7 +80,9 @@ impl ExplorerStorage {
         let _ = self.db.try_catch_up_with_primary();
         
         use setu_storage::ColumnFamily;
-        self.db.get_raw::<Event>(ColumnFamily::Events, event_id.as_bytes()).ok().flatten()
+        // Event keys are stored as "evt:{event_id}"
+        let key = format!("evt:{}", event_id);
+        self.db.get_raw::<Event>(ColumnFamily::Events, key.as_bytes()).ok().flatten()
     }
     
     /// Get multiple events
@@ -102,31 +104,48 @@ impl ExplorerStorage {
         // Catch up with primary to see latest writes
         if let Err(e) = self.db.try_catch_up_with_primary() {
             tracing::warn!("Failed to catch up with primary: {}", e);
-        } else {
-            tracing::debug!("Successfully caught up with primary");
         }
         
         use setu_storage::ColumnFamily;
-        let mut events = Vec::new();
-        let mut total_scanned = 0;
-        let mut matched = 0;
         
-        if let Ok(iter) = self.db.iter_values::<Event>(ColumnFamily::Events) {
-            for event_result in iter {
-                total_scanned += 1;
-                if let Ok(event) = event_result {
-                    tracing::debug!("Found event: id={}, status={:?}, looking_for={:?}", 
-                        event.id, event.status, status);
-                    if event.status == status {
-                        matched += 1;
-                        events.push(event);
-                    }
-                }
+        // Build status prefix: "status:{status_byte}:"
+        let status_byte = status as u8;
+        let mut prefix = Vec::with_capacity(7 + 2); // "status:" + byte + ":"
+        prefix.extend_from_slice(b"status:");
+        prefix.push(status_byte);
+        prefix.push(b':');
+        
+        // Scan prefix to get event IDs
+        let event_ids: Vec<String> = match self.db.prefix_scan_keys(ColumnFamily::Events, &prefix) {
+            Ok(keys) => {
+                keys.into_iter()
+                    .filter_map(|key| {
+                        // Key format: status:{status}:{event_id}
+                        // Extract event_id from end of key
+                        if key.len() > prefix.len() {
+                            String::from_utf8(key[prefix.len()..].to_vec()).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+            Err(e) => {
+                tracing::warn!("Failed to scan status prefix: {}", e);
+                return Vec::new();
+            }
+        };
+        
+        tracing::info!("Found {} events with status {:?}", event_ids.len(), status);
+        
+        // Get events by IDs
+        let mut events = Vec::new();
+        for event_id in event_ids {
+            if let Some(event) = self.get_event(&event_id).await {
+                events.push(event);
             }
         }
         
-        tracing::info!("Scanned {} events, matched {} with status {:?}", 
-            total_scanned, matched, status);
         events
     }
     
