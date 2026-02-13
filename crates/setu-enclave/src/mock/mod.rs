@@ -64,7 +64,7 @@ struct CoinState {
 }
 
 fn default_coin_type() -> String {
-    "SETU".to_string()
+    "ROOT".to_string()  // ROOT subnet's native token (consistent with storage)
 }
 
 /// Mock enclave measurement (constant for testing)

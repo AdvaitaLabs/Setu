@@ -501,17 +501,18 @@ impl<S: StateStore> RuntimeExecutor<S> {
         });
         
         // 2. Mint initial token supply to owner if configured
-        if let (Some(symbol), Some(supply)) = (token_symbol, initial_supply) {
+        // Note: token_symbol is for display only, we use subnet_id as the coin namespace
+        if let Some(supply) = initial_supply {
             if supply > 0 {
-                // Use deterministic coin ID for consistency with storage layer queries
-                // This ensures get_coins_for_address() can find this coin
-                let coin_id = deterministic_coin_id(owner, symbol);
+                // Use subnet_id as the coin namespace (1:1 binding)
+                // token_symbol is only for display purposes (stored in SubnetConfig)
+                let coin_id = deterministic_coin_id(owner, subnet_id);
                 
                 // Create token coin for subnet owner
                 let token_coin = create_typed_coin(
                     owner.clone(),
                     supply,
-                    symbol,
+                    subnet_id,  // Use subnet_id as coin_type internally
                 );
                 let coin_state = serde_json::to_vec(&token_coin)?;
                 
@@ -528,7 +529,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 info!(
                     subnet_id = %subnet_id,
                     owner = %owner,
-                    token_symbol = %symbol,
+                    token_symbol = ?token_symbol,
                     initial_supply = supply,
                     "Minted initial subnet token supply"
                 );
@@ -623,13 +624,13 @@ impl<S: StateStore> RuntimeExecutor<S> {
     /// 
     /// # Arguments
     /// * `to` - Address to mint tokens to
-    /// * `coin_type` - Type of token to mint (e.g., "SETU", "SUBNET_TOKEN")
+    /// * `subnet_id` - Subnet ID (determines token type, 1:1 binding)
     /// * `amount` - Amount to mint
     /// * `ctx` - Execution context
     pub fn mint_tokens(
         &mut self,
         to: &Address,
-        coin_type: &str,
+        subnet_id: &str,
         amount: u64,
         _ctx: &ExecutionContext,
     ) -> RuntimeResult<ExecutionOutput> {
@@ -644,8 +645,8 @@ impl<S: StateStore> RuntimeExecutor<S> {
             });
         }
         
-        // Use deterministic coin ID for consistency with storage layer
-        let coin_id = deterministic_coin_id(to, coin_type);
+        // Use deterministic coin ID with subnet_id as namespace
+        let coin_id = deterministic_coin_id(to, subnet_id);
         
         // Check if coin already exists
         let existing = self.state.get_object(&coin_id)?;
@@ -668,7 +669,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
             }, false)
         } else {
             // Create new coin
-            let coin = create_typed_coin(to.clone(), amount, coin_type);
+            let coin = create_typed_coin(to.clone(), amount, subnet_id);
             let new_state = serde_json::to_vec(&coin)?;
             
             // Store with deterministic ID (not the random ID from create_typed_coin)
@@ -684,7 +685,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
         
         info!(
             to = %to,
-            coin_type = %coin_type,
+            subnet_id = %subnet_id,
             amount = amount,
             created = created,
             "Tokens minted"
@@ -692,7 +693,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
         
         Ok(ExecutionOutput {
             success: true,
-            message: Some(format!("Minted {} {} to {}", amount, coin_type, to)),
+            message: Some(format!("Minted {} tokens to {} in subnet {}", amount, to, subnet_id)),
             state_changes: vec![state_change],
             created_objects: if created { vec![coin_id] } else { vec![] },
             deleted_objects: vec![],
@@ -700,18 +701,23 @@ impl<S: StateStore> RuntimeExecutor<S> {
         })
     }
     
-    /// Get or create a coin for an address with specific token type
+    /// Get or create a coin for an address in specific subnet
     /// 
     /// Uses deterministic coin ID generation for consistency with storage layer.
     /// Returns (coin_id, was_created).
+    /// 
+    /// # Arguments
+    /// * `owner` - Owner address
+    /// * `subnet_id` - Subnet ID (determines token type)
+    /// * `ctx` - Execution context
     pub fn get_or_create_coin(
         &mut self,
         owner: &Address,
-        coin_type: &str,
+        subnet_id: &str,
         _ctx: &ExecutionContext,
     ) -> RuntimeResult<(ObjectId, bool)> {
-        // Use deterministic coin ID (same as storage layer)
-        let coin_id = deterministic_coin_id(owner, coin_type);
+        // Use deterministic coin ID with subnet_id
+        let coin_id = deterministic_coin_id(owner, subnet_id);
         
         // Check if coin already exists
         if self.state.get_object(&coin_id).is_ok() {
@@ -719,13 +725,13 @@ impl<S: StateStore> RuntimeExecutor<S> {
         }
         
         // Create new coin with 0 balance using deterministic ID
-        let coin = create_typed_coin(owner.clone(), 0, coin_type);
+        let coin = create_typed_coin(owner.clone(), 0, subnet_id);
         // Note: create_typed_coin generates random ID, but we use deterministic ID for storage
         self.state.set_object(coin_id, coin)?;
         
         info!(
             owner = %owner,
-            coin_type = %coin_type,
+            subnet_id = %subnet_id,
             coin_id = %coin_id,
             "Created empty coin for recipient with deterministic ID"
         );
