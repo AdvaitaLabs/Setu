@@ -54,15 +54,17 @@ pub fn read_key<P: AsRef<Path>>(path: P) -> Result<SetuKeyPair, KeyError> {
     let contents = std::fs::read_to_string(path)?;
     let contents = contents.trim();
     
-    // Try hex encoded private key first (32 bytes, most common for CLI-generated keys)
-    if let Ok(bytes) = hex::decode(contents) {
-        if bytes.len() == 32 {
-            // Raw 32-byte private key - try Secp256k1 first (validator keys)
-            if let Ok(kp) = SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::Secp256k1, &bytes) {
-                return Ok(kp);
+    // Try hex encoded private key first (64 hex chars = 32 bytes, most common for CLI-generated keys)
+    if contents.len() == 64 && contents.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Ok(bytes) = hex::decode(contents) {
+            if bytes.len() == 32 {
+                // Raw 32-byte private key - try Secp256k1 first (validator keys)
+                if let Ok(kp) = SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::Secp256k1, &bytes) {
+                    return Ok(kp);
+                }
+                // Fallback to Ed25519
+                return SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::ED25519, &bytes);
             }
-            // Fallback to Ed25519
-            return SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::ED25519, &bytes);
         }
     }
     
@@ -153,5 +155,23 @@ mod tests {
     fn test_file_not_found() {
         let result = read_keypair_from_file("/nonexistent/path/key.file");
         assert!(result.is_err());
+    }
+    
+    #[test]
+    fn test_read_hex_key() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hex.key");
+        
+        // Write hex private key (64 hex chars = 32 bytes)
+        std::fs::write(&path, "724fb385c31cd3ad3471620f93503c959a02c72f9bd3971a748f38172c9b89f8").unwrap();
+        
+        // Should load as Secp256k1
+        let loaded = read_key(&path).unwrap();
+        assert_eq!(loaded.scheme(), SignatureScheme::Secp256k1);
+        
+        // Should have valid address
+        let addr = loaded.address();
+        println!("Loaded key address: {}", addr);
+        assert_eq!(addr.to_hex().len(), 66); // 0x + 64 hex chars
     }
 }
