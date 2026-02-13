@@ -41,6 +41,7 @@ pub fn read_keypair_from_file<P: AsRef<Path>>(path: P) -> Result<SetuKeyPair, Ke
 /// Read a keypair from a file, supporting multiple formats:
 /// - Base64 encoded `flag || privkey`
 /// - Hex encoded private key (assumes Ed25519)
+/// - JSON format (from CLI keygen)
 pub fn read_key<P: AsRef<Path>>(path: P) -> Result<SetuKeyPair, KeyError> {
     let path = path.as_ref();
     if !path.exists() {
@@ -58,9 +59,27 @@ pub fn read_key<P: AsRef<Path>>(path: P) -> Result<SetuKeyPair, KeyError> {
         return Ok(kp);
     }
     
-    // Try hex encoded private key (assume Ed25519 32 bytes)
+    // Try JSON format (from CLI keygen)
+    if contents.starts_with('{') {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(contents) {
+            if let Some(private_key_str) = json.get("private_key").and_then(|v| v.as_str()) {
+                if let Ok(bytes) = hex::decode(private_key_str) {
+                    // Assume Secp256k1 for validator keys (32 bytes)
+                    if bytes.len() == 32 {
+                        return SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::Secp256k1, &bytes);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Try hex encoded private key (32 bytes)
     if let Ok(bytes) = hex::decode(contents) {
         if bytes.len() == 32 {
+            // Try Secp256k1 first (validator keys), fallback to Ed25519
+            if let Ok(kp) = SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::Secp256k1, &bytes) {
+                return Ok(kp);
+            }
             return SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::ED25519, &bytes);
         }
     }

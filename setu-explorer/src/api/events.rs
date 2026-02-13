@@ -26,9 +26,8 @@ pub async fn list_events(
         // Filter by creator
         storage.get_events_by_creator(creator).await
     } else {
-        // Get all events (this might be slow for large datasets)
-        // TODO: Implement proper pagination at storage level
-        vec![]
+        // Get all finalized events by default
+        storage.get_events_by_status(EventStatus::Finalized).await
     };
     
     // Filter by event type if specified

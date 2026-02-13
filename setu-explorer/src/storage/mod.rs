@@ -23,7 +23,7 @@ impl ExplorerStorage {
         // Open RocksDB in read-only mode (won't conflict with validator)
         let db = Arc::new(SetuDB::open_readonly(path.as_ref())?);
         
-        // Create stores (they will use the read-only DB)
+        // Create stores (not used anymore, kept for compatibility)
         let event_store = EventStore::new();
         let anchor_store = AnchorStore::new();
         
@@ -37,60 +37,15 @@ impl ExplorerStorage {
             object_store,
         };
         
-        // Load data from RocksDB into memory caches
-        storage.load_from_db()?;
+        // No need to load data into memory - we query RocksDB directly!
+        println!("✓ Explorer storage initialized (real-time RocksDB queries)");
         
         Ok(storage)
     }
     
-    /// Load events and anchors from RocksDB into memory caches
+    /// Load events and anchors from RocksDB into memory caches (DEPRECATED - not used)
     fn load_from_db(&self) -> anyhow::Result<()> {
-        use setu_storage::ColumnFamily;
-        
-        // Load events
-        let events_iter = self.db.iter_values::<Event>(ColumnFamily::Events)?;
-        let mut event_count = 0;
-        
-        for event_result in events_iter {
-            match event_result {
-                Ok(event) => {
-                    // Store in memory cache (depth will be 0 for now)
-                    // TODO: Calculate depth from parent relationships
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            let _ = self.event_store.store_with_depth(event, 0).await;
-                        })
-                    });
-                    event_count += 1;
-                }
-                Err(e) => {
-                    eprintln!("Failed to load event: {}", e);
-                }
-            }
-        }
-        
-        // Load anchors
-        let anchors_iter = self.db.iter_values::<Anchor>(ColumnFamily::Anchors)?;
-        let mut anchor_count = 0;
-        
-        for anchor_result in anchors_iter {
-            match anchor_result {
-                Ok(anchor) => {
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            let _ = self.anchor_store.store(anchor).await;
-                        })
-                    });
-                    anchor_count += 1;
-                }
-                Err(e) => {
-                    eprintln!("Failed to load anchor: {}", e);
-                }
-            }
-        }
-        
-        println!("✓ Loaded {} events and {} anchors from RocksDB", event_count, anchor_count);
-        
+        // This method is no longer used - we query RocksDB directly for real-time data
         Ok(())
     }
     
@@ -111,59 +66,136 @@ impl ExplorerStorage {
     
     // Convenience methods
     
-    /// Get event by ID
+    /// Get event by ID (query RocksDB directly for real-time data)
     pub async fn get_event(&self, event_id: &str) -> Option<Event> {
-        self.event_store.get(&event_id.to_string()).await
+        use setu_storage::ColumnFamily;
+        self.db.get::<Event>(ColumnFamily::Events, event_id.as_bytes()).ok().flatten()
     }
     
     /// Get multiple events
     pub async fn get_events(&self, event_ids: &[EventId]) -> Vec<Event> {
-        self.event_store.get_many(event_ids).await
+        let mut events = Vec::new();
+        for event_id in event_ids {
+            if let Some(event) = self.get_event(event_id).await {
+                events.push(event);
+            }
+        }
+        events
     }
     
-    /// Get events by status
+    /// Get events by status (query RocksDB directly for real-time data)
     pub async fn get_events_by_status(&self, status: EventStatus) -> Vec<Event> {
-        self.event_store.get_by_status(status).await
+        use setu_storage::ColumnFamily;
+        let mut events = Vec::new();
+        if let Ok(iter) = self.db.iter_values::<Event>(ColumnFamily::Events) {
+            for event_result in iter {
+                if let Ok(event) = event_result {
+                    if event.status == status {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+        events
     }
     
     /// Get events by creator
     pub async fn get_events_by_creator(&self, creator: &str) -> Vec<Event> {
-        self.event_store.get_by_creator(creator).await
+        use setu_storage::ColumnFamily;
+        let mut events = Vec::new();
+        if let Ok(iter) = self.db.iter_values::<Event>(ColumnFamily::Events) {
+            for event_result in iter {
+                if let Ok(event) = event_result {
+                    if event.creator == creator {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+        events
     }
     
     /// Get event depth
     pub async fn get_event_depth(&self, event_id: &EventId) -> Option<u64> {
-        self.event_store.get_depth(event_id).await
+        // TODO: Store depth in RocksDB
+        None
     }
     
-    /// Count events
+    /// Count events (query RocksDB directly for real-time count)
     pub async fn count_events(&self) -> usize {
-        self.event_store.count().await
+        use setu_storage::ColumnFamily;
+        let mut count = 0;
+        if let Ok(iter) = self.db.iter_values::<Event>(ColumnFamily::Events) {
+            for _ in iter {
+                count += 1;
+            }
+        }
+        count
     }
     
-    /// Get anchor by ID
+    /// Get anchor by ID (query RocksDB directly for real-time data)
     pub async fn get_anchor(&self, anchor_id: &str) -> Option<Anchor> {
-        self.anchor_store.get(&anchor_id.to_string()).await
+        use setu_storage::ColumnFamily;
+        self.db.get::<Anchor>(ColumnFamily::Anchors, anchor_id.as_bytes()).ok().flatten()
     }
     
     /// Get latest anchor
     pub async fn get_latest_anchor(&self) -> Option<Anchor> {
-        self.anchor_store.get_latest().await
+        use setu_storage::ColumnFamily;
+        let mut latest: Option<Anchor> = None;
+        if let Ok(iter) = self.db.iter_values::<Anchor>(ColumnFamily::Anchors) {
+            for anchor_result in iter {
+                if let Ok(anchor) = anchor_result {
+                    if latest.is_none() || anchor.depth > latest.as_ref().unwrap().depth {
+                        latest = Some(anchor);
+                    }
+                }
+            }
+        }
+        latest
     }
     
     /// Get anchor by depth
     pub async fn get_anchor_by_depth(&self, depth: u64) -> Option<Anchor> {
-        self.anchor_store.get_by_depth(depth).await
+        use setu_storage::ColumnFamily;
+        if let Ok(iter) = self.db.iter_values::<Anchor>(ColumnFamily::Anchors) {
+            for anchor_result in iter {
+                if let Ok(anchor) = anchor_result {
+                    if anchor.depth == depth {
+                        return Some(anchor);
+                    }
+                }
+            }
+        }
+        None
     }
     
     /// Get anchor chain
     pub async fn get_anchor_chain(&self) -> Vec<AnchorId> {
-        self.anchor_store.get_chain().await
+        use setu_storage::ColumnFamily;
+        let mut anchors = Vec::new();
+        if let Ok(iter) = self.db.iter_values::<Anchor>(ColumnFamily::Anchors) {
+            for anchor_result in iter {
+                if let Ok(anchor) = anchor_result {
+                    anchors.push(anchor);
+                }
+            }
+        }
+        // Sort by depth
+        anchors.sort_by_key(|a| a.depth);
+        anchors.into_iter().map(|a| a.id).collect()
     }
     
-    /// Count anchors
+    /// Count anchors (query RocksDB directly for real-time count)
     pub async fn count_anchors(&self) -> usize {
-        self.anchor_store.count().await
+        use setu_storage::ColumnFamily;
+        let mut count = 0;
+        if let Ok(iter) = self.db.iter_values::<Anchor>(ColumnFamily::Anchors) {
+            for _ in iter {
+                count += 1;
+            }
+        }
+        count
     }
     
     // Object store methods
