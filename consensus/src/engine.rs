@@ -1390,6 +1390,7 @@ mod tests {
             max_events_per_cf: 100,
             cf_timeout_ms: 5000,
             validator_count: 4,  // 4 validators: need 2 rejects to reject (1/3+1)
+            pocw: None,
         };
         
         let validator_set = create_validator_set();
@@ -1446,6 +1447,7 @@ mod tests {
             max_events_per_cf: 100,
             cf_timeout_ms: 100,  // 100ms timeout for testing
             validator_count: 4,
+            pocw: None,
         };
         
         let validator_set = create_validator_set();
@@ -1500,6 +1502,7 @@ mod tests {
             max_events_per_cf: 100,
             cf_timeout_ms: 100,  // 100ms timeout
             validator_count: 4,
+            pocw: None,
         };
         
         let validator_set = create_validator_set();
@@ -1549,6 +1552,7 @@ mod tests {
             max_events_per_cf: 100,
             cf_timeout_ms: 5000,
             validator_count: 4,
+            pocw: None,
         };
         
         let validator_set = create_validator_set();

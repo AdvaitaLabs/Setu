@@ -45,6 +45,7 @@ pub mod router;
 pub mod tee_verifier;
 pub mod validator_set;
 pub mod vlc;
+pub mod pocw;
 
 // Re-export main types
 pub use anchor_builder::{
