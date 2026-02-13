@@ -34,8 +34,8 @@ pub use address_derive::{
     verify_ethereum_address_derivation,
 };
 
-// Convenience alias
-pub use read_keypair_from_file as load_keypair;
+// Convenience alias - use read_key to support multiple formats (hex, base64, json)
+pub use read_key as load_keypair;
 
 // Re-export KeyPair type for convenience
 pub use SetuKeyPair as KeyPair;
