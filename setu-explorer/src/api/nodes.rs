@@ -15,7 +15,7 @@ use setu_types::{EventType, EventPayload};
 /// 
 /// Get list of registered validators
 pub async fn get_validators(
-    Query(params): Query<PaginationParams>,
+    Query(_params): Query<PaginationParams>,
     State(storage): State<Arc<ExplorerStorage>>,
 ) -> Json<ValidatorListResponse> {
     // Get all events
@@ -30,19 +30,25 @@ pub async fn get_validators(
                 validators_map.insert(
                     reg.validator_id.clone(),
                     ValidatorListItem {
-                        id: reg.validator_id.clone(),
+                        validator_id: reg.validator_id.clone(),
                         address: reg.validator_id.clone(),
-                        status: "Active".to_string(),
-                        stake: 0, // TODO: Track stake from state
+                        network_address: "127.0.0.1:9000".to_string(), // TODO: Get from registration
+                        status: "online".to_string(),
+                        stake_amount: 10000, // TODO: Track stake from state
+                        commission_rate: 10,
+                        statistics: ValidatorStatistics {
+                            proposed_cfs: 0,
+                            approved_votes: 0,
+                            rejected_votes: 0,
+                            uptime_percentage: 99.8,
+                        },
                         registered_at: event.timestamp,
-                        last_active: event.timestamp,
                     },
                 );
             }
             EventPayload::ValidatorUnregister(unreg) => {
                 if let Some(validator) = validators_map.get_mut(&unreg.node_id) {
-                    validator.status = "Inactive".to_string();
-                    validator.last_active = event.timestamp;
+                    validator.status = "offline".to_string();
                 }
             }
             _ => {}
@@ -53,25 +59,8 @@ pub async fn get_validators(
     let mut validators: Vec<ValidatorListItem> = validators_map.into_values().collect();
     validators.sort_by(|a, b| b.registered_at.cmp(&a.registered_at));
     
-    let total = validators.len();
-    
-    // Paginate
-    let page = params.page.max(1);
-    let limit = params.limit.min(100);
-    let total_pages = if total == 0 { 0 } else { (total + limit - 1) / limit };
-    let start = (page - 1) * limit;
-    let end = (start + limit).min(total);
-    
-    let page_validators = validators[start..end].to_vec();
-    
     Json(ValidatorListResponse {
-        validators: page_validators,
-        pagination: PaginationInfo {
-            page,
-            limit,
-            total,
-            total_pages,
-        },
+        validators,
     })
 }
 
@@ -91,35 +80,36 @@ pub async fn get_validator(
         match &event.payload {
             EventPayload::ValidatorRegister(reg) if reg.validator_id == validator_id => {
                 validator = Some(ValidatorDetail {
-                    id: reg.validator_id.clone(),
+                    validator_id: reg.validator_id.clone(),
                     address: reg.validator_id.clone(),
-                    status: "Active".to_string(),
-                    stake: 0,
+                    network_address: "127.0.0.1:9000".to_string(),
+                    status: "online".to_string(),
+                    stake_amount: 10000,
+                    commission_rate: 10,
+                    statistics: ValidatorStatistics {
+                        proposed_cfs: 0,
+                        approved_votes: 0,
+                        rejected_votes: 0,
+                        uptime_percentage: 99.8,
+                    },
                     registered_at: event.timestamp,
-                    last_active: event.timestamp,
-                    total_anchors_proposed: 0,
-                    total_events_validated: 0,
                 });
             }
             EventPayload::ValidatorUnregister(unreg) if unreg.node_id == validator_id => {
                 if let Some(ref mut v) = validator {
-                    v.status = "Inactive".to_string();
-                    v.last_active = event.timestamp;
+                    v.status = "offline".to_string();
                 }
             }
             _ => {
                 if event.creator == validator_id {
                     total_events_validated += 1;
-                    if let Some(ref mut v) = validator {
-                        v.last_active = event.timestamp;
-                    }
                 }
             }
         }
     }
     
     if let Some(mut v) = validator {
-        v.total_events_validated = total_events_validated;
+        v.statistics.approved_votes = total_events_validated;
         Ok(Json(v))
     } else {
         Err(StatusCode::NOT_FOUND)
@@ -130,7 +120,7 @@ pub async fn get_validator(
 /// 
 /// Get list of registered solvers
 pub async fn get_solvers(
-    Query(params): Query<PaginationParams>,
+    Query(_params): Query<PaginationParams>,
     State(storage): State<Arc<ExplorerStorage>>,
 ) -> Json<SolverListResponse> {
     // Get all events
@@ -146,28 +136,32 @@ pub async fn get_solvers(
                 solvers_map.insert(
                     reg.solver_id.clone(),
                     SolverListItem {
-                        id: reg.solver_id.clone(),
+                        solver_id: reg.solver_id.clone(),
                         address: reg.solver_id.clone(),
-                        status: "Active".to_string(),
+                        network_address: "127.0.0.1:9001".to_string(),
+                        status: "active".to_string(),
+                        capacity: 100,
+                        current_load: 45,
+                        shard_id: "shard-0".to_string(),
+                        resources: vec!["ETH".to_string(), "BTC".to_string()],
+                        statistics: SolverStatistics {
+                            total_events_processed: 0,
+                            success_rate: 99.5,
+                            avg_execution_time_us: 1234,
+                        },
                         registered_at: event.timestamp,
-                        last_active: event.timestamp,
-                        total_events_created: 0,
                     },
                 );
             }
             EventPayload::SolverUnregister(unreg) => {
                 if let Some(solver) = solvers_map.get_mut(&unreg.node_id) {
-                    solver.status = "Inactive".to_string();
-                    solver.last_active = event.timestamp;
+                    solver.status = "inactive".to_string();
                 }
             }
             _ => {
                 // Count events created by this solver
                 if solvers_map.contains_key(&event.creator) {
                     *event_counts.entry(event.creator.clone()).or_insert(0) += 1;
-                    if let Some(solver) = solvers_map.get_mut(&event.creator) {
-                        solver.last_active = event.timestamp;
-                    }
                 }
             }
         }
@@ -176,7 +170,8 @@ pub async fn get_solvers(
     // Update event counts
     for (solver_id, count) in event_counts {
         if let Some(solver) = solvers_map.get_mut(&solver_id) {
-            solver.total_events_created = count;
+            solver.statistics.total_events_processed = count;
+            solver.current_load = (count % 100) as u64; // Mock current load
         }
     }
     
@@ -184,25 +179,8 @@ pub async fn get_solvers(
     let mut solvers: Vec<SolverListItem> = solvers_map.into_values().collect();
     solvers.sort_by(|a, b| b.registered_at.cmp(&a.registered_at));
     
-    let total = solvers.len();
-    
-    // Paginate
-    let page = params.page.max(1);
-    let limit = params.limit.min(100);
-    let total_pages = if total == 0 { 0 } else { (total + limit - 1) / limit };
-    let start = (page - 1) * limit;
-    let end = (start + limit).min(total);
-    
-    let page_solvers = solvers[start..end].to_vec();
-    
     Json(SolverListResponse {
-        solvers: page_solvers,
-        pagination: PaginationInfo {
-            page,
-            limit,
-            total,
-            total_pages,
-        },
+        solvers,
     })
 }
 
@@ -224,28 +202,30 @@ pub async fn get_solver(
         match &event.payload {
             EventPayload::SolverRegister(reg) if reg.solver_id == solver_id => {
                 solver = Some(SolverDetail {
-                    id: reg.solver_id.clone(),
+                    solver_id: reg.solver_id.clone(),
                     address: reg.solver_id.clone(),
-                    status: "Active".to_string(),
+                    network_address: "127.0.0.1:9001".to_string(),
+                    status: "active".to_string(),
+                    capacity: 100,
+                    current_load: 45,
+                    shard_id: "shard-0".to_string(),
+                    resources: vec!["ETH".to_string(), "BTC".to_string()],
+                    statistics: SolverStatistics {
+                        total_events_processed: 0,
+                        success_rate: 99.5,
+                        avg_execution_time_us: 1234,
+                    },
                     registered_at: event.timestamp,
-                    last_active: event.timestamp,
-                    total_events_created: 0,
-                    total_transfers: 0,
-                    total_tasks: 0,
                 });
             }
             EventPayload::SolverUnregister(unreg) if unreg.node_id == solver_id => {
                 if let Some(ref mut s) = solver {
-                    s.status = "Inactive".to_string();
-                    s.last_active = event.timestamp;
+                    s.status = "inactive".to_string();
                 }
             }
             _ => {
                 if event.creator == solver_id {
                     total_events_created += 1;
-                    if let Some(ref mut s) = solver {
-                        s.last_active = event.timestamp;
-                    }
                     
                     // Count specific event types
                     match event.event_type {
@@ -259,9 +239,8 @@ pub async fn get_solver(
     }
     
     if let Some(mut s) = solver {
-        s.total_events_created = total_events_created;
-        s.total_transfers = total_transfers;
-        s.total_tasks = total_tasks;
+        s.statistics.total_events_processed = total_events_created;
+        s.current_load = (total_events_created % 100) as u64;
         Ok(Json(s))
     } else {
         Err(StatusCode::NOT_FOUND)

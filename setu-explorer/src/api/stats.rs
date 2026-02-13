@@ -16,19 +16,15 @@ use std::sync::Arc;
 pub async fn get_stats(
     State(storage): State<Arc<ExplorerStorage>>,
 ) -> Json<StatsResponse> {
-    // Get anchor store stats
+    // Get anchor store stats (fast)
     let anchor_count = storage.count_anchors().await;
     let latest_anchor = storage.get_latest_anchor().await;
     
     // Get event store stats (fast - uses metadata or prefix count)
     let event_count = storage.count_events().await;
     
-    // Count validators and solvers from latest anchor events only (much faster)
-    let (validator_count, solver_count) = if let Some(ref anchor) = latest_anchor {
-        count_nodes_from_anchor_events(&storage, &anchor.event_ids).await
-    } else {
-        (0, 0)
-    };
+    // Count validators and solvers by scanning only registration events (fast)
+    let (validator_count, solver_count) = count_registered_nodes(&storage).await;
     
     // Calculate TPS (placeholder - need time-series data)
     let tps = 0.0;
@@ -77,25 +73,45 @@ pub async fn get_stats(
     })
 }
 
-/// Count nodes from specific anchor events (fast - only scans one anchor)
-async fn count_nodes_from_anchor_events(
-    storage: &ExplorerStorage,
-    event_ids: &[String],
-) -> (usize, usize) {
+/// Count registered nodes by scanning only registration events (fast)
+async fn count_registered_nodes(storage: &ExplorerStorage) -> (usize, usize) {
+    use setu_storage::ColumnFamily;
+    
     let mut registered_validators = std::collections::HashSet::new();
     let mut registered_solvers = std::collections::HashSet::new();
     
-    let events = storage.get_events(event_ids).await;
+    // Catch up with primary
+    let _ = storage.db().try_catch_up_with_primary();
     
-    for event in &events {
-        match &event.payload {
-            setu_types::EventPayload::ValidatorRegister(reg) => {
-                registered_validators.insert(reg.validator_id.clone());
+    // Get CF handle
+    let cf_handle = match storage.db().inner().cf_handle("events") {
+        Some(cf) => cf,
+        None => return (0, 0),
+    };
+    
+    // Scan only "evt:" prefix (skip index keys)
+    let prefix = b"evt:";
+    for result in storage.db().inner().prefix_iterator_cf(cf_handle, prefix) {
+        if let Ok((_key, value_bytes)) = result {
+            // Deserialize event
+            if let Ok(event) = bcs::from_bytes::<setu_types::Event>(&value_bytes) {
+                // Only process registration events
+                match &event.payload {
+                    setu_types::EventPayload::ValidatorRegister(reg) => {
+                        registered_validators.insert(reg.validator_id.clone());
+                    }
+                    setu_types::EventPayload::SolverRegister(reg) => {
+                        registered_solvers.insert(reg.solver_id.clone());
+                    }
+                    setu_types::EventPayload::ValidatorUnregister(unreg) => {
+                        registered_validators.remove(&unreg.node_id);
+                    }
+                    setu_types::EventPayload::SolverUnregister(unreg) => {
+                        registered_solvers.remove(&unreg.node_id);
+                    }
+                    _ => {}
+                }
             }
-            setu_types::EventPayload::SolverRegister(reg) => {
-                registered_solvers.insert(reg.solver_id.clone());
-            }
-            _ => {}
         }
     }
     

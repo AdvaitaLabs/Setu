@@ -230,59 +230,80 @@ pub struct CausalPathResponse {
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorStatistics {
+    pub proposed_cfs: u64,
+    pub approved_votes: u64,
+    pub rejected_votes: u64,
+    pub uptime_percentage: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidatorListItem {
-    pub id: String,
+    pub validator_id: String,
     pub address: String,
+    pub network_address: String,
     pub status: String,
-    pub stake: u64,
+    pub stake_amount: u64,
+    pub commission_rate: u64,
+    pub statistics: ValidatorStatistics,
     pub registered_at: u64,
-    pub last_active: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidatorListResponse {
     pub validators: Vec<ValidatorListItem>,
-    pub pagination: PaginationInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidatorDetail {
-    pub id: String,
+    pub validator_id: String,
     pub address: String,
+    pub network_address: String,
     pub status: String,
-    pub stake: u64,
+    pub stake_amount: u64,
+    pub commission_rate: u64,
+    pub statistics: ValidatorStatistics,
     pub registered_at: u64,
-    pub last_active: u64,
-    pub total_anchors_proposed: u64,
-    pub total_events_validated: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolverStatistics {
+    pub total_events_processed: u64,
+    pub success_rate: f64,
+    pub avg_execution_time_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolverListItem {
-    pub id: String,
+    pub solver_id: String,
     pub address: String,
+    pub network_address: String,
     pub status: String,
+    pub capacity: u64,
+    pub current_load: u64,
+    pub shard_id: String,
+    pub resources: Vec<String>,
+    pub statistics: SolverStatistics,
     pub registered_at: u64,
-    pub last_active: u64,
-    pub total_events_created: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolverListResponse {
     pub solvers: Vec<SolverListItem>,
-    pub pagination: PaginationInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolverDetail {
-    pub id: String,
+    pub solver_id: String,
     pub address: String,
+    pub network_address: String,
     pub status: String,
+    pub capacity: u64,
+    pub current_load: u64,
+    pub shard_id: String,
+    pub resources: Vec<String>,
+    pub statistics: SolverStatistics,
     pub registered_at: u64,
-    pub last_active: u64,
-    pub total_events_created: u64,
-    pub total_transfers: u64,
-    pub total_tasks: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
