@@ -180,37 +180,37 @@ impl ExplorerStorage {
         
         use setu_storage::ColumnFamily;
         
-        // Scan all event keys with "evt:" prefix
-        let event_ids: Vec<String> = match self.db.prefix_scan_keys(ColumnFamily::Events, b"evt:") {
-            Ok(keys) => {
-                keys.into_iter()
-                    .filter_map(|key| {
-                        // Key format: evt:{event_id}
-                        // Extract event_id from key
-                        if key.len() > 4 {
-                            String::from_utf8(key[4..].to_vec()).ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            }
-            Err(e) => {
-                tracing::warn!("Failed to scan event prefix: {}", e);
+        // Use prefix_iterator to scan only "evt:" keys efficiently
+        let cf_handle = match self.db.inner().cf_handle("events") {
+            Some(cf) => cf,
+            None => {
+                tracing::error!("Events column family not found");
                 return Vec::new();
             }
         };
         
-        tracing::info!("Found {} total events", event_ids.len());
-        
-        // Get events by IDs
         let mut events = Vec::new();
-        for event_id in event_ids {
-            if let Some(event) = self.get_event(&event_id).await {
-                events.push(event);
+        let prefix = b"evt:";
+        
+        for result in self.db.inner().prefix_iterator_cf(cf_handle, prefix) {
+            match result {
+                Ok((_key, value_bytes)) => {
+                    // Deserialize value using BCS
+                    match bcs::from_bytes::<Event>(&value_bytes) {
+                        Ok(event) => events.push(event),
+                        Err(e) => {
+                            tracing::debug!("Failed to deserialize event: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Iterator error: {}", e);
+                    break;
+                }
             }
         }
         
+        tracing::info!("Found {} total events", events.len());
         events
     }
     
