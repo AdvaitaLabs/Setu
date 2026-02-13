@@ -20,24 +20,26 @@ pub async fn get_stats(
     
     let start = Instant::now();
     
-    // Get anchor store stats (fast)
+    // Get anchor chain length (accurate count)
     let t1 = Instant::now();
-    let anchor_count = storage.count_anchors().await;
-    tracing::info!("count_anchors took: {:?}", t1.elapsed());
+    let anchor_chain = storage.get_anchor_chain().await;
+    let anchor_count = anchor_chain.len();
+    tracing::info!("get_anchor_chain took: {:?}", t1.elapsed());
     
     let t2 = Instant::now();
     let latest_anchor = storage.get_latest_anchor().await;
     tracing::info!("get_latest_anchor took: {:?}", t2.elapsed());
     
-    // Get event store stats (fast - uses metadata or prefix count)
+    // Get all events to count accurately
     let t3 = Instant::now();
-    let event_count = storage.count_events().await;
-    tracing::info!("count_events took: {:?}", t3.elapsed());
+    let all_events = storage.get_all_events().await;
+    let event_count = all_events.len();
+    tracing::info!("get_all_events took: {:?}", t3.elapsed());
     
-    // Count validators and solvers from /validators and /solvers APIs
+    // Count validators and solvers from events
     let t4 = Instant::now();
-    let (validator_count, solver_count) = count_nodes_fast(&storage).await;
-    tracing::info!("count_nodes_fast took: {:?}", t4.elapsed());
+    let (validator_count, solver_count) = count_nodes_from_events(&all_events);
+    tracing::info!("count_nodes_from_events took: {:?}", t4.elapsed());
     
     // Calculate TPS (placeholder - need time-series data)
     let tps = 0.0;
@@ -92,42 +94,32 @@ pub async fn get_stats(
     })
 }
 
-/// Count nodes quickly by only checking event types (no deserialization of payload)
-async fn count_nodes_fast(storage: &ExplorerStorage) -> (usize, usize) {
-    use setu_storage::ColumnFamily;
-    use setu_types::EventType;
+/// Count nodes from events list (fast - already in memory)
+fn count_nodes_from_events(events: &[setu_types::Event]) -> (usize, usize) {
+    use std::collections::HashSet;
     
-    let mut validator_registrations: usize = 0;
-    let mut solver_registrations: usize = 0;
+    let mut validators = HashSet::new();
+    let mut solvers = HashSet::new();
     
-    // Catch up with primary
-    let _ = storage.db().try_catch_up_with_primary();
-    
-    // Get CF handle
-    let cf_handle = match storage.db().inner().cf_handle("events") {
-        Some(cf) => cf,
-        None => return (0, 0),
-    };
-    
-    // Scan only "evt:" prefix (skip index keys)
-    let prefix = b"evt:";
-    for result in storage.db().inner().prefix_iterator_cf(cf_handle, prefix) {
-        if let Ok((_key, value_bytes)) = result {
-            // Deserialize event
-            if let Ok(event) = bcs::from_bytes::<setu_types::Event>(&value_bytes) {
-                // Only count by event type (fast - no payload deserialization needed)
-                match event.event_type {
-                    EventType::ValidatorRegister => validator_registrations += 1,
-                    EventType::SolverRegister => solver_registrations += 1,
-                    EventType::ValidatorUnregister => validator_registrations = validator_registrations.saturating_sub(1),
-                    EventType::SolverUnregister => solver_registrations = solver_registrations.saturating_sub(1),
-                    _ => {}
-                }
+    for event in events {
+        match &event.payload {
+            setu_types::EventPayload::ValidatorRegister(reg) => {
+                validators.insert(reg.validator_id.clone());
             }
+            setu_types::EventPayload::SolverRegister(reg) => {
+                solvers.insert(reg.solver_id.clone());
+            }
+            setu_types::EventPayload::ValidatorUnregister(unreg) => {
+                validators.remove(&unreg.node_id);
+            }
+            setu_types::EventPayload::SolverUnregister(unreg) => {
+                solvers.remove(&unreg.node_id);
+            }
+            _ => {}
         }
     }
     
-    (validator_registrations, solver_registrations)
+    (validators.len(), solvers.len())
 }
 
 
