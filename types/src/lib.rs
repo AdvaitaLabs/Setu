@@ -81,7 +81,7 @@ pub use merkle::{
 pub use account_view::AccountView;
 
 // Task types for Validator → Solver communication
-pub use pocw::PoCWConfig;
+pub use pocw::{PoCWConfig, SolverReward, FoldEconomics};
 
 pub use task::{
     SolverTask, ResolvedInputs, OperationType, ResolvedObject,

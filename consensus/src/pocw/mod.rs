@@ -4,3 +4,4 @@
 
 pub mod flux_burn;
 pub mod power;
+pub mod processor;

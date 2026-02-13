@@ -35,6 +35,31 @@ impl Default for PoCWConfig {
     }
 }
 
+/// Solver reward record for a single solver within a fold
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolverReward {
+    pub solver_id: String,
+    /// Number of FluxTransfer events this solver processed in the fold
+    pub transfer_count: u64,
+    /// Flux reward for this solver
+    pub flux_reward: u64,
+}
+
+/// Fold-level economic summary
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FoldEconomics {
+    /// Number of events in this fold
+    pub event_count: usize,
+    /// Total Flux burned across all events in this fold
+    pub total_flux_burned: u64,
+    /// Total power drained across all events in this fold
+    pub total_power_consumed: u64,
+    /// Total Flux minted as solver rewards in this fold
+    pub total_solver_rewards: u64,
+    /// Per-solver reward breakdown
+    pub solver_rewards: Vec<SolverReward>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
