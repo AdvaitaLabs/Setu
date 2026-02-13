@@ -214,13 +214,35 @@ impl ExplorerStorage {
     
     /// Count events (query RocksDB directly for real-time count)
     pub async fn count_events(&self) -> usize {
+        // Catch up with primary to see latest writes
+        if let Err(e) = self.db.try_catch_up_with_primary() {
+            tracing::warn!("Failed to catch up with primary: {}", e);
+        }
+        
         use setu_storage::ColumnFamily;
+        
+        // Try to get count from metadata first (much faster)
+        let count_key = b"meta:event_count";
+        if let Ok(Some(count)) = self.db.get_raw::<u64>(ColumnFamily::Events, count_key) {
+            return count as usize;
+        }
+        
+        // Fallback: count by iterating (slower)
         let mut count = 0;
-        if let Ok(iter) = self.db.iter_values::<Event>(ColumnFamily::Events) {
-            for _ in iter {
+        let cf_handle = match self.db.inner().cf_handle("events") {
+            Some(cf) => cf,
+            None => return 0,
+        };
+        
+        let prefix = b"evt:";
+        for result in self.db.inner().prefix_iterator_cf(cf_handle, prefix) {
+            if result.is_ok() {
                 count += 1;
+            } else {
+                break;
             }
         }
+        
         count
     }
     

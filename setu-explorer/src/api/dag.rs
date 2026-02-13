@@ -19,22 +19,23 @@ pub async fn get_dag_live(
     Query(params): Query<DagLiveParams>,
     State(storage): State<Arc<ExplorerStorage>>,
 ) -> Result<Json<DagLiveResponse>, StatusCode> {
-    // Get events to visualize
+    // Get events to visualize - only from latest anchor (fast)
     let events = if let Some(ref anchor_id) = params.anchor_id {
         // Get events from specific anchor
         let anchor = storage
             .get_anchor(anchor_id)
             .await
             .ok_or(StatusCode::NOT_FOUND)?;
-        storage.get_events(&anchor.event_ids).await
+        
+        let mut events = storage.get_events(&anchor.event_ids).await;
+        events.truncate(params.limit);
+        events
     } else {
-        // Get recent events from latest anchor
+        // Get events from latest anchor only (much faster than scanning all events)
         if let Some(latest_anchor) = storage.get_latest_anchor().await {
-            let mut all_events = storage.get_events(&latest_anchor.event_ids).await;
-            
-            // Limit to requested size
-            all_events.truncate(params.limit);
-            all_events
+            let mut events = storage.get_events(&latest_anchor.event_ids).await;
+            events.truncate(params.limit);
+            events
         } else {
             vec![]
         }
@@ -67,7 +68,7 @@ pub async fn get_dag_live(
     
     for (idx, event) in events.iter().enumerate() {
         let short_id = format!("ev_{}", idx);
-        let depth = storage.get_event_depth(&event.id).await.unwrap_or(0);
+        let depth = idx as u64; // Use index as depth for now (fast)
         depths.push(depth);
         
         nodes.push(DagNode {

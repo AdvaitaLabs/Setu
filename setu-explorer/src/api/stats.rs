@@ -20,18 +20,15 @@ pub async fn get_stats(
     let anchor_count = storage.count_anchors().await;
     let latest_anchor = storage.get_latest_anchor().await;
     
-    // Get event store stats
+    // Get event store stats (fast - uses metadata or prefix count)
     let event_count = storage.count_events().await;
     
-    // Count validators and solvers
-    // Strategy: Try RPC first, fallback to events
-    let (validator_count, solver_count) = match get_node_counts_from_rpc().await {
-        Some(counts) => counts,
-        None => get_node_counts_from_events(&storage).await,
+    // Count validators and solvers from latest anchor events only (much faster)
+    let (validator_count, solver_count) = if let Some(ref anchor) = latest_anchor {
+        count_nodes_from_anchor_events(&storage, &anchor.event_ids).await
+    } else {
+        (0, 0)
     };
-    
-    // Get all events for activity stats
-    let all_events = storage.get_events_by_status(setu_types::EventStatus::Finalized).await;
     
     // Calculate TPS (placeholder - need time-series data)
     let tps = 0.0;
@@ -44,7 +41,7 @@ pub async fn get_stats(
     };
     
     // Build latest anchor info
-    let latest_anchor_info = latest_anchor.map(|anchor| LatestAnchorInfo {
+    let latest_anchor_info = latest_anchor.as_ref().map(|anchor| LatestAnchorInfo {
         id: anchor.id.to_string(),
         depth: anchor.depth,
         event_count: anchor.event_ids.len(),
@@ -52,29 +49,13 @@ pub async fn get_stats(
         vlc_time: anchor.vlc_snapshot.logical_time,
     });
     
-    // Calculate recent activity (last 24 hours)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    let day_ago = now.saturating_sub(24 * 60 * 60 * 1000);
-    
-    let mut last_24h_events = 0;
-    let mut last_24h_transfers = 0;
-    let mut last_24h_registrations = 0;
-    
-    for event in &all_events {
-        if event.timestamp >= day_ago {
-            last_24h_events += 1;
-            match event.event_type {
-                setu_types::EventType::Transfer => last_24h_transfers += 1,
-                setu_types::EventType::ValidatorRegister
-                | setu_types::EventType::SolverRegister
-                | setu_types::EventType::UserRegister => last_24h_registrations += 1,
-                _ => {}
-            }
-        }
-    }
+    // Calculate recent activity from latest anchor only (fast approximation)
+    let (last_24h_events, last_24h_transfers, last_24h_registrations) = 
+        if let Some(anchor) = latest_anchor {
+            calculate_recent_activity_from_anchor(&storage, &anchor).await
+        } else {
+            (0, 0, 0)
+        };
     
     let recent_activity = RecentActivity {
         last_24h_events,
@@ -96,47 +77,17 @@ pub async fn get_stats(
     })
 }
 
-/// Try to get node counts from RPC
-async fn get_node_counts_from_rpc() -> Option<(usize, usize)> {
-    // Get RPC address from environment or use default
-    let rpc_addr = std::env::var("VALIDATOR_RPC_ADDR")
-        .unwrap_or_else(|_| "http://localhost:8080".to_string());
-    
-    // Try to get validators
-    let validators_url = format!("{}/api/v1/validators", rpc_addr);
-    let validator_count = reqwest::get(&validators_url)
-        .await
-        .ok()?
-        .json::<serde_json::Value>()
-        .await
-        .ok()?
-        .get("validators")?
-        .as_array()?
-        .len();
-    
-    // Try to get solvers
-    let solvers_url = format!("{}/api/v1/solvers", rpc_addr);
-    let solver_count = reqwest::get(&solvers_url)
-        .await
-        .ok()?
-        .json::<serde_json::Value>()
-        .await
-        .ok()?
-        .get("solvers")?
-        .as_array()?
-        .len();
-    
-    Some((validator_count, solver_count))
-}
-
-/// Fallback: count nodes from events
-async fn get_node_counts_from_events(storage: &ExplorerStorage) -> (usize, usize) {
+/// Count nodes from specific anchor events (fast - only scans one anchor)
+async fn count_nodes_from_anchor_events(
+    storage: &ExplorerStorage,
+    event_ids: &[String],
+) -> (usize, usize) {
     let mut registered_validators = std::collections::HashSet::new();
     let mut registered_solvers = std::collections::HashSet::new();
     
-    let all_events = storage.get_events_by_status(setu_types::EventStatus::Finalized).await;
+    let events = storage.get_events(event_ids).await;
     
-    for event in &all_events {
+    for event in &events {
         match &event.payload {
             setu_types::EventPayload::ValidatorRegister(reg) => {
                 registered_validators.insert(reg.validator_id.clone());
@@ -149,6 +100,39 @@ async fn get_node_counts_from_events(storage: &ExplorerStorage) -> (usize, usize
     }
     
     (registered_validators.len(), registered_solvers.len())
+}
+
+/// Calculate recent activity from anchor events (fast approximation)
+async fn calculate_recent_activity_from_anchor(
+    storage: &ExplorerStorage,
+    anchor: &setu_types::Anchor,
+) -> (u64, u64, u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let day_ago = now.saturating_sub(24 * 60 * 60 * 1000);
+    
+    let events = storage.get_events(&anchor.event_ids).await;
+    
+    let mut last_24h_events = 0;
+    let mut last_24h_transfers = 0;
+    let mut last_24h_registrations = 0;
+    
+    for event in &events {
+        if event.timestamp >= day_ago {
+            last_24h_events += 1;
+            match event.event_type {
+                setu_types::EventType::Transfer => last_24h_transfers += 1,
+                setu_types::EventType::ValidatorRegister
+                | setu_types::EventType::SolverRegister
+                | setu_types::EventType::UserRegister => last_24h_registrations += 1,
+                _ => {}
+            }
+        }
+    }
+    
+    (last_24h_events, last_24h_transfers, last_24h_registrations)
 }
 
 
