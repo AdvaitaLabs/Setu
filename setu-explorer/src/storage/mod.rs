@@ -20,8 +20,16 @@ pub struct ExplorerStorage {
 impl ExplorerStorage {
     /// Open storage in read-only mode
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        // Open RocksDB in read-only mode (won't conflict with validator)
-        let db = Arc::new(SetuDB::open_readonly(path.as_ref())?);
+        // Open RocksDB as secondary instance (can see validator's writes)
+        // Secondary path is in a subdirectory to avoid conflicts
+        let primary_path = path.as_ref();
+        let secondary_path = primary_path.join("secondary");
+        std::fs::create_dir_all(&secondary_path)?;
+        
+        let db = Arc::new(SetuDB::open_secondary(primary_path, &secondary_path)?);
+        
+        // Catch up with primary to see latest data
+        db.try_catch_up_with_primary()?;
         
         // Create stores (not used anymore, kept for compatibility)
         let event_store = EventStore::new();
@@ -38,7 +46,7 @@ impl ExplorerStorage {
         };
         
         // No need to load data into memory - we query RocksDB directly!
-        println!("✓ Explorer storage initialized (real-time RocksDB queries)");
+        println!("✓ Explorer storage initialized (secondary instance, real-time sync)");
         
         Ok(storage)
     }
@@ -68,12 +76,18 @@ impl ExplorerStorage {
     
     /// Get event by ID (query RocksDB directly for real-time data)
     pub async fn get_event(&self, event_id: &str) -> Option<Event> {
+        // Catch up with primary to see latest writes
+        let _ = self.db.try_catch_up_with_primary();
+        
         use setu_storage::ColumnFamily;
         self.db.get_raw::<Event>(ColumnFamily::Events, event_id.as_bytes()).ok().flatten()
     }
     
     /// Get multiple events
     pub async fn get_events(&self, event_ids: &[EventId]) -> Vec<Event> {
+        // Catch up with primary to see latest writes
+        let _ = self.db.try_catch_up_with_primary();
+        
         let mut events = Vec::new();
         for event_id in event_ids {
             if let Some(event) = self.get_event(event_id).await {
@@ -85,6 +99,9 @@ impl ExplorerStorage {
     
     /// Get events by status (query RocksDB directly for real-time data)
     pub async fn get_events_by_status(&self, status: EventStatus) -> Vec<Event> {
+        // Catch up with primary to see latest writes
+        let _ = self.db.try_catch_up_with_primary();
+        
         use setu_storage::ColumnFamily;
         let mut events = Vec::new();
         if let Ok(iter) = self.db.iter_values::<Event>(ColumnFamily::Events) {

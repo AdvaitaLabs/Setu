@@ -45,6 +45,32 @@ impl SetuDB {
         })
     }
     
+    /// Open a database as secondary instance (can see primary's writes)
+    /// 
+    /// This is the correct mode for Explorer to use when Validator is running.
+    /// The secondary instance can see writes from the primary instance in real-time
+    /// by calling try_catch_up_with_primary().
+    pub fn open_secondary(primary_path: impl AsRef<Path>, secondary_path: impl AsRef<Path>) -> Result<Self> {
+        let config = RocksDBConfig::new(primary_path.as_ref());
+        let opts = config.to_options();
+        let cfs = ColumnFamily::descriptors();
+        
+        // Open as secondary instance
+        let db = DB::open_cf_descriptors_as_secondary(&opts, primary_path, secondary_path, cfs)?;
+        
+        Ok(Self {
+            db: Arc::new(db),
+        })
+    }
+    
+    /// Catch up with primary instance (for secondary mode)
+    /// 
+    /// Call this periodically to see the latest writes from the primary instance.
+    pub fn try_catch_up_with_primary(&self) -> Result<()> {
+        self.db.try_catch_up_with_primary()?;
+        Ok(())
+    }
+    
     /// Get a reference to the underlying RocksDB instance
     pub fn inner(&self) -> &DB {
         &self.db
