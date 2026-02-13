@@ -163,11 +163,10 @@ async fn main() -> anyhow::Result<()> {
         config.http_addr.ip().to_string(),
         config.http_addr.port(),
     );
-    let consensus_config = ConsensusValidatorConfig {
-        node_info,
-        is_leader: true, // Single node mode: always leader
-        ..Default::default()
-    };
+    let mut consensus_config = ConsensusValidatorConfig::default();
+    consensus_config.node_info = node_info;
+    consensus_config.is_leader = true; // Single node mode: always leader
+    consensus_config.consensus.validator_count = 1; // Single node mode: only 1 validator
     
     // Create ConsensusValidator with appropriate storage backend
     let consensus_validator = if let Some(ref db_path) = config.db_path {
