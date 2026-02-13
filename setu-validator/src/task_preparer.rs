@@ -150,47 +150,45 @@ impl TaskPreparer {
     ///
     /// This is the main entry point for task preparation.
     /// Returns a fully prepared SolverTask ready for Solver execution.
+    /// 
+    /// The coin is selected based on the subnet_id (1 subnet : 1 token binding).
+    /// - If `subnet_id` is ROOT, uses ROOT subnet's native token
+    /// - Otherwise, uses the subnet's native token
     pub fn prepare_transfer_task(
         &self,
         transfer: &setu_types::Transfer,
         subnet_id: SubnetId,
     ) -> Result<SolverTask, TaskPrepareError> {
-        // Use default coin type (native SETU)
-        self.prepare_transfer_task_with_coin_type(transfer, subnet_id, None)
-    }
-    
-    /// Prepare a SolverTask from a Transfer request with specified coin type
-    ///
-    /// This variant allows specifying a coin type for multi-subnet scenarios
-    /// where each subnet application may have its own token type.
-    pub fn prepare_transfer_task_with_coin_type(
-        &self,
-        transfer: &setu_types::Transfer,
-        subnet_id: SubnetId,
-        coin_type: Option<&str>,
-    ) -> Result<SolverTask, TaskPrepareError> {
         let amount = transfer.amount;
+        
+        // Use subnet_id as the coin namespace (1:1 binding)
+        // For ROOT subnet, use "ROOT" as the identifier
+        let subnet_id_str = if subnet_id == SubnetId::ROOT {
+            "ROOT".to_string()
+        } else {
+            subnet_id.to_string()
+        };
         
         debug!(
             transfer_id = %transfer.id,
             from = %transfer.from,
             to = %transfer.to,
             amount = amount,
-            coin_type = ?coin_type,
+            subnet_id = %subnet_id_str,
             "Preparing SolverTask for transfer"
         );
         
-        // Step 1: Select coins for sender (filter by coin_type if specified)
-        let sender_coins = match coin_type {
-            Some(ct) => self.state_provider.get_coins_for_address_by_type(&transfer.from, ct),
-            None => self.state_provider.get_coins_for_address(&transfer.from),
-        };
+        // Step 1: Select coins for sender filtered by subnet_id
+        let sender_coins = self.state_provider.get_coins_for_address_by_type(
+            &transfer.from,
+            &subnet_id_str,
+        );
         let selected_coin = self.select_coin_for_transfer(&sender_coins, amount)?;
         
         debug!(
             object_id = ?selected_coin.object_id,
             coin_balance = selected_coin.balance,
-            coin_type = %selected_coin.coin_type,
+            subnet_id = %selected_coin.coin_type,
             "Selected coin for transfer"
         );
         
@@ -429,27 +427,28 @@ mod tests {
     fn test_select_smallest_sufficient_coin() {
         let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
         
+        // coin_type now represents subnet_id (ROOT = root subnet)
         let coins = vec![
             CoinInfo {
                 object_id: ObjectId::new([1u8; 32]),
                 owner: "alice".to_string(),
                 balance: 500,
                 version: 1,
-                coin_type: "SETU".to_string(),
+                coin_type: "ROOT".to_string(),
             },
             CoinInfo {
                 object_id: ObjectId::new([2u8; 32]),
                 owner: "alice".to_string(),
                 balance: 200,
                 version: 1,
-                coin_type: "SETU".to_string(),
+                coin_type: "ROOT".to_string(),
             },
             CoinInfo {
                 object_id: ObjectId::new([3u8; 32]),
                 owner: "alice".to_string(),
                 balance: 1000,
                 version: 1,
-                coin_type: "SETU".to_string(),
+                coin_type: "ROOT".to_string(),
             },
         ];
         
@@ -474,7 +473,7 @@ mod tests {
                 owner: "alice".to_string(),
                 balance: 50,
                 version: 1,
-                coin_type: "SETU".to_string(),
+                coin_type: "ROOT".to_string(),  // subnet_id
             },
         ];
         

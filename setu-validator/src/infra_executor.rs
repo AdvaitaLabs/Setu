@@ -250,8 +250,8 @@ mod tests {
         let provider = Arc::new(MerkleStateProvider::new(state_manager));
         let executor = InfraExecutor::new("validator-1".to_string(), provider);
 
-        let registration = SubnetRegistration::new("subnet-test", "Test Subnet", "owner-addr")
-            .with_token("TEST", 1_000_000);
+        let registration = SubnetRegistration::new("subnet-test", "Test Subnet", "owner-addr", "TEST")
+            .with_initial_supply(1_000_000);
 
         let vlc = VLCSnapshot {
             vector_clock: setu_vlc::VectorClock::new(),
