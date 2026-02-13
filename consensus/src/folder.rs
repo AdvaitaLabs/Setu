@@ -160,6 +160,9 @@ impl ConsensusManager {
     /// 1. Calls prepare_build() which computes but doesn't modify state
     /// 2. Stores PendingAnchorBuild for later commit on finalization
     /// 3. Creates ConsensusFrame for voting
+    /// 
+    /// Note: The CF is NOT added to pending_cfs here. The caller should
+    /// call receive_cf() to add it and vote for it.
     pub fn try_create_cf(
         &mut self,
         dag: &Dag,
@@ -175,7 +178,7 @@ impl ConsensusManager {
                 
                 // Store pending_build for later commit (keyed by cf_id)
                 self.pending_builds.insert(cf.id.clone(), pending_build);
-                self.pending_cfs.insert(cf.id.clone(), cf.clone());
+                // NOTE: Do NOT add to pending_cfs here - let receive_cf() handle it
                 
                 Some(cf)
             }

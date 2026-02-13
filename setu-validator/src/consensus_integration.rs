@@ -411,7 +411,7 @@ impl ConsensusValidator {
                             "CF created by periodic task"
                         );
                         
-                        // In single-node mode, immediately finalize (no voting needed)
+                        // In single-node mode, receive CF (will auto-vote and finalize)
                         match engine.receive_cf(cf.clone()).await {
                             Ok((finalized, Some(anchor))) if finalized => {
                                 info!(
@@ -449,7 +449,7 @@ impl ConsensusValidator {
                                 );
                             }
                             Ok(_) => {
-                                debug!("CF received but not finalized yet");
+                                warn!("CF received but not finalized - this should not happen in single-node mode!");
                             }
                             Err(e) => {
                                 warn!(error = %e, "Failed to receive CF");
