@@ -124,6 +124,19 @@ impl SubnetStateSMT {
     pub fn is_empty(&self) -> bool {
         self.object_count == 0
     }
+
+    /// Iterate over all objects in this subnet.
+    ///
+    /// Returns an iterator of (object_id_bytes, value_bytes).
+    /// Useful for rebuilding indexes at startup.
+    pub fn iter_objects(&self) -> impl Iterator<Item = ([u8; 32], &Vec<u8>)> {
+        self.tree.iter_leaves().map(|(k, v)| (*k.as_bytes(), v))
+    }
+
+    /// Get all objects as a vector of (object_id_bytes, value_bytes).
+    pub fn all_objects(&self) -> Vec<([u8; 32], Vec<u8>)> {
+        self.tree.iter_leaves().map(|(k, v)| (*k.as_bytes(), v.clone())).collect()
+    }
 }
 
 /// Global state manager handling all subnets' SMTs.
@@ -325,6 +338,23 @@ impl GlobalStateManager {
             return false; // Cannot remove ROOT
         }
         self.subnet_states.remove(subnet_id).is_some()
+    }
+
+    /// Iterate over all objects across all subnets.
+    ///
+    /// Returns an iterator of (subnet_id, object_id_bytes, value_bytes).
+    /// Useful for rebuilding indexes at startup.
+    pub fn iter_all_objects(&self) -> impl Iterator<Item = (SubnetId, [u8; 32], &Vec<u8>)> {
+        self.subnet_states.iter().flat_map(|(subnet_id, smt)| {
+            smt.iter_objects().map(move |(obj_id, value)| (*subnet_id, obj_id, value))
+        })
+    }
+
+    /// Get all objects across all subnets as a vector.
+    pub fn all_objects(&self) -> Vec<(SubnetId, [u8; 32], Vec<u8>)> {
+        self.iter_all_objects()
+            .map(|(subnet_id, obj_id, value)| (subnet_id, obj_id, value.clone()))
+            .collect()
     }
     
     // =========================================================================

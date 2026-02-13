@@ -1230,6 +1230,24 @@ impl IncrementalSparseMerkleTree {
         self.nodes.retain(|hash, _| reachable.contains(hash));
     }
 
+    /// Iterate over all leaf entries (key, value).
+    ///
+    /// This is useful for rebuilding indexes at startup.
+    /// 
+    /// # Performance
+    /// - O(n) where n is the number of leaves
+    /// - Just iterates over the in-memory HashMap, very fast
+    pub fn iter_leaves(&self) -> impl Iterator<Item = (&HashValue, &Vec<u8>)> {
+        self.leaves.iter()
+    }
+
+    /// Get all leaves as a vector of (key, value) pairs.
+    ///
+    /// Useful when you need ownership of the data.
+    pub fn all_leaves(&self) -> Vec<(HashValue, Vec<u8>)> {
+        self.leaves.iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
     fn mark_reachable(&self, hash: HashValue, reachable: &mut std::collections::HashSet<HashValue>) {
         if hash == empty_hash() || reachable.contains(&hash) {
             return;
