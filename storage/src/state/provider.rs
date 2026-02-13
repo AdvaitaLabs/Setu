@@ -41,7 +41,12 @@ pub struct CoinInfo {
     pub owner: String,
     pub balance: u64,
     pub version: u64,
-    /// Coin type (e.g., "SETU", "USDC") - supports multi-subnet token types
+    /// Subnet ID that owns this coin type (1 subnet : 1 token binding)
+    /// 
+    /// Stored internally as "coin_type" for backwards compatibility.
+    /// For ROOT subnet, this is "ROOT". For other subnets, it's the subnet_id.
+    /// 
+    /// To get the display name (e.g., "GAME"), lookup SubnetConfig.token_symbol.
     pub coin_type: String,
 }
 
@@ -51,26 +56,34 @@ pub struct CoinState {
     pub owner: String,
     pub balance: u64,
     pub version: u64,
-    /// Coin type identifier (e.g., "SETU", "USDC")
+    /// Subnet ID that owns this coin type (1 subnet : 1 token)
+    /// 
+    /// Named "coin_type" for backwards compatibility in serialization.
+    /// For ROOT subnet, this is "ROOT". For other subnets, it's the subnet_id.
     #[serde(default = "default_coin_type")]
     pub coin_type: String,
 }
 
 fn default_coin_type() -> String {
-    "SETU".to_string()
+    "ROOT".to_string()  // ROOT subnet's native token
 }
 
 impl CoinState {
+    /// Create a new coin state for ROOT subnet
     pub fn new(owner: String, balance: u64) -> Self {
-        Self::new_with_type(owner, balance, "SETU".to_string())
+        Self::new_with_type(owner, balance, "ROOT".to_string())
     }
     
-    pub fn new_with_type(owner: String, balance: u64, coin_type: String) -> Self {
+    /// Create a new coin state with specific subnet_id
+    /// 
+    /// The `subnet_id` parameter determines which subnet this coin belongs to.
+    /// For display purposes, lookup SubnetConfig.token_symbol.
+    pub fn new_with_type(owner: String, balance: u64, subnet_id: String) -> Self {
         Self {
             owner,
             balance,
             version: 1,
-            coin_type,
+            coin_type: subnet_id,  // Internally stored as coin_type
         }
     }
 
@@ -230,16 +243,20 @@ impl MerkleStateProvider {
         tracker.clear();
     }
 
-    /// Register a coin type for an address (called when creating/updating coins)
-    pub fn register_coin_type(&self, address: &str, coin_type: &str) {
+    /// Register a subnet for an address (called when creating/updating coins)
+    /// 
+    /// Despite the name "coin_type", this stores subnet_id internally.
+    pub fn register_coin_type(&self, address: &str, subnet_id: &str) {
         let mut index = self.coin_type_index.write().unwrap();
         index
             .entry(address.to_string())
             .or_insert_with(std::collections::HashSet::new)
-            .insert(coin_type.to_string());
+            .insert(subnet_id.to_string());
     }
 
-    /// Get all registered coin types for an address
+    /// Get all registered subnet_ids for an address
+    /// 
+    /// Returns the list of subnets where this address has coins.
     pub fn get_coin_types_for_address(&self, address: &str) -> Vec<String> {
         let index = self.coin_type_index.read().unwrap();
         index
@@ -305,26 +322,27 @@ impl MerkleStateProvider {
 
     /// Generate object ID for a coin owned by an address with specific coin type
     /// 
-    /// Convention: coin_object_id = SHA256("coin:" || address || ":" || coin_type)
-    /// This allows each address to hold multiple coin types (e.g., SETU, USDC, subnet tokens)
+    /// Convention: coin_object_id = SHA256("coin:" || address || ":" || subnet_id)
     /// 
-    /// Note: For backwards compatibility, "SETU" type uses the legacy format without suffix.
-    pub fn coin_object_id_with_type(address: &str, coin_type: &str) -> [u8; 32] {
+    /// Each address can hold coins in different subnets (1 subnet = 1 native token).
+    /// The subnet_id is used as the coin namespace.
+    /// 
+    /// Examples:
+    /// - ROOT subnet: SHA256("coin:alice:ROOT")
+    /// - gaming subnet: SHA256("coin:alice:gaming-subnet")
+    pub fn coin_object_id_with_type(address: &str, subnet_id: &str) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(b"coin:");
         hasher.update(address.as_bytes());
-        // For backwards compatibility: SETU uses legacy format without coin_type suffix
-        if coin_type != "SETU" {
-            hasher.update(b":");
-            hasher.update(coin_type.as_bytes());
-        }
+        hasher.update(b":");
+        hasher.update(subnet_id.as_bytes());
         hasher.finalize().into()
     }
 
-    /// Generate object ID for default SETU coin (backwards compatible)
-    /// Uses legacy format: SHA256("coin:" || address)
+    /// Generate object ID for ROOT subnet coin
+    /// Format: SHA256("coin:" || address || ":ROOT")
     fn coin_object_id(address: &str) -> [u8; 32] {
-        Self::coin_object_id_with_type(address, "SETU")
+        Self::coin_object_id_with_type(address, "ROOT")
     }
 
     /// Convert SparseMerkleProof to SimpleMerkleProof
@@ -350,30 +368,52 @@ impl MerkleStateProvider {
         }
     }
 
-    /// Get object from the default subnet
-    fn get_object_internal(&self, object_id_bytes: &[u8; 32]) -> Option<Vec<u8>> {
+    /// Get object from a specific subnet SMT
+    fn get_object_from_subnet(&self, object_id_bytes: &[u8; 32], subnet_id: &SubnetId) -> Option<Vec<u8>> {
         let manager = self.state_manager.read().unwrap();
         let hash = HashValue::from_slice(object_id_bytes).ok()?;
-        manager.get_subnet(&self.default_subnet)?.get(&hash).cloned()
+        manager.get_subnet(subnet_id)?.get(&hash).cloned()
     }
 
-    /// Get Merkle proof from the default subnet
-    fn get_proof_internal(&self, object_id_bytes: &[u8; 32]) -> Option<SparseMerkleProof> {
+    /// Get object from the default subnet (ROOT)
+    fn get_object_internal(&self, object_id_bytes: &[u8; 32]) -> Option<Vec<u8>> {
+        self.get_object_from_subnet(object_id_bytes, &self.default_subnet)
+    }
+
+    /// Get Merkle proof from a specific subnet SMT
+    fn get_proof_from_subnet(&self, object_id_bytes: &[u8; 32], subnet_id: &SubnetId) -> Option<SparseMerkleProof> {
         let manager = self.state_manager.read().unwrap();
         let hash = HashValue::from_slice(object_id_bytes).ok()?;
-        manager.get_subnet(&self.default_subnet).map(|smt| smt.prove(&hash))
+        manager.get_subnet(subnet_id).map(|smt| smt.prove(&hash))
+    }
+
+    /// Get Merkle proof from the default subnet (ROOT)
+    fn get_proof_internal(&self, object_id_bytes: &[u8; 32]) -> Option<SparseMerkleProof> {
+        self.get_proof_from_subnet(object_id_bytes, &self.default_subnet)
+    }
+    
+    /// Convert subnet_id string to SubnetId
+    fn resolve_subnet_id(subnet_id_str: &str) -> SubnetId {
+        if subnet_id_str == "ROOT" {
+            SubnetId::ROOT
+        } else {
+            SubnetId::from_hex(subnet_id_str).unwrap_or_else(|_| {
+                SubnetId::from_str_id(subnet_id_str)
+            })
+        }
     }
 }
 
 impl StateProvider for MerkleStateProvider {
     fn get_coins_for_address(&self, address: &str) -> Vec<CoinInfo> {
-        // Query all registered coin types for this address
+        // Query all registered coin types (subnet_ids) for this address
         let coin_types = self.get_coin_types_for_address(address);
         
         if coin_types.is_empty() {
-            // Fallback: try default SETU type for backwards compatibility
+            // Fallback: try ROOT subnet coin
             let coin_object_id = Self::coin_object_id(address);
-            if let Some(data) = self.get_object_internal(&coin_object_id) {
+            let target_subnet = SubnetId::ROOT;
+            if let Some(data) = self.get_object_from_subnet(&coin_object_id, &target_subnet) {
                 if let Some(coin_state) = CoinState::from_bytes(&data) {
                     return vec![CoinInfo {
                         object_id: ObjectId::new(coin_object_id),
@@ -388,11 +428,13 @@ impl StateProvider for MerkleStateProvider {
             return vec![];
         }
 
-        // Collect coins for all registered types
+        // Collect coins for all registered types - query from CORRECT subnet SMT
         let mut coins = Vec::new();
         for coin_type in coin_types {
             let coin_object_id = Self::coin_object_id_with_type(address, &coin_type);
-            if let Some(data) = self.get_object_internal(&coin_object_id) {
+            // Physical isolation: query from the correct subnet's SMT
+            let target_subnet = Self::resolve_subnet_id(&coin_type);
+            if let Some(data) = self.get_object_from_subnet(&coin_object_id, &target_subnet) {
                 if let Some(coin_state) = CoinState::from_bytes(&data) {
                     coins.push(CoinInfo {
                         object_id: ObjectId::new(coin_object_id),
@@ -438,19 +480,23 @@ impl StateProvider for MerkleStateProvider {
 // ============================================================================
 
 /// Initialize a coin in the state (for testing/genesis)
-/// Uses default "SETU" coin type
+/// Uses ROOT subnet (native SETU token)
 pub fn init_coin(
     state_manager: &mut GlobalStateManager,
     owner: &str,
     balance: u64,
 ) -> ObjectId {
-    init_coin_with_type(state_manager, owner, balance, "SETU")
+    init_coin_with_type(state_manager, owner, balance, "ROOT")
 }
 
-/// Initialize a coin with specific type in the state
+/// Initialize a coin with specific subnet_id in the state
 /// 
 /// Use this for multi-subnet scenarios where each subnet has its own token.
-/// Example coin_types: "SETU" (main), "SUBNET_A_TOKEN", "USDC", etc.
+/// The `subnet_id` determines which subnet's native token to use.
+/// 
+/// Examples:
+/// - "ROOT" for the root subnet's SETU token
+/// - "gaming-subnet" for a gaming app's token
 /// 
 /// Note: This only writes to the Merkle tree. If using MerkleStateProvider,
 /// also call `provider.register_coin_type()` or use `init_coin_with_provider()`.
@@ -458,13 +504,23 @@ pub fn init_coin_with_type(
     state_manager: &mut GlobalStateManager,
     owner: &str,
     balance: u64,
-    coin_type: &str,
+    subnet_id: &str,
 ) -> ObjectId {
-    let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(owner, coin_type);
-    let coin_state = CoinState::new_with_type(owner.to_string(), balance, coin_type.to_string());
+    let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(owner, subnet_id);
+    let coin_state = CoinState::new_with_type(owner.to_string(), balance, subnet_id.to_string());
+    
+    // Physical isolation: store coin in the correct subnet's SMT
+    let target_subnet = if subnet_id == "ROOT" {
+        SubnetId::ROOT
+    } else {
+        SubnetId::from_hex(subnet_id).unwrap_or_else(|_| {
+            // If not a valid hex, create subnet from string hash
+            SubnetId::from_str_id(subnet_id)
+        })
+    };
     
     state_manager.upsert_object(
-        SubnetId::ROOT,
+        target_subnet,
         object_id_bytes,
         coin_state.to_bytes(),
     );
@@ -475,37 +531,48 @@ pub fn init_coin_with_type(
 /// Initialize a coin and register it with the provider's index
 /// 
 /// This is the recommended way to create coins as it ensures the index stays in sync.
+/// 
+/// # Arguments
+/// * `provider` - The MerkleStateProvider
+/// * `owner` - Owner address
+/// * `balance` - Initial balance
+/// * `subnet_id` - Subnet ID (determines token type, 1:1 binding)
 pub fn init_coin_with_provider(
     provider: &MerkleStateProvider,
     owner: &str,
     balance: u64,
-    coin_type: &str,
+    subnet_id: &str,
 ) -> ObjectId {
     let object_id = {
         let state_manager = provider.state_manager();
         let mut manager = state_manager.write().unwrap();
-        init_coin_with_type(&mut manager, owner, balance, coin_type)
+        init_coin_with_type(&mut manager, owner, balance, subnet_id)
     };
     
     // Auto-register to index
-    provider.register_coin_type(owner, coin_type);
+    provider.register_coin_type(owner, subnet_id);
     
     object_id
 }
 
-/// Get or create a coin for the given address and type
+/// Get or create a coin for the given address and subnet
 /// 
 /// This is useful for transfer operations where the recipient may not have
 /// a coin object yet. Returns the existing coin or creates one with 0 balance.
+/// 
+/// # Arguments
+/// * `provider` - The MerkleStateProvider
+/// * `owner` - Owner address
+/// * `subnet_id` - Subnet ID (determines token type)
 /// 
 /// # Returns
 /// (ObjectId, is_new) - object ID and whether it was newly created
 pub fn get_or_create_coin(
     provider: &MerkleStateProvider,
     owner: &str,
-    coin_type: &str,
+    subnet_id: &str,
 ) -> (ObjectId, bool) {
-    let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(owner, coin_type);
+    let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(owner, subnet_id);
     let object_id = ObjectId::new(object_id_bytes);
     
     // Check if coin already exists
@@ -514,20 +581,27 @@ pub fn get_or_create_coin(
     }
     
     // Create new coin with 0 balance
-    let new_object_id = init_coin_with_provider(provider, owner, 0, coin_type);
+    let new_object_id = init_coin_with_provider(provider, owner, 0, subnet_id);
     (new_object_id, true)
 }
 
 /// Mint initial supply for a subnet token to the owner
 /// 
 /// Called when a subnet with token is registered.
+/// Uses the subnet_id as the coin type identifier.
+/// 
+/// # Arguments
+/// * `provider` - The MerkleStateProvider
+/// * `subnet_id` - The subnet ID (also used as coin namespace)
+/// * `subnet_owner` - Owner address to receive the tokens
+/// * `initial_supply` - Amount of tokens to mint
 pub fn mint_subnet_token(
     provider: &MerkleStateProvider,
+    subnet_id: &str,
     subnet_owner: &str,
-    token_symbol: &str,
     initial_supply: u64,
 ) -> ObjectId {
-    init_coin_with_provider(provider, subnet_owner, initial_supply, token_symbol)
+    init_coin_with_provider(provider, subnet_owner, initial_supply, subnet_id)
 }
 
 /// Get coin state from raw bytes
@@ -554,16 +628,17 @@ mod tests {
     fn test_merkle_state_provider() {
         let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
 
-        // Initialize a coin
+        // Initialize a coin for ROOT subnet
         {
             let mut manager = state_manager.write().unwrap();
-            init_coin(&mut manager, "alice", 1000);
+            init_coin(&mut manager, "alice", 1000);  // Uses ROOT as default
         }
 
         // Create provider and query
         let provider = MerkleStateProvider::new(Arc::clone(&state_manager));
 
-        let coins = provider.get_coins_for_address("alice");
+        // Query by ROOT subnet (not SETU)
+        let coins = provider.get_coins_for_address_by_type("alice", "ROOT");
         assert_eq!(coins.len(), 1);
         assert_eq!(coins[0].owner, "alice");
         assert_eq!(coins[0].balance, 1000);
@@ -601,38 +676,39 @@ mod tests {
     fn test_multi_coin_types() {
         let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
 
-        // Initialize multiple coin types for alice
+        // Initialize coins for different subnets
+        // Note: coin_type now represents subnet_id (1:1 binding)
         {
             let mut manager = state_manager.write().unwrap();
-            init_coin_with_type(&mut manager, "alice", 1000, "SETU");
-            init_coin_with_type(&mut manager, "alice", 500, "USDC");
-            init_coin_with_type(&mut manager, "alice", 200, "SUBNET_A_TOKEN");
+            init_coin_with_type(&mut manager, "alice", 1000, "ROOT");       // Root subnet
+            init_coin_with_type(&mut manager, "alice", 500, "defi-subnet"); // DeFi subnet
+            init_coin_with_type(&mut manager, "alice", 200, "nft-subnet");  // NFT subnet
         }
 
-        // Create provider and register coin types
+        // Create provider and register subnets for this address
         let provider = MerkleStateProvider::new(Arc::clone(&state_manager));
-        provider.register_coin_type("alice", "SETU");
-        provider.register_coin_type("alice", "USDC");
-        provider.register_coin_type("alice", "SUBNET_A_TOKEN");
+        provider.register_coin_type("alice", "ROOT");
+        provider.register_coin_type("alice", "defi-subnet");
+        provider.register_coin_type("alice", "nft-subnet");
 
         // Query all coins for alice
         let coins = provider.get_coins_for_address("alice");
         assert_eq!(coins.len(), 3);
 
-        // Verify each coin type exists with correct balance
-        let setu_coin = coins.iter().find(|c| c.coin_type == "SETU").unwrap();
-        assert_eq!(setu_coin.balance, 1000);
+        // Verify each subnet's coin exists with correct balance
+        let root_coin = coins.iter().find(|c| c.coin_type == "ROOT").unwrap();
+        assert_eq!(root_coin.balance, 1000);
 
-        let usdc_coin = coins.iter().find(|c| c.coin_type == "USDC").unwrap();
-        assert_eq!(usdc_coin.balance, 500);
+        let defi_coin = coins.iter().find(|c| c.coin_type == "defi-subnet").unwrap();
+        assert_eq!(defi_coin.balance, 500);
 
-        let subnet_coin = coins.iter().find(|c| c.coin_type == "SUBNET_A_TOKEN").unwrap();
-        assert_eq!(subnet_coin.balance, 200);
+        let nft_coin = coins.iter().find(|c| c.coin_type == "nft-subnet").unwrap();
+        assert_eq!(nft_coin.balance, 200);
 
-        // Query by specific type
-        let setu_only = provider.get_coins_for_address_by_type("alice", "SETU");
-        assert_eq!(setu_only.len(), 1);
-        assert_eq!(setu_only[0].balance, 1000);
+        // Query by specific subnet
+        let root_only = provider.get_coins_for_address_by_type("alice", "ROOT");
+        assert_eq!(root_only.len(), 1);
+        assert_eq!(root_only[0].balance, 1000);
     }
 
     #[test]
@@ -662,9 +738,12 @@ mod tests {
         let provider = MerkleStateProvider::new(Arc::clone(&state_manager));
 
         // Mint initial supply to subnet owner
-        let obj_id = mint_subnet_token(&provider, "subnet_owner", "MYAPP", 1_000_000);
+        // Note: subnet_id is first param, then owner, then amount
+        let subnet_id = "my-app-subnet";
+        let obj_id = mint_subnet_token(&provider, subnet_id, "subnet_owner", 1_000_000);
         
-        let coins = provider.get_coins_for_address_by_type("subnet_owner", "MYAPP");
+        // Query by subnet_id (not token_symbol)
+        let coins = provider.get_coins_for_address_by_type("subnet_owner", subnet_id);
         assert_eq!(coins.len(), 1);
         assert_eq!(coins[0].balance, 1_000_000);
         assert_eq!(coins[0].object_id, obj_id);
@@ -675,22 +754,23 @@ mod tests {
         let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
 
         // Initialize multiple coins for multiple users
+        // Using subnet_id as the coin namespace
         {
             let mut manager = state_manager.write().unwrap();
-            init_coin_with_type(&mut manager, "alice", 1000, "SETU");
-            init_coin_with_type(&mut manager, "alice", 500, "USDC");
-            init_coin_with_type(&mut manager, "bob", 800, "SETU");
-            init_coin_with_type(&mut manager, "bob", 300, "GAMING_TOKEN");
-            init_coin_with_type(&mut manager, "charlie", 100, "SETU");
+            init_coin_with_type(&mut manager, "alice", 1000, "ROOT");
+            init_coin_with_type(&mut manager, "alice", 500, "defi-subnet");
+            init_coin_with_type(&mut manager, "bob", 800, "ROOT");
+            init_coin_with_type(&mut manager, "bob", 300, "gaming-subnet");
+            init_coin_with_type(&mut manager, "charlie", 100, "ROOT");
         }
 
         // Create provider WITHOUT registering coin types (simulating restart)
         let provider = MerkleStateProvider::new(Arc::clone(&state_manager));
 
-        // Before rebuild: alice's coins not found (except SETU fallback)
+        // Before rebuild: alice's coins not found (except ROOT fallback)
         let alice_coins_before = provider.get_coins_for_address("alice");
-        assert_eq!(alice_coins_before.len(), 1); // Only SETU via fallback
-        assert_eq!(alice_coins_before[0].coin_type, "SETU");
+        assert_eq!(alice_coins_before.len(), 1); // Only ROOT via fallback
+        assert_eq!(alice_coins_before[0].coin_type, "ROOT");
 
         // Rebuild the index from Merkle Tree
         let indexed_count = provider.rebuild_coin_type_index();
