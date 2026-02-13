@@ -171,6 +171,49 @@ impl ExplorerStorage {
         None
     }
     
+    /// Get all events (query RocksDB directly for real-time data)
+    pub async fn get_all_events(&self) -> Vec<Event> {
+        // Catch up with primary to see latest writes
+        if let Err(e) = self.db.try_catch_up_with_primary() {
+            tracing::warn!("Failed to catch up with primary: {}", e);
+        }
+        
+        use setu_storage::ColumnFamily;
+        
+        // Scan all event keys with "evt:" prefix
+        let event_ids: Vec<String> = match self.db.prefix_scan_keys(ColumnFamily::Events, b"evt:") {
+            Ok(keys) => {
+                keys.into_iter()
+                    .filter_map(|key| {
+                        // Key format: evt:{event_id}
+                        // Extract event_id from key
+                        if key.len() > 4 {
+                            String::from_utf8(key[4..].to_vec()).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+            Err(e) => {
+                tracing::warn!("Failed to scan event prefix: {}", e);
+                return Vec::new();
+            }
+        };
+        
+        tracing::info!("Found {} total events", event_ids.len());
+        
+        // Get events by IDs
+        let mut events = Vec::new();
+        for event_id in event_ids {
+            if let Some(event) = self.get_event(&event_id).await {
+                events.push(event);
+            }
+        }
+        
+        events
+    }
+    
     /// Count events (query RocksDB directly for real-time count)
     pub async fn count_events(&self) -> usize {
         use setu_storage::ColumnFamily;

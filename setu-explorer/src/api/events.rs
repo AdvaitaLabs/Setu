@@ -26,8 +26,8 @@ pub async fn list_events(
         // Filter by creator
         storage.get_events_by_creator(creator).await
     } else {
-        // Get all finalized events by default
-        storage.get_events_by_status(EventStatus::Finalized).await
+        // Get all events (no status filter)
+        storage.get_all_events().await
     };
     
     // Filter by event type if specified

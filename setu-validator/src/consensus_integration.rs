@@ -429,9 +429,12 @@ impl ConsensusValidator {
                                     );
                                 }
                                 
-                                // Persist all events in the anchor
+                                // Persist all events in the anchor with Finalized status
                                 for event_id in &anchor.event_ids {
-                                    if let Some(event) = engine.get_events_by_ids(&[event_id.clone()]).await.into_iter().next() {
+                                    if let Some(mut event) = engine.get_events_by_ids(&[event_id.clone()]).await.into_iter().next() {
+                                        // Update status to Finalized before persisting
+                                        event.status = setu_types::EventStatus::Finalized;
+                                        
                                         if let Err(e) = event_store.store(event.clone()).await {
                                             warn!(
                                                 event_id = %event_id,
