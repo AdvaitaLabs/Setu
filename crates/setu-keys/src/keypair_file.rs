@@ -54,7 +54,19 @@ pub fn read_key<P: AsRef<Path>>(path: P) -> Result<SetuKeyPair, KeyError> {
     let contents = std::fs::read_to_string(path)?;
     let contents = contents.trim();
     
-    // Try Base64 encoded SetuKeyPair first
+    // Try hex encoded private key first (32 bytes, most common for CLI-generated keys)
+    if let Ok(bytes) = hex::decode(contents) {
+        if bytes.len() == 32 {
+            // Raw 32-byte private key - try Secp256k1 first (validator keys)
+            if let Ok(kp) = SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::Secp256k1, &bytes) {
+                return Ok(kp);
+            }
+            // Fallback to Ed25519
+            return SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::ED25519, &bytes);
+        }
+    }
+    
+    // Try Base64 encoded SetuKeyPair
     if let Ok(kp) = SetuKeyPair::decode_base64(contents) {
         return Ok(kp);
     }
@@ -70,18 +82,6 @@ pub fn read_key<P: AsRef<Path>>(path: P) -> Result<SetuKeyPair, KeyError> {
                     }
                 }
             }
-        }
-    }
-    
-    // Try hex encoded private key (32 bytes)
-    if let Ok(bytes) = hex::decode(contents) {
-        if bytes.len() == 32 {
-            // Raw 32-byte private key - try Secp256k1 first (validator keys)
-            if let Ok(kp) = SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::Secp256k1, &bytes) {
-                return Ok(kp);
-            }
-            // Fallback to Ed25519
-            return SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::ED25519, &bytes);
         }
     }
     
