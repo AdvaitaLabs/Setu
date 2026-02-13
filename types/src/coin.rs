@@ -6,7 +6,8 @@
 //! - Balance is a value type, not an object
 
 use serde::{Deserialize, Serialize};
-use crate::object::{Object, Address, generate_object_id};
+use sha2::{Sha256, Digest};
+use crate::object::{Object, Address, ObjectId, generate_object_id};
 
 /// Coin type identifier (e.g., "SUI", "USDC", "SETU")
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -179,6 +180,46 @@ pub fn create_typed_coin(owner: Address, value: u64, coin_type: impl Into<String
     Coin::new_with_type(owner, value, CoinType::new(coin_type))
 }
 
+/// Generate deterministic coin ObjectId for an address and coin type
+/// 
+/// Convention: coin_object_id = SHA256("coin:" || address || [":" || coin_type])
+/// 
+/// This is the canonical ID generation used by both storage layer and runtime.
+/// For backwards compatibility, "SETU" type uses legacy format without suffix.
+/// 
+/// # Arguments
+/// * `owner` - Owner address (will be converted to hex string)
+/// * `coin_type` - Coin type (e.g., "SETU", "USDC", "SUBNET_TOKEN")
+/// 
+/// # Returns
+/// Deterministic 32-byte ObjectId
+pub fn deterministic_coin_id(owner: &Address, coin_type: &str) -> ObjectId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"coin:");
+    hasher.update(owner.to_string().as_bytes());
+    // For backwards compatibility: SETU uses legacy format without coin_type suffix
+    if coin_type != CoinType::NATIVE {
+        hasher.update(b":");
+        hasher.update(coin_type.as_bytes());
+    }
+    ObjectId::new(hasher.finalize().into())
+}
+
+/// Generate deterministic coin ObjectId from string address
+/// 
+/// Convenience function for when you have a string address instead of Address.
+pub fn deterministic_coin_id_from_str(owner: &str, coin_type: &str) -> ObjectId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"coin:");
+    hasher.update(owner.as_bytes());
+    // For backwards compatibility: SETU uses legacy format without coin_type suffix
+    if coin_type != CoinType::NATIVE {
+        hasher.update(b":");
+        hasher.update(coin_type.as_bytes());
+    }
+    ObjectId::new(hasher.finalize().into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +326,36 @@ mod tests {
         
         assert_eq!(coin.metadata.owner.as_ref().unwrap(), &new_owner);
         assert_eq!(coin.metadata.version, 2);
+    }
+    
+    #[test]
+    fn test_deterministic_coin_id() {
+        use crate::object::ObjectId;
+        
+        // Test SETU (native) coin - should use legacy format (no suffix)
+        let id1 = deterministic_coin_id_from_str("alice", "SETU");
+        let id2 = deterministic_coin_id_from_str("alice", "SETU");
+        assert_eq!(id1, id2, "Same input should produce same ID");
+        
+        // Different address should produce different ID
+        let id3 = deterministic_coin_id_from_str("bob", "SETU");
+        assert_ne!(id1, id3, "Different address should produce different ID");
+        
+        // Different coin type should produce different ID
+        let id4 = deterministic_coin_id_from_str("alice", "USDC");
+        assert_ne!(id1, id4, "Different coin type should produce different ID");
+        
+        // Test Address-based version matches string-based version
+        let addr = Address::from_str_id("alice");
+        let id5 = deterministic_coin_id(&addr, "SETU");
+        // Note: Address::from_str_id hashes the string, so direct comparison won't work
+        // But same Address should produce same ID
+        let id6 = deterministic_coin_id(&addr, "SETU");
+        assert_eq!(id5, id6, "Same Address should produce same ID");
+        
+        // Non-SETU coins should have different format from SETU
+        let id_setu = deterministic_coin_id_from_str("alice", "SETU");
+        let id_other = deterministic_coin_id_from_str("alice", "OTHER");
+        assert_ne!(id_setu, id_other, "SETU and non-SETU should have different IDs");
     }
 }
