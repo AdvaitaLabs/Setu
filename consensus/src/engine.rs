@@ -708,11 +708,15 @@ impl ConsensusEngine {
         
         // Step 5-6: Apply state changes from the CF's events to maintain consistent state
         // This also verifies the resulting state matches the anchor's state root
-        let state_verified = manager.apply_cf_state_changes(&dag, &cf);
-        if !state_verified {
-            return Err(setu_types::SetuError::InvalidData(
-                "State root mismatch after applying CF state changes".to_string()
-            ));
+        // Skip for self-created CFs (leader path) as state is already up-to-date
+        let is_self_created = cf.proposer == self.local_validator_id;
+        if !is_self_created {
+            let state_verified = manager.apply_cf_state_changes(&dag, &cf);
+            if !state_verified {
+                return Err(setu_types::SetuError::InvalidData(
+                    "State root mismatch after applying CF state changes".to_string()
+                ));
+            }
         }
         
         let cf_id = cf.id.clone();
