@@ -100,19 +100,33 @@ impl ExplorerStorage {
     /// Get events by status (query RocksDB directly for real-time data)
     pub async fn get_events_by_status(&self, status: EventStatus) -> Vec<Event> {
         // Catch up with primary to see latest writes
-        let _ = self.db.try_catch_up_with_primary();
+        if let Err(e) = self.db.try_catch_up_with_primary() {
+            tracing::warn!("Failed to catch up with primary: {}", e);
+        } else {
+            tracing::debug!("Successfully caught up with primary");
+        }
         
         use setu_storage::ColumnFamily;
         let mut events = Vec::new();
+        let mut total_scanned = 0;
+        let mut matched = 0;
+        
         if let Ok(iter) = self.db.iter_values::<Event>(ColumnFamily::Events) {
             for event_result in iter {
+                total_scanned += 1;
                 if let Ok(event) = event_result {
+                    tracing::debug!("Found event: id={}, status={:?}, looking_for={:?}", 
+                        event.id, event.status, status);
                     if event.status == status {
+                        matched += 1;
                         events.push(event);
                     }
                 }
             }
         }
+        
+        tracing::info!("Scanned {} events, matched {} with status {:?}", 
+            total_scanned, matched, status);
         events
     }
     
@@ -152,8 +166,13 @@ impl ExplorerStorage {
     
     /// Get anchor by ID (query RocksDB directly for real-time data)
     pub async fn get_anchor(&self, anchor_id: &str) -> Option<Anchor> {
+        // Catch up with primary to see latest writes
+        let _ = self.db.try_catch_up_with_primary();
+        
         use setu_storage::ColumnFamily;
-        self.db.get_raw::<Anchor>(ColumnFamily::Anchors, anchor_id.as_bytes()).ok().flatten()
+        // Anchor keys are stored as "anchor:{anchor_id}"
+        let key = format!("anchor:{}", anchor_id);
+        self.db.get_raw::<Anchor>(ColumnFamily::Anchors, key.as_bytes()).ok().flatten()
     }
     
     /// Get latest anchor
@@ -189,22 +208,45 @@ impl ExplorerStorage {
     
     /// Get anchor chain
     pub async fn get_anchor_chain(&self) -> Vec<AnchorId> {
+        // Catch up with primary to see latest writes
+        let _ = self.db.try_catch_up_with_primary();
+        
         use setu_storage::ColumnFamily;
-        let mut anchors = Vec::new();
-        if let Ok(iter) = self.db.iter_values::<Anchor>(ColumnFamily::Anchors) {
-            for anchor_result in iter {
-                if let Ok(anchor) = anchor_result {
-                    anchors.push(anchor);
-                }
+        
+        // First, try to get count from metadata
+        let count_key = b"meta:count";
+        let count: usize = self.db.get_raw::<u64>(ColumnFamily::Anchors, count_key)
+            .ok()
+            .flatten()
+            .unwrap_or(0) as usize;
+        
+        if count == 0 {
+            return Vec::new();
+        }
+        
+        // Read chain indices: "chain:{index}" -> AnchorId
+        // Key format: b"chain:" + index.to_be_bytes()
+        let mut chain = Vec::with_capacity(count);
+        for i in 0..count as u64 {
+            let mut chain_key = Vec::with_capacity(6 + 8); // "chain:" + 8 bytes
+            chain_key.extend_from_slice(b"chain:");
+            chain_key.extend_from_slice(&i.to_be_bytes());
+            
+            if let Ok(Some(anchor_id)) = self.db.get_raw::<AnchorId>(ColumnFamily::Anchors, &chain_key) {
+                chain.push(anchor_id);
             }
         }
-        // Sort by depth
-        anchors.sort_by_key(|a| a.depth);
-        anchors.into_iter().map(|a| a.id).collect()
+        
+        chain
     }
     
     /// Count anchors (query RocksDB directly for real-time count)
     pub async fn count_anchors(&self) -> usize {
+        // Catch up with primary to see latest writes
+        if let Err(e) = self.db.try_catch_up_with_primary() {
+            tracing::warn!("Failed to catch up with primary: {}", e);
+        }
+        
         use setu_storage::ColumnFamily;
         let mut count = 0;
         if let Ok(iter) = self.db.iter_values::<Anchor>(ColumnFamily::Anchors) {
@@ -212,6 +254,7 @@ impl ExplorerStorage {
                 count += 1;
             }
         }
+        tracing::info!("Found {} anchors in RocksDB", count);
         count
     }
     
