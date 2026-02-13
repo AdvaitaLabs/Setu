@@ -56,7 +56,7 @@ impl SetuDB {
         let cfs = ColumnFamily::descriptors();
         
         // Open as secondary instance
-        let db = DB::open_cf_descriptors_as_secondary(&opts, primary_path, secondary_path, cfs)?;
+        let db = DB::open_cf_descriptors_as_secondary(&opts, primary_path.as_ref(), secondary_path.as_ref(), cfs)?;
         
         Ok(Self {
             db: Arc::new(db),
