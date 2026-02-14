@@ -409,11 +409,12 @@ impl MockEnclave {
         // Use the coin_id from resolved_inputs
         let output = {
             let mut runtime = self.runtime.write().await;
-            runtime.execute_transfer_with_coin(
+            runtime.execute_transfer_with_coin_and_burn(
                 resolved_coin.object_id.clone(),
                 &transfer.from,
                 &transfer.to,
                 Some(transfer.amount as u64),
+                transfer.burn_fee,
                 &ctx,
             ).map_err(|e| format!("Runtime error: {}", e))?
         };
@@ -473,11 +474,12 @@ impl MockEnclave {
         );
         
         // Use the LOCAL runtime (not self.runtime!)
-        let output = local_runtime.execute_transfer_with_coin(
+        let output = local_runtime.execute_transfer_with_coin_and_burn(
             resolved_coin.object_id.clone(),
             &transfer.from,
             &transfer.to,
             Some(transfer.amount as u64),
+            transfer.burn_fee,
             &ctx,
         ).map_err(|e| format!("Runtime error: {}", e))?;
         

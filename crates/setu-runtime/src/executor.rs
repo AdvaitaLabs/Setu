@@ -152,27 +152,35 @@ impl<S: StateStore> RuntimeExecutor<S> {
         let mut created_objects = Vec::new();
         let deleted_objects = Vec::new();
         
-        // 3. 执行转账逻辑
+        let burn_fee = transfer_tx.burn_fee;
+
+        // 3. Execute transfer logic
         match transfer_tx.amount {
-            // 完整转账：直接转移对象所有权
+            // Full transfer: transfer ownership (burn fee deducted from coin value)
             None => {
+                // Deduct burn fee before transferring ownership
+                if burn_fee > 0 {
+                    coin.data.balance.withdraw(burn_fee)
+                        .map_err(|e| RuntimeError::InvalidTransaction(
+                            format!("Insufficient balance for burn fee: {}", e)
+                        ))?;
+                }
+
                 debug!(
                     coin_id = %coin_id,
                     from = %tx.sender,
                     to = %recipient,
                     amount = coin.data.balance.value(),
+                    burn_fee = burn_fee,
                     "Full transfer"
                 );
-                
-                // 更改所有者
+
                 coin.metadata.owner = Some(recipient.clone());
                 coin.metadata.version += 1;
-                
+
                 let new_state = serde_json::to_vec(&coin)?;
-                
-                // 保存更新后的对象
                 self.state.set_object(coin_id, coin)?;
-                
+
                 state_changes.push(StateChange {
                     change_type: StateChangeType::Update,
                     object_id: coin_id,
@@ -180,45 +188,52 @@ impl<S: StateStore> RuntimeExecutor<S> {
                     new_state: Some(new_state),
                 });
             }
-            
-            // 部分转账：需要分割 Coin
+
+            // Partial transfer: split coin (burn fee deducted from sender, not sent to recipient)
             Some(amount) => {
+                let total_deduction = amount.checked_add(burn_fee)
+                    .ok_or_else(|| RuntimeError::InvalidTransaction(
+                        "Amount + burn_fee overflow".to_string()
+                    ))?;
+
                 debug!(
                     coin_id = %coin_id,
                     from = %tx.sender,
                     to = %recipient,
                     amount = amount,
-                    remaining = coin.data.balance.value() - amount,
+                    burn_fee = burn_fee,
+                    total_deduction = total_deduction,
                     "Partial transfer (split)"
                 );
-                
-                // 从原 Coin 中提取金额
-                let transferred_balance = coin.data.balance.withdraw(amount)
+
+                // Withdraw amount + burn_fee from sender
+                coin.data.balance.withdraw(total_deduction)
                     .map_err(|e| RuntimeError::InvalidTransaction(e))?;
-                
-                // 更新原 Coin
+
+                // Update sender's coin (reduced by amount + burn_fee)
                 coin.metadata.version += 1;
                 let new_state = serde_json::to_vec(&coin)?;
                 self.state.set_object(coin_id, coin.clone())?;
-                
+
                 state_changes.push(StateChange {
                     change_type: StateChangeType::Update,
                     object_id: coin_id,
                     old_state: Some(old_state),
                     new_state: Some(new_state),
                 });
-                
-                // 创建新 Coin 给接收者
+
+                // Create new coin for recipient with only the transfer amount
+                // (burn_fee is destroyed — no coin created for it)
                 let new_coin = create_typed_coin(
                     recipient.clone(),
-                    transferred_balance.value(),
+                    amount,
                     coin.data.coin_type.as_str(),
                 );
                 let new_coin_id = *new_coin.id();
                 let new_coin_state = serde_json::to_vec(&new_coin)?;
-                
+
                 self.state.set_object(new_coin_id, new_coin)?;
-                
+
                 created_objects.push(new_coin_id);
                 state_changes.push(StateChange {
                     change_type: StateChangeType::Create,
@@ -329,25 +344,43 @@ impl<S: StateStore> RuntimeExecutor<S> {
         amount: Option<u64>,
         ctx: &ExecutionContext,
     ) -> RuntimeResult<ExecutionOutput> {
+        self.execute_transfer_with_coin_and_burn(coin_id, sender, recipient, amount, 0, ctx)
+    }
+
+    /// Execute a transfer with burn fee (solver-tee3 architecture)
+    ///
+    /// The burn_fee is deducted from the sender's coin and destroyed (not
+    /// transferred to any recipient). This reduces total supply.
+    pub fn execute_transfer_with_coin_and_burn(
+        &mut self,
+        coin_id: ObjectId,
+        sender: &str,
+        recipient: &str,
+        amount: Option<u64>,
+        burn_fee: u64,
+        ctx: &ExecutionContext,
+    ) -> RuntimeResult<ExecutionOutput> {
         let sender_addr = Address::from(sender);
         let recipient_addr = Address::from(recipient);
-        
+
         info!(
             coin_id = %coin_id,
             from = %sender,
             to = %recipient,
             amount = ?amount,
+            burn_fee = burn_fee,
             "Executing transfer with specified coin_id"
         );
-        
+
         // Create and execute the transfer transaction
-        let tx = Transaction::new_transfer(
+        let tx = Transaction::new_transfer_with_burn(
             sender_addr,
             coin_id,
             recipient_addr,
             amount,
+            burn_fee,
         );
-        
+
         self.execute_transaction(&tx, ctx)
     }
     
@@ -534,5 +567,129 @@ mod tests {
         let new_coin = executor.state().get_object(&new_coin_id).unwrap().unwrap();
         assert_eq!(new_coin.data.balance.value(), 300);
         assert_eq!(new_coin.metadata.owner.unwrap(), recipient);
+    }
+
+    #[test]
+    fn test_partial_transfer_with_burn_fee() {
+        let mut store = InMemoryStateStore::new();
+        let sender = Address::from("alice");
+        let recipient = Address::from("bob");
+
+        let coin = setu_types::create_coin(sender.clone(), 100_000);
+        let coin_id = *coin.id();
+        store.set_object(coin_id, coin).unwrap();
+
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = ExecutionContext {
+            executor_id: "solver1".to_string(),
+            timestamp: 1000,
+            in_tee: false,
+        };
+
+        // Transfer 5000 with 21000 burn fee → sender loses 26000 total
+        let tx = Transaction::new_transfer_with_burn(
+            sender.clone(), coin_id, recipient.clone(), Some(5000), 21_000,
+        );
+
+        let output = executor.execute_transaction(&tx, &ctx).unwrap();
+        assert!(output.success);
+
+        // Sender: 100_000 - 5000 - 21000 = 74_000
+        let original = executor.state().get_object(&coin_id).unwrap().unwrap();
+        assert_eq!(original.data.balance.value(), 74_000);
+
+        // Recipient gets only the transfer amount, not the burn
+        let new_coin_id = output.created_objects[0];
+        let new_coin = executor.state().get_object(&new_coin_id).unwrap().unwrap();
+        assert_eq!(new_coin.data.balance.value(), 5000);
+    }
+
+    #[test]
+    fn test_full_transfer_with_burn_fee() {
+        let mut store = InMemoryStateStore::new();
+        let sender = Address::from("alice");
+        let recipient = Address::from("bob");
+
+        let coin = setu_types::create_coin(sender.clone(), 50_000);
+        let coin_id = *coin.id();
+        store.set_object(coin_id, coin).unwrap();
+
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = ExecutionContext {
+            executor_id: "solver1".to_string(),
+            timestamp: 1000,
+            in_tee: false,
+        };
+
+        // Full transfer with 21000 burn → coin arrives with 50_000 - 21_000 = 29_000
+        let tx = Transaction::new_transfer_with_burn(
+            sender.clone(), coin_id, recipient.clone(), None, 21_000,
+        );
+
+        let output = executor.execute_transaction(&tx, &ctx).unwrap();
+        assert!(output.success);
+
+        let coin = executor.state().get_object(&coin_id).unwrap().unwrap();
+        assert_eq!(coin.data.balance.value(), 29_000);
+        assert_eq!(coin.metadata.owner.unwrap(), recipient);
+    }
+
+    #[test]
+    fn test_burn_fee_insufficient_balance() {
+        let mut store = InMemoryStateStore::new();
+        let sender = Address::from("alice");
+        let recipient = Address::from("bob");
+
+        let coin = setu_types::create_coin(sender.clone(), 1000);
+        let coin_id = *coin.id();
+        store.set_object(coin_id, coin).unwrap();
+
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = ExecutionContext {
+            executor_id: "solver1".to_string(),
+            timestamp: 1000,
+            in_tee: false,
+        };
+
+        // Transfer 500 with 21000 burn fee → needs 21500, has 1000
+        let tx = Transaction::new_transfer_with_burn(
+            sender.clone(), coin_id, recipient.clone(), Some(500), 21_000,
+        );
+
+        let result = executor.execute_transaction(&tx, &ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_zero_burn_fee_unchanged_behavior() {
+        let mut store = InMemoryStateStore::new();
+        let sender = Address::from("alice");
+        let recipient = Address::from("bob");
+
+        let coin = setu_types::create_coin(sender.clone(), 1000);
+        let coin_id = *coin.id();
+        store.set_object(coin_id, coin).unwrap();
+
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = ExecutionContext {
+            executor_id: "solver1".to_string(),
+            timestamp: 1000,
+            in_tee: false,
+        };
+
+        // Zero burn_fee = identical to old behavior
+        let tx = Transaction::new_transfer_with_burn(
+            sender.clone(), coin_id, recipient.clone(), Some(300), 0,
+        );
+
+        let output = executor.execute_transaction(&tx, &ctx).unwrap();
+        assert!(output.success);
+
+        let original = executor.state().get_object(&coin_id).unwrap().unwrap();
+        assert_eq!(original.data.balance.value(), 700);
+
+        let new_coin_id = output.created_objects[0];
+        let new_coin = executor.state().get_object(&new_coin_id).unwrap().unwrap();
+        assert_eq!(new_coin.data.balance.value(), 300);
     }
 }

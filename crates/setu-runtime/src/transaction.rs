@@ -36,6 +36,9 @@ pub struct TransferTx {
     pub recipient: Address,
     /// Transfer amount (if partial transfer)
     pub amount: Option<u64>,
+    /// Burn fee deducted from sender (destroyed, not transferred)
+    #[serde(default)]
+    pub burn_fee: u64,
 }
 
 /// Query transaction (read-only)
@@ -65,13 +68,24 @@ impl Transaction {
         recipient: Address,
         amount: Option<u64>,
     ) -> Self {
+        Self::new_transfer_with_burn(sender, coin_id, recipient, amount, 0)
+    }
+
+    /// Create a transfer transaction with burn fee
+    pub fn new_transfer_with_burn(
+        sender: Address,
+        coin_id: ObjectId,
+        recipient: Address,
+        amount: Option<u64>,
+        burn_fee: u64,
+    ) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
+
         let id = format!("tx_{:x}", timestamp);
-        
+
         Self {
             id,
             sender,
@@ -79,6 +93,7 @@ impl Transaction {
                 coin_id,
                 recipient,
                 amount,
+                burn_fee,
             }),
             input_objects: vec![coin_id],
             timestamp,
