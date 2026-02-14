@@ -41,6 +41,7 @@ impl TransferHandler {
         vlc_time: u64,
         request: SubmitTransferRequest,
         tee_executor: &TeeExecutor,
+        burn_fee: u64,
     ) -> SubmitTransferResponse {
         let now = current_timestamp_secs();
         let transfer_id = format!(
@@ -112,7 +113,8 @@ impl TransferHandler {
         .with_preferred_solver_opt(request.preferred_solver.clone())
         .with_shard_id(request.shard_id.clone())
         .with_subnet_id(request.subnet_id.clone())
-        .with_assigned_vlc(assigned_vlc);
+        .with_assigned_vlc(assigned_vlc)
+        .with_burn_fee(burn_fee);
 
         // Step 4a: Prepare SolverTask
         let subnet_id = match &transfer.subnet_id {

@@ -399,6 +399,7 @@ impl ValidatorNetworkService {
             vlc_time,
             request,
             &self.tee_executor,
+            self.config.transfer_burn_fee,
         )
         .await
     }
