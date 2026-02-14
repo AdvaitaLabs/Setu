@@ -168,13 +168,17 @@ cargo test --all
 #### 1. Start Validator
 
 ```bash
-# Set environment variables
+# Using an env file (auto-loads .env from working directory)
+./target/release/setu-validator
+
+# Or specify a custom env file
+./target/release/setu-validator --env-file config/prod.env
+
+# Or set environment variables directly
 export VALIDATOR_ID=validator-1
 export VALIDATOR_HTTP_PORT=8080
 export VALIDATOR_P2P_PORT=9000
 export VALIDATOR_DB_PATH=/tmp/setu/validator
-
-# Start validator
 ./target/release/setu-validator
 ```
 
@@ -229,6 +233,8 @@ docker-compose logs -f
 | `VALIDATOR_P2P_PORT` | `9000` | P2P network port |
 | `VALIDATOR_DB_PATH` | (memory) | RocksDB path for persistence |
 | `VALIDATOR_KEY_FILE` | - | Path to keypair file |
+| `POCW_ENABLED` | `false` | Enable PoCW economic layer |
+| `POCW_TRANSFER_FEE` | `21000` | Fee per transfer (burned) |
 
 ### Solver Environment Variables
 

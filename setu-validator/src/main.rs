@@ -94,8 +94,51 @@ fn load_key_info(key_file: &str) -> anyhow::Result<(String, Vec<u8>, Vec<u8>)> {
     Ok((account_address, public_key, signature))
 }
 
+/// Load environment variables from a dotenv file.
+/// Priority: `--env-file <path>` flag, then `.env` in the working directory.
+/// Each line should be KEY=VALUE (comments and blank lines are skipped).
+fn load_env_file() {
+    let args: Vec<String> = std::env::args().collect();
+    let explicit = args.windows(2)
+        .find(|w| w[0] == "--env-file")
+        .map(|w| w[1].clone());
+
+    let path = match explicit {
+        Some(p) => p,
+        None => {
+            // Auto-load .env from working directory if it exists
+            if std::path::Path::new(".env").exists() {
+                ".env".to_string()
+            } else {
+                return;
+            }
+        }
+    };
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to read env file {}: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            std::env::set_var(key.trim(), value.trim());
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load .env automatically, or from --env-file <path>
+    load_env_file();
+
     // Initialize tracing with more detailed output
     tracing_subscriber::fmt()
         .with_max_level(Level::DEBUG)
@@ -167,7 +210,25 @@ async fn main() -> anyhow::Result<()> {
     consensus_config.node_info = node_info;
     consensus_config.is_leader = true; // Single node mode: always leader
     consensus_config.consensus.validator_count = 1; // Single node mode: only 1 validator
+
+    // PoCW configuration from environment
+    if std::env::var("POCW_ENABLED").unwrap_or_default() == "true" {
+        let fee = std::env::var("POCW_TRANSFER_FEE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(21_000);
+        consensus_config.consensus.pocw = Some(setu_types::pocw::PoCWConfig {
+            enabled: true,
+            transfer_fee: fee,
+            ..Default::default()
+        });
+        info!("✓ PoCW enabled (transfer_fee={})", fee);
+    }
     
+    // Extract transfer fee before consensus_config is consumed
+    let transfer_fee = consensus_config.consensus.pocw
+        .filter(|p| p.enabled)
+        .map(|p| p.transfer_fee)
+        .unwrap_or(0);
+
     // Create ConsensusValidator with appropriate storage backend
     let consensus_validator = if let Some(ref db_path) = config.db_path {
         // RocksDB persistence mode - open database and create all backends
@@ -215,6 +276,7 @@ async fn main() -> anyhow::Result<()> {
     let network_config = NetworkServiceConfig {
         http_listen_addr: config.http_addr,
         p2p_listen_addr: config.p2p_addr,
+        transfer_fee,
     };
     
     // Create network service with consensus enabled

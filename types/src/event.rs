@@ -255,9 +255,13 @@ pub struct Event {
     /// Execution result (if executed)
     #[serde(default)]
     pub execution_result: Option<ExecutionResult>,
-    
+
     /// Creation timestamp (milliseconds since epoch)
     pub timestamp: u64,
+
+    /// Solver that executed this event (creator is the validator, not the solver)
+    #[serde(default)]
+    pub executed_by: Option<String>,
 }
 
 impl Event {
@@ -294,6 +298,7 @@ impl Event {
             status: EventStatus::Pending,
             execution_result: None,
             timestamp,
+            executed_by: None,
         }
     }
 
@@ -714,5 +719,34 @@ mod tests {
             .with_changes(vec![StateChange::insert("key1", vec![1, 2, 3])]);
         assert!(result.success);
         assert_eq!(result.state_changes.len(), 1);
+    }
+
+    #[test]
+    fn test_executed_by_default_none() {
+        let event = Event::new(
+            EventType::Transfer,
+            vec![],
+            create_vlc_snapshot(),
+            "node1".to_string(),
+        );
+        assert!(event.executed_by.is_none());
+    }
+
+    #[test]
+    fn test_event_backward_compat_serde() {
+        // JSON without executed_by should deserialize with None default
+        let json = r#"{
+            "id": "abc123",
+            "event_type": "Transfer",
+            "parent_ids": [],
+            "payload": "None",
+            "vlc_snapshot": {"vector_clock": {"clocks": {}}, "logical_time": 1, "physical_time": 1000},
+            "creator": "node1",
+            "status": "Pending",
+            "timestamp": 1000
+        }"#;
+
+        let event: Event = serde_json::from_str(json).unwrap();
+        assert!(event.executed_by.is_none());
     }
 }

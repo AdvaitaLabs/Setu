@@ -1,8 +1,10 @@
 use setu_types::{
-    Anchor, ConsensusConfig, ConsensusFrame, EventId, Vote,
+    Anchor, ConsensusConfig, ConsensusFrame, EventId, SubnetId, Vote,
+    event::StateChange,
 };
 use crate::anchor_builder::{AnchorBuilder, AnchorBuildResult, AnchorBuildError, PendingAnchorBuild};
 use crate::dag::Dag;
+use crate::pocw::fold_observer::FoldObserver;
 use crate::vlc::VLC;
 use setu_storage::subnet_state::GlobalStateManager;
 use std::collections::HashMap;
@@ -117,11 +119,16 @@ pub struct ConsensusManager {
     local_validator_id: String,
     /// Last build result for diagnostics
     last_build_result: Option<AnchorBuildResult>,
+    /// PoCW fold observer (active when PoCWConfig::enabled)
+    fold_observer: Option<FoldObserver>,
 }
 
 impl ConsensusManager {
     /// Create a new ConsensusManager with AnchorBuilder
     pub fn new(config: ConsensusConfig, validator_id: String) -> Self {
+        let fold_observer = config.pocw
+            .filter(|p| p.enabled)
+            .map(FoldObserver::new);
         Self {
             config: config.clone(),
             anchor_builder: AnchorBuilder::new(config.clone()),
@@ -132,15 +139,19 @@ impl ConsensusManager {
             persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
             last_build_result: None,
+            fold_observer,
         }
     }
     
     /// Create with an existing GlobalStateManager (for state persistence)
     pub fn with_state_manager(
-        config: ConsensusConfig, 
+        config: ConsensusConfig,
         validator_id: String,
         state_manager: GlobalStateManager,
     ) -> Self {
+        let fold_observer = config.pocw
+            .filter(|p| p.enabled)
+            .map(FoldObserver::new);
         Self {
             config: config.clone(),
             anchor_builder: AnchorBuilder::with_state_manager(config.clone(), state_manager),
@@ -151,6 +162,7 @@ impl ConsensusManager {
             persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
             last_build_result: None,
+            fold_observer,
         }
     }
 
@@ -304,6 +316,14 @@ impl ConsensusManager {
                         // Leader path: commit the pending build
                         match self.anchor_builder.commit_build(pending_build.clone()) {
                             Ok(state_summary) => {
+                                // PoCW: observe the committed fold and mint rewards
+                                if let Some(ref mut observer) = self.fold_observer {
+                                    let fold_events = pending_build.all_events();
+                                    if let Some(economics) = observer.on_fold_committed(&fold_events) {
+                                        self.apply_reward_minting(&economics);
+                                    }
+                                }
+
                                 // Store result for diagnostics
                                 self.last_build_result = Some(AnchorBuildResult {
                                     anchor: cf.anchor.clone(),
@@ -450,7 +470,55 @@ impl ConsensusManager {
     }
     
     // =========================================================================
-    // New methods for Merkle tree access
+    // PoCW Reward Minting
+    // =========================================================================
+
+    /// Mint solver rewards by writing StateChanges to the ROOT subnet SMT.
+    ///
+    /// For each solver with a non-zero reward, reads the current accumulated
+    /// balance from state, adds the new reward, and writes back. The key
+    /// namespace is "pocw:reward:{solver_id}" to avoid conflicts with coin
+    /// objects. Rewards are persisted across folds.
+    fn apply_reward_minting(&mut self, economics: &setu_types::pocw::FoldEconomics) {
+        let state_manager = self.anchor_builder.state_manager_mut();
+
+        for reward in &economics.solver_rewards {
+            if reward.flux_reward == 0 {
+                continue;
+            }
+
+            let key = format!("pocw:reward:{}", reward.solver_id);
+
+            // Read current accumulated reward
+            let old_balance = state_manager
+                .get_value(&SubnetId::ROOT, &key)
+                .and_then(|bytes| {
+                    if bytes.len() == 8 {
+                        Some(u64::from_le_bytes(bytes.try_into().unwrap()))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+
+            let new_balance = old_balance.saturating_add(reward.flux_reward);
+
+            let change = StateChange::new(
+                key,
+                if old_balance > 0 {
+                    Some(old_balance.to_le_bytes().to_vec())
+                } else {
+                    None
+                },
+                Some(new_balance.to_le_bytes().to_vec()),
+            );
+
+            state_manager.apply_state_change(SubnetId::ROOT, &change);
+        }
+    }
+
+    // =========================================================================
+    // Merkle tree access
     // =========================================================================
     
     /// Get the AnchorBuilder (read-only)
@@ -669,5 +737,67 @@ mod tests {
         // Global root should be computed
         let global_root = manager.get_global_root();
         assert_ne!(global_root, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_apply_reward_minting() {
+        use setu_types::pocw::{PoCWConfig, FoldEconomics, SolverReward};
+
+        let config = ConsensusConfig {
+            pocw: Some(PoCWConfig {
+                enabled: true,
+                solver_transfer_reward_enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut manager = ConsensusManager::new(config, "v1".to_string());
+
+        // Simulate fold economics with two solvers
+        let economics = FoldEconomics {
+            event_count: 5,
+            total_flux_burned: 105_000,
+            total_power_consumed: 5,
+            total_solver_rewards: 5,
+            solver_rewards: vec![
+                SolverReward { solver_id: "solver-a".into(), transfer_count: 3, flux_reward: 3 },
+                SolverReward { solver_id: "solver-b".into(), transfer_count: 2, flux_reward: 2 },
+            ],
+        };
+
+        // Apply minting
+        manager.apply_reward_minting(&economics);
+
+        // Verify rewards persisted in state
+        {
+            let sm = manager.state_manager();
+            let val_a = sm.get_value(&SubnetId::ROOT, "pocw:reward:solver-a").unwrap();
+            assert_eq!(u64::from_le_bytes(val_a.try_into().unwrap()), 3);
+
+            let val_b = sm.get_value(&SubnetId::ROOT, "pocw:reward:solver-b").unwrap();
+            assert_eq!(u64::from_le_bytes(val_b.try_into().unwrap()), 2);
+        }
+
+        // Apply a second fold — rewards accumulate
+        let economics2 = FoldEconomics {
+            event_count: 2,
+            total_flux_burned: 42_000,
+            total_power_consumed: 2,
+            total_solver_rewards: 2,
+            solver_rewards: vec![
+                SolverReward { solver_id: "solver-a".into(), transfer_count: 2, flux_reward: 2 },
+            ],
+        };
+        manager.apply_reward_minting(&economics2);
+
+        {
+            let sm = manager.state_manager();
+            let val_a = sm.get_value(&SubnetId::ROOT, "pocw:reward:solver-a").unwrap();
+            assert_eq!(u64::from_le_bytes(val_a.try_into().unwrap()), 5); // 3 + 2
+
+            // solver-b unchanged
+            let val_b = sm.get_value(&SubnetId::ROOT, "pocw:reward:solver-b").unwrap();
+            assert_eq!(u64::from_le_bytes(val_b.try_into().unwrap()), 2);
+        }
     }
 }

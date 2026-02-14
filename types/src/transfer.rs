@@ -78,6 +78,11 @@ pub struct Transfer {
     
     /// Power/work score used for tie-breaks in ordering
     pub power: u64,
+
+    /// Transaction fee deducted from sender and destroyed.
+    /// Burn mechanism subject to revision.
+    #[serde(default)]
+    pub fee: u64,
     
     // ========== Routing Hints ==========
     
@@ -108,13 +113,20 @@ impl Transfer {
             transfer_type: TransferType::FluxTransfer,
             resources: vec![],
             power: 0,
+            fee: 0,
             preferred_solver: None,
             shard_id: None,
             subnet_id: None,
             assigned_vlc: None,
         }
     }
-    
+
+    /// Set transaction fee (typically called by validator from PoCWConfig)
+    pub fn with_fee(mut self, fee: u64) -> Self {
+        self.fee = fee;
+        self
+    }
+
     /// Set transfer type
     pub fn with_type(mut self, transfer_type: TransferType) -> Self {
         self.transfer_type = transfer_type;
@@ -188,6 +200,7 @@ impl Default for Transfer {
             transfer_type: TransferType::default(),
             resources: vec![],
             power: 0,
+            fee: 0,
             preferred_solver: None,
             shard_id: None,
             subnet_id: None,
