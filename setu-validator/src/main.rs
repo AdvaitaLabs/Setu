@@ -210,6 +210,18 @@ async fn main() -> anyhow::Result<()> {
     consensus_config.node_info = node_info;
     consensus_config.is_leader = true; // Single node mode: always leader
     consensus_config.consensus.validator_count = 1; // Single node mode: only 1 validator
+
+    // PoCW configuration from environment
+    if std::env::var("POCW_ENABLED").unwrap_or_default() == "true" {
+        let fee = std::env::var("POCW_TRANSFER_FEE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(21_000);
+        consensus_config.consensus.pocw = Some(setu_types::pocw::PoCWConfig {
+            enabled: true,
+            transfer_fee: fee,
+            ..Default::default()
+        });
+        info!("✓ PoCW enabled (transfer_fee={})", fee);
+    }
     
     // Extract transfer fee before consensus_config is consumed
     let transfer_fee = consensus_config.consensus.pocw
