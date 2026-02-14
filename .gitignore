@@ -15,6 +15,9 @@ Thumbs.db
 **/*.rs.bk
 Cargo.lock
 
+# Environment
+.env
+
 # Logs
 *.log
 logs/
