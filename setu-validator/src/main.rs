@@ -168,10 +168,10 @@ async fn main() -> anyhow::Result<()> {
     consensus_config.is_leader = true; // Single node mode: always leader
     consensus_config.consensus.validator_count = 1; // Single node mode: only 1 validator
     
-    // Extract burn fee before consensus_config is consumed
-    let transfer_burn_fee = consensus_config.consensus.pocw
+    // Extract transfer fee before consensus_config is consumed
+    let transfer_fee = consensus_config.consensus.pocw
         .filter(|p| p.enabled)
-        .map(|p| p.transfer_fixed_fee)
+        .map(|p| p.transfer_fee)
         .unwrap_or(0);
 
     // Create ConsensusValidator with appropriate storage backend
@@ -221,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
     let network_config = NetworkServiceConfig {
         http_listen_addr: config.http_addr,
         p2p_listen_addr: config.p2p_addr,
-        transfer_burn_fee,
+        transfer_fee,
     };
     
     // Create network service with consensus enabled

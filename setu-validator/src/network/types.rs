@@ -23,8 +23,9 @@ pub struct NetworkServiceConfig {
     pub http_listen_addr: SocketAddr,
     /// Listen address for Anemo P2P
     pub p2p_listen_addr: SocketAddr,
-    /// Burn fee applied to each FluxTransfer (from PoCWConfig, 0 if disabled)
-    pub transfer_burn_fee: u64,
+    /// Transaction fee applied to each FluxTransfer (from PoCWConfig, 0 if disabled).
+    /// This fee is burned (destroyed) — it is not paid to any recipient.
+    pub transfer_fee: u64,
 }
 
 impl Default for NetworkServiceConfig {
@@ -32,7 +33,7 @@ impl Default for NetworkServiceConfig {
         Self {
             http_listen_addr: "127.0.0.1:8080".parse().unwrap(),
             p2p_listen_addr: "127.0.0.1:9000".parse().unwrap(),
-            transfer_burn_fee: 0,
+            transfer_fee: 0,
         }
     }
 }

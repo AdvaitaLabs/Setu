@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 pub struct PoCWConfig {
     /// Master toggle for PoCW economics
     pub enabled: bool,
-    /// Fixed gas fee for FluxTransfer transactions
-    pub transfer_fixed_fee: u64,
+    /// Fee per FluxTransfer (burned). Burn mechanism subject to revision.
+    pub transfer_fee: u64,
     /// Flat power drain per FluxTransfer
     pub transfer_power_drain: u64,
     /// Whether solvers receive a nominal reward for processing FluxTransfer transactions
@@ -27,7 +27,7 @@ impl Default for PoCWConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            transfer_fixed_fee: 21_000,
+            transfer_fee: 21_000,
             transfer_power_drain: 1,
             solver_transfer_reward_enabled: false,
             solver_transfer_reward: 1,
@@ -68,7 +68,7 @@ mod tests {
     fn test_defaults() {
         let config = PoCWConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.transfer_fixed_fee, 21_000);
+        assert_eq!(config.transfer_fee, 21_000);
         assert_eq!(config.transfer_power_drain, 1);
         assert!(!config.solver_transfer_reward_enabled);
         assert_eq!(config.solver_transfer_reward, 1);
@@ -81,7 +81,7 @@ mod tests {
         let deserialized: PoCWConfig = serde_json::from_str(&json).unwrap();
 
         assert_eq!(config.enabled, deserialized.enabled);
-        assert_eq!(config.transfer_fixed_fee, deserialized.transfer_fixed_fee);
+        assert_eq!(config.transfer_fee, deserialized.transfer_fee);
         assert_eq!(config.transfer_power_drain, deserialized.transfer_power_drain);
         assert_eq!(config.solver_transfer_reward_enabled, deserialized.solver_transfer_reward_enabled);
         assert_eq!(config.solver_transfer_reward, deserialized.solver_transfer_reward);
@@ -93,14 +93,14 @@ mod tests {
             enabled: true,
             solver_transfer_reward_enabled: true,
             solver_transfer_reward: 5,
-            transfer_fixed_fee: 10_000,
+            transfer_fee: 10_000,
             ..Default::default()
         };
 
         assert!(config.enabled);
         assert!(config.solver_transfer_reward_enabled);
         assert_eq!(config.solver_transfer_reward, 5);
-        assert_eq!(config.transfer_fixed_fee, 10_000);
+        assert_eq!(config.transfer_fee, 10_000);
         assert_eq!(config.transfer_power_drain, 1);
     }
 }

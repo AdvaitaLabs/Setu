@@ -7,7 +7,7 @@ use setu_types::pocw::PoCWConfig;
 /// Calculate the Flux burn for a FluxTransfer transaction.
 pub fn calculate_transfer_burn(config: &PoCWConfig) -> u64 {
     if config.enabled {
-        config.transfer_fixed_fee
+        config.transfer_fee
     } else {
         0
     }
@@ -36,7 +36,7 @@ mod tests {
     fn test_custom_fee() {
         let config = PoCWConfig {
             enabled: true,
-            transfer_fixed_fee: 50_000,
+            transfer_fee: 50_000,
             ..Default::default()
         };
         assert_eq!(calculate_transfer_burn(&config), 50_000);

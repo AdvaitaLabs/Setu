@@ -152,17 +152,17 @@ impl<S: StateStore> RuntimeExecutor<S> {
         let mut created_objects = Vec::new();
         let deleted_objects = Vec::new();
         
-        let burn_fee = transfer_tx.burn_fee;
+        let fee = transfer_tx.fee;
 
         // 3. Execute transfer logic
         match transfer_tx.amount {
-            // Full transfer: transfer ownership (burn fee deducted from coin value)
+            // Full transfer: transfer ownership (fee deducted from coin value, then burned)
             None => {
-                // Deduct burn fee before transferring ownership
-                if burn_fee > 0 {
-                    coin.data.balance.withdraw(burn_fee)
+                // Deduct fee before transferring ownership
+                if fee > 0 {
+                    coin.data.balance.withdraw(fee)
                         .map_err(|e| RuntimeError::InvalidTransaction(
-                            format!("Insufficient balance for burn fee: {}", e)
+                            format!("Insufficient balance for fee: {}", e)
                         ))?;
                 }
 
@@ -171,7 +171,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
                     from = %tx.sender,
                     to = %recipient,
                     amount = coin.data.balance.value(),
-                    burn_fee = burn_fee,
+                    fee = fee,
                     "Full transfer"
                 );
 
@@ -189,11 +189,11 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 });
             }
 
-            // Partial transfer: split coin (burn fee deducted from sender, not sent to recipient)
+            // Partial transfer: split coin (fee deducted from sender and burned, not sent to recipient)
             Some(amount) => {
-                let total_deduction = amount.checked_add(burn_fee)
+                let total_deduction = amount.checked_add(fee)
                     .ok_or_else(|| RuntimeError::InvalidTransaction(
-                        "Amount + burn_fee overflow".to_string()
+                        "Amount + fee overflow".to_string()
                     ))?;
 
                 debug!(
@@ -201,16 +201,16 @@ impl<S: StateStore> RuntimeExecutor<S> {
                     from = %tx.sender,
                     to = %recipient,
                     amount = amount,
-                    burn_fee = burn_fee,
+                    fee = fee,
                     total_deduction = total_deduction,
                     "Partial transfer (split)"
                 );
 
-                // Withdraw amount + burn_fee from sender
+                // Withdraw amount + fee from sender
                 coin.data.balance.withdraw(total_deduction)
                     .map_err(|e| RuntimeError::InvalidTransaction(e))?;
 
-                // Update sender's coin (reduced by amount + burn_fee)
+                // Update sender's coin (reduced by amount + fee)
                 coin.metadata.version += 1;
                 let new_state = serde_json::to_vec(&coin)?;
                 self.state.set_object(coin_id, coin.clone())?;
@@ -223,7 +223,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 });
 
                 // Create new coin for recipient with only the transfer amount
-                // (burn_fee is destroyed — no coin created for it)
+                // (fee is burned/destroyed — no coin created for it)
                 let new_coin = create_typed_coin(
                     recipient.clone(),
                     amount,
@@ -344,20 +344,20 @@ impl<S: StateStore> RuntimeExecutor<S> {
         amount: Option<u64>,
         ctx: &ExecutionContext,
     ) -> RuntimeResult<ExecutionOutput> {
-        self.execute_transfer_with_coin_and_burn(coin_id, sender, recipient, amount, 0, ctx)
+        self.execute_transfer_with_coin_and_fee(coin_id, sender, recipient, amount, 0, ctx)
     }
 
-    /// Execute a transfer with burn fee (solver-tee3 architecture)
+    /// Execute a transfer with fee (solver-tee3 architecture).
     ///
-    /// The burn_fee is deducted from the sender's coin and destroyed (not
-    /// transferred to any recipient). This reduces total supply.
-    pub fn execute_transfer_with_coin_and_burn(
+    /// Fee is deducted from the sender and destroyed.
+    /// Burn mechanism subject to revision.
+    pub fn execute_transfer_with_coin_and_fee(
         &mut self,
         coin_id: ObjectId,
         sender: &str,
         recipient: &str,
         amount: Option<u64>,
-        burn_fee: u64,
+        fee: u64,
         ctx: &ExecutionContext,
     ) -> RuntimeResult<ExecutionOutput> {
         let sender_addr = Address::from(sender);
@@ -368,17 +368,17 @@ impl<S: StateStore> RuntimeExecutor<S> {
             from = %sender,
             to = %recipient,
             amount = ?amount,
-            burn_fee = burn_fee,
+            fee = fee,
             "Executing transfer with specified coin_id"
         );
 
         // Create and execute the transfer transaction
-        let tx = Transaction::new_transfer_with_burn(
+        let tx = Transaction::new_transfer_with_fee(
             sender_addr,
             coin_id,
             recipient_addr,
             amount,
-            burn_fee,
+            fee,
         );
 
         self.execute_transaction(&tx, ctx)
@@ -570,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_transfer_with_burn_fee() {
+    fn test_partial_transfer_with_fee() {
         let mut store = InMemoryStateStore::new();
         let sender = Address::from("alice");
         let recipient = Address::from("bob");
@@ -586,8 +586,8 @@ mod tests {
             in_tee: false,
         };
 
-        // Transfer 5000 with 21000 burn fee → sender loses 26000 total
-        let tx = Transaction::new_transfer_with_burn(
+        // Transfer 5000 with 21000 fee → sender loses 26000 total
+        let tx = Transaction::new_transfer_with_fee(
             sender.clone(), coin_id, recipient.clone(), Some(5000), 21_000,
         );
 
@@ -605,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_transfer_with_burn_fee() {
+    fn test_full_transfer_with_fee() {
         let mut store = InMemoryStateStore::new();
         let sender = Address::from("alice");
         let recipient = Address::from("bob");
@@ -621,8 +621,8 @@ mod tests {
             in_tee: false,
         };
 
-        // Full transfer with 21000 burn → coin arrives with 50_000 - 21_000 = 29_000
-        let tx = Transaction::new_transfer_with_burn(
+        // Full transfer with 21000 fee → coin arrives with 50_000 - 21_000 = 29_000
+        let tx = Transaction::new_transfer_with_fee(
             sender.clone(), coin_id, recipient.clone(), None, 21_000,
         );
 
@@ -635,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn test_burn_fee_insufficient_balance() {
+    fn test_fee_insufficient_balance() {
         let mut store = InMemoryStateStore::new();
         let sender = Address::from("alice");
         let recipient = Address::from("bob");
@@ -651,8 +651,8 @@ mod tests {
             in_tee: false,
         };
 
-        // Transfer 500 with 21000 burn fee → needs 21500, has 1000
-        let tx = Transaction::new_transfer_with_burn(
+        // Transfer 500 with 21000 fee → needs 21500, has 1000
+        let tx = Transaction::new_transfer_with_fee(
             sender.clone(), coin_id, recipient.clone(), Some(500), 21_000,
         );
 
@@ -661,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_burn_fee_unchanged_behavior() {
+    fn test_zero_fee_unchanged_behavior() {
         let mut store = InMemoryStateStore::new();
         let sender = Address::from("alice");
         let recipient = Address::from("bob");
@@ -677,8 +677,8 @@ mod tests {
             in_tee: false,
         };
 
-        // Zero burn_fee = identical to old behavior
-        let tx = Transaction::new_transfer_with_burn(
+        // Zero fee = identical to old behavior
+        let tx = Transaction::new_transfer_with_fee(
             sender.clone(), coin_id, recipient.clone(), Some(300), 0,
         );
 
