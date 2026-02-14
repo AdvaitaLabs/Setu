@@ -94,8 +94,51 @@ fn load_key_info(key_file: &str) -> anyhow::Result<(String, Vec<u8>, Vec<u8>)> {
     Ok((account_address, public_key, signature))
 }
 
+/// Load environment variables from a dotenv file.
+/// Priority: `--env-file <path>` flag, then `.env` in the working directory.
+/// Each line should be KEY=VALUE (comments and blank lines are skipped).
+fn load_env_file() {
+    let args: Vec<String> = std::env::args().collect();
+    let explicit = args.windows(2)
+        .find(|w| w[0] == "--env-file")
+        .map(|w| w[1].clone());
+
+    let path = match explicit {
+        Some(p) => p,
+        None => {
+            // Auto-load .env from working directory if it exists
+            if std::path::Path::new(".env").exists() {
+                ".env".to_string()
+            } else {
+                return;
+            }
+        }
+    };
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to read env file {}: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            std::env::set_var(key.trim(), value.trim());
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load .env automatically, or from --env-file <path>
+    load_env_file();
+
     // Initialize tracing with more detailed output
     tracing_subscriber::fmt()
         .with_max_level(Level::DEBUG)
