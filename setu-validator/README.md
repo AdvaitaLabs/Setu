@@ -50,7 +50,10 @@ Validator node for the Setu network. Responsible for verifying events, maintaini
 # Start validator with default config
 cargo run -p setu-validator
 
-# With environment variables
+# With an env file (auto-loads .env from working directory, or use --env-file)
+cargo run -p setu-validator -- --env-file .env
+
+# With inline environment variables
 VALIDATOR_ID=validator_1 \
 VALIDATOR_PORT=8001 \
 IS_LEADER=true \
@@ -83,6 +86,8 @@ validator.run().await;
 | node_id | VALIDATOR_ID | auto-generated | Unique validator identifier |
 | port | VALIDATOR_PORT | 8001 | Network port |
 | is_leader | IS_LEADER | false | Whether this is the leader node |
+| pocw_enabled | POCW_ENABLED | false | Enable PoCW economic layer |
+| pocw_transfer_fee | POCW_TRANSFER_FEE | 21000 | Fee per transfer (burned) |
 
 ## Modules
 
