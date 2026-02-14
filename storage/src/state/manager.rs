@@ -465,6 +465,12 @@ impl GlobalStateManager {
         Ok((anchor_roots, summary))
     }
     
+    /// Read a value from a subnet by string key
+    pub fn get_value(&self, subnet_id: &SubnetId, key: &str) -> Option<Vec<u8>> {
+        let object_id = Self::key_to_object_id(key);
+        self.get_subnet(subnet_id)?.get(&object_id).cloned()
+    }
+
     /// Convert a string key to a 32-byte ObjectId using SHA-256
     fn key_to_object_id(key: &str) -> HashValue {
         let mut hasher = Sha256::new();
