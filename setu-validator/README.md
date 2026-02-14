@@ -50,7 +50,10 @@ Validator node for the Setu network. Responsible for verifying events, maintaini
 # Start validator with default config
 cargo run -p setu-validator
 
-# With environment variables
+# With an env file (auto-loads .env from working directory, or use --env-file)
+cargo run -p setu-validator -- --env-file .env
+
+# With inline environment variables
 VALIDATOR_ID=validator_1 \
 VALIDATOR_PORT=8001 \
 IS_LEADER=true \
