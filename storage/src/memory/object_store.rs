@@ -15,9 +15,8 @@
 use crate::backends::object::ObjectStore;
 use dashmap::DashMap;
 use setu_types::{
-    Address, AccountView, Coin, CoinType, Credential, ObjectId,
-    Profile, RelationGraph, SetuError, SetuResult, SubnetId,
-    UserRelationNetworkObject, UserSubnetActivity,
+    AccountView, Address, Coin, CoinType, Credential, ObjectId, Profile, RelationGraph, SetuError,
+    SetuResult, SubnetId, UserRelationNetworkObject, UserSubnetActivity,
 };
 use std::sync::Arc;
 
@@ -126,7 +125,7 @@ impl ObjectStore for MemoryObjectStore {
         // Update indexes
         if let Some(owner) = coin.owner() {
             Self::add_to_index(&self.coins_by_owner, owner, &id);
-            
+
             // Update (owner, coin_type) index
             self.coins_by_owner_and_type
                 .entry((owner.clone(), coin.coin_type().clone()))
@@ -150,13 +149,18 @@ impl ObjectStore for MemoryObjectStore {
         Ok(coins)
     }
 
-    fn get_coins_by_owner_and_type(&self, owner: &Address, coin_type: &CoinType) -> SetuResult<Vec<Coin>> {
+    fn get_coins_by_owner_and_type(
+        &self,
+        owner: &Address,
+        coin_type: &CoinType,
+    ) -> SetuResult<Vec<Coin>> {
         let key = (owner.clone(), coin_type.clone());
-        let ids = self.coins_by_owner_and_type
+        let ids = self
+            .coins_by_owner_and_type
             .get(&key)
             .map(|v| v.clone())
             .unwrap_or_default();
-        
+
         let coins: Vec<Coin> = ids
             .iter()
             .filter_map(|id| self.coins.get(id).map(|c| c.clone()))
@@ -166,20 +170,20 @@ impl ObjectStore for MemoryObjectStore {
 
     fn update_coin(&self, coin: &Coin) -> SetuResult<()> {
         let id = *coin.id();
-        
+
         // Get old coin to update indexes if owner or coin_type changed
         if let Some(old_coin) = self.coins.get(&id) {
             let old_owner = old_coin.owner().cloned();
             let new_owner = coin.owner().cloned();
             let old_coin_type = old_coin.coin_type().clone();
             let new_coin_type = coin.coin_type().clone();
-            
+
             // If owner changed, update both indexes
             if old_owner != new_owner {
                 // Remove from old owner's index
                 if let Some(old_owner) = &old_owner {
                     Self::remove_from_index(&self.coins_by_owner, old_owner, &id);
-                    
+
                     let old_key = (old_owner.clone(), old_coin_type.clone());
                     if let Some(mut entry) = self.coins_by_owner_and_type.get_mut(&old_key) {
                         entry.retain(|existing| *existing != id);
@@ -189,11 +193,11 @@ impl ObjectStore for MemoryObjectStore {
                         }
                     }
                 }
-                
+
                 // Add to new owner's index
                 if let Some(new_owner) = &new_owner {
                     Self::add_to_index(&self.coins_by_owner, new_owner, &id);
-                    
+
                     self.coins_by_owner_and_type
                         .entry((new_owner.clone(), new_coin_type.clone()))
                         .or_insert_with(Vec::new)
@@ -212,7 +216,7 @@ impl ObjectStore for MemoryObjectStore {
                             self.coins_by_owner_and_type.remove(&old_key);
                         }
                     }
-                    
+
                     // Add to new (owner, coin_type) index
                     self.coins_by_owner_and_type
                         .entry((owner.clone(), new_coin_type))
@@ -221,7 +225,7 @@ impl ObjectStore for MemoryObjectStore {
                 }
             }
         }
-        
+
         // Update coin data
         self.coins.insert(id, coin.clone());
         Ok(())
@@ -231,7 +235,7 @@ impl ObjectStore for MemoryObjectStore {
         if let Some((_, coin)) = self.coins.remove(id) {
             if let Some(owner) = coin.owner() {
                 Self::remove_from_index(&self.coins_by_owner, owner, id);
-                
+
                 let key = (owner.clone(), coin.coin_type().clone());
                 if let Some(mut entry) = self.coins_by_owner_and_type.get_mut(&key) {
                     entry.retain(|existing| *existing != *id);
@@ -288,10 +292,7 @@ impl ObjectStore for MemoryObjectStore {
 
         // Check if profile exists
         if !self.profiles.contains_key(&id) {
-            return Err(SetuError::StorageError(format!(
-                "Profile {} not found",
-                id
-            )));
+            return Err(SetuError::StorageError(format!("Profile {} not found", id)));
         }
 
         // Update profile
@@ -434,10 +435,13 @@ impl ObjectStore for MemoryObjectStore {
 
     // ========== UserRelationNetwork operations ==========
 
-    fn store_user_relation_network(&self, network: &UserRelationNetworkObject) -> SetuResult<ObjectId> {
+    fn store_user_relation_network(
+        &self,
+        network: &UserRelationNetworkObject,
+    ) -> SetuResult<ObjectId> {
         let id = *network.id();
         let user = network.data.user.clone();
-        
+
         // Atomic check-and-insert using entry API to prevent TOCTOU race
         use dashmap::mapref::entry::Entry;
         match self.user_relation_networks.entry(user.clone()) {
@@ -451,17 +455,20 @@ impl ObjectStore for MemoryObjectStore {
                 entry.insert(network.clone());
             }
         }
-        
+
         Ok(id)
     }
 
-    fn get_user_relation_network(&self, user: &Address) -> SetuResult<Option<UserRelationNetworkObject>> {
+    fn get_user_relation_network(
+        &self,
+        user: &Address,
+    ) -> SetuResult<Option<UserRelationNetworkObject>> {
         Ok(self.user_relation_networks.get(user).map(|n| n.clone()))
     }
 
     fn update_user_relation_network(&self, network: &UserRelationNetworkObject) -> SetuResult<()> {
         let user = &network.data.user;
-        
+
         if !self.user_relation_networks.contains_key(user) {
             return Err(SetuError::StorageError(format!(
                 "User relation network not found for user {}",
@@ -469,7 +476,8 @@ impl ObjectStore for MemoryObjectStore {
             )));
         }
 
-        self.user_relation_networks.insert(user.clone(), network.clone());
+        self.user_relation_networks
+            .insert(user.clone(), network.clone());
         Ok(())
     }
 
@@ -482,13 +490,13 @@ impl ObjectStore for MemoryObjectStore {
 
     fn store_user_subnet_activity(&self, activity: &UserSubnetActivity) -> SetuResult<()> {
         let key = (activity.user.clone(), activity.subnet_id);
-        
+
         // Check if already exists to avoid duplicate index entries
         let is_new = !self.user_subnet_activities.contains_key(&key);
-        
+
         // Store activity
         self.user_subnet_activities.insert(key, activity.clone());
-        
+
         // Update user -> subnet_ids index only for new entries
         if is_new {
             self.subnet_ids_by_user
@@ -500,17 +508,25 @@ impl ObjectStore for MemoryObjectStore {
         Ok(())
     }
 
-    fn get_user_subnet_activity(&self, user: &Address, subnet_id: &SubnetId) -> SetuResult<Option<UserSubnetActivity>> {
+    fn get_user_subnet_activity(
+        &self,
+        user: &Address,
+        subnet_id: &SubnetId,
+    ) -> SetuResult<Option<UserSubnetActivity>> {
         let key = (user.clone(), *subnet_id);
         Ok(self.user_subnet_activities.get(&key).map(|a| a.clone()))
     }
 
-    fn get_user_all_subnet_activities(&self, user: &Address) -> SetuResult<Vec<UserSubnetActivity>> {
-        let subnet_ids = self.subnet_ids_by_user
+    fn get_user_all_subnet_activities(
+        &self,
+        user: &Address,
+    ) -> SetuResult<Vec<UserSubnetActivity>> {
+        let subnet_ids = self
+            .subnet_ids_by_user
             .get(user)
             .map(|v| v.clone())
             .unwrap_or_default();
-        
+
         let activities: Vec<UserSubnetActivity> = subnet_ids
             .iter()
             .filter_map(|subnet_id| {
@@ -518,13 +534,13 @@ impl ObjectStore for MemoryObjectStore {
                 self.user_subnet_activities.get(&key).map(|a| a.clone())
             })
             .collect();
-        
+
         Ok(activities)
     }
 
     fn update_user_subnet_activity(&self, activity: &UserSubnetActivity) -> SetuResult<()> {
         let key = (activity.user.clone(), activity.subnet_id);
-        
+
         if !self.user_subnet_activities.contains_key(&key) {
             return Err(SetuError::StorageError(format!(
                 "User subnet activity not found for user {} and subnet {}",
@@ -538,7 +554,7 @@ impl ObjectStore for MemoryObjectStore {
 
     fn delete_user_subnet_activity(&self, user: &Address, subnet_id: &SubnetId) -> SetuResult<()> {
         let key = (user.clone(), *subnet_id);
-        
+
         if self.user_subnet_activities.remove(&key).is_some() {
             // Update user -> subnet_ids index
             if let Some(mut entry) = self.subnet_ids_by_user.get_mut(user) {
@@ -549,7 +565,7 @@ impl ObjectStore for MemoryObjectStore {
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -597,7 +613,9 @@ mod tests {
         assert_eq!(by_owner.len(), 1);
 
         // Get by owner and type
-        let by_type = store.get_coins_by_owner_and_type(&owner, &CoinType::native()).unwrap();
+        let by_type = store
+            .get_coins_by_owner_and_type(&owner, &CoinType::native())
+            .unwrap();
         assert_eq!(by_type.len(), 1);
 
         // Update
@@ -617,16 +635,26 @@ mod tests {
     fn test_coin_by_type_filter() {
         let store = MemoryObjectStore::new();
         let owner = Address::from_str_id("alice");
-        
+
         // Store coins with different types
         store.store_coin(&Coin::new(owner.clone(), 100)).unwrap();
         store.store_coin(&Coin::new(owner.clone(), 200)).unwrap();
-        store.store_coin(&Coin::new_with_type(owner.clone(), 300, CoinType::new("OTHER"))).unwrap();
+        store
+            .store_coin(&Coin::new_with_type(
+                owner.clone(),
+                300,
+                CoinType::new("OTHER"),
+            ))
+            .unwrap();
 
-        let native_coins = store.get_coins_by_owner_and_type(&owner, &CoinType::native()).unwrap();
+        let native_coins = store
+            .get_coins_by_owner_and_type(&owner, &CoinType::native())
+            .unwrap();
         assert_eq!(native_coins.len(), 2);
-        
-        let other_coins = store.get_coins_by_owner_and_type(&owner, &CoinType::new("OTHER")).unwrap();
+
+        let other_coins = store
+            .get_coins_by_owner_and_type(&owner, &CoinType::new("OTHER"))
+            .unwrap();
         assert_eq!(other_coins.len(), 1);
 
         let all_coins = store.get_coins_by_owner(&owner).unwrap();
@@ -733,14 +761,22 @@ mod tests {
 
         // Create credential (holder)
         let issuer = Address::from_str_id("issuer");
-        store.store_credential(&Credential::new(address.clone(), "kyc", issuer)).unwrap();
+        store
+            .store_credential(&Credential::new(address.clone(), "kyc", issuer))
+            .unwrap();
 
         // Create graph
-        store.store_graph(&RelationGraph::new(ObjectId::random(), address.clone(), "social".to_string())).unwrap();
+        store
+            .store_graph(&RelationGraph::new(
+                ObjectId::random(),
+                address.clone(),
+                "social".to_string(),
+            ))
+            .unwrap();
 
         // Load account view
         let view = store.load_account_view(&address).unwrap();
-        
+
         assert!(view.profile.is_some());
         assert_eq!(view.coins.len(), 2);
         assert_eq!(view.credentials.len(), 1);
@@ -760,7 +796,10 @@ mod tests {
         store.store_user_subnet_activity(&activity).unwrap();
 
         // Get specific
-        let retrieved = store.get_user_subnet_activity(&user, &subnet_id).unwrap().unwrap();
+        let retrieved = store
+            .get_user_subnet_activity(&user, &subnet_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.total_interaction_count, 0);
 
         // Get all for user
@@ -771,12 +810,20 @@ mod tests {
         let mut updated = activity.clone();
         updated.total_interaction_count = 20;
         store.update_user_subnet_activity(&updated).unwrap();
-        let retrieved = store.get_user_subnet_activity(&user, &subnet_id).unwrap().unwrap();
+        let retrieved = store
+            .get_user_subnet_activity(&user, &subnet_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.total_interaction_count, 20);
 
         // Delete
-        store.delete_user_subnet_activity(&user, &subnet_id).unwrap();
-        assert!(store.get_user_subnet_activity(&user, &subnet_id).unwrap().is_none());
+        store
+            .delete_user_subnet_activity(&user, &subnet_id)
+            .unwrap();
+        assert!(store
+            .get_user_subnet_activity(&user, &subnet_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -786,9 +833,9 @@ mod tests {
 
         let store = Arc::new(MemoryObjectStore::new());
         let owner = Address::from_str_id("alice");
-        
+
         let mut handles = vec![];
-        
+
         // Spawn 10 threads, each storing 10 coins
         for i in 0..10 {
             let store = Arc::clone(&store);
@@ -796,11 +843,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 for j in 0..10 {
                     let coin_type = CoinType::new(format!("TYPE_{}", i));
-                    let coin = Coin::new_with_type(
-                        owner.clone(),
-                        (i * 10 + j) as u64,
-                        coin_type,
-                    );
+                    let coin = Coin::new_with_type(owner.clone(), (i * 10 + j) as u64, coin_type);
                     store.store_coin(&coin).unwrap();
                 }
             }));
@@ -811,7 +854,7 @@ mod tests {
         }
 
         assert_eq!(store.coin_count(), 100);
-        
+
         let all_coins = store.get_coins_by_owner(&owner).unwrap();
         assert_eq!(all_coins.len(), 100);
     }
@@ -840,17 +883,21 @@ mod tests {
         // Test that changing coin_type updates the index correctly
         let store = MemoryObjectStore::new();
         let owner = Address::from_str_id("alice");
-        
+
         // Create a coin with native type
         let mut coin = Coin::new(owner.clone(), 1000);
         let id = *coin.id();
         store.store_coin(&coin).unwrap();
 
         // Verify initial index state
-        let native_coins = store.get_coins_by_owner_and_type(&owner, &CoinType::native()).unwrap();
+        let native_coins = store
+            .get_coins_by_owner_and_type(&owner, &CoinType::native())
+            .unwrap();
         assert_eq!(native_coins.len(), 1);
-        
-        let other_coins = store.get_coins_by_owner_and_type(&owner, &CoinType::new("OTHER")).unwrap();
+
+        let other_coins = store
+            .get_coins_by_owner_and_type(&owner, &CoinType::new("OTHER"))
+            .unwrap();
         assert_eq!(other_coins.len(), 0);
 
         // Update coin type (this is a rare operation but should be handled)
@@ -858,10 +905,14 @@ mod tests {
         store.update_coin(&coin).unwrap();
 
         // Verify index updated correctly
-        let native_coins = store.get_coins_by_owner_and_type(&owner, &CoinType::native()).unwrap();
+        let native_coins = store
+            .get_coins_by_owner_and_type(&owner, &CoinType::native())
+            .unwrap();
         assert_eq!(native_coins.len(), 0, "Old type index should be empty");
-        
-        let other_coins = store.get_coins_by_owner_and_type(&owner, &CoinType::new("OTHER")).unwrap();
+
+        let other_coins = store
+            .get_coins_by_owner_and_type(&owner, &CoinType::new("OTHER"))
+            .unwrap();
         assert_eq!(other_coins.len(), 1, "New type index should have the coin");
 
         // Verify coin data is correct
@@ -895,7 +946,11 @@ mod tests {
         let alice_creds = store.get_credentials_by_holder(&holder1).unwrap();
         assert_eq!(alice_creds.len(), 0, "Old holder index should be empty");
         let bob_creds = store.get_credentials_by_holder(&holder2).unwrap();
-        assert_eq!(bob_creds.len(), 1, "New holder index should have the credential");
+        assert_eq!(
+            bob_creds.len(),
+            1,
+            "New holder index should have the credential"
+        );
     }
 
     #[test]
@@ -906,7 +961,8 @@ mod tests {
         let owner2 = Address::from_str_id("bob");
 
         // Create a graph
-        let mut graph = RelationGraph::new(ObjectId::random(), owner1.clone(), "social".to_string());
+        let mut graph =
+            RelationGraph::new(ObjectId::random(), owner1.clone(), "social".to_string());
         store.store_graph(&graph).unwrap();
 
         // Verify initial index state

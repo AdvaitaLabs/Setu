@@ -126,35 +126,24 @@ mod tests {
 
     #[test]
     fn test_new_validator() {
-        let info = NodeInfo::new_validator(
-            "validator-1".to_string(),
-            "127.0.0.1".to_string(),
-            8080,
-        );
+        let info =
+            NodeInfo::new_validator("validator-1".to_string(), "127.0.0.1".to_string(), 8080);
         assert!(info.is_validator());
         assert_eq!(info.endpoint(), "127.0.0.1:8080");
     }
 
     #[test]
     fn test_new_solver() {
-        let info = NodeInfo::new_solver(
-            "solver-1".to_string(),
-            "192.168.1.1".to_string(),
-            9090,
-        );
+        let info = NodeInfo::new_solver("solver-1".to_string(), "192.168.1.1".to_string(), 9090);
         assert!(info.is_solver());
         assert!(!info.is_validator());
     }
 
     #[test]
     fn test_status() {
-        let mut info = NodeInfo::new_validator(
-            "test".to_string(),
-            "localhost".to_string(),
-            8080,
-        );
+        let mut info = NodeInfo::new_validator("test".to_string(), "localhost".to_string(), 8080);
         assert!(!info.is_active());
-        
+
         info.set_status(NodeStatus::Active);
         assert!(info.is_active());
     }

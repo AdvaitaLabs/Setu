@@ -31,43 +31,40 @@
 //! TeeExecutionResult → Validator
 //! ```
 
-mod tee;
-mod network_client;
 pub mod http_server;
+mod network_client;
+mod tee;
 
 // Re-export HTTP types from setu-transport
 pub use setu_transport::http::{
-    ExecuteTaskRequest, ExecuteTaskResponse,
-    TeeExecutionResultDto, StateChangeDto, AttestationDto,
+    AttestationDto, ExecuteTaskRequest, ExecuteTaskResponse, StateChangeDto, TeeExecutionResultDto,
 };
 
 // Core exports for solver-tee3 architecture
-pub use tee::{TeeExecutor, TeeExecutionResult};
 pub use setu_enclave::{
-    EnclaveInfo, Attestation, SolverTask,
-    ResolvedInputs, ResolvedObject, GasBudget, GasUsage,
+    Attestation, EnclaveInfo, GasBudget, GasUsage, ResolvedInputs, ResolvedObject, SolverTask,
 };
+pub use tee::{TeeExecutionResult, TeeExecutor};
 
 // Network client for communication with Validator
 pub use network_client::{
-    SolverNetworkClient, SolverNetworkConfig, 
-    SubmitEventRequest, SubmitEventResponse,
+    SolverNetworkClient, SolverNetworkConfig, SubmitEventRequest, SubmitEventResponse,
 };
 
 // HTTP server for sync task execution
-pub use http_server::{SolverHandler, create_handler, start_server};
+pub use http_server::{create_handler, start_server, SolverHandler};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use setu_types::event::{Event, EventType, VLCSnapshot};
     use setu_types::SubnetId;
-    
+
     #[tokio::test]
     async fn test_solver_tee3_flow() {
         // Create TeeExecutor
         let executor = TeeExecutor::new("test-solver".to_string());
-        
+
         // Create a test event
         let event = Event::new(
             EventType::Transfer,
@@ -75,7 +72,7 @@ mod tests {
             VLCSnapshot::default(),
             "test-creator".to_string(),
         );
-        
+
         // Create SolverTask (normally prepared by Validator's TaskPreparer)
         let task_id = SolverTask::generate_task_id(&event, &[0u8; 32]);
         let task = SolverTask::new(
@@ -84,16 +81,17 @@ mod tests {
             ResolvedInputs::new(),
             [0u8; 32],
             SubnetId::ROOT,
-        ).with_gas_budget(GasBudget::default());
-        
+        )
+        .with_gas_budget(GasBudget::default());
+
         // Execute via TeeExecutor (Solver's main entry point)
         let result = executor.execute_solver_task(task).await;
-        
+
         assert!(result.is_ok());
         let result = result.unwrap();
         assert!(result.is_success());
         assert_eq!(result.events_processed, 1);
-        
+
         // Attestation should be included
         assert!(result.attestation.is_mock());
     }

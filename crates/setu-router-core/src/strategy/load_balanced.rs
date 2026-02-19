@@ -5,9 +5,9 @@
 
 use tracing::trace;
 
+use super::SolverStrategy;
 use crate::error::RouterError;
 use crate::solver::SolverInfo;
-use super::SolverStrategy;
 
 /// Load-balanced routing strategy
 pub struct LoadBalancedStrategy {
@@ -18,12 +18,16 @@ pub struct LoadBalancedStrategy {
 impl LoadBalancedStrategy {
     /// Create a new load balanced strategy
     pub fn new() -> Self {
-        Self { load_threshold: 0.9 }
+        Self {
+            load_threshold: 0.9,
+        }
     }
 
     /// Create with custom load threshold
     pub fn with_threshold(threshold: f64) -> Self {
-        Self { load_threshold: threshold }
+        Self {
+            load_threshold: threshold,
+        }
     }
 }
 
@@ -34,7 +38,11 @@ impl Default for LoadBalancedStrategy {
 }
 
 impl SolverStrategy for LoadBalancedStrategy {
-    fn select(&self, available: &[SolverInfo], _routing_key: &str) -> Result<SolverInfo, RouterError> {
+    fn select(
+        &self,
+        available: &[SolverInfo],
+        _routing_key: &str,
+    ) -> Result<SolverInfo, RouterError> {
         if available.is_empty() {
             return Err(RouterError::NoSolverAvailable);
         }
@@ -52,10 +60,12 @@ impl SolverStrategy for LoadBalancedStrategy {
                 .max_by(|a, b| {
                     let score_a = (1.0 - a.load_ratio()) * a.weight as f64;
                     let score_b = (1.0 - b.load_ratio()) * b.weight as f64;
-                    score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+                    score_a
+                        .partial_cmp(&score_b)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap();
-            
+
             trace!(solver_id = %solver.id, load = %solver.load_ratio(), "Selected by weighted capacity");
             return Ok(solver.clone());
         }
@@ -69,7 +79,7 @@ impl SolverStrategy for LoadBalancedStrategy {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .unwrap();
-        
+
         trace!(solver_id = %solver.id, load = %solver.load_ratio(), "Selected least loaded");
         Ok(solver.clone())
     }
@@ -96,7 +106,7 @@ mod tests {
 
         // Set different loads
         solvers[0].pending_load = 100;
-        solvers[1].pending_load = 50;  // Lowest load
+        solvers[1].pending_load = 50; // Lowest load
         solvers[2].pending_load = 200;
 
         let result = strategy.select(&solvers, "any").unwrap();

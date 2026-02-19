@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::str::FromStr;
 
@@ -9,11 +9,11 @@ pub struct ObjectId([u8; 32]);
 
 impl ObjectId {
     pub const ZERO: ObjectId = ObjectId([0u8; 32]);
-    
+
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
-    
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
         if bytes.len() != 32 {
             return Err("ObjectId must be 32 bytes");
@@ -22,13 +22,13 @@ impl ObjectId {
         arr.copy_from_slice(bytes);
         Ok(Self(arr))
     }
-    
+
     pub fn from_hex(hex_str: &str) -> Result<Self, &'static str> {
         let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
         let bytes = hex::decode(hex_str).map_err(|_| "Invalid hex string")?;
         Self::from_bytes(&bytes)
     }
-    
+
     pub fn random() -> Self {
         use sha2::Digest;
         let mut hasher = Sha256::new();
@@ -47,11 +47,11 @@ impl ObjectId {
         bytes.copy_from_slice(&result);
         Self(bytes)
     }
-    
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
-    
+
     pub fn to_vec(&self) -> Vec<u8> {
         self.0.to_vec()
     }
@@ -71,7 +71,7 @@ impl fmt::Debug for ObjectId {
 
 impl FromStr for ObjectId {
     type Err = &'static str;
-    
+
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::from_hex(s)
     }
@@ -115,11 +115,11 @@ pub struct Address([u8; 32]);
 
 impl Address {
     pub const ZERO: Address = Address([0u8; 32]);
-    
+
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
-    
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
         if bytes.len() != 32 {
             return Err("Address must be 32 bytes");
@@ -128,13 +128,13 @@ impl Address {
         arr.copy_from_slice(bytes);
         Ok(Self(arr))
     }
-    
+
     pub fn from_hex(hex_str: &str) -> Result<Self, &'static str> {
         let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
         let bytes = hex::decode(hex_str).map_err(|_| "Invalid hex string")?;
         Self::from_bytes(&bytes)
     }
-    
+
     /// Create address from a string identifier (hashes the string)
     pub fn from_str_id(id: &str) -> Self {
         let mut hasher = Sha256::new();
@@ -144,11 +144,11 @@ impl Address {
         bytes.copy_from_slice(&result);
         Self(bytes)
     }
-    
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
-    
+
     pub fn to_vec(&self) -> Vec<u8> {
         self.0.to_vec()
     }
@@ -168,7 +168,7 @@ impl fmt::Debug for Address {
 
 impl FromStr for Address {
     type Err = &'static str;
-    
+
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::from_hex(s)
     }
@@ -218,11 +218,11 @@ pub struct ObjectDigest([u8; 32]);
 
 impl ObjectDigest {
     pub const ZERO: ObjectDigest = ObjectDigest([0u8; 32]);
-    
+
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
-    
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
         if bytes.len() != 32 {
             return Err("ObjectDigest must be 32 bytes");
@@ -231,7 +231,7 @@ impl ObjectDigest {
         arr.copy_from_slice(bytes);
         Ok(Self(arr))
     }
-    
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -361,7 +361,7 @@ impl<T: Serialize + Clone> Object<T> {
     pub fn version(&self) -> u64 {
         self.metadata.version
     }
-    
+
     pub fn digest(&self) -> &ObjectDigest {
         &self.metadata.digest
     }
@@ -385,7 +385,7 @@ impl<T: Serialize + Clone> Object<T> {
     pub fn is_owned_by(&self, address: &Address) -> bool {
         self.metadata.owner.as_ref() == Some(address)
     }
-    
+
     /// Compute and update the object digest
     pub fn compute_digest(&mut self) {
         let mut hasher = Sha256::new();
@@ -457,11 +457,7 @@ mod tests {
 
     #[test]
     fn test_shared_object() {
-        let obj = Object::new_shared(
-            generate_object_id(b"obj2"),
-            TestData { value: 200 },
-            1,
-        );
+        let obj = Object::new_shared(generate_object_id(b"obj2"), TestData { value: 200 }, 1);
         assert!(obj.is_shared());
     }
 
@@ -475,7 +471,7 @@ mod tests {
         obj.transfer_to(Address::from_str_id("bob"));
         assert_eq!(obj.version(), 2);
     }
-    
+
     #[test]
     fn test_object_id() {
         let id = ObjectId::random();
@@ -483,12 +479,12 @@ mod tests {
         let parsed = ObjectId::from_hex(&hex_str).unwrap();
         assert_eq!(id, parsed);
     }
-    
+
     #[test]
     fn test_address() {
         let addr = Address::from_str_id("alice");
         assert_ne!(addr, Address::ZERO);
-        
+
         let addr2 = Address::from_str_id("alice");
         assert_eq!(addr, addr2);
     }

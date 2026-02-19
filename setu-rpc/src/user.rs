@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 // ============================================================================
 
 /// Request to register a new user
-/// 
+///
 /// Supports two registration methods:
 /// 1. MetaMask (Ethereum wallet): address + ECDSA signature
 /// 2. Nostr: nostr_pubkey + Schnorr signature (address derived from pubkey)
@@ -29,35 +29,35 @@ pub struct RegisterUserRequest {
     /// - For MetaMask: directly from wallet
     /// - For Nostr: derived from nostr_pubkey
     pub address: String,
-    
+
     /// Optional: Nostr public key (32 bytes, Schnorr x-only public key)
     /// Only present for Nostr-based registrations
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nostr_pubkey: Option<Vec<u8>>,
-    
+
     /// Optional: Signature proving ownership
     /// - For MetaMask: ECDSA signature (65 bytes)
     /// - For Nostr: Schnorr signature (64 bytes)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<Vec<u8>>,
-    
+
     /// Optional: Signed message (for verification)
     /// Format: "Register to Setu: {timestamp}"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    
+
     /// Timestamp (for replay attack prevention)
     pub timestamp: u64,
-    
+
     /// Subnet ID to register in (None = root subnet)
     pub subnet_id: Option<String>,
-    
+
     /// Optional display name
     pub display_name: Option<String>,
-    
+
     /// Optional metadata (JSON string)
     pub metadata: Option<String>,
-    
+
     /// Invite code used for registration
     pub invite_code: Option<String>,
 }
@@ -313,37 +313,37 @@ pub struct TransferResponse {
 // ============================================================================
 
 /// Trait for handling user RPC requests
-/// 
+///
 /// Implement this trait to provide user-related RPC services.
 /// This is designed to be used by validators or dedicated API servers.
 #[async_trait::async_trait]
 pub trait UserRpcHandler: Send + Sync {
     // ========== Registration ==========
-    
+
     /// Register a new user
     async fn register_user(&self, request: RegisterUserRequest) -> RegisterUserResponse;
-    
+
     // ========== Account Queries ==========
-    
+
     /// Get user account information
     async fn get_account(&self, request: GetAccountRequest) -> GetAccountResponse;
-    
+
     /// Get user balance
     async fn get_balance(&self, request: GetBalanceRequest) -> GetBalanceResponse;
-    
+
     /// Get user power
     async fn get_power(&self, request: GetPowerRequest) -> GetPowerResponse;
-    
+
     /// Get user credit
     async fn get_credit(&self, request: GetCreditRequest) -> GetCreditResponse;
-    
+
     // ========== Credential Queries ==========
-    
+
     /// Get user credentials
     async fn get_credentials(&self, request: GetCredentialsRequest) -> GetCredentialsResponse;
-    
+
     // ========== Operations ==========
-    
+
     /// Transfer Flux to another user
     async fn transfer(&self, request: TransferRequest) -> TransferResponse;
 }
@@ -382,7 +382,7 @@ impl UserRpcRequest {
     pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
         bincode::serialize(self)
     }
-    
+
     /// Deserialize request from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
         bincode::deserialize(bytes)
@@ -394,7 +394,7 @@ impl UserRpcResponse {
     pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
         bincode::serialize(self)
     }
-    
+
     /// Deserialize response from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
         bincode::deserialize(bytes)
@@ -404,7 +404,7 @@ impl UserRpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_register_user_request_serialization() {
         // Test MetaMask registration
@@ -419,11 +419,11 @@ mod tests {
             metadata: None,
             invite_code: Some("INVITE123".to_string()),
         };
-        
+
         let wrapped = UserRpcRequest::RegisterUser(metamask_request);
         let bytes = wrapped.to_bytes().unwrap();
         let decoded = UserRpcRequest::from_bytes(&bytes).unwrap();
-        
+
         match decoded {
             UserRpcRequest::RegisterUser(req) => {
                 assert_eq!(req.address, "0x1234567890abcdef");
@@ -435,7 +435,7 @@ mod tests {
             }
             _ => panic!("Wrong request type"),
         }
-        
+
         // Test Nostr registration
         let nostr_request = RegisterUserRequest {
             address: "0xabcdef1234567890".to_string(),
@@ -448,11 +448,11 @@ mod tests {
             metadata: None,
             invite_code: None,
         };
-        
+
         let wrapped = UserRpcRequest::RegisterUser(nostr_request);
         let bytes = wrapped.to_bytes().unwrap();
         let decoded = UserRpcRequest::from_bytes(&bytes).unwrap();
-        
+
         match decoded {
             UserRpcRequest::RegisterUser(req) => {
                 assert_eq!(req.address, "0xabcdef1234567890");
@@ -463,7 +463,7 @@ mod tests {
             _ => panic!("Wrong request type"),
         }
     }
-    
+
     #[test]
     fn test_get_account_response_serialization() {
         let response = GetAccountResponse {
@@ -480,11 +480,11 @@ mod tests {
             }),
             credential_count: 1,
         };
-        
+
         let wrapped = UserRpcResponse::GetAccount(response);
         let bytes = wrapped.to_bytes().unwrap();
         let decoded = UserRpcResponse::from_bytes(&bytes).unwrap();
-        
+
         match decoded {
             UserRpcResponse::GetAccount(resp) => {
                 assert!(resp.found);

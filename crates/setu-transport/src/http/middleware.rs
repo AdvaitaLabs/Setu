@@ -28,6 +28,8 @@ pub fn production_cors(allowed_origins: Vec<String>) -> CorsLayer {
 }
 
 /// Create a trace layer for request logging
-pub fn request_tracing() -> TraceLayer<tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>> {
+pub fn request_tracing(
+) -> TraceLayer<tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>>
+{
     TraceLayer::new_for_http()
 }

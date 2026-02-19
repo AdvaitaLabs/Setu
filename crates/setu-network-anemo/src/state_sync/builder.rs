@@ -4,8 +4,8 @@
 //! Builder pattern for StateSync service
 
 use super::{
-    Handle, Server, StateSyncConfig, StateSyncEventLoop, StateSyncMessage, StateSyncStore, SyncState,
-    metrics::StateSyncMetrics,
+    metrics::StateSyncMetrics, Handle, Server, StateSyncConfig, StateSyncEventLoop,
+    StateSyncMessage, StateSyncStore, SyncState,
 };
 use anemo::NetworkRef;
 use std::sync::Arc;
@@ -89,7 +89,7 @@ where
         let metrics = self.metrics.unwrap_or_else(StateSyncMetrics::disabled);
 
         let (tx, rx) = mpsc::channel(1000);
-        
+
         let handle = Handle { sender: tx };
 
         let state = Arc::new(SyncState::new());

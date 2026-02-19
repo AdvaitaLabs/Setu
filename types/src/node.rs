@@ -155,26 +155,17 @@ mod tests {
 
     #[test]
     fn test_node_info_creation() {
-        let validator = NodeInfo::new_validator(
-            "v1".to_string(),
-            "127.0.0.1".to_string(),
-            8000,
-        );
+        let validator = NodeInfo::new_validator("v1".to_string(), "127.0.0.1".to_string(), 8000);
         assert!(validator.is_validator());
         assert_eq!(validator.endpoint(), "127.0.0.1:8000");
     }
 
     #[test]
     fn test_solver_capacity() {
-        let node = NodeInfo::new_solver(
-            "s1".to_string(),
-            "127.0.0.1".to_string(),
-            9000,
-            1000,
-        );
+        let node = NodeInfo::new_solver("s1".to_string(), "127.0.0.1".to_string(), 9000, 1000);
         let mut solver = SolverInfo::new(node, 50);
         assert_eq!(solver.available_capacity(), 50);
-        
+
         solver.current_load = 30;
         assert_eq!(solver.available_capacity(), 20);
     }

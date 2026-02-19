@@ -8,9 +8,9 @@ use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use tracing::trace;
 
+use super::SolverStrategy;
 use crate::error::RouterError;
 use crate::solver::SolverInfo;
-use super::SolverStrategy;
 
 /// Consistent hash routing strategy with cached hash ring
 pub struct ConsistentHashStrategy {
@@ -42,8 +42,7 @@ impl ConsistentHashStrategy {
         let hash = hasher.finalize();
         let bytes = hash.as_bytes();
         u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ])
     }
 
@@ -56,8 +55,7 @@ impl ConsistentHashStrategy {
         let hash = hasher.finalize();
         let bytes = hash.as_bytes();
         u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ])
     }
 
@@ -95,7 +93,7 @@ impl ConsistentHashStrategy {
         if ring.is_empty() {
             return None;
         }
-        
+
         // Find the first node >= hash, or wrap around to first
         ring.range(hash..)
             .next()
@@ -111,7 +109,11 @@ impl Default for ConsistentHashStrategy {
 }
 
 impl SolverStrategy for ConsistentHashStrategy {
-    fn select(&self, available: &[SolverInfo], routing_key: &str) -> Result<SolverInfo, RouterError> {
+    fn select(
+        &self,
+        available: &[SolverInfo],
+        routing_key: &str,
+    ) -> Result<SolverInfo, RouterError> {
         if available.is_empty() {
             return Err(RouterError::NoSolverAvailable);
         }
@@ -122,11 +124,10 @@ impl SolverStrategy for ConsistentHashStrategy {
 
         let ring = self.get_or_build_ring(available);
         let hash = Self::hash_key(routing_key);
-        
+
         trace!(routing_key = %routing_key, hash = %hash, "Consistent hash lookup");
 
-        let idx = Self::find_in_ring(&ring, hash)
-            .ok_or(RouterError::NoSolverAvailable)?;
+        let idx = Self::find_in_ring(&ring, hash).ok_or(RouterError::NoSolverAvailable)?;
 
         Ok(available[idx].clone())
     }
@@ -154,7 +155,10 @@ mod tests {
         let result1 = strategy.select(&solvers, "account:alice").unwrap();
         let result2 = strategy.select(&solvers, "account:alice").unwrap();
 
-        assert_eq!(result1.id, result2.id, "Same key should route to same solver");
+        assert_eq!(
+            result1.id, result2.id,
+            "Same key should route to same solver"
+        );
     }
 
     #[test]
@@ -175,7 +179,11 @@ mod tests {
 
         // Check reasonable distribution (each solver gets roughly 10-30%)
         for count in distribution.values() {
-            assert!(*count > 50 && *count < 300, "count={} is outside expected range", count);
+            assert!(
+                *count > 50 && *count < 300,
+                "count={} is outside expected range",
+                count
+            );
         }
     }
 

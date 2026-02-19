@@ -4,7 +4,7 @@
 //! persistent (RocksDBCFStore) implementations at runtime.
 
 use async_trait::async_trait;
-use setu_types::{ConsensusFrame, CFId, SetuResult};
+use setu_types::{CFId, ConsensusFrame, SetuResult};
 use std::fmt::Debug;
 
 /// Backend trait for CFStore implementations

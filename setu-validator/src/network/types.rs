@@ -4,7 +4,9 @@ use setu_rpc::ProcessingStep;
 use std::net::SocketAddr;
 
 // Re-export types from api module
-pub use setu_api::{GetBalanceResponse, GetObjectResponse, SubmitEventRequest, SubmitEventResponse};
+pub use setu_api::{
+    GetBalanceResponse, GetObjectResponse, SubmitEventRequest, SubmitEventResponse,
+};
 
 /// Validator info for registration
 #[derive(Debug, Clone)]
@@ -63,7 +65,7 @@ impl SolverInfo {
     pub fn http_url(&self) -> String {
         format!("http://{}:{}", self.address, self.port)
     }
-    
+
     /// Get execute-task endpoint URL
     pub fn execute_task_url(&self) -> String {
         format!("{}/api/v1/execute-task", self.http_url())

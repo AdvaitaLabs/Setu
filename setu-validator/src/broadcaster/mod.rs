@@ -10,6 +10,5 @@ pub use anemo_adapter::AnemoConsensusBroadcaster;
 
 // Re-export from consensus for convenience
 pub use consensus::{
-    ConsensusBroadcaster, BroadcastError, BroadcastResult,
-    NoOpBroadcaster, MockBroadcaster,
+    BroadcastError, BroadcastResult, ConsensusBroadcaster, MockBroadcaster, NoOpBroadcaster,
 };

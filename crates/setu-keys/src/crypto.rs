@@ -11,17 +11,17 @@
 //! - `SetuAddress`: Account address derived from public key
 
 use crate::error::KeyError;
-use blake2::{Blake2b, Digest};
 use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest};
 use ed25519_dalek::{SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey};
 use k256::ecdsa::{
-    SigningKey as Secp256k1SigningKey, VerifyingKey as Secp256k1VerifyingKey,
-    Signature as Secp256k1Signature, signature::Signer as Secp256k1Signer,
-    signature::Verifier as Secp256k1Verifier,
+    signature::Signer as Secp256k1Signer, signature::Verifier as Secp256k1Verifier,
+    Signature as Secp256k1Signature, SigningKey as Secp256k1SigningKey,
+    VerifyingKey as Secp256k1VerifyingKey,
 };
 use p256::ecdsa::{
-    SigningKey as Secp256r1SigningKey, VerifyingKey as Secp256r1VerifyingKey,
-    Signature as Secp256r1Signature,
+    Signature as Secp256r1Signature, SigningKey as Secp256r1SigningKey,
+    VerifyingKey as Secp256r1VerifyingKey,
 };
 
 /// Type alias for Blake2b-256

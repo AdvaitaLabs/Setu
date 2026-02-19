@@ -1,12 +1,12 @@
 //! Solver RPC client and server (simplified, no protobuf)
 
 use crate::error::{Result, RpcError};
-use setu_types::Transfer;
 use anemo::{Network, PeerId};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use setu_types::Transfer;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tracing::{info, debug};
+use std::sync::Arc;
+use tracing::{debug, info};
 
 // ============================================
 // Request/Response types
@@ -37,23 +37,24 @@ impl SolverClient {
     pub fn new(network: Network, peer_id: PeerId) -> Self {
         Self { network, peer_id }
     }
-    
+
     pub async fn submit_transfer(&self, transfer: Transfer) -> Result<String> {
         debug!(
             transfer_id = %transfer.id,
             "Submitting transfer to solver via RPC"
         );
-        
+
         let request = SubmitTransferRequest { transfer };
         let bytes = bincode::serialize(&request)?;
-        
-        let response = self.network
+
+        let response = self
+            .network
             .rpc(self.peer_id, anemo::Request::new(bytes::Bytes::from(bytes)))
             .await
             .map_err(|e| RpcError::Network(e.to_string()))?;
-        
+
         let response: SubmitTransferResponse = bincode::deserialize(response.body())?;
-        
+
         if response.accepted {
             info!(transfer_id = %response.transfer_id, "Transfer accepted");
             Ok(response.transfer_id)
@@ -87,17 +88,17 @@ impl SolverServer {
             capacity,
         }
     }
-    
+
     pub async fn handle_request(&self, request_bytes: bytes::Bytes) -> Result<bytes::Bytes> {
         let request: SubmitTransferRequest = bincode::deserialize(&request_bytes)?;
-        
+
         info!(
             transfer_id = %request.transfer.id,
             from = %request.transfer.from,
             to = %request.transfer.to,
             "Received transfer via RPC"
         );
-        
+
         // Check capacity
         let current = self.current_load.load(Ordering::Relaxed);
         if current >= self.capacity {
@@ -108,22 +109,23 @@ impl SolverServer {
             };
             return Ok(bytes::Bytes::from(bincode::serialize(&response)?));
         }
-        
+
         // Send to internal channel
-        self.transfer_tx.send(request.transfer.clone())
+        self.transfer_tx
+            .send(request.transfer.clone())
             .map_err(|e| RpcError::Network(e.to_string()))?;
-        
+
         self.current_load.fetch_add(1, Ordering::Relaxed);
-        
+
         let response = SubmitTransferResponse {
             transfer_id: request.transfer.id,
             accepted: true,
             message: "Transfer accepted".to_string(),
         };
-        
+
         Ok(bytes::Bytes::from(bincode::serialize(&response)?))
     }
-    
+
     pub fn decrement_load(&self) {
         self.current_load.fetch_sub(1, Ordering::Relaxed);
     }

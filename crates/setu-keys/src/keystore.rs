@@ -67,12 +67,22 @@ impl AccountKeystore for Keystore {
         word_count: Option<WordCount>,
     ) -> Result<GeneratedKey, KeyError> {
         match self {
-            Keystore::File(ks) => ks.generate(alias, scheme, derivation_path, word_count).await,
-            Keystore::InMem(ks) => ks.generate(alias, scheme, derivation_path, word_count).await,
+            Keystore::File(ks) => {
+                ks.generate(alias, scheme, derivation_path, word_count)
+                    .await
+            }
+            Keystore::InMem(ks) => {
+                ks.generate(alias, scheme, derivation_path, word_count)
+                    .await
+            }
         }
     }
 
-    async fn import(&mut self, alias: Option<String>, keypair: SetuKeyPair) -> Result<(), KeyError> {
+    async fn import(
+        &mut self,
+        alias: Option<String>,
+        keypair: SetuKeyPair,
+    ) -> Result<(), KeyError> {
         match self {
             Keystore::File(ks) => ks.import(alias, keypair).await,
             Keystore::InMem(ks) => ks.import(alias, keypair).await,
@@ -177,8 +187,7 @@ pub trait AccountKeystore: Send + Sync {
         derivation_path: Option<DerivationPath>,
         word_count: Option<WordCount>,
     ) -> Result<GeneratedKey, KeyError> {
-        let (address, kp, scheme, phrase) =
-            generate_new_key(scheme, derivation_path, word_count)?;
+        let (address, kp, scheme, phrase) = generate_new_key(scheme, derivation_path, word_count)?;
         let public_key = kp.public();
         self.import(alias, kp).await?;
         Ok(GeneratedKey {
@@ -190,7 +199,8 @@ pub trait AccountKeystore: Send + Sync {
     }
 
     /// Import a keypair into the keystore.
-    async fn import(&mut self, alias: Option<String>, keypair: SetuKeyPair) -> Result<(), KeyError>;
+    async fn import(&mut self, alias: Option<String>, keypair: SetuKeyPair)
+        -> Result<(), KeyError>;
 
     /// Import from a mnemonic phrase.
     async fn import_from_mnemonic(
@@ -296,7 +306,11 @@ impl<'de> Deserialize<'de> for FileBasedKeystore {
 
 #[async_trait]
 impl AccountKeystore for FileBasedKeystore {
-    async fn import(&mut self, alias: Option<String>, keypair: SetuKeyPair) -> Result<(), KeyError> {
+    async fn import(
+        &mut self,
+        alias: Option<String>,
+        keypair: SetuKeyPair,
+    ) -> Result<(), KeyError> {
         let address = keypair.address();
         let alias_name = self.create_alias(alias)?;
         self.aliases.insert(
@@ -352,7 +366,9 @@ impl AccountKeystore for FileBasedKeystore {
         match alias {
             Some(a) if self.alias_exists(&a) => Err(KeyError::AliasExists(a)),
             Some(a) => Ok(a),
-            None => Ok(generate_random_alias(&self.aliases().iter().map(|a| a.alias.clone()).collect())),
+            None => Ok(generate_random_alias(
+                &self.aliases().iter().map(|a| a.alias.clone()).collect(),
+            )),
         }
     }
 
@@ -439,8 +455,9 @@ impl FileBasedKeystore {
     /// Save aliases to file.
     pub async fn save_aliases(&self) -> Result<(), KeyError> {
         if let Some(path) = &self.path {
-            let aliases_store = serde_json::to_string_pretty(&self.aliases.values().collect::<Vec<_>>())
-                .map_err(|e| KeyError::Serialization(e.to_string()))?;
+            let aliases_store =
+                serde_json::to_string_pretty(&self.aliases.values().collect::<Vec<_>>())
+                    .map_err(|e| KeyError::Serialization(e.to_string()))?;
             let mut aliases_path = path.clone();
             aliases_path.set_extension(ALIASES_FILE_EXTENSION);
             tokio::fs::write(aliases_path, aliases_store).await?;
@@ -452,7 +469,11 @@ impl FileBasedKeystore {
     pub async fn save_keystore(&self) -> Result<(), KeyError> {
         if let Some(path) = &self.path {
             let store = serde_json::to_string_pretty(
-                &self.keys.values().map(|k| k.encode_base64()).collect::<Vec<_>>(),
+                &self
+                    .keys
+                    .values()
+                    .map(|k| k.encode_base64())
+                    .collect::<Vec<_>>(),
             )
             .map_err(|e| KeyError::Serialization(e.to_string()))?;
             tokio::fs::write(path, store).await?;
@@ -483,7 +504,11 @@ pub struct InMemKeystore {
 
 #[async_trait]
 impl AccountKeystore for InMemKeystore {
-    async fn import(&mut self, alias: Option<String>, keypair: SetuKeyPair) -> Result<(), KeyError> {
+    async fn import(
+        &mut self,
+        alias: Option<String>,
+        keypair: SetuKeyPair,
+    ) -> Result<(), KeyError> {
         let address = keypair.address();
         let alias_name = self.create_alias(alias)?;
         self.aliases.insert(
@@ -537,7 +562,9 @@ impl AccountKeystore for InMemKeystore {
         match alias {
             Some(a) if self.alias_exists(&a) => Err(KeyError::AliasExists(a)),
             Some(a) => Ok(a),
-            None => Ok(generate_random_alias(&self.aliases().iter().map(|a| a.alias.clone()).collect())),
+            None => Ok(generate_random_alias(
+                &self.aliases().iter().map(|a| a.alias.clone()).collect(),
+            )),
         }
     }
 
@@ -562,7 +589,9 @@ impl AccountKeystore for InMemKeystore {
 
 /// Generate a random alias that doesn't conflict with existing aliases.
 fn generate_random_alias(existing: &HashSet<String>) -> String {
-    let adjectives = ["brave", "calm", "eager", "fair", "kind", "bold", "wise", "swift"];
+    let adjectives = [
+        "brave", "calm", "eager", "fair", "kind", "bold", "wise", "swift",
+    ];
     let nouns = ["wolf", "bear", "hawk", "lion", "deer", "fox", "owl", "seal"];
 
     use rand::seq::SliceRandom;
@@ -597,7 +626,12 @@ mod tests {
 
         // Generate a key
         let result = ks
-            .generate(Some("test-key".to_string()), SignatureScheme::ED25519, None, None)
+            .generate(
+                Some("test-key".to_string()),
+                SignatureScheme::ED25519,
+                None,
+                None,
+            )
             .await
             .unwrap();
 

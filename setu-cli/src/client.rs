@@ -2,4 +2,3 @@
 
 // Placeholder for future RPC client implementation
 // This will use setu-rpc module to communicate over network
-

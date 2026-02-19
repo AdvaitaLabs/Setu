@@ -8,8 +8,8 @@
 //! - Address derivation from Nostr public keys (for Users)
 
 use crate::error::KeyError;
-use sha2::{Sha256, Digest as Sha2Digest};
-use sha3::{Keccak256, Digest as Sha3Digest};
+use sha2::{Digest as Sha2Digest, Sha256};
+use sha3::{Digest as Sha3Digest, Keccak256};
 
 /// Ethereum-style address (20 bytes, 0x-prefixed hex string)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +62,9 @@ impl std::fmt::Display for EthereumAddress {
 /// 4. Take the last 20 bytes as the address
 ///
 /// This is the standard Ethereum address derivation.
-pub fn derive_ethereum_address_from_secp256k1(public_key: &[u8]) -> Result<EthereumAddress, KeyError> {
+pub fn derive_ethereum_address_from_secp256k1(
+    public_key: &[u8],
+) -> Result<EthereumAddress, KeyError> {
     // Validate public key format
     if public_key.len() != 65 {
         return Err(KeyError::InvalidKeyFormat(format!(
@@ -70,23 +72,23 @@ pub fn derive_ethereum_address_from_secp256k1(public_key: &[u8]) -> Result<Ether
             public_key.len()
         )));
     }
-    
+
     if public_key[0] != 0x04 {
         return Err(KeyError::InvalidKeyFormat(
-            "Public key must start with 0x04 (uncompressed format)".to_string()
+            "Public key must start with 0x04 (uncompressed format)".to_string(),
         ));
     }
-    
+
     // Remove the 0x04 prefix
     let key_without_prefix = &public_key[1..];
-    
+
     // Compute Keccak256 hash
     let hash = Keccak256::digest(key_without_prefix);
-    
+
     // Take the last 20 bytes
     let mut address = [0u8; 20];
     address.copy_from_slice(&hash[12..]);
-    
+
     Ok(EthereumAddress(address))
 }
 
@@ -106,14 +108,14 @@ pub fn derive_address_from_nostr_pubkey(nostr_pubkey: &[u8]) -> Result<EthereumA
             nostr_pubkey.len()
         )));
     }
-    
+
     // Compute SHA256 hash
     let hash = Sha256::digest(nostr_pubkey);
-    
+
     // Take the first 20 bytes
     let mut address = [0u8; 20];
     address.copy_from_slice(&hash[0..20]);
-    
+
     Ok(EthereumAddress(address))
 }
 
@@ -148,20 +150,20 @@ mod tests {
         // Generate a secp256k1 keypair
         let signing_key = SigningKey::random(&mut rand::thread_rng());
         let verifying_key = VerifyingKey::from(&signing_key);
-        
+
         // Get uncompressed public key (65 bytes)
         let public_key = verifying_key.to_encoded_point(false);
         let public_key_bytes = public_key.as_bytes();
-        
+
         // Derive address
         let address = derive_ethereum_address_from_secp256k1(public_key_bytes).unwrap();
-        
+
         // Verify format
         assert_eq!(address.as_bytes().len(), 20);
         let hex = address.to_hex();
         assert!(hex.starts_with("0x"));
         assert_eq!(hex.len(), 42); // 0x + 40 hex chars
-        
+
         // Verify derivation
         assert!(verify_ethereum_address_derivation(&hex, public_key_bytes).unwrap());
     }
@@ -170,16 +172,16 @@ mod tests {
     fn test_nostr_address_derivation() {
         // Mock Nostr public key (32 bytes)
         let nostr_pubkey = [0x42u8; 32];
-        
+
         // Derive address
         let address = derive_address_from_nostr_pubkey(&nostr_pubkey).unwrap();
-        
+
         // Verify format
         assert_eq!(address.as_bytes().len(), 20);
         let hex = address.to_hex();
         assert!(hex.starts_with("0x"));
         assert_eq!(hex.len(), 42);
-        
+
         // Verify derivation
         assert!(verify_nostr_address_derivation(&hex, &nostr_pubkey).unwrap());
     }
@@ -197,10 +199,10 @@ mod tests {
     fn test_different_keys_different_addresses() {
         let nostr_pubkey1 = [0x42u8; 32];
         let nostr_pubkey2 = [0x43u8; 32];
-        
+
         let addr1 = derive_address_from_nostr_pubkey(&nostr_pubkey1).unwrap();
         let addr2 = derive_address_from_nostr_pubkey(&nostr_pubkey2).unwrap();
-        
+
         assert_ne!(addr1, addr2);
     }
 
@@ -224,11 +226,10 @@ mod tests {
         let hex = addr.to_hex();
         let parsed = EthereumAddress::from_hex(&hex).unwrap();
         assert_eq!(addr, parsed);
-        
+
         // Test without 0x prefix
         let hex_no_prefix = &hex[2..];
         let parsed2 = EthereumAddress::from_hex(hex_no_prefix).unwrap();
         assert_eq!(addr, parsed2);
     }
 }
-

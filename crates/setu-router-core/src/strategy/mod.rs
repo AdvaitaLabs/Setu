@@ -27,13 +27,15 @@
 
 mod consistent_hash;
 mod load_balanced;
-mod subnet_shard;
 mod object_shard;
+mod subnet_shard;
 
 pub use consistent_hash::ConsistentHashStrategy;
 pub use load_balanced::LoadBalancedStrategy;
-pub use subnet_shard::{SubnetShardStrategy, SubnetShardRouter, CrossSubnetRoutingDecision, ShardLoadMetrics};
 pub use object_shard::ObjectShardStrategy;
+pub use subnet_shard::{
+    CrossSubnetRoutingDecision, ShardLoadMetrics, SubnetShardRouter, SubnetShardStrategy,
+};
 
 use crate::error::RouterError;
 use crate::solver::SolverInfo;
@@ -41,8 +43,12 @@ use crate::solver::SolverInfo;
 /// Trait for solver selection strategies
 pub trait SolverStrategy: Send + Sync {
     /// Select a solver from available solvers based on routing key
-    fn select(&self, available: &[SolverInfo], routing_key: &str) -> Result<SolverInfo, RouterError>;
-    
+    fn select(
+        &self,
+        available: &[SolverInfo],
+        routing_key: &str,
+    ) -> Result<SolverInfo, RouterError>;
+
     /// Strategy name for logging
     fn name(&self) -> &'static str;
 }
@@ -51,7 +57,7 @@ pub trait SolverStrategy: Send + Sync {
 pub trait ShardStrategy: Send + Sync {
     /// Route a key to a shard
     fn route(&self, key: &[u8; 32]) -> crate::types::ShardId;
-    
+
     /// Strategy name for logging
     fn name(&self) -> &'static str;
 }

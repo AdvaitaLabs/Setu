@@ -95,9 +95,7 @@ pub fn choose_index(weights: Vec<VotingPower>, seed: Vec<u8>) -> usize {
 
     // Convert to cumulative weights
     for w in &mut cumulative_weights {
-        total_weight = total_weight
-            .checked_add(*w)
-            .expect("Total weight overflow");
+        total_weight = total_weight.checked_add(*w).expect("Total weight overflow");
         *w = total_weight;
     }
 
@@ -119,12 +117,12 @@ pub fn choose_index(weights: Vec<VotingPower>, seed: Vec<u8>) -> usize {
 /// Generate a deterministic pseudo-random value in [0, max) range from a seed.
 fn next_in_range(seed: Vec<u8>, max: VotingPower) -> VotingPower {
     use sha2::{Digest, Sha256};
-    
+
     let hash = Sha256::digest(&seed);
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&hash[..16]);
     let value = u128::from_le_bytes(bytes);
-    
+
     value % max
 }
 
@@ -136,17 +134,21 @@ mod tests {
     fn test_choose_index_uniform() {
         let weights = vec![100, 100, 100, 100];
         let mut counts = [0u32; 4];
-        
+
         // Test with different seeds
         for i in 0u64..1000 {
             let seed = i.to_le_bytes().to_vec();
             let idx = choose_index(weights.clone(), seed);
             counts[idx] += 1;
         }
-        
+
         // Each should be selected roughly 250 times (allow 20% variance)
         for count in counts {
-            assert!(count > 150 && count < 350, "Unexpected distribution: {:?}", counts);
+            assert!(
+                count > 150 && count < 350,
+                "Unexpected distribution: {:?}",
+                counts
+            );
         }
     }
 
@@ -155,17 +157,29 @@ mod tests {
         // First candidate has 3x the weight
         let weights = vec![300, 100, 100, 100];
         let mut counts = [0u32; 4];
-        
+
         for i in 0u64..1000 {
             let seed = i.to_le_bytes().to_vec();
             let idx = choose_index(weights.clone(), seed);
             counts[idx] += 1;
         }
-        
+
         // First should be selected more often
-        assert!(counts[0] > counts[1], "Weighted selection failed: {:?}", counts);
-        assert!(counts[0] > counts[2], "Weighted selection failed: {:?}", counts);
-        assert!(counts[0] > counts[3], "Weighted selection failed: {:?}", counts);
+        assert!(
+            counts[0] > counts[1],
+            "Weighted selection failed: {:?}",
+            counts
+        );
+        assert!(
+            counts[0] > counts[2],
+            "Weighted selection failed: {:?}",
+            counts
+        );
+        assert!(
+            counts[0] > counts[3],
+            "Weighted selection failed: {:?}",
+            counts
+        );
     }
 
     #[test]

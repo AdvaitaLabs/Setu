@@ -17,16 +17,16 @@ pub enum MessageType {
     RegisterValidator = 0x11,
     Unregister = 0x12,
     Heartbeat = 0x13,
-    
+
     // Query messages (0x2x)
     GetSolverList = 0x20,
     GetValidatorList = 0x21,
     GetNodeStatus = 0x22,
-    
+
     // Transfer messages (0x3x)
     SubmitTransfer = 0x30,
     TransferResult = 0x31,
-    
+
     // Event messages (0x4x)
     SubmitEvent = 0x40,
     EventResult = 0x41,
@@ -340,7 +340,7 @@ impl RpcRequest {
     pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
         bincode::serialize(self)
     }
-    
+
     /// Deserialize request from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
         bincode::deserialize(bytes)
@@ -352,7 +352,7 @@ impl RpcResponse {
     pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
         bincode::serialize(self)
     }
-    
+
     /// Deserialize response from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
         bincode::deserialize(bytes)

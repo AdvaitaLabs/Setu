@@ -34,8 +34,8 @@
 
 use crate::rocks::core::{ColumnFamily, SetuDB, StorageError};
 use setu_merkle::error::{MerkleError, MerkleResult};
-use setu_merkle::storage::{AnchorId, MerkleNodeStore, MerkleRootStore, MerkleStore, SubnetId};
 use setu_merkle::sparse::SparseMerkleNode;
+use setu_merkle::storage::{AnchorId, MerkleNodeStore, MerkleRootStore, MerkleStore, SubnetId};
 use setu_merkle::HashValue;
 use std::sync::Arc;
 
@@ -57,7 +57,7 @@ struct RootKey {
 /// The marker is all 0xFF bytes to distinguish from subnet keys
 #[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
 struct GlobalRootKey {
-    marker: [u8; 32],  // All 0xFF to indicate global root
+    marker: [u8; 32], // All 0xFF to indicate global root
     anchor_id: u64,
 }
 
@@ -73,7 +73,7 @@ impl GlobalRootKey {
 /// Key for storing latest anchor for a subnet
 #[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
 struct LatestAnchorKey {
-    prefix: u8,  // 0x01 for subnet, 0x02 for global
+    prefix: u8, // 0x01 for subnet, 0x02 for global
     subnet_id: [u8; 32],
 }
 
@@ -128,7 +128,11 @@ impl RocksDBMerkleStore {
     }
 
     /// Store the latest anchor for a subnet
-    fn put_latest_subnet_anchor(&self, subnet_id: &SubnetId, anchor_id: AnchorId) -> MerkleResult<()> {
+    fn put_latest_subnet_anchor(
+        &self,
+        subnet_id: &SubnetId,
+        anchor_id: AnchorId,
+    ) -> MerkleResult<()> {
         let key = LatestAnchorKey {
             prefix: LATEST_SUBNET_PREFIX,
             subnet_id: *subnet_id,
@@ -173,7 +177,12 @@ impl RocksDBMerkleStore {
 }
 
 impl MerkleNodeStore for RocksDBMerkleStore {
-    fn put_node(&self, subnet_id: &SubnetId, hash: &HashValue, node: &SparseMerkleNode) -> MerkleResult<()> {
+    fn put_node(
+        &self,
+        subnet_id: &SubnetId,
+        hash: &HashValue,
+        node: &SparseMerkleNode,
+    ) -> MerkleResult<()> {
         let key = NodeKey {
             subnet_id: *subnet_id,
             node_hash: Self::hash_to_bytes(hash),
@@ -183,7 +192,11 @@ impl MerkleNodeStore for RocksDBMerkleStore {
             .map_err(Self::to_merkle_error)
     }
 
-    fn get_node(&self, subnet_id: &SubnetId, hash: &HashValue) -> MerkleResult<Option<SparseMerkleNode>> {
+    fn get_node(
+        &self,
+        subnet_id: &SubnetId,
+        hash: &HashValue,
+    ) -> MerkleResult<Option<SparseMerkleNode>> {
         let key = NodeKey {
             subnet_id: *subnet_id,
             node_hash: Self::hash_to_bytes(hash),
@@ -213,7 +226,11 @@ impl MerkleNodeStore for RocksDBMerkleStore {
             .map_err(Self::to_merkle_error)
     }
 
-    fn batch_put_nodes(&self, subnet_id: &SubnetId, nodes: &[(HashValue, SparseMerkleNode)]) -> MerkleResult<()> {
+    fn batch_put_nodes(
+        &self,
+        subnet_id: &SubnetId,
+        nodes: &[(HashValue, SparseMerkleNode)],
+    ) -> MerkleResult<()> {
         // Use write batch for atomicity
         for (hash, node) in nodes {
             self.put_node(subnet_id, hash, node)?;
@@ -223,7 +240,12 @@ impl MerkleNodeStore for RocksDBMerkleStore {
 }
 
 impl MerkleRootStore for RocksDBMerkleStore {
-    fn put_subnet_root(&self, subnet_id: &SubnetId, anchor_id: AnchorId, root: &HashValue) -> MerkleResult<()> {
+    fn put_subnet_root(
+        &self,
+        subnet_id: &SubnetId,
+        anchor_id: AnchorId,
+        root: &HashValue,
+    ) -> MerkleResult<()> {
         let key = RootKey {
             subnet_id: *subnet_id,
             anchor_id,
@@ -243,7 +265,11 @@ impl MerkleRootStore for RocksDBMerkleStore {
         Ok(())
     }
 
-    fn get_subnet_root(&self, subnet_id: &SubnetId, anchor_id: AnchorId) -> MerkleResult<Option<HashValue>> {
+    fn get_subnet_root(
+        &self,
+        subnet_id: &SubnetId,
+        anchor_id: AnchorId,
+    ) -> MerkleResult<Option<HashValue>> {
         let key = RootKey {
             subnet_id: *subnet_id,
             anchor_id,
@@ -257,7 +283,10 @@ impl MerkleRootStore for RocksDBMerkleStore {
         Ok(root_bytes.map(Self::bytes_to_hash))
     }
 
-    fn get_latest_subnet_root(&self, subnet_id: &SubnetId) -> MerkleResult<Option<(AnchorId, HashValue)>> {
+    fn get_latest_subnet_root(
+        &self,
+        subnet_id: &SubnetId,
+    ) -> MerkleResult<Option<(AnchorId, HashValue)>> {
         let latest_anchor = match self.get_latest_subnet_anchor(subnet_id)? {
             Some(a) => a,
             None => return Ok(None),
@@ -305,7 +334,12 @@ impl MerkleRootStore for RocksDBMerkleStore {
         Ok(root.map(|r| (latest_anchor, r)))
     }
 
-    fn list_anchors(&self, subnet_id: &SubnetId, start: AnchorId, end: AnchorId) -> MerkleResult<Vec<AnchorId>> {
+    fn list_anchors(
+        &self,
+        subnet_id: &SubnetId,
+        start: AnchorId,
+        end: AnchorId,
+    ) -> MerkleResult<Vec<AnchorId>> {
         // For now, return a simple range if we know the latest anchor
         // A full implementation would use prefix iteration
         let mut anchors = Vec::new();
@@ -450,13 +484,22 @@ mod tests {
         let root3 = test_hash(3);
 
         store.put_subnet_root(&subnet_id, 10, &root1).unwrap();
-        assert_eq!(store.get_latest_subnet_root(&subnet_id).unwrap(), Some((10, root1)));
+        assert_eq!(
+            store.get_latest_subnet_root(&subnet_id).unwrap(),
+            Some((10, root1))
+        );
 
         store.put_subnet_root(&subnet_id, 20, &root2).unwrap();
-        assert_eq!(store.get_latest_subnet_root(&subnet_id).unwrap(), Some((20, root2)));
+        assert_eq!(
+            store.get_latest_subnet_root(&subnet_id).unwrap(),
+            Some((20, root2))
+        );
 
         store.put_subnet_root(&subnet_id, 15, &root3).unwrap(); // Insert at earlier anchor
-        assert_eq!(store.get_latest_subnet_root(&subnet_id).unwrap(), Some((20, root2))); // Still root2
+        assert_eq!(
+            store.get_latest_subnet_root(&subnet_id).unwrap(),
+            Some((20, root2))
+        ); // Still root2
     }
 
     #[test]
@@ -482,9 +525,8 @@ mod tests {
         let (store, _temp_dir) = create_test_store();
         let subnet_id = test_subnet(1);
 
-        let nodes: Vec<(HashValue, SparseMerkleNode)> = (0..5)
-            .map(|i| (test_hash(i), test_node(i)))
-            .collect();
+        let nodes: Vec<(HashValue, SparseMerkleNode)> =
+            (0..5).map(|i| (test_hash(i), test_node(i))).collect();
 
         store.batch_put_nodes(&subnet_id, &nodes).unwrap();
 
@@ -500,7 +542,9 @@ mod tests {
 
         // Add some roots
         for i in [10, 20, 30, 40, 50] {
-            store.put_subnet_root(&subnet_id, i, &test_hash(i as u8)).unwrap();
+            store
+                .put_subnet_root(&subnet_id, i, &test_hash(i as u8))
+                .unwrap();
         }
 
         let anchors = store.list_anchors(&subnet_id, 15, 45).unwrap();

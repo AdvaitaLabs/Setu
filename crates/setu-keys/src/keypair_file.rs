@@ -8,10 +8,13 @@ use crate::error::KeyError;
 use std::path::Path;
 
 /// Write a keypair to a file as Base64 encoded `flag || privkey`.
-pub fn write_keypair_to_file<P: AsRef<Path>>(keypair: &SetuKeyPair, path: P) -> Result<(), KeyError> {
+pub fn write_keypair_to_file<P: AsRef<Path>>(
+    keypair: &SetuKeyPair,
+    path: P,
+) -> Result<(), KeyError> {
     let contents = keypair.encode_base64();
     std::fs::write(&path, contents)?;
-    
+
     // Set restrictive permissions on Unix
     #[cfg(unix)]
     {
@@ -21,7 +24,7 @@ pub fn write_keypair_to_file<P: AsRef<Path>>(keypair: &SetuKeyPair, path: P) -> 
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
     }
-    
+
     Ok(())
 }
 
@@ -49,22 +52,22 @@ pub fn read_key<P: AsRef<Path>>(path: P) -> Result<SetuKeyPair, KeyError> {
             format!("Key file not found: {:?}", path),
         )));
     }
-    
+
     let contents = std::fs::read_to_string(path)?;
     let contents = contents.trim();
-    
+
     // Try Base64 encoded SetuKeyPair first
     if let Ok(kp) = SetuKeyPair::decode_base64(contents) {
         return Ok(kp);
     }
-    
+
     // Try hex encoded private key (assume Ed25519 32 bytes)
     if let Ok(bytes) = hex::decode(contents) {
         if bytes.len() == 32 {
             return SetuKeyPair::from_bytes(crate::crypto::SignatureScheme::ED25519, &bytes);
         }
     }
-    
+
     Err(KeyError::InvalidKeyFormat(
         "Could not parse key file in any supported format".to_string(),
     ))
@@ -76,11 +79,11 @@ pub fn write_keypair_hex<P: AsRef<Path>>(keypair: &SetuKeyPair, path: P) -> Resu
     let encoded = keypair.encode_base64();
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded)
         .map_err(|e| KeyError::Decoding(e.to_string()))?;
-    
+
     // Skip the first byte (flag)
     let hex_str = hex::encode(&bytes[1..]);
     std::fs::write(&path, hex_str)?;
-    
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -89,7 +92,7 @@ pub fn write_keypair_hex<P: AsRef<Path>>(keypair: &SetuKeyPair, path: P) -> Resu
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
     }
-    
+
     Ok(())
 }
 

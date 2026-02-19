@@ -72,7 +72,7 @@ impl NodeInfo {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        
+
         Self {
             node_id,
             peer_id,
@@ -179,7 +179,7 @@ pub struct DiscoveryConfig {
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
-            tick_interval_ms: 5_000, // 5 seconds
+            tick_interval_ms: 5_000,   // 5 seconds
             max_clock_skew_ms: 60_000, // 1 minute
             seed_peers: Vec::new(),
             enable_peer_exchange: true,
@@ -218,7 +218,10 @@ impl DiscoveryEventLoop {
         let mut interval = tokio::time::interval(tick_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        tracing::info!("Discovery event loop started with {:?} tick interval", tick_interval);
+        tracing::info!(
+            "Discovery event loop started with {:?} tick interval",
+            tick_interval
+        );
 
         loop {
             tokio::select! {
@@ -242,11 +245,13 @@ impl DiscoveryEventLoop {
 
         // Get current connected peers
         let connected_peers: Vec<PeerId> = network.peers().into_iter().collect();
-        
+
         // Update connected peers in state
         {
             let mut state = self.state.write().unwrap();
-            state.connected_peers.retain(|peer_id, _| connected_peers.contains(peer_id));
+            state
+                .connected_peers
+                .retain(|peer_id, _| connected_peers.contains(peer_id));
         }
 
         // If peer exchange is enabled, query peers for their known peers

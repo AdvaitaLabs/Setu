@@ -13,8 +13,8 @@
 //! - Semaphore limits concurrent TEE calls (default: 100)
 //! - Direct DashMap updates avoid mutex contention
 
-use super::types::*;
 use super::solver_client::{ExecuteTaskRequest, ExecuteTaskResponse};
+use super::types::*;
 use crate::ConsensusValidator;
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -79,12 +79,7 @@ impl TeeExecutor {
     /// - submit_transfer returns immediately after spawning
     /// - TEE execution happens in background with Semaphore-controlled concurrency
     /// - Status is updated via transfer_id lookup (not find())
-    pub fn spawn_tee_task(
-        &self,
-        transfer_id: String,
-        solver_id: String,
-        task: SolverTask,
-    ) {
+    pub fn spawn_tee_task(&self, transfer_id: String, solver_id: String, task: SolverTask) {
         // Clone Arc-wrapped fields for the spawned task
         let semaphore = Arc::clone(&self.semaphore);
         let pending_count = Arc::clone(&self.pending_count);
@@ -143,7 +138,11 @@ impl TeeExecutor {
             }
             Err(_) => {
                 // Semaphore closed - service shutting down
-                Self::update_tracker_failed(&transfer_status, &transfer_id, "Service shutting down");
+                Self::update_tracker_failed(
+                    &transfer_status,
+                    &transfer_id,
+                    "Service shutting down",
+                );
                 return;
             }
         };
@@ -368,7 +367,7 @@ impl TeeExecutor {
 // ============================================
 
 /// Legacy synchronous TEE execution
-/// 
+///
 /// **DEPRECATED**: Use TeeExecutor::spawn_tee_task for parallel execution.
 /// This is kept for backward compatibility and testing.
 #[allow(dead_code)]
@@ -448,7 +447,10 @@ pub async fn send_solver_task_sync(
             message = %exec_response.message,
             "Solver execution failed"
         );
-        return Err(format!("Solver execution failed: {}", exec_response.message));
+        return Err(format!(
+            "Solver execution failed: {}",
+            exec_response.message
+        ));
     }
 
     // Get result from response

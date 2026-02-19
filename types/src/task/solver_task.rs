@@ -9,9 +9,9 @@
 //! - `ResolvedInputs` is required (not Option) for stateless execution
 //! - Supports multiple objects via `Vec<ResolvedObject>` for future MergeCoins/SplitCoin
 
-use serde::{Deserialize, Serialize};
-use crate::{Event, ObjectId, SubnetId};
 use super::gas::GasBudget;
+use crate::{Event, ObjectId, SubnetId};
+use serde::{Deserialize, Serialize};
 
 /// Solver Task sent from Validator to Solver
 ///
@@ -25,22 +25,22 @@ pub struct SolverTask {
     /// Unique task ID (used for Attestation binding)
     /// This is a 32-byte hash for cryptographic binding
     pub task_id: [u8; 32],
-    
+
     /// Event to execute
     pub event: Event,
-    
+
     /// Validator-resolved object references (required)
     pub resolved_inputs: ResolvedInputs,
-    
+
     /// Object data + Merkle proofs
     pub read_set: Vec<ReadSetEntry>,
-    
+
     /// Pre-execution state root (for TEE verification)
     pub pre_state_root: [u8; 32],
-    
+
     /// Target subnet
     pub subnet_id: SubnetId,
-    
+
     /// Gas budget for execution
     pub gas_budget: GasBudget,
 }
@@ -64,26 +64,26 @@ impl SolverTask {
             gas_budget: GasBudget::default(),
         }
     }
-    
+
     /// Generate task_id from event and state context
     /// This creates a unique identifier for Attestation binding
     pub fn generate_task_id(event: &Event, pre_state_root: &[u8; 32]) -> [u8; 32] {
-        use sha2::{Sha256, Digest};
-        
+        use sha2::{Digest, Sha256};
+
         let mut hasher = Sha256::new();
         hasher.update(event.id.as_bytes());
         hasher.update(pre_state_root);
         hasher.update(&event.timestamp.to_le_bytes());
-        
+
         hasher.finalize().into()
     }
-    
+
     /// Add read set entries
     pub fn with_read_set(mut self, read_set: Vec<ReadSetEntry>) -> Self {
         self.read_set = read_set;
         self
     }
-    
+
     /// Set gas budget
     pub fn with_gas_budget(mut self, gas_budget: GasBudget) -> Self {
         self.gas_budget = gas_budget;
@@ -99,7 +99,7 @@ impl SolverTask {
 pub struct ResolvedInputs {
     /// Operation type with parameters
     pub operation: OperationType,
-    
+
     /// Input objects (referenced by index in operation)
     pub input_objects: Vec<ResolvedObject>,
 }
@@ -112,7 +112,7 @@ impl ResolvedInputs {
             input_objects: Vec::new(),
         }
     }
-    
+
     /// Create for a single-coin transfer
     pub fn transfer(coin: ResolvedObject, amount: u64) -> Self {
         Self {
@@ -123,13 +123,13 @@ impl ResolvedInputs {
             input_objects: vec![coin],
         }
     }
-    
+
     /// Create for merge coins (future)
     pub fn merge_coins(target: ResolvedObject, sources: Vec<ResolvedObject>) -> Self {
         let source_indices: Vec<usize> = (1..=sources.len()).collect();
         let mut objects = vec![target];
         objects.extend(sources);
-        
+
         Self {
             operation: OperationType::MergeCoins {
                 target_index: 0,
@@ -138,20 +138,16 @@ impl ResolvedInputs {
             input_objects: objects,
         }
     }
-    
+
     /// Get primary coin object (for Transfer)
     pub fn primary_coin(&self) -> Option<&ResolvedObject> {
         match &self.operation {
             OperationType::NoOp => None,
-            OperationType::Transfer { from_coin_index, .. } => {
-                self.input_objects.get(*from_coin_index)
-            }
-            OperationType::MergeCoins { target_index, .. } => {
-                self.input_objects.get(*target_index)
-            }
-            OperationType::SplitCoin { source_index, .. } => {
-                self.input_objects.get(*source_index)
-            }
+            OperationType::Transfer {
+                from_coin_index, ..
+            } => self.input_objects.get(*from_coin_index),
+            OperationType::MergeCoins { target_index, .. } => self.input_objects.get(*target_index),
+            OperationType::SplitCoin { source_index, .. } => self.input_objects.get(*source_index),
         }
     }
 }
@@ -167,7 +163,7 @@ impl Default for ResolvedInputs {
 pub enum OperationType {
     /// No operation (for non-coin events like state registration)
     NoOp,
-    
+
     /// Single coin transfer
     Transfer {
         /// Index of source coin in input_objects
@@ -175,7 +171,7 @@ pub enum OperationType {
         /// Amount to transfer
         amount: u64,
     },
-    
+
     /// Merge multiple coins into one (future)
     MergeCoins {
         /// Index of target coin in input_objects
@@ -183,7 +179,7 @@ pub enum OperationType {
         /// Indices of source coins to merge
         source_indices: Vec<usize>,
     },
-    
+
     /// Split one coin into multiple (future)
     SplitCoin {
         /// Index of source coin in input_objects
@@ -198,10 +194,10 @@ pub enum OperationType {
 pub struct ResolvedObject {
     /// Object ID
     pub object_id: ObjectId,
-    
+
     /// Object type (e.g., "Coin", "NFT")
     pub object_type: String,
-    
+
     /// Expected version (for optimistic locking)
     pub expected_version: u64,
 }
@@ -215,12 +211,12 @@ impl ResolvedObject {
             expected_version: 0,
         }
     }
-    
+
     /// Create a Coin object reference
     pub fn coin(object_id: ObjectId) -> Self {
         Self::new(object_id, "Coin")
     }
-    
+
     /// Set expected version
     pub fn with_version(mut self, version: u64) -> Self {
         self.expected_version = version;
@@ -247,7 +243,7 @@ impl ReadSetEntry {
             proof: None,
         }
     }
-    
+
     pub fn with_proof(mut self, proof: Vec<u8>) -> Self {
         self.proof = Some(proof);
         self
@@ -259,10 +255,10 @@ impl ReadSetEntry {
 pub struct MerkleProof {
     /// Sibling hashes on the path to root
     pub siblings: Vec<[u8; 32]>,
-    
+
     /// Path direction bits (true = right, false = left)
     pub path_bits: Vec<bool>,
-    
+
     /// Leaf index (optional, for verification)
     pub leaf_index: Option<u64>,
 }
@@ -276,7 +272,7 @@ impl MerkleProof {
             leaf_index: None,
         }
     }
-    
+
     /// Create an empty proof (for MVP without actual verification)
     pub fn empty() -> Self {
         Self {
@@ -290,17 +286,20 @@ impl MerkleProof {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_resolved_inputs_transfer() {
         let coin = ResolvedObject::coin(ObjectId::random()).with_version(1);
         let resolved = ResolvedInputs::transfer(coin.clone(), 100);
-        
-        assert!(matches!(resolved.operation, OperationType::Transfer { amount: 100, .. }));
+
+        assert!(matches!(
+            resolved.operation,
+            OperationType::Transfer { amount: 100, .. }
+        ));
         assert_eq!(resolved.input_objects.len(), 1);
         assert_eq!(resolved.primary_coin().unwrap().object_id, coin.object_id);
     }
-    
+
     #[test]
     fn test_gas_budget_default() {
         let budget = GasBudget::default();

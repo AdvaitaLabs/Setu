@@ -2,9 +2,9 @@
 //!
 //! This module defines the core interface that all enclave implementations must satisfy.
 
+use crate::stf::{StfInput, StfOutput, StfResult};
 use async_trait::async_trait;
 use setu_types::task::Attestation;
-use crate::stf::{StfInput, StfOutput, StfResult};
 
 /// Configuration for enclave initialization
 #[derive(Debug, Clone)]
@@ -26,7 +26,7 @@ impl Default for EnclaveConfig {
         Self {
             enclave_id: uuid::Uuid::new_v4().to_string(),
             solver_id: "default-solver".to_string(),
-            max_execution_time_ms: 30_000, // 30 seconds
+            max_execution_time_ms: 30_000,        // 30 seconds
             max_memory_bytes: 1024 * 1024 * 1024, // 1 GB
             enable_debug_logging: false,
         }
@@ -40,7 +40,7 @@ impl EnclaveConfig {
             ..Default::default()
         }
     }
-    
+
     pub fn with_solver_id(mut self, solver_id: String) -> Self {
         self.solver_id = solver_id;
         self
@@ -104,7 +104,7 @@ pub trait EnclaveRuntime: Send + Sync {
     /// - **Deterministic**: Same inputs produce same outputs
     /// - **Attested**: Output is cryptographically signed
     async fn execute_stf(&self, input: StfInput) -> StfResult<StfOutput>;
-    
+
     /// Generate an attestation for given user data.
     ///
     /// The attestation proves that:
@@ -112,7 +112,7 @@ pub trait EnclaveRuntime: Send + Sync {
     /// 2. The enclave code has the expected measurement
     /// 3. The output data was produced by this enclave
     async fn generate_attestation(&self, user_data: [u8; 32]) -> StfResult<Attestation>;
-    
+
     /// Verify an attestation (typically called by validators).
     ///
     /// Checks:
@@ -120,13 +120,13 @@ pub trait EnclaveRuntime: Send + Sync {
     /// 2. Enclave measurement matches expected value
     /// 3. Attestation is not expired
     async fn verify_attestation(&self, attestation: &Attestation) -> StfResult<bool>;
-    
+
     /// Get information about this enclave.
     fn info(&self) -> EnclaveInfo;
-    
+
     /// Get the enclave's measurement (used for verification).
     fn measurement(&self) -> [u8; 32];
-    
+
     /// Check if this is a simulated/mock enclave.
     fn is_simulated(&self) -> bool;
 }
@@ -152,14 +152,14 @@ impl<T: EnclaveRuntime> EnclaveRuntimeExt for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_enclave_config_default() {
         let config = EnclaveConfig::default();
         assert_eq!(config.max_execution_time_ms, 30_000);
         assert_eq!(config.max_memory_bytes, 1024 * 1024 * 1024);
     }
-    
+
     #[test]
     fn test_enclave_platform_display() {
         assert_eq!(format!("{}", EnclavePlatform::Mock), "Mock");

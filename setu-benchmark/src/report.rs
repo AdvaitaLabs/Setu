@@ -9,16 +9,31 @@ pub fn print_report(summary: &BenchmarkSummary) {
     info!("║                    BENCHMARK RESULTS                     ║");
     info!("╚══════════════════════════════════════════════════════════╝");
     info!("");
-    
+
     // Overview
     info!("┌─────────────────────────────────────────────────────────┐");
     info!("│ OVERVIEW                                                │");
     info!("├─────────────────────────────────────────────────────────┤");
-    info!("│ Total Requests:     {:>10}                          │", summary.total_requests);
-    info!("│ Successful:         {:>10}                          │", summary.success_count);
-    info!("│ Failed:             {:>10}                          │", summary.failure_count);
-    info!("│ Timeout:            {:>10}                          │", summary.timeout_count);
-    info!("│ Duration:           {:>10.2}s                         │", summary.elapsed_ms as f64 / 1000.0);
+    info!(
+        "│ Total Requests:     {:>10}                          │",
+        summary.total_requests
+    );
+    info!(
+        "│ Successful:         {:>10}                          │",
+        summary.success_count
+    );
+    info!(
+        "│ Failed:             {:>10}                          │",
+        summary.failure_count
+    );
+    info!(
+        "│ Timeout:            {:>10}                          │",
+        summary.timeout_count
+    );
+    info!(
+        "│ Duration:           {:>10.2}s                         │",
+        summary.elapsed_ms as f64 / 1000.0
+    );
     info!("└─────────────────────────────────────────────────────────┘");
     info!("");
 
@@ -26,8 +41,14 @@ pub fn print_report(summary: &BenchmarkSummary) {
     info!("┌─────────────────────────────────────────────────────────┐");
     info!("│ PERFORMANCE                                             │");
     info!("├─────────────────────────────────────────────────────────┤");
-    info!("│ ★ TPS (Successful): {:>10.2}                         │", summary.tps);
-    info!("│ Success Rate:       {:>10.2}%                        │", summary.success_rate);
+    info!(
+        "│ ★ TPS (Successful): {:>10.2}                         │",
+        summary.tps
+    );
+    info!(
+        "│ Success Rate:       {:>10.2}%                        │",
+        summary.success_rate
+    );
     info!("└─────────────────────────────────────────────────────────┘");
     info!("");
 
@@ -35,14 +56,38 @@ pub fn print_report(summary: &BenchmarkSummary) {
     info!("┌─────────────────────────────────────────────────────────┐");
     info!("│ LATENCY (milliseconds)                                  │");
     info!("├─────────────────────────────────────────────────────────┤");
-    info!("│ Min:                {:>10.2} ms                       │", summary.latency.min_us as f64 / 1000.0);
-    info!("│ Max:                {:>10.2} ms                       │", summary.latency.max_us as f64 / 1000.0);
-    info!("│ Mean:               {:>10.2} ms                       │", summary.latency.mean_us / 1000.0);
-    info!("│ P50 (Median):       {:>10.2} ms                       │", summary.latency.p50_us as f64 / 1000.0);
-    info!("│ P90:                {:>10.2} ms                       │", summary.latency.p90_us as f64 / 1000.0);
-    info!("│ P95:                {:>10.2} ms                       │", summary.latency.p95_us as f64 / 1000.0);
-    info!("│ P99:                {:>10.2} ms                       │", summary.latency.p99_us as f64 / 1000.0);
-    info!("│ P99.9:              {:>10.2} ms                       │", summary.latency.p999_us as f64 / 1000.0);
+    info!(
+        "│ Min:                {:>10.2} ms                       │",
+        summary.latency.min_us as f64 / 1000.0
+    );
+    info!(
+        "│ Max:                {:>10.2} ms                       │",
+        summary.latency.max_us as f64 / 1000.0
+    );
+    info!(
+        "│ Mean:               {:>10.2} ms                       │",
+        summary.latency.mean_us / 1000.0
+    );
+    info!(
+        "│ P50 (Median):       {:>10.2} ms                       │",
+        summary.latency.p50_us as f64 / 1000.0
+    );
+    info!(
+        "│ P90:                {:>10.2} ms                       │",
+        summary.latency.p90_us as f64 / 1000.0
+    );
+    info!(
+        "│ P95:                {:>10.2} ms                       │",
+        summary.latency.p95_us as f64 / 1000.0
+    );
+    info!(
+        "│ P99:                {:>10.2} ms                       │",
+        summary.latency.p99_us as f64 / 1000.0
+    );
+    info!(
+        "│ P99.9:              {:>10.2} ms                       │",
+        summary.latency.p999_us as f64 / 1000.0
+    );
     info!("└─────────────────────────────────────────────────────────┘");
     info!("");
 
@@ -85,7 +130,8 @@ pub fn json_report(summary: &BenchmarkSummary) -> String {
             "p99_ms": summary.latency.p99_us as f64 / 1000.0,
             "p999_ms": summary.latency.p999_us as f64 / 1000.0,
         }
-    }).to_string()
+    })
+    .to_string()
 }
 
 /// Generate CSV header

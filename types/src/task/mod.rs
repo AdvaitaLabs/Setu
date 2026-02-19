@@ -14,17 +14,16 @@
 //! These are **pure data types** that both Validator and Solver can use
 //! without Validator needing to depend on the TEE execution implementation.
 
-mod solver_task;
 mod attestation;
 mod gas;
+mod solver_task;
 
 // Re-export all types
-pub use solver_task::{
-    SolverTask, ResolvedInputs, OperationType, ResolvedObject,
-    ReadSetEntry, MerkleProof,
-};
 pub use attestation::{
-    Attestation, AttestationType, AttestationData,
-    AttestationError, AttestationResult, VerifiedAttestation,
+    Attestation, AttestationData, AttestationError, AttestationResult, AttestationType,
+    VerifiedAttestation,
 };
 pub use gas::{GasBudget, GasUsage};
+pub use solver_task::{
+    MerkleProof, OperationType, ReadSetEntry, ResolvedInputs, ResolvedObject, SolverTask,
+};

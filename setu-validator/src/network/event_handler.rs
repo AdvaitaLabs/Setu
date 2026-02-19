@@ -18,7 +18,9 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 // Re-export API types
-pub use super::types::{GetBalanceResponse, GetObjectResponse, SubmitEventRequest, SubmitEventResponse};
+pub use super::types::{
+    GetBalanceResponse, GetObjectResponse, SubmitEventRequest, SubmitEventResponse,
+};
 
 /// Event handler for processing event submissions and DAG management
 pub struct EventHandler;

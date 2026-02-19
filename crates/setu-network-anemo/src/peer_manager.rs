@@ -72,10 +72,7 @@ impl AnemoPeerManager {
             }
         });
 
-        Ok(Self {
-            transport,
-            peers,
-        })
+        Ok(Self { transport, peers })
     }
 
     /// Handle peer events (static version for use in spawned task)
@@ -83,17 +80,20 @@ impl AnemoPeerManager {
         match event {
             PeerEvent::NewPeer(peer_id) => {
                 info!("New peer connected: {}", peer_id);
-                peers.entry(peer_id).and_modify(|info| {
-                    info.connected = true;
-                }).or_insert_with(|| PeerInfo {
-                    node_info: NodeInfo::new_validator(
-                        format!("peer-{}", peer_id),
-                        "unknown".to_string(),
-                        0,
-                    ),
-                    peer_id,
-                    connected: true,
-                });
+                peers
+                    .entry(peer_id)
+                    .and_modify(|info| {
+                        info.connected = true;
+                    })
+                    .or_insert_with(|| PeerInfo {
+                        node_info: NodeInfo::new_validator(
+                            format!("peer-{}", peer_id),
+                            "unknown".to_string(),
+                            0,
+                        ),
+                        peer_id,
+                        connected: true,
+                    });
             }
             PeerEvent::LostPeer(peer_id, reason) => {
                 info!("Peer disconnected: {} (reason: {:?})", peer_id, reason);

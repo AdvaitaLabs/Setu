@@ -3,11 +3,11 @@
 //! Routes incoming network events to appropriate handlers in the consensus layer.
 //! Events and CFs are stored in-memory (DAG) until finalized, then persisted.
 
-use consensus::ConsensusEngine;
-use crate::protocol::NetworkEvent;
-use setu_storage::{EventStoreBackend, AnchorStoreBackend};
-use setu_types::{ConsensusFrame, Event, Vote};
 use crate::persistence::FinalizationPersister;
+use crate::protocol::NetworkEvent;
+use consensus::ConsensusEngine;
+use setu_storage::{AnchorStoreBackend, EventStoreBackend};
+use setu_types::{ConsensusFrame, Event, Vote};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -20,30 +20,30 @@ use tracing::{debug, info, warn};
 pub trait NetworkEventHandler: Send + Sync {
     /// Handle an incoming event from the network
     async fn handle_event(&self, peer_id: String, event: Event);
-    
+
     /// Handle an incoming CF proposal
     async fn handle_cf_proposal(&self, peer_id: String, cf: ConsensusFrame);
-    
+
     /// Handle an incoming vote
     async fn handle_vote(&self, peer_id: String, vote: Vote);
-    
+
     /// Handle CF finalized notification
     async fn handle_cf_finalized(&self, peer_id: String, cf: ConsensusFrame);
-    
+
     /// Handle peer connected event
     async fn handle_peer_connected(&self, peer_id: String);
-    
+
     /// Handle peer disconnected event
     async fn handle_peer_disconnected(&self, peer_id: String);
 }
 
 /// Message router that directs network events to the consensus engine
-/// 
+///
 /// The router handles:
 /// 1. Adding events to the DAG via ConsensusEngine (in-memory until finalized)
 /// 2. Routing CF proposals and votes to consensus
 /// 3. Persisting finalized data (Anchor + Events) when CF reaches quorum
-/// 
+///
 /// Note: Events are NOT persisted immediately. Persistence happens when CF is finalized,
 /// which batch-persists the Anchor and all Events included in the CF.
 pub struct MessageRouter {
@@ -53,7 +53,6 @@ pub struct MessageRouter {
     event_store: Arc<dyn EventStoreBackend>,
     /// Anchor store for persisting finalized anchors
     anchor_store: Arc<dyn AnchorStoreBackend>,
-
 }
 
 impl MessageRouter {
@@ -69,7 +68,7 @@ impl MessageRouter {
             anchor_store,
         }
     }
-    
+
     /// Start the message router event loop
     ///
     /// This spawns a task that consumes network events and routes them
@@ -80,15 +79,15 @@ impl MessageRouter {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!("Message router started");
-            
+
             while let Some(event) = event_rx.recv().await {
                 self.route_event(event).await;
             }
-            
+
             info!("Message router stopped");
         })
     }
-    
+
     /// Route a single network event to the appropriate handler
     async fn route_event(&self, event: NetworkEvent) {
         match event {
@@ -117,18 +116,18 @@ impl MessageRouter {
 }
 
 /// Implement FinalizationPersister for MessageRouter
-/// 
+///
 /// This provides the shared persist_finalized_anchor() implementation
 #[async_trait::async_trait]
 impl FinalizationPersister for MessageRouter {
     fn engine(&self) -> &Arc<ConsensusEngine> {
         &self.engine
     }
-    
+
     fn event_store(&self) -> &Arc<dyn EventStoreBackend> {
         &self.event_store
     }
-    
+
     fn anchor_store(&self) -> &Arc<dyn AnchorStoreBackend> {
         &self.anchor_store
     }
@@ -142,7 +141,7 @@ impl NetworkEventHandler for MessageRouter {
             from = %peer_id,
             "Routing event to consensus engine"
         );
-        
+
         // Step 1: Verify event ID matches content (anti-tampering)
         if !event.verify_id() {
             warn!(
@@ -152,7 +151,7 @@ impl NetworkEventHandler for MessageRouter {
             );
             return;
         }
-        
+
         // Step 2: Add to consensus DAG (in-memory only)
         // Events are persisted later when CF is finalized
         // Note: receive_event_from_network is idempotent - duplicate events return Ok
@@ -165,7 +164,7 @@ impl NetworkEventHandler for MessageRouter {
             }
             Err(e) => {
                 let error_str = e.to_string();
-                
+
                 // Check if this is a MissingParent error
                 if error_str.contains("Missing parent") {
                     warn!(
@@ -174,7 +173,7 @@ impl NetworkEventHandler for MessageRouter {
                         parents = ?event.parent_ids,
                         "Event has missing parents, attempting sync"
                     );
-                    
+
                     // Attempt to fetch missing parent events from the broadcaster
                     if let Some(broadcaster) = self.engine.get_broadcaster().await {
                         match broadcaster.request_events(&event.parent_ids).await {
@@ -183,14 +182,16 @@ impl NetworkEventHandler for MessageRouter {
                                     count = fetched_events.len(),
                                     "Fetched missing parent events"
                                 );
-                                
+
                                 // Add fetched parents to DAG
                                 for parent_event in fetched_events {
-                                    if let Err(e) = self.engine.receive_event_from_network(parent_event).await {
+                                    if let Err(e) =
+                                        self.engine.receive_event_from_network(parent_event).await
+                                    {
                                         debug!(error = %e, "Failed to add fetched parent (may already exist)");
                                     }
                                 }
-                                
+
                                 // Retry adding the original event
                                 match self.engine.receive_event_from_network(event).await {
                                     Ok(event_id) => {
@@ -227,7 +228,7 @@ impl NetworkEventHandler for MessageRouter {
             }
         }
     }
-    
+
     async fn handle_cf_proposal(&self, peer_id: String, cf: ConsensusFrame) {
         info!(
             cf_id = %cf.id,
@@ -235,7 +236,7 @@ impl NetworkEventHandler for MessageRouter {
             from = %peer_id,
             "Routing CF proposal to consensus engine"
         );
-        
+
         let cf_id = cf.id.clone();
         match self.engine.receive_cf(cf).await {
             Ok((finalized, anchor)) => {
@@ -245,7 +246,7 @@ impl NetworkEventHandler for MessageRouter {
                         anchor = ?anchor.as_ref().map(|a| &a.id),
                         "CF finalized after local vote"
                     );
-                    
+
                     // Persist finalized data (same logic as handle_vote)
                     if let Some(anchor) = anchor {
                         if let Err(e) = self.persist_finalized_anchor(&anchor).await {
@@ -269,7 +270,7 @@ impl NetworkEventHandler for MessageRouter {
             }
         }
     }
-    
+
     async fn handle_vote(&self, peer_id: String, vote: Vote) {
         debug!(
             cf_id = %vote.cf_id,
@@ -277,7 +278,7 @@ impl NetworkEventHandler for MessageRouter {
             from = %peer_id,
             "Routing vote to consensus engine"
         );
-        
+
         match self.engine.receive_vote(vote.clone()).await {
             Ok((finalized, anchor)) => {
                 if finalized {
@@ -286,7 +287,7 @@ impl NetworkEventHandler for MessageRouter {
                         anchor = ?anchor.as_ref().map(|a| &a.id),
                         "CF finalized after vote"
                     );
-                    
+
                     // Persist finalized data
                     if let Some(anchor) = anchor {
                         if let Err(e) = self.persist_finalized_anchor(&anchor).await {
@@ -308,7 +309,7 @@ impl NetworkEventHandler for MessageRouter {
             }
         }
     }
-    
+
     async fn handle_cf_finalized(&self, peer_id: String, cf: ConsensusFrame) {
         info!(
             cf_id = %cf.id,
@@ -318,12 +319,12 @@ impl NetworkEventHandler for MessageRouter {
         // The engine already handles finalization through vote quorum
         // This notification is for state sync purposes
     }
-    
+
     async fn handle_peer_connected(&self, peer_id: String) {
         debug!(peer = %peer_id, "New peer connected - may trigger sync");
         // Could trigger state sync with new peer here
     }
-    
+
     async fn handle_peer_disconnected(&self, peer_id: String) {
         debug!(peer = %peer_id, "Peer disconnected");
         // Could update peer tracking state here
@@ -334,16 +335,16 @@ impl NetworkEventHandler for MessageRouter {
 mod tests {
     use super::*;
     use consensus::{ConsensusEngine, ValidatorSet};
-    use setu_storage::{EventStore, AnchorStore};
-    use setu_types::{ConsensusConfig, ValidatorInfo, NodeInfo, VLCSnapshot};
+    use setu_storage::{AnchorStore, EventStore};
+    use setu_types::{ConsensusConfig, NodeInfo, VLCSnapshot, ValidatorInfo};
     use setu_vlc::VectorClock;
-    
+
     fn create_test_stores() -> (Arc<dyn EventStoreBackend>, Arc<dyn AnchorStoreBackend>) {
         let event_store: Arc<dyn EventStoreBackend> = Arc::new(EventStore::new());
         let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(AnchorStore::new());
         (event_store, anchor_store)
     }
-    
+
     fn create_test_engine() -> Arc<ConsensusEngine> {
         let config = ConsensusConfig::default();
         let mut validator_set = ValidatorSet::new();
@@ -355,7 +356,7 @@ mod tests {
             validator_set,
         ))
     }
-    
+
     fn create_test_event() -> Event {
         Event::genesis(
             "test-creator".to_string(),
@@ -366,7 +367,7 @@ mod tests {
             },
         )
     }
-    
+
     #[tokio::test]
     async fn test_router_creation() {
         let engine = create_test_engine();
@@ -374,19 +375,19 @@ mod tests {
         let _router = MessageRouter::new(engine, event_store, anchor_store);
         // Router created successfully
     }
-    
+
     #[tokio::test]
     async fn test_handle_event_adds_to_dag() {
         let engine = create_test_engine();
         let (event_store, anchor_store) = create_test_stores();
         let router = MessageRouter::new(engine.clone(), event_store, anchor_store);
-        
+
         let event = create_test_event();
         let event_id = event.id.clone();
-        
+
         // Handle the event - adds to DAG only, not persisted
         router.handle_event("peer-1".to_string(), event).await;
-        
+
         // Verify it was added to the DAG
         let events = engine.get_events_by_ids(&[event_id.clone()]).await;
         assert_eq!(events.len(), 1, "Event should be in DAG");

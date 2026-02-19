@@ -43,10 +43,10 @@
 // Core Modules (Generic Protocol Tools - NO setu-types dependency)
 // =============================================================================
 
-pub mod version;
 pub mod codec;
 pub mod error;
 pub mod rpc;
+pub mod version;
 
 // =============================================================================
 // Solver HTTP Communication (Validator ↔ Solver)
@@ -55,21 +55,17 @@ pub mod rpc;
 pub mod solver_http;
 
 // Re-export core types
-pub use version::ProtocolVersion;
-pub use codec::{GenericCodec, BincodeCodec};
+pub use codec::{BincodeCodec, GenericCodec};
 pub use error::ProtocolError;
+pub use version::ProtocolVersion;
 
 // Re-export RPC serialization types (these are generic wrappers)
 pub use rpc::{
-    SerializedEvent, SerializedConsensusFrame, SerializedVote,
-    SyncEventsRequest, SyncEventsResponse,
-    SyncConsensusFramesRequest, SyncConsensusFramesResponse,
+    SerializedConsensusFrame, SerializedEvent, SerializedVote, SyncConsensusFramesRequest,
+    SyncConsensusFramesResponse, SyncEventsRequest, SyncEventsResponse,
 };
 
 // Re-export Solver HTTP types
 pub use solver_http::{
-    ExecuteTaskRequest, ExecuteTaskResponse,
-    TeeExecutionResultDto, StateChangeDto, AttestationDto,
+    AttestationDto, ExecuteTaskRequest, ExecuteTaskResponse, StateChangeDto, TeeExecutionResultDto,
 };
-
-

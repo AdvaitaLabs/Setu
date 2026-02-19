@@ -1,5 +1,5 @@
 //! Profile & Credential - Identity Display and Verification
-//! 
+//!
 //! Design Philosophy:
 //! - Profile is OPTIONAL identity display information (like ENS profile)
 //! - Credential is an independent verifiable attestation
@@ -9,36 +9,36 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::object::{Object, Address, generate_object_id};
+use crate::object::{generate_object_id, Address, Object};
 
 // ============================================================================
 // Profile - Optional Identity Display
 // ============================================================================
 
 /// Profile data - Optional identity display information
-/// 
+///
 /// This is similar to ENS profiles or social media profiles.
 /// An Address can have zero or one Profile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileData {
     /// Owner address
     pub owner: Address,
-    
+
     /// Display name
     pub display_name: Option<String>,
-    
+
     /// Avatar URL (IPFS hash or HTTP URL)
     pub avatar_url: Option<String>,
-    
+
     /// Bio/Description
     pub bio: Option<String>,
-    
+
     /// Custom attributes (website, twitter, etc.)
     pub attributes: HashMap<String, String>,
-    
+
     /// Creation timestamp (milliseconds)
     pub created_at: u64,
-    
+
     /// Last update timestamp (milliseconds)
     pub updated_at: u64,
 }
@@ -135,37 +135,37 @@ pub enum CredentialStatus {
 }
 
 /// Credential data - Verifiable attestation
-/// 
+///
 /// Credentials are issued by trusted parties (issuers) and can be:
 /// - KYC verification
 /// - Membership proof
 /// - Achievement badges
 /// - Professional certifications
-/// 
+///
 /// Each credential is an independent object that can be queried and verified.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialData {
     /// Credential holder (the Address that owns this credential)
     pub holder: Address,
-    
+
     /// Credential type (e.g., "kyc", "membership", "achievement")
     pub credential_type: String,
-    
+
     /// Issuer address (who issued this credential)
     pub issuer: Address,
-    
+
     /// Issue timestamp (milliseconds)
     pub issued_at: u64,
-    
+
     /// Expiration timestamp (None = never expires)
     pub expires_at: Option<u64>,
-    
+
     /// Credential status
     pub status: CredentialStatus,
-    
+
     /// Credential data/claims (key-value pairs)
     pub claims: HashMap<String, String>,
-    
+
     /// Optional metadata (e.g., proof, signature reference)
     pub metadata: HashMap<String, String>,
 }
@@ -175,11 +175,7 @@ pub type Credential = Object<CredentialData>;
 
 impl CredentialData {
     /// Create new credential data
-    pub fn new(
-        holder: Address,
-        credential_type: impl Into<String>,
-        issuer: Address,
-    ) -> Self {
+    pub fn new(holder: Address, credential_type: impl Into<String>, issuer: Address) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -202,7 +198,7 @@ impl CredentialData {
         if self.status != CredentialStatus::Active {
             return false;
         }
-        
+
         if let Some(expires_at) = self.expires_at {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -212,7 +208,7 @@ impl CredentialData {
                 return false;
             }
         }
-        
+
         true
     }
 
@@ -239,14 +235,10 @@ impl CredentialData {
 
 impl Credential {
     /// Create a new Credential object
-    pub fn new(
-        holder: Address,
-        credential_type: impl Into<String>,
-        issuer: Address,
-    ) -> Self {
+    pub fn new(holder: Address, credential_type: impl Into<String>, issuer: Address) -> Self {
         let cred_type = credential_type.into();
         let id = generate_object_id(
-            format!("credential:{}:{}:{}", holder, issuer, cred_type).as_bytes()
+            format!("credential:{}:{}:{}", holder, issuer, cred_type).as_bytes(),
         );
         let data = CredentialData::new(holder.clone(), cred_type, issuer);
         // Credentials are owned by the holder but issued by issuer
@@ -317,26 +309,29 @@ mod tests {
     fn test_create_profile() {
         let owner = Address::from_str_id("alice");
         let mut profile = create_profile(owner.clone());
-        
+
         assert_eq!(profile.data.owner, owner);
         assert!(profile.data.display_name.is_none());
-        
+
         profile.data.set_display_name("Alice");
         profile.data.set_bio("Hello, World!");
         profile.data.set_attribute("twitter", "@alice");
-        
+
         assert_eq!(profile.data.display_name, Some("Alice".to_string()));
         assert_eq!(profile.data.bio, Some("Hello, World!".to_string()));
-        assert_eq!(profile.data.get_attribute("twitter"), Some(&"@alice".to_string()));
+        assert_eq!(
+            profile.data.get_attribute("twitter"),
+            Some(&"@alice".to_string())
+        );
     }
 
     #[test]
     fn test_create_credential() {
         let holder = Address::from_str_id("alice");
         let issuer = Address::from_str_id("kyc_provider");
-        
+
         let cred = create_kyc_credential(holder.clone(), issuer.clone(), "level_2");
-        
+
         assert_eq!(cred.data.holder, holder);
         assert_eq!(cred.data.issuer, issuer);
         assert_eq!(cred.data.credential_type, "kyc");
@@ -348,11 +343,11 @@ mod tests {
     fn test_credential_expiry() {
         let holder = Address::from_str_id("bob");
         let issuer = Address::from_str_id("org");
-        
+
         // Create credential that expires in the past
         let mut cred = Credential::new(holder, "test", issuer);
         cred.data.set_expiry(1000); // Very old timestamp
-        
+
         assert!(!cred.data.is_valid()); // Should be expired
     }
 
@@ -360,10 +355,10 @@ mod tests {
     fn test_credential_revoke() {
         let holder = Address::from_str_id("charlie");
         let issuer = Address::from_str_id("authority");
-        
+
         let mut cred = Credential::new(holder, "certificate", issuer);
         assert!(cred.data.is_valid());
-        
+
         cred.data.revoke();
         assert!(!cred.data.is_valid());
         assert_eq!(cred.data.status, CredentialStatus::Revoked);
@@ -373,16 +368,14 @@ mod tests {
     fn test_membership_credential() {
         let holder = Address::from_str_id("member");
         let issuer = Address::from_str_id("dao");
-        
-        let cred = create_membership_credential(
-            holder.clone(),
-            issuer.clone(),
-            "CryptoDAO",
-            None,
-        );
-        
+
+        let cred = create_membership_credential(holder.clone(), issuer.clone(), "CryptoDAO", None);
+
         assert_eq!(cred.data.credential_type, "membership");
-        assert_eq!(cred.data.get_claim("organization"), Some(&"CryptoDAO".to_string()));
+        assert_eq!(
+            cred.data.get_claim("organization"),
+            Some(&"CryptoDAO".to_string())
+        );
         assert!(cred.data.expires_at.is_none());
     }
 }

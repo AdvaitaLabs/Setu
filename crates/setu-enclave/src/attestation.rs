@@ -20,8 +20,8 @@ use std::collections::HashSet;
 
 // Re-export core types from setu_types::task for backward compatibility
 pub use setu_types::task::{
-    Attestation, AttestationType, AttestationData,
-    AttestationError, AttestationResult, VerifiedAttestation,
+    Attestation, AttestationData, AttestationError, AttestationResult, AttestationType,
+    VerifiedAttestation,
 };
 
 // ============================================
@@ -33,25 +33,25 @@ pub use setu_types::task::{
 pub struct NitroAttestationDocument {
     /// Module ID (enclave image ID)
     pub module_id: String,
-    
+
     /// PCR values (Platform Configuration Registers)
     /// PCR0: Enclave image hash
     /// PCR1: Linux kernel and boot ramdisk hash
     /// PCR2: Application hash
     pub pcrs: NitroPcrs,
-    
+
     /// Certificate chain
     pub certificate: Vec<u8>,
-    
+
     /// CA bundle for verification
     pub cabundle: Vec<Vec<u8>>,
-    
+
     /// Optional public key
     pub public_key: Option<Vec<u8>>,
-    
+
     /// User-provided data (nonce)
     pub user_data: Option<Vec<u8>>,
-    
+
     /// Timestamp
     pub timestamp: u64,
 }
@@ -93,7 +93,7 @@ impl NitroPcrs {
 pub trait AttestationVerifier: Send + Sync {
     /// Verify an attestation document
     fn verify(&self, attestation: &Attestation) -> AttestationResult<VerifiedAttestation>;
-    
+
     /// Check if a measurement is in the allowlist
     fn is_measurement_allowed(&self, measurement: &[u8; 32]) -> bool;
 }
@@ -121,12 +121,12 @@ impl AllowlistVerifier {
             allow_mock,
         }
     }
-    
+
     /// Add a measurement to the allowlist
     pub fn add_measurement(&mut self, measurement: [u8; 32]) {
         self.allowed_measurements.insert(measurement);
     }
-    
+
     /// Create a verifier that allows all mock attestations (for testing)
     pub fn allow_all_mock() -> Self {
         Self::new(true)
@@ -151,14 +151,14 @@ impl AttestationVerifier for AllowlistVerifier {
                 return Err(AttestationError::UnsupportedType("mock".to_string()));
             }
         }
-        
+
         // Check measurement allowlist
         if !self.is_measurement_allowed(&attestation.measurement) {
             return Err(AttestationError::UnknownMeasurement {
                 measurement: attestation.measurement_hex(),
             });
         }
-        
+
         // For non-mock attestations, we'd need to verify the document
         // This is a placeholder - real implementation would parse and verify
         match attestation.attestation_type {
@@ -179,7 +179,7 @@ impl AttestationVerifier for AllowlistVerifier {
             )),
         }
     }
-    
+
     fn is_measurement_allowed(&self, measurement: &[u8; 32]) -> bool {
         self.allowed_measurements.contains(measurement)
     }
@@ -188,42 +188,42 @@ impl AttestationVerifier for AllowlistVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_mock_attestation() {
         let user_data = [42u8; 32];
         let attestation = Attestation::mock(user_data);
-        
+
         assert!(attestation.is_mock());
         assert_eq!(attestation.user_data, user_data);
         assert!(!attestation.measurement_hex().is_empty());
     }
-    
+
     #[test]
     fn test_attestation_hash() {
         let user_data = [1u8; 32];
         let attestation = Attestation::mock(user_data);
-        
+
         let hash1 = attestation.hash();
         let hash2 = attestation.hash();
-        
+
         assert_eq!(hash1, hash2);
     }
-    
+
     #[test]
     fn test_allowlist_verifier_mock() {
         let verifier = AllowlistVerifier::allow_all_mock();
         let attestation = Attestation::mock([0u8; 32]);
-        
+
         let result = verifier.verify(&attestation);
         assert!(result.is_ok());
     }
-    
+
     #[test]
     fn test_allowlist_verifier_rejects_mock() {
         let verifier = AllowlistVerifier::new(false);
         let attestation = Attestation::mock([0u8; 32]);
-        
+
         let result = verifier.verify(&attestation);
         assert!(result.is_err());
     }

@@ -7,7 +7,7 @@
 use setu_types::EventId;
 
 /// Result of a batch store operation
-/// 
+///
 /// This type provides detailed information about what happened during
 /// a batch store operation, allowing callers to handle various scenarios:
 /// - Complete success (all events stored)
@@ -32,27 +32,27 @@ impl BatchStoreResult {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Check if there were any critical failures
     pub fn has_critical_failures(&self) -> bool {
         self.failed > 0
     }
-    
+
     /// Total events processed
     pub fn total(&self) -> usize {
         self.stored + self.skipped + self.failed
     }
-    
+
     /// Check if operation was fully successful (no failures, no skips)
     pub fn is_complete_success(&self) -> bool {
         self.failed == 0 && self.skipped == 0
     }
-    
+
     /// Check if operation was successful (no failures, skips are OK)
     pub fn is_success(&self) -> bool {
         self.failed == 0
     }
-    
+
     /// Merge another result into this one
     pub fn merge(&mut self, other: BatchStoreResult) {
         self.stored += other.stored;
@@ -68,7 +68,10 @@ impl std::fmt::Display for BatchStoreResult {
         write!(
             f,
             "BatchStoreResult {{ stored: {}, skipped: {}, failed: {}, total: {} }}",
-            self.stored, self.skipped, self.failed, self.total()
+            self.stored,
+            self.skipped,
+            self.failed,
+            self.total()
         )
     }
 }
@@ -93,7 +96,7 @@ mod tests {
         result.stored = 5;
         result.skipped = 2;
         result.skipped_ids = vec!["id1".to_string(), "id2".to_string()];
-        
+
         assert_eq!(result.total(), 7);
         assert!(result.is_success());
         assert!(!result.is_complete_success());
@@ -106,7 +109,7 @@ mod tests {
         result.stored = 3;
         result.failed = 1;
         result.failed_errors = vec![("id1".to_string(), "some error".to_string())];
-        
+
         assert_eq!(result.total(), 4);
         assert!(!result.is_success());
         assert!(result.has_critical_failures());
@@ -117,13 +120,13 @@ mod tests {
         let mut result1 = BatchStoreResult::new();
         result1.stored = 3;
         result1.skipped = 1;
-        
+
         let mut result2 = BatchStoreResult::new();
         result2.stored = 2;
         result2.failed = 1;
-        
+
         result1.merge(result2);
-        
+
         assert_eq!(result1.stored, 5);
         assert_eq!(result1.skipped, 1);
         assert_eq!(result1.failed, 1);

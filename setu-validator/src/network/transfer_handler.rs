@@ -6,15 +6,14 @@
 //! - Solver routing
 //! - Transfer status tracking
 
-use super::types::*;
 use super::tee_executor::TeeExecutor;
+use super::types::*;
 use crate::{RouterManager, TaskPreparer};
 use dashmap::DashMap;
-use setu_types::{Transfer, TransferType, AssignedVlc};
 use setu_rpc::{
-    GetTransferStatusResponse, ProcessingStep,
-    SubmitTransferRequest, SubmitTransferResponse,
+    GetTransferStatusResponse, ProcessingStep, SubmitTransferRequest, SubmitTransferResponse,
 };
+use setu_types::{AssignedVlc, Transfer, TransferType};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -100,19 +99,14 @@ impl TransferHandler {
             request.resources.clone()
         };
 
-        let transfer = Transfer::new(
-            &transfer_id,
-            &request.from,
-            &request.to,
-            request.amount,
-        )
-        .with_type(transfer_type)
-        .with_resources(resources)
-        .with_power(10)
-        .with_preferred_solver_opt(request.preferred_solver.clone())
-        .with_shard_id(request.shard_id.clone())
-        .with_subnet_id(request.subnet_id.clone())
-        .with_assigned_vlc(assigned_vlc);
+        let transfer = Transfer::new(&transfer_id, &request.from, &request.to, request.amount)
+            .with_type(transfer_type)
+            .with_resources(resources)
+            .with_power(10)
+            .with_preferred_solver_opt(request.preferred_solver.clone())
+            .with_shard_id(request.shard_id.clone())
+            .with_subnet_id(request.subnet_id.clone())
+            .with_assigned_vlc(assigned_vlc);
 
         // Step 4a: Prepare SolverTask
         let subnet_id = match &transfer.subnet_id {

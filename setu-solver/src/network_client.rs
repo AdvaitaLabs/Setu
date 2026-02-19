@@ -13,18 +13,16 @@
 //! 1. Registration and heartbeat (lifecycle management)
 //! 2. Submitting TeeExecutionResult back to Validator
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use setu_rpc::{
-    RegisterSolverRequest, RegisterSolverResponse,
-    HeartbeatRequest, HeartbeatResponse,
-    HttpRegistrationClient,
-    Result as RpcResult, RpcError,
+    HeartbeatRequest, HeartbeatResponse, HttpRegistrationClient, RegisterSolverRequest,
+    RegisterSolverResponse, Result as RpcResult, RpcError,
 };
 use setu_types::event::Event;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use std::time::Duration;
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
 /// Submit Event Request
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,17 +108,15 @@ pub struct SolverNetworkClient {
 impl SolverNetworkClient {
     /// Create a new solver network client
     pub fn new(config: SolverNetworkConfig) -> Self {
-        let http_client = HttpRegistrationClient::new(
-            &config.validator_address,
-            config.validator_port,
-        );
-        
+        let http_client =
+            HttpRegistrationClient::new(&config.validator_address, config.validator_port);
+
         info!(
             solver_id = %config.solver_id,
             validator = %format!("{}:{}", config.validator_address, config.validator_port),
             "Creating solver network client"
         );
-        
+
         Self {
             config,
             http_client,
@@ -129,7 +125,7 @@ impl SolverNetworkClient {
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
-    
+
     /// Register with the validator
     pub async fn register(&self) -> RpcResult<RegisterSolverResponse> {
         info!(
@@ -137,7 +133,7 @@ impl SolverNetworkClient {
             validator = %format!("{}:{}", self.config.validator_address, self.config.validator_port),
             "Registering with validator"
         );
-        
+
         let request = RegisterSolverRequest {
             solver_id: self.config.solver_id.clone(),
             address: self.config.address.clone(),
@@ -149,9 +145,9 @@ impl SolverNetworkClient {
             shard_id: self.config.shard_id.clone(),
             resources: self.config.resources.clone(),
         };
-        
+
         let response = self.http_client.register_solver(request).await?;
-        
+
         if response.success {
             self.is_registered.store(true, Ordering::SeqCst);
             info!(
@@ -165,37 +161,36 @@ impl SolverNetworkClient {
                 "Failed to register with validator"
             );
         }
-        
+
         Ok(response)
     }
-    
+
     /// Send heartbeat to validator
     pub async fn heartbeat(&self) -> RpcResult<HeartbeatResponse> {
         let current_load = self.current_load.load(Ordering::Relaxed);
-        
+
         debug!(
             solver_id = %self.config.solver_id,
             current_load = current_load,
             "Sending heartbeat"
         );
-        
+
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        
+
         let request = HeartbeatRequest {
             node_id: self.config.solver_id.clone(),
             current_load: Some(current_load),
             timestamp,
         };
-        
+
         let url = format!(
             "http://{}:{}/api/v1/heartbeat",
-            self.config.validator_address,
-            self.config.validator_port
+            self.config.validator_address, self.config.validator_port
         );
-        
+
         let client = reqwest::Client::new();
         let response = client
             .post(&url)
@@ -203,22 +198,22 @@ impl SolverNetworkClient {
             .send()
             .await
             .map_err(|e| RpcError::Network(e.to_string()))?;
-        
+
         if !response.status().is_success() {
             return Ok(HeartbeatResponse {
                 acknowledged: false,
                 server_timestamp: 0,
             });
         }
-        
+
         let response: HeartbeatResponse = response
             .json()
             .await
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
-        
+
         Ok(response)
     }
-    
+
     /// Submit an event to the validator (for backward compatibility)
     ///
     /// In solver-tee3, prefer using `submit_execution_result` instead.
@@ -229,15 +224,14 @@ impl SolverNetworkClient {
             event_type = %event.event_type.name(),
             "Submitting event to validator"
         );
-        
+
         let request = SubmitEventRequest { event };
-        
+
         let url = format!(
             "http://{}:{}/api/v1/event",
-            self.config.validator_address,
-            self.config.validator_port
+            self.config.validator_address, self.config.validator_port
         );
-        
+
         let client = reqwest::Client::new();
         let response = client
             .post(&url)
@@ -245,7 +239,7 @@ impl SolverNetworkClient {
             .send()
             .await
             .map_err(|e| RpcError::Network(e.to_string()))?;
-        
+
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -254,14 +248,17 @@ impl SolverNetworkClient {
                 body = %body,
                 "Failed to submit event"
             );
-            return Err(RpcError::Network(format!("HTTP error: {} - {}", status, body)));
+            return Err(RpcError::Network(format!(
+                "HTTP error: {} - {}",
+                status, body
+            )));
         }
-        
+
         let response: SubmitEventResponse = response
             .json()
             .await
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
-        
+
         if response.success {
             info!(
                 event_id = ?response.event_id,
@@ -274,38 +271,41 @@ impl SolverNetworkClient {
                 "Event submission failed"
             );
         }
-        
+
         Ok(response)
     }
-    
+
     /// Get validator base URL
     pub fn validator_url(&self) -> String {
-        format!("http://{}:{}", self.config.validator_address, self.config.validator_port)
+        format!(
+            "http://{}:{}",
+            self.config.validator_address, self.config.validator_port
+        )
     }
-    
+
     /// Start the heartbeat loop
     pub async fn start_heartbeat_loop(&self) {
         let interval = Duration::from_secs(self.config.heartbeat_interval_secs);
-        
+
         info!(
             solver_id = %self.config.solver_id,
             interval_secs = self.config.heartbeat_interval_secs,
             "Starting heartbeat loop"
         );
-        
+
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
                 info!("Heartbeat loop shutting down");
                 break;
             }
-            
+
             tokio::time::sleep(interval).await;
-            
+
             if !self.is_registered.load(Ordering::Relaxed) {
                 debug!("Not registered, skipping heartbeat");
                 continue;
             }
-            
+
             match self.heartbeat().await {
                 Ok(response) => {
                     if response.acknowledged {
@@ -321,32 +321,32 @@ impl SolverNetworkClient {
             }
         }
     }
-    
+
     /// Increment current load
     pub fn increment_load(&self) {
         self.current_load.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     /// Decrement current load
     pub fn decrement_load(&self) {
         self.current_load.fetch_sub(1, Ordering::Relaxed);
     }
-    
+
     /// Get current load
     pub fn get_load(&self) -> u32 {
         self.current_load.load(Ordering::Relaxed)
     }
-    
+
     /// Check if registered
     pub fn is_registered(&self) -> bool {
         self.is_registered.load(Ordering::Relaxed)
     }
-    
+
     /// Shutdown the client
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
     }
-    
+
     /// Get solver ID
     pub fn solver_id(&self) -> &str {
         &self.config.solver_id
@@ -356,7 +356,7 @@ impl SolverNetworkClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_config_default() {
         let config = SolverNetworkConfig::default();
@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(config.capacity, 100);
         assert_eq!(config.heartbeat_interval_secs, 30);
     }
-    
+
     #[test]
     fn test_client_creation() {
         let config = SolverNetworkConfig {
@@ -381,27 +381,26 @@ mod tests {
             public_key: vec![],
             signature: vec![],
         };
-        
+
         let client = SolverNetworkClient::new(config);
-        
+
         assert_eq!(client.solver_id(), "test-solver");
         assert_eq!(client.get_load(), 0);
         assert!(!client.is_registered());
     }
-    
+
     #[test]
     fn test_load_tracking() {
         let config = SolverNetworkConfig::default();
         let client = SolverNetworkClient::new(config);
-        
+
         assert_eq!(client.get_load(), 0);
-        
+
         client.increment_load();
         client.increment_load();
         assert_eq!(client.get_load(), 2);
-        
+
         client.decrement_load();
         assert_eq!(client.get_load(), 1);
     }
 }
-

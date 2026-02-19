@@ -27,33 +27,19 @@ pub enum NetworkEvent {
     },
 
     /// A peer has disconnected
-    PeerDisconnected {
-        peer_id: String,
-    },
+    PeerDisconnected { peer_id: String },
 
     /// Received an event broadcast from a peer
-    EventReceived {
-        peer_id: String,
-        event: Event,
-    },
+    EventReceived { peer_id: String, event: Event },
 
     /// Received a consensus frame proposal
-    CFProposal {
-        peer_id: String,
-        cf: ConsensusFrame,
-    },
+    CFProposal { peer_id: String, cf: ConsensusFrame },
 
     /// Received a vote for a consensus frame
-    VoteReceived {
-        peer_id: String,
-        vote: Vote,
-    },
+    VoteReceived { peer_id: String, vote: Vote },
 
     /// Received notification that a CF was finalized
-    CFFinalized {
-        peer_id: String,
-        cf: ConsensusFrame,
-    },
+    CFFinalized { peer_id: String, cf: ConsensusFrame },
 }
 
 impl NetworkEvent {
@@ -86,7 +72,7 @@ impl NetworkEvent {
                 | NetworkEvent::CFFinalized { .. }
         )
     }
-    
+
     /// Check if this is an event-related notification
     pub fn is_event_notification(&self) -> bool {
         matches!(self, NetworkEvent::EventReceived { .. })
@@ -110,11 +96,7 @@ mod tests {
     fn test_connection_event() {
         let event = NetworkEvent::PeerConnected {
             peer_id: "peer1".to_string(),
-            node_info: NodeInfo::new_validator(
-                "peer1".to_string(),
-                "127.0.0.1".to_string(),
-                8080,
-            ),
+            node_info: NodeInfo::new_validator("peer1".to_string(), "127.0.0.1".to_string(), 8080),
         };
         assert!(event.is_connection_event());
         assert!(!event.is_consensus_event());
@@ -130,7 +112,7 @@ mod tests {
         assert!(event.is_consensus_event());
         assert!(!event.is_connection_event());
     }
-    
+
     #[test]
     fn test_event_notification() {
         let e = Event::genesis("creator".to_string(), VLCSnapshot::default());

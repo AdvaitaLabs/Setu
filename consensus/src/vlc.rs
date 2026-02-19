@@ -19,7 +19,7 @@ use setu_vlc::{VLCSnapshot, VectorClock};
 pub struct VLC {
     /// The node ID this clock belongs to
     pub node_id: String,
-    
+
     /// The underlying VLC snapshot
     snapshot: VLCSnapshot,
 }
@@ -82,9 +82,9 @@ impl VLC {
     pub fn gc_inactive_nodes(&mut self, active_nodes: &[String]) -> usize {
         self.snapshot.gc_inactive_nodes(active_nodes)
     }
-    
+
     /// Restore VLC state from a snapshot (used for node restart recovery)
-    /// 
+    ///
     /// This replaces the current snapshot with the provided one, allowing
     /// the node to resume from a previous state after restart.
     pub fn restore_from_snapshot(&mut self, snapshot: &VLCSnapshot) {

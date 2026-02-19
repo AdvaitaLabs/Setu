@@ -31,39 +31,29 @@
 //! assert!(election.is_valid_proposer(&"v2".to_string(), 1));
 //! ```
 
+mod leader_reputation;
 mod proposer_election;
 mod rotating_proposer_election;
-mod leader_reputation;
 
 // Re-export main types
-pub use proposer_election::{
-    ProposerElection,
-    Round,
-    ValidatorId,
-    VotingPower,
-    choose_index,
-};
+pub use proposer_election::{choose_index, ProposerElection, Round, ValidatorId, VotingPower};
 
-pub use rotating_proposer_election::{
-    RotatingProposer,
-    choose_leader,
-};
+pub use rotating_proposer_election::{choose_leader, RotatingProposer};
 
 pub use leader_reputation::{
-    // Traits and interfaces
-    MetadataBackend,
-    ReputationHeuristic,
-    
-    // Types
-    ConsensusFrameMetadata,
-    ReputationConfig,
-    VotingPowerRatio,
-    
     // Implementations
     ConsensusFrameAggregation,
-    ProposerAndVoterHeuristic,
+    // Types
+    ConsensusFrameMetadata,
     InMemoryMetadataBackend,
     LeaderReputation,
+    // Traits and interfaces
+    MetadataBackend,
+    ProposerAndVoterHeuristic,
+    ReputationConfig,
+    ReputationHeuristic,
+
+    VotingPowerRatio,
 };
 
 /// Create a default proposer election for the given validators.
@@ -94,12 +84,10 @@ pub fn create_reputation_election(
     config: ReputationConfig,
 ) -> LeaderReputation<InMemoryMetadataBackend, ProposerAndVoterHeuristic> {
     let backend = InMemoryMetadataBackend::new(config.proposer_window_size * 2);
-    let heuristic = ProposerAndVoterHeuristic::new(
-        candidates.first().cloned().unwrap_or_default(),
-        config,
-    );
+    let heuristic =
+        ProposerAndVoterHeuristic::new(candidates.first().cloned().unwrap_or_default(), config);
     let voting_powers = std::collections::HashMap::new();
-    
+
     LeaderReputation::new(epoch, candidates, voting_powers, backend, heuristic)
 }
 
@@ -126,7 +114,7 @@ mod tests {
         assert_eq!(election.get_valid_proposer(0), Some("v1".to_string()));
         assert_eq!(election.get_valid_proposer(1), Some("v1".to_string()));
         assert_eq!(election.get_valid_proposer(2), Some("v1".to_string()));
-        
+
         // v2 for rounds 3-5
         assert_eq!(election.get_valid_proposer(3), Some("v2".to_string()));
         assert_eq!(election.get_valid_proposer(4), Some("v2".to_string()));

@@ -78,7 +78,11 @@ impl BroadcastResult {
     }
 
     /// Create a result with failures
-    pub fn with_failures(success_count: usize, total: usize, failures: Vec<(String, String)>) -> Self {
+    pub fn with_failures(
+        success_count: usize,
+        total: usize,
+        failures: Vec<(String, String)>,
+    ) -> Self {
         Self {
             success_count,
             total_peers: total,
@@ -238,7 +242,8 @@ impl MockBroadcaster {
 
     /// Set whether to simulate failures
     pub fn set_simulate_failure(&self, fail: bool) {
-        self.simulate_failure.store(fail, std::sync::atomic::Ordering::SeqCst);
+        self.simulate_failure
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Get recorded CF broadcasts
@@ -265,7 +270,10 @@ impl MockBroadcaster {
 #[async_trait::async_trait]
 impl ConsensusBroadcaster for MockBroadcaster {
     async fn broadcast_cf(&self, cf: &ConsensusFrame) -> Result<BroadcastResult, BroadcastError> {
-        if self.simulate_failure.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .simulate_failure
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(BroadcastError::AllFailed("Simulated failure".to_string()));
         }
         self.cf_broadcasts.lock().unwrap().push(cf.clone());
@@ -273,7 +281,10 @@ impl ConsensusBroadcaster for MockBroadcaster {
     }
 
     async fn broadcast_vote(&self, vote: &Vote) -> Result<BroadcastResult, BroadcastError> {
-        if self.simulate_failure.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .simulate_failure
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(BroadcastError::AllFailed("Simulated failure".to_string()));
         }
         self.vote_broadcasts.lock().unwrap().push(vote.clone());
@@ -281,15 +292,24 @@ impl ConsensusBroadcaster for MockBroadcaster {
     }
 
     async fn broadcast_finalized(&self, cf_id: &str) -> Result<BroadcastResult, BroadcastError> {
-        if self.simulate_failure.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .simulate_failure
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(BroadcastError::AllFailed("Simulated failure".to_string()));
         }
-        self.finalized_broadcasts.lock().unwrap().push(cf_id.to_string());
+        self.finalized_broadcasts
+            .lock()
+            .unwrap()
+            .push(cf_id.to_string());
         Ok(BroadcastResult::success(self.peer_count, self.peer_count))
     }
 
     async fn broadcast_event(&self, event: &Event) -> Result<BroadcastResult, BroadcastError> {
-        if self.simulate_failure.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .simulate_failure
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(BroadcastError::AllFailed("Simulated failure".to_string()));
         }
         self.event_broadcasts.lock().unwrap().push(event.clone());
@@ -297,7 +317,10 @@ impl ConsensusBroadcaster for MockBroadcaster {
     }
 
     async fn request_events(&self, _event_ids: &[EventId]) -> Result<Vec<Event>, BroadcastError> {
-        if self.simulate_failure.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .simulate_failure
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(BroadcastError::AllFailed("Simulated failure".to_string()));
         }
         // Mock: return empty vec (no events to fetch)
@@ -341,7 +364,7 @@ mod tests {
             0,
         );
         let cf = setu_types::ConsensusFrame::new(anchor, "validator-1".to_string());
-        
+
         let result = broadcaster.broadcast_cf(&cf).await.unwrap();
         assert_eq!(result.success_count, 3);
         assert!(result.all_succeeded());
@@ -353,14 +376,14 @@ mod tests {
         // For 3 validators: (3*2)/3 + 1 = 3 needed for quorum
         let result = BroadcastResult::success(3, 3);
         assert!(result.reached_quorum(3)); // 3 >= 3 ✓
-        
+
         let result = BroadcastResult::success(2, 3);
         assert!(!result.reached_quorum(3)); // 2 < 3 ✗
-        
+
         // For 4 validators: (4*2)/3 + 1 = 3 needed for quorum (rounded down)
         let result = BroadcastResult::success(3, 4);
         assert!(result.reached_quorum(4)); // 3 >= 3 ✓
-        
+
         let result = BroadcastResult::success(2, 4);
         assert!(!result.reached_quorum(4)); // 2 < 3 ✗
     }

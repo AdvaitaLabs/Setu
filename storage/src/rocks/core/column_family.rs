@@ -56,7 +56,7 @@ impl ColumnFamily {
             Self::ConsensusFrames => "consensus_frames",
         }
     }
-    
+
     pub fn all() -> Vec<Self> {
         vec![
             Self::Objects,
@@ -82,7 +82,7 @@ impl ColumnFamily {
             Self::ConsensusFrames,
         ]
     }
-    
+
     pub fn descriptors() -> Vec<rocksdb::ColumnFamilyDescriptor> {
         Self::all()
             .into_iter()
@@ -97,8 +97,12 @@ impl ColumnFamily {
                         opts.set_write_buffer_size(64 * 1024 * 1024);
                         opts.set_max_write_buffer_number(3);
                     }
-                    Self::CoinsByOwner | Self::CoinsByOwnerAndType | Self::GraphsByOwner | Self::ProfileByAddress |
-                    Self::CredentialsByHolder | Self::CredentialsByIssuer => {
+                    Self::CoinsByOwner
+                    | Self::CoinsByOwnerAndType
+                    | Self::GraphsByOwner
+                    | Self::ProfileByAddress
+                    | Self::CredentialsByHolder
+                    | Self::CredentialsByIssuer => {
                         opts.set_write_buffer_size(32 * 1024 * 1024);
                         opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
                     }

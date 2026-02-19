@@ -119,7 +119,7 @@ impl<D: Clone + Send + 'static> BlockingDbWrapper<D> {
 pub trait BatchBlockingOps {
     /// The database type
     type Db;
-    
+
     /// Run a batch of operations that should be executed together
     fn run_batch<F, T>(&self, f: F) -> JoinHandle<T>
     where
@@ -130,35 +130,32 @@ pub trait BatchBlockingOps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_spawn_db_op() {
         let counter = Arc::new(AtomicU64::new(0));
         let counter_clone = counter.clone();
-        
+
         let result = spawn_db_op(move || {
             counter_clone.fetch_add(1, Ordering::SeqCst);
             42u64
-        }).await;
-        
+        })
+        .await;
+
         assert_eq!(result, 42);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn test_spawn_db_op_result() {
-        let result: Result<u64, &str> = spawn_db_op_result(|| {
-            Ok(42)
-        }).await;
-        
+        let result: Result<u64, &str> = spawn_db_op_result(|| Ok(42)).await;
+
         assert_eq!(result, Ok(42));
-        
-        let err_result: Result<u64, &str> = spawn_db_op_result(|| {
-            Err("failed")
-        }).await;
-        
+
+        let err_result: Result<u64, &str> = spawn_db_op_result(|| Err("failed")).await;
+
         assert_eq!(err_result, Err("failed"));
     }
 
@@ -166,12 +163,14 @@ mod tests {
     async fn test_blocking_wrapper() {
         let counter = Arc::new(AtomicU64::new(0));
         let wrapper = BlockingDbWrapper::new(counter.clone());
-        
-        let result = wrapper.run(|c| {
-            c.fetch_add(10, Ordering::SeqCst);
-            c.load(Ordering::SeqCst)
-        }).await;
-        
+
+        let result = wrapper
+            .run(|c| {
+                c.fetch_add(10, Ordering::SeqCst);
+                c.load(Ordering::SeqCst)
+            })
+            .await;
+
         assert_eq!(result, 10);
         assert_eq!(counter.load(Ordering::SeqCst), 10);
     }
@@ -179,21 +178,19 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_concurrent_ops() {
         let counter = Arc::new(AtomicU64::new(0));
-        
+
         let mut handles = Vec::new();
         for _ in 0..10 {
             let c = counter.clone();
             handles.push(tokio::spawn(async move {
-                spawn_db_op(move || {
-                    c.fetch_add(1, Ordering::SeqCst)
-                }).await
+                spawn_db_op(move || c.fetch_add(1, Ordering::SeqCst)).await
             }));
         }
-        
+
         for handle in handles {
             handle.await.unwrap();
         }
-        
+
         assert_eq!(counter.load(Ordering::SeqCst), 10);
     }
 }

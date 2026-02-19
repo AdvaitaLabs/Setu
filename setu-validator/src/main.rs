@@ -8,20 +8,19 @@
 //! - Providing HTTP API for registration and transfer submission
 
 use setu_core::NodeConfig;
-use setu_validator::{
-    RouterManager, 
-    ValidatorNetworkService, NetworkServiceConfig,
-    ConsensusValidator, ConsensusValidatorConfig,
-};
+use setu_keys::load_keypair;
 use setu_storage::{
-    SetuDB, RocksDBEventStore, RocksDBCFStore, RocksDBAnchorStore, RocksDBMerkleStore,
-    GlobalStateManager, EventStoreBackend, CFStoreBackend, AnchorStoreBackend, MerkleStore,
+    AnchorStoreBackend, CFStoreBackend, EventStoreBackend, GlobalStateManager, MerkleStore,
+    RocksDBAnchorStore, RocksDBCFStore, RocksDBEventStore, RocksDBMerkleStore, SetuDB,
 };
 use setu_types::NodeInfo;
-use setu_keys::{load_keypair};
-use std::sync::Arc;
+use setu_validator::{
+    ConsensusValidator, ConsensusValidatorConfig, NetworkServiceConfig, RouterManager,
+    ValidatorNetworkService,
+};
 use std::net::SocketAddr;
-use tracing::{info, error, warn, Level};
+use std::sync::Arc;
+use tracing::{error, info, warn, Level};
 use tracing_subscriber;
 
 /// Validator configuration from environment
@@ -43,28 +42,28 @@ struct ValidatorConfig {
 impl ValidatorConfig {
     fn from_env() -> Self {
         let node_config = NodeConfig::from_env();
-        
+
         // HTTP API port (default: 8080)
         let http_port: u16 = std::env::var("VALIDATOR_HTTP_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8080);
-        
+
         // P2P port (default: 9000)
         let p2p_port: u16 = std::env::var("VALIDATOR_P2P_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(9000);
-        
-        let listen_addr = std::env::var("VALIDATOR_LISTEN_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1".to_string());
-        
+
+        let listen_addr =
+            std::env::var("VALIDATOR_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+
         let key_file = std::env::var("VALIDATOR_KEY_FILE").ok();
-        
+
         // Database path for persistence (optional)
         // If set, enables RocksDB persistence for Events and Anchors
         let db_path = std::env::var("VALIDATOR_DB_PATH").ok();
-        
+
         Self {
             node_config,
             http_addr: format!("{}:{}", listen_addr, http_port).parse().unwrap(),
@@ -78,19 +77,19 @@ impl ValidatorConfig {
 /// Load keypair from file and extract registration info
 fn load_key_info(key_file: &str) -> anyhow::Result<(String, Vec<u8>, Vec<u8>)> {
     info!("Loading keypair from: {}", key_file);
-    
+
     let keypair = load_keypair(key_file)?;
     let account_address = keypair.address().to_string();
     let public_key = keypair.public().as_bytes();
-    
+
     // Create registration message to sign
     let message = format!("Register Validator: {}", account_address);
     let signature = keypair.sign(message.as_bytes()).as_bytes();
-    
+
     info!("Keypair loaded successfully");
     info!("  Account Address: {}", account_address);
     info!("  Public Key: {}", hex::encode(&public_key));
-    
+
     Ok((account_address, public_key, signature))
 }
 
@@ -105,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load configuration
     let config = ValidatorConfig::from_env();
-    
+
     info!("╔════════════════════════════════════════════════════════════╗");
     info!("║              Setu Validator Node Starting                  ║");
     info!("╠════════════════════════════════════════════════════════════╣");
@@ -148,15 +147,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Create router manager (shared between NetworkService components)
     let router_manager = Arc::new(RouterManager::new());
-    
+
     // Create task preparer (solver-tee3 architecture)
     // Uses real MerkleStateProvider with pre-initialized test accounts
     let task_preparer = Arc::new(setu_validator::TaskPreparer::new_for_testing(
         config.node_config.node_id.clone(),
     ));
-    
+
     info!("✓ TaskPreparer initialized with test accounts (alice, bob, charlie)");
-    
+
     // Create ConsensusValidator for DAG + VLC + Consensus
     let node_info = NodeInfo::new_validator(
         config.node_config.node_id.clone(),
@@ -168,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
         is_leader: true, // Single node mode: always leader
         ..Default::default()
     };
-    
+
     // Create ConsensusValidator with appropriate storage backend
     let consensus_validator = if let Some(ref db_path) = config.db_path {
         // RocksDB persistence mode - open database and create all backends
@@ -180,18 +179,21 @@ async fn main() -> anyhow::Result<()> {
                 return Err(anyhow::anyhow!("Database open failed: {}", e));
             }
         };
-        
+
         // Create all RocksDB-backed stores from shared database
-        let event_store: Arc<dyn EventStoreBackend> = Arc::new(RocksDBEventStore::from_shared(db.clone()));
+        let event_store: Arc<dyn EventStoreBackend> =
+            Arc::new(RocksDBEventStore::from_shared(db.clone()));
         let cf_store: Arc<dyn CFStoreBackend> = Arc::new(RocksDBCFStore::from_shared(db.clone()));
-        let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(RocksDBAnchorStore::from_shared(db.clone()));
-        let merkle_store: Arc<dyn MerkleStore> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
-        
+        let anchor_store: Arc<dyn AnchorStoreBackend> =
+            Arc::new(RocksDBAnchorStore::from_shared(db.clone()));
+        let merkle_store: Arc<dyn MerkleStore> =
+            Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
+
         // Create GlobalStateManager with Merkle persistence
         let state_manager = GlobalStateManager::with_store(merkle_store);
-        
+
         info!("✓ RocksDB backends initialized (Events, CF, Anchors, Merkle)");
-        
+
         Arc::new(ConsensusValidator::with_all_backends(
             consensus_config,
             state_manager,
@@ -203,21 +205,21 @@ async fn main() -> anyhow::Result<()> {
         // Memory mode - use default in-memory stores
         Arc::new(ConsensusValidator::new(consensus_config))
     };
-    
+
     info!("✓ ConsensusValidator initialized (single node mode)");
-    
+
     // Attempt to recover state from storage (if any)
     // This is safe to call even with empty storage (fresh start)
     if let Err(e) = consensus_validator.recover_from_storage().await {
         warn!("Recovery from storage failed: {}, starting fresh", e);
     }
-    
+
     // Create network service configuration
     let network_config = NetworkServiceConfig {
         http_listen_addr: config.http_addr,
         p2p_listen_addr: config.p2p_addr,
     };
-    
+
     // Create network service with consensus enabled
     let network_service = Arc::new(ValidatorNetworkService::with_consensus(
         config.node_config.node_id.clone(),
@@ -230,31 +232,31 @@ async fn main() -> anyhow::Result<()> {
     // ========================================
     // Components Status
     // ========================================
-    
+
     info!("┌─────────────────────────────────────────────────────────────┐");
     info!("│                  Components Initialized                     │");
     info!("├─────────────────────────────────────────────────────────────┤");
-    
+
     // VLC (Vector Logical Clock) - Real implementation
     info!("│ [VLC]       Vector Logical Clock initialized               │");
     info!("│             - Managed by ConsensusEngine                   │");
     info!("│             - Increments on each event                     │");
-    
-    // DAG Manager - Real implementation  
+
+    // DAG Manager - Real implementation
     info!("│ [DAG]       DAG Manager initialized                        │");
     info!("│             - Events stored in ConsensusEngine DAG         │");
     info!("│             - Parent tracking: enabled                     │");
-    
+
     // Consensus - Real implementation
     info!("│ [CONSENSUS] Consensus module initialized                   │");
     info!("│             - Mode: Single validator (leader)              │");
     info!("│             - CF creation and finalization enabled         │");
-    
+
     // AnchorBuilder
     info!("│ [ANCHOR]    AnchorBuilder initialized                      │");
     info!("│             - Merkle tree computation enabled              │");
     info!("│             - State persistence ready                      │");
-    
+
     info!("└─────────────────────────────────────────────────────────────┘");
 
     // Spawn HTTP server

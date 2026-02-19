@@ -20,7 +20,7 @@
 //! no pending_tasks mapping needed.
 
 use serde::{Deserialize, Serialize};
-use setu_enclave::{SolverTask, Attestation, GasUsage};
+use setu_enclave::{Attestation, GasUsage, SolverTask};
 use setu_types::event::StateChange;
 use setu_types::SubnetId;
 
@@ -177,17 +177,21 @@ impl TeeExecutionResultDto {
             execution_time_us,
         }
     }
-    
+
     /// Convert state_changes back to Vec<StateChange>
     pub fn to_state_changes(&self) -> Vec<StateChange> {
-        self.state_changes.iter().cloned().map(StateChange::from).collect()
+        self.state_changes
+            .iter()
+            .cloned()
+            .map(StateChange::from)
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_state_change_dto_roundtrip() {
         let original = StateChange {
@@ -195,10 +199,10 @@ mod tests {
             old_value: Some(vec![1, 2, 3]),
             new_value: Some(vec![4, 5, 6]),
         };
-        
+
         let dto = StateChangeDto::from(&original);
         let restored: StateChange = dto.into();
-        
+
         assert_eq!(original.key, restored.key);
         assert_eq!(original.old_value, restored.old_value);
         assert_eq!(original.new_value, restored.new_value);

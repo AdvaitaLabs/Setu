@@ -40,22 +40,22 @@ pub trait MetadataBackend: Send + Sync {
 pub struct ConsensusFrameMetadata {
     /// The epoch this frame belongs to
     pub epoch: u64,
-    
+
     /// The round number
     pub round: Round,
-    
+
     /// The proposer who created this frame
     pub proposer: ValidatorId,
-    
+
     /// Validators who voted for this frame
     pub voters: Vec<ValidatorId>,
-    
+
     /// Whether the proposal was successful
     pub success: bool,
-    
+
     /// Validators who failed to vote (for participation tracking)
     pub failed_voters: Vec<ValidatorId>,
-    
+
     /// Timestamp of the frame
     pub timestamp: u64,
 }
@@ -87,19 +87,19 @@ pub trait ReputationHeuristic: Send + Sync {
 pub struct ReputationConfig {
     /// Size of the voting window for reputation calculation
     pub voter_window_size: usize,
-    
+
     /// Size of the proposer window for reputation calculation
     pub proposer_window_size: usize,
-    
+
     /// Weight for active validators (participated recently)
     pub active_weight: u64,
-    
+
     /// Weight for inactive validators (no recent participation)
     pub inactive_weight: u64,
-    
+
     /// Weight for validators with high failure rate
     pub failed_weight: u64,
-    
+
     /// Failure threshold percentage (0-100)
     /// Above this threshold, validator is considered failing
     pub failure_threshold_percent: u32,
@@ -198,9 +198,9 @@ impl ConsensusFrameAggregation {
         epoch_to_candidates: &HashMap<u64, Vec<ValidatorId>>,
         history: &[ConsensusFrameMetadata],
     ) -> (
-        HashMap<ValidatorId, u32>,  // votes
-        HashMap<ValidatorId, u32>,  // proposals
-        HashMap<ValidatorId, u32>,  // failed_proposals
+        HashMap<ValidatorId, u32>, // votes
+        HashMap<ValidatorId, u32>, // proposals
+        HashMap<ValidatorId, u32>, // failed_proposals
     ) {
         (
             self.count_votes(epoch_to_candidates, history),
@@ -328,19 +328,19 @@ impl MetadataBackend for InMemoryMetadataBackend {
 pub struct LeaderReputation<B: MetadataBackend, H: ReputationHeuristic> {
     /// Current epoch
     epoch: u64,
-    
+
     /// Mapping of epoch to validator candidates
     epoch_to_candidates: HashMap<u64, Vec<ValidatorId>>,
-    
+
     /// Voting power for each validator
     voting_powers: HashMap<ValidatorId, VotingPower>,
-    
+
     /// Backend for fetching historical metadata
     backend: B,
-    
+
     /// Heuristic for calculating weights
     heuristic: H,
-    
+
     /// Whether to exclude inactive validators
     exclude_inactive: bool,
 }
@@ -355,7 +355,7 @@ impl<B: MetadataBackend, H: ReputationHeuristic> LeaderReputation<B, H> {
     ) -> Self {
         let mut epoch_to_candidates = HashMap::new();
         epoch_to_candidates.insert(epoch, candidates);
-        
+
         Self {
             epoch,
             epoch_to_candidates,
@@ -380,7 +380,8 @@ impl<B: MetadataBackend, H: ReputationHeuristic> LeaderReputation<B, H> {
     /// Get the reputation weights for all candidates.
     pub fn get_reputation_weights(&self, round: Round) -> Vec<u64> {
         let (history, _root) = self.backend.get_block_metadata(self.epoch, round);
-        self.heuristic.get_weights(self.epoch, &self.epoch_to_candidates, &history)
+        self.heuristic
+            .get_weights(self.epoch, &self.epoch_to_candidates, &history)
     }
 }
 
@@ -392,7 +393,7 @@ impl<B: MetadataBackend, H: ReputationHeuristic> ProposerElection for LeaderRepu
         }
 
         let weights = self.get_reputation_weights(round);
-        
+
         // Convert to VotingPower
         let voting_weights: Vec<VotingPower> = weights
             .into_iter()
@@ -407,7 +408,7 @@ impl<B: MetadataBackend, H: ReputationHeuristic> ProposerElection for LeaderRepu
         // Use round as seed for deterministic selection
         let seed = round.to_le_bytes().to_vec();
         let selected_idx = choose_index(voting_weights, seed);
-        
+
         candidates.get(selected_idx).cloned()
     }
 
@@ -497,9 +498,12 @@ mod tests {
     #[test]
     fn test_consensus_frame_aggregation_count_votes() {
         let aggregation = ConsensusFrameAggregation::new(10, 10);
-        
+
         let mut epoch_to_candidates = HashMap::new();
-        epoch_to_candidates.insert(1, vec!["v1".to_string(), "v2".to_string(), "v3".to_string()]);
+        epoch_to_candidates.insert(
+            1,
+            vec!["v1".to_string(), "v2".to_string(), "v3".to_string()],
+        );
 
         let history = vec![
             create_test_frame(1, 3, "v1", vec!["v1", "v2", "v3"], true),
@@ -508,7 +512,7 @@ mod tests {
         ];
 
         let votes = aggregation.count_votes(&epoch_to_candidates, &history);
-        
+
         assert_eq!(votes.get(&"v1".to_string()), Some(&3));
         assert_eq!(votes.get(&"v2".to_string()), Some(&2));
         assert_eq!(votes.get(&"v3".to_string()), Some(&2));
@@ -517,9 +521,12 @@ mod tests {
     #[test]
     fn test_consensus_frame_aggregation_count_proposals() {
         let aggregation = ConsensusFrameAggregation::new(10, 10);
-        
+
         let mut epoch_to_candidates = HashMap::new();
-        epoch_to_candidates.insert(1, vec!["v1".to_string(), "v2".to_string(), "v3".to_string()]);
+        epoch_to_candidates.insert(
+            1,
+            vec!["v1".to_string(), "v2".to_string(), "v3".to_string()],
+        );
 
         let history = vec![
             create_test_frame(1, 3, "v1", vec!["v1", "v2", "v3"], true),
@@ -528,7 +535,7 @@ mod tests {
         ];
 
         let proposals = aggregation.count_proposals(&epoch_to_candidates, &history);
-        
+
         assert_eq!(proposals.get(&"v1".to_string()), Some(&2));
         assert_eq!(proposals.get(&"v2".to_string()), Some(&1));
         assert_eq!(proposals.get(&"v3".to_string()), None);
@@ -540,7 +547,10 @@ mod tests {
         let heuristic = ProposerAndVoterHeuristic::new("v1".to_string(), config.clone());
 
         let mut epoch_to_candidates = HashMap::new();
-        epoch_to_candidates.insert(1, vec!["v1".to_string(), "v2".to_string(), "v3".to_string()]);
+        epoch_to_candidates.insert(
+            1,
+            vec!["v1".to_string(), "v2".to_string(), "v3".to_string()],
+        );
 
         let history = vec![
             create_test_frame(1, 3, "v1", vec!["v1", "v2"], true),
@@ -549,7 +559,7 @@ mod tests {
         ];
 
         let weights = heuristic.get_weights(1, &epoch_to_candidates, &history);
-        
+
         // v1 and v2 should have active weight, v3 should have inactive weight
         assert_eq!(weights[0], config.active_weight); // v1
         assert_eq!(weights[1], config.active_weight); // v2
@@ -559,12 +569,12 @@ mod tests {
     #[test]
     fn test_in_memory_backend() {
         let mut backend = InMemoryMetadataBackend::new(100);
-        
+
         backend.add_frame(create_test_frame(1, 1, "v1", vec!["v1", "v2"], true));
         backend.add_frame(create_test_frame(1, 2, "v2", vec!["v1", "v2", "v3"], true));
-        
+
         assert_eq!(backend.history().len(), 2);
-        
+
         // Most recent should be first
         assert_eq!(backend.history()[0].round, 2);
         assert_eq!(backend.history()[1].round, 1);
@@ -575,17 +585,12 @@ mod tests {
         let backend = InMemoryMetadataBackend::new(100);
         let config = ReputationConfig::default();
         let heuristic = ProposerAndVoterHeuristic::new("v1".to_string(), config);
-        
+
         let candidates = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
         let voting_powers = HashMap::new();
-        
-        let election = LeaderReputation::new(
-            1,
-            candidates.clone(),
-            voting_powers,
-            backend,
-            heuristic,
-        );
+
+        let election =
+            LeaderReputation::new(1, candidates.clone(), voting_powers, backend, heuristic);
 
         // Should return a valid proposer
         let proposer = election.get_valid_proposer(0);

@@ -71,7 +71,7 @@ impl MetricsCollector {
             failure_count: AtomicU64::new(0),
             timeout_count: AtomicU64::new(0),
             latency_histogram: RwLock::new(
-                Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap()
+                Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap(),
             ),
             start_time_ms: AtomicU64::new(0),
             end_time_ms: AtomicU64::new(0),
@@ -122,7 +122,7 @@ impl MetricsCollector {
         if start == 0 {
             return 0; // Not started yet
         }
-        
+
         let end = self.end_time_ms.load(Ordering::SeqCst);
         if end > start {
             // Benchmark completed

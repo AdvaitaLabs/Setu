@@ -1,5 +1,5 @@
 //! Criterion benchmarks for TPS measurement
-//! 
+//!
 //! Run with: cargo bench -p setu-benchmark
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
@@ -7,7 +7,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 fn tps_benchmark(_c: &mut Criterion) {
     // Note: This is a placeholder for criterion-based benchmarks
     // The main TPS testing is done via the CLI tool
-    // 
+    //
     // For real benchmarks, you would need to:
     // 1. Start a validator in the background
     // 2. Run transfer requests
@@ -22,7 +22,7 @@ fn tps_benchmark(_c: &mut Criterion) {
     //     })
     // });
     // group.finish();
-    
+
     println!("Use `setu-benchmark` CLI for TPS testing");
 }
 

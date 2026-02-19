@@ -17,4 +17,3 @@ pub enum RouterError {
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 }
-

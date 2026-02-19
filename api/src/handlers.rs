@@ -6,17 +6,37 @@
 use crate::types::*;
 use axum::{extract::State, Json};
 use setu_rpc::{
-    GetSolverListRequest, GetSolverListResponse, GetTransferStatusRequest,
-    GetTransferStatusResponse, GetValidatorListRequest, GetValidatorListResponse,
-    HeartbeatRequest, HeartbeatResponse, RegisterSolverRequest, RegisterSolverResponse,
-    RegisterValidatorRequest, RegisterValidatorResponse, RegistrationHandler,
-    SubmitTransferRequest, SubmitTransferResponse,
-    // User RPC imports
-    UserRpcHandler, RegisterUserRequest, RegisterUserResponse,
-    GetAccountRequest, GetAccountResponse, GetBalanceRequest, 
+    GetAccountRequest,
+    GetAccountResponse,
+    GetBalanceRequest,
     GetBalanceResponse as UserGetBalanceResponse,
-    GetPowerRequest, GetPowerResponse, GetCreditRequest, GetCreditResponse,
-    GetCredentialsRequest, GetCredentialsResponse, TransferRequest, TransferResponse,
+    GetCredentialsRequest,
+    GetCredentialsResponse,
+    GetCreditRequest,
+    GetCreditResponse,
+    GetPowerRequest,
+    GetPowerResponse,
+    GetSolverListRequest,
+    GetSolverListResponse,
+    GetTransferStatusRequest,
+    GetTransferStatusResponse,
+    GetValidatorListRequest,
+    GetValidatorListResponse,
+    HeartbeatRequest,
+    HeartbeatResponse,
+    RegisterSolverRequest,
+    RegisterSolverResponse,
+    RegisterUserRequest,
+    RegisterUserResponse,
+    RegisterValidatorRequest,
+    RegisterValidatorResponse,
+    RegistrationHandler,
+    SubmitTransferRequest,
+    SubmitTransferResponse,
+    TransferRequest,
+    TransferResponse,
+    // User RPC imports
+    UserRpcHandler,
 };
 use std::sync::Arc;
 
@@ -24,43 +44,49 @@ use std::sync::Arc;
 pub trait ValidatorService: Send + Sync {
     /// Get validator ID
     fn validator_id(&self) -> &str;
-    
+
     /// Get start time
     fn start_time(&self) -> u64;
-    
+
     /// Get solver count
     fn solver_count(&self) -> usize;
-    
+
     /// Get validator count
     fn validator_count(&self) -> usize;
-    
+
     /// Get DAG events count
     fn dag_events_count(&self) -> usize;
-    
+
     /// Get pending events count
     fn pending_events_count(&self) -> usize;
-    
+
     /// Get registration handler
     fn registration_handler(self: &Arc<Self>) -> Arc<dyn RegistrationHandler>;
-    
+
     /// Get user handler
     fn user_handler(self: &Arc<Self>) -> Arc<dyn UserRpcHandler>;
-    
+
     /// Submit transfer
-    fn submit_transfer(&self, request: SubmitTransferRequest) -> impl std::future::Future<Output = SubmitTransferResponse> + Send;
-    
+    fn submit_transfer(
+        &self,
+        request: SubmitTransferRequest,
+    ) -> impl std::future::Future<Output = SubmitTransferResponse> + Send;
+
     /// Get transfer status
     fn get_transfer_status(&self, transfer_id: &str) -> GetTransferStatusResponse;
-    
+
     /// Submit event
-    fn submit_event(&self, request: SubmitEventRequest) -> impl std::future::Future<Output = SubmitEventResponse> + Send;
-    
+    fn submit_event(
+        &self,
+        request: SubmitEventRequest,
+    ) -> impl std::future::Future<Output = SubmitEventResponse> + Send;
+
     /// Get events
     fn get_events(&self) -> Vec<setu_types::event::Event>;
-    
+
     /// Get balance (state query)
     fn get_balance(&self, account: &str) -> GetBalanceResponse;
-    
+
     /// Get object (state query)
     fn get_object(&self, key: &str) -> GetObjectResponse;
 }
@@ -196,7 +222,7 @@ pub async fn http_health<S: ValidatorService>(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    
+
     Json(serde_json::json!({
         "status": "healthy",
         "validator_id": service.validator_id(),
@@ -293,4 +319,3 @@ pub async fn http_user_transfer<S: ValidatorService>(
     let handler = service.user_handler();
     Json(handler.transfer(request).await)
 }
-

@@ -18,24 +18,24 @@
 //! - Reverse index (solver_pending_transfers) to avoid O(n) scans
 //! - Lock-free VLC allocation via atomic counter
 
-use super::registration::ValidatorRegistrationHandler;
-use super::types::*;
-use super::transfer_handler::TransferHandler;
-use super::tee_executor::TeeExecutor;
 use super::event_handler::EventHandler;
-use crate::{RouterManager, TaskPreparer, ConsensusValidator};
+use super::registration::ValidatorRegistrationHandler;
+use super::tee_executor::TeeExecutor;
+use super::transfer_handler::TransferHandler;
+use super::types::*;
+use crate::{ConsensusValidator, RouterManager, TaskPreparer};
 use axum::{
     routing::{get, post},
     Router,
 };
 use dashmap::DashMap;
-use setu_types::Transfer;
 use parking_lot::RwLock;
 use setu_rpc::{
-    GetTransferStatusResponse, RegisterSolverRequest,
-    SubmitTransferRequest, SubmitTransferResponse, ValidatorListItem,
+    GetTransferStatusResponse, RegisterSolverRequest, SubmitTransferRequest,
+    SubmitTransferResponse, ValidatorListItem,
 };
 use setu_types::event::{Event, EventPayload};
+use setu_types::Transfer;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -75,7 +75,8 @@ pub struct ValidatorNetworkService {
     solver_info: Arc<DashMap<String, SolverInfo>>,
 
     /// Solver channels for sending SolverTasks (legacy, kept for compatibility)
-    solver_channels: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<setu_types::task::SolverTask>>>>,
+    solver_channels:
+        Arc<RwLock<HashMap<String, mpsc::UnboundedSender<setu_types::task::SolverTask>>>>,
 
     /// HTTP client for sync Solver calls (used by TeeExecutor)
     #[allow(dead_code)]
@@ -333,31 +334,88 @@ impl ValidatorNetworkService {
 
         let app = Router::new()
             // Registration endpoints
-            .route("/api/v1/register/solver", post(setu_api::http_register_solver::<ValidatorNetworkService>))
-            .route("/api/v1/register/validator", post(setu_api::http_register_validator::<ValidatorNetworkService>))
+            .route(
+                "/api/v1/register/solver",
+                post(setu_api::http_register_solver::<ValidatorNetworkService>),
+            )
+            .route(
+                "/api/v1/register/validator",
+                post(setu_api::http_register_validator::<ValidatorNetworkService>),
+            )
             // Query endpoints
-            .route("/api/v1/solvers", get(setu_api::http_get_solvers::<ValidatorNetworkService>))
-            .route("/api/v1/validators", get(setu_api::http_get_validators::<ValidatorNetworkService>))
-            .route("/api/v1/health", get(setu_api::http_health::<ValidatorNetworkService>))
+            .route(
+                "/api/v1/solvers",
+                get(setu_api::http_get_solvers::<ValidatorNetworkService>),
+            )
+            .route(
+                "/api/v1/validators",
+                get(setu_api::http_get_validators::<ValidatorNetworkService>),
+            )
+            .route(
+                "/api/v1/health",
+                get(setu_api::http_health::<ValidatorNetworkService>),
+            )
             // State query endpoints (Scheme B)
-            .route("/api/v1/state/balance/:account", get(setu_api::http_get_balance::<ValidatorNetworkService>))
-            .route("/api/v1/state/object/:key", get(setu_api::http_get_object::<ValidatorNetworkService>))
+            .route(
+                "/api/v1/state/balance/:account",
+                get(setu_api::http_get_balance::<ValidatorNetworkService>),
+            )
+            .route(
+                "/api/v1/state/object/:key",
+                get(setu_api::http_get_object::<ValidatorNetworkService>),
+            )
             // Transfer endpoints
-            .route("/api/v1/transfer", post(setu_api::http_submit_transfer::<ValidatorNetworkService>))
-            .route("/api/v1/transfer/status", post(setu_api::http_get_transfer_status::<ValidatorNetworkService>))
+            .route(
+                "/api/v1/transfer",
+                post(setu_api::http_submit_transfer::<ValidatorNetworkService>),
+            )
+            .route(
+                "/api/v1/transfer/status",
+                post(setu_api::http_get_transfer_status::<ValidatorNetworkService>),
+            )
             // Event endpoints
-            .route("/api/v1/event", post(setu_api::http_submit_event::<ValidatorNetworkService>))
-            .route("/api/v1/events", get(setu_api::http_get_events::<ValidatorNetworkService>))
+            .route(
+                "/api/v1/event",
+                post(setu_api::http_submit_event::<ValidatorNetworkService>),
+            )
+            .route(
+                "/api/v1/events",
+                get(setu_api::http_get_events::<ValidatorNetworkService>),
+            )
             // Heartbeat
-            .route("/api/v1/heartbeat", post(setu_api::http_heartbeat::<ValidatorNetworkService>))
+            .route(
+                "/api/v1/heartbeat",
+                post(setu_api::http_heartbeat::<ValidatorNetworkService>),
+            )
             // User RPC endpoints
-            .route("/api/v1/user/register", post(setu_api::http_register_user::<ValidatorNetworkService>))
-            .route("/api/v1/user/account", post(setu_api::http_get_account::<ValidatorNetworkService>))
-            .route("/api/v1/user/balance", post(setu_api::http_get_user_balance::<ValidatorNetworkService>))
-            .route("/api/v1/user/power", post(setu_api::http_get_power::<ValidatorNetworkService>))
-            .route("/api/v1/user/credit", post(setu_api::http_get_credit::<ValidatorNetworkService>))
-            .route("/api/v1/user/credentials", post(setu_api::http_get_credentials::<ValidatorNetworkService>))
-            .route("/api/v1/user/transfer", post(setu_api::http_user_transfer::<ValidatorNetworkService>))
+            .route(
+                "/api/v1/user/register",
+                post(setu_api::http_register_user::<ValidatorNetworkService>),
+            )
+            .route(
+                "/api/v1/user/account",
+                post(setu_api::http_get_account::<ValidatorNetworkService>),
+            )
+            .route(
+                "/api/v1/user/balance",
+                post(setu_api::http_get_user_balance::<ValidatorNetworkService>),
+            )
+            .route(
+                "/api/v1/user/power",
+                post(setu_api::http_get_power::<ValidatorNetworkService>),
+            )
+            .route(
+                "/api/v1/user/credit",
+                post(setu_api::http_get_credit::<ValidatorNetworkService>),
+            )
+            .route(
+                "/api/v1/user/credentials",
+                post(setu_api::http_get_credentials::<ValidatorNetworkService>),
+            )
+            .route(
+                "/api/v1/user/transfer",
+                post(setu_api::http_user_transfer::<ValidatorNetworkService>),
+            )
             .with_state(service);
 
         let listener = tokio::net::TcpListener::bind(self.config.http_listen_addr).await?;
@@ -499,7 +557,8 @@ impl ValidatorNetworkService {
             registered_at: current_timestamp_secs(),
         };
 
-        self.solver_info.insert(request.solver_id.clone(), solver_info);
+        self.solver_info
+            .insert(request.solver_id.clone(), solver_info);
 
         self.solver_channels
             .write()
@@ -617,7 +676,10 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
         self.get_transfer_status(transfer_id)
     }
 
-    async fn submit_event(&self, request: setu_api::SubmitEventRequest) -> setu_api::SubmitEventResponse {
+    async fn submit_event(
+        &self,
+        request: setu_api::SubmitEventRequest,
+    ) -> setu_api::SubmitEventResponse {
         self.submit_event(request).await
     }
 

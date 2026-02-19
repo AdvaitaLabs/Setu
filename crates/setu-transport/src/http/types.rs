@@ -32,7 +32,11 @@ pub struct ExecuteTaskRequest {
 
 impl ExecuteTaskRequest {
     /// Create a new execute task request
-    pub fn new(solver_task: SolverTask, validator_id: impl Into<String>, request_id: impl Into<String>) -> Self {
+    pub fn new(
+        solver_task: SolverTask,
+        validator_id: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
         Self {
             solver_task,
             validator_id: validator_id.into(),
@@ -59,7 +63,11 @@ pub struct ExecuteTaskResponse {
 
 impl ExecuteTaskResponse {
     /// Create a success response
-    pub fn success(result: TeeExecutionResultDto, message: impl Into<String>, execution_time_us: u64) -> Self {
+    pub fn success(
+        result: TeeExecutionResultDto,
+        message: impl Into<String>,
+        execution_time_us: u64,
+    ) -> Self {
         Self {
             success: true,
             message: message.into(),
@@ -126,7 +134,11 @@ pub struct StateChangeDto {
 
 impl StateChangeDto {
     /// Create a new state change
-    pub fn new(key: impl Into<String>, old_value: Option<Vec<u8>>, new_value: Option<Vec<u8>>) -> Self {
+    pub fn new(
+        key: impl Into<String>,
+        old_value: Option<Vec<u8>>,
+        new_value: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             key: key.into(),
             old_value,
@@ -247,8 +259,8 @@ pub struct EnclaveInfoDto {
 mod tests {
     use super::*;
     use setu_types::event::{Event, EventType, VLCSnapshot};
-    use setu_types::SubnetId;
     use setu_types::task::ResolvedInputs;
+    use setu_types::SubnetId;
 
     fn create_test_solver_task() -> SolverTask {
         let event = Event::new(
@@ -257,7 +269,7 @@ mod tests {
             VLCSnapshot::default(),
             "test-creator".to_string(),
         );
-        
+
         SolverTask::new(
             [0u8; 32],
             event,

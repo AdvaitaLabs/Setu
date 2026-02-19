@@ -3,7 +3,9 @@
 //! Provides a typed HTTP client for calling Solver endpoints.
 
 use crate::error::{TransportError, TransportResult};
-use crate::http::types::{ExecuteTaskRequest, ExecuteTaskResponse, HealthResponse, SolverInfoResponse};
+use crate::http::types::{
+    ExecuteTaskRequest, ExecuteTaskResponse, HealthResponse, SolverInfoResponse,
+};
 use reqwest::Client;
 use std::time::Duration;
 use tracing::{debug, error, instrument};
@@ -52,16 +54,15 @@ impl SolverHttpClient {
     ///
     /// POST /api/v1/execute-task
     #[instrument(skip(self, request), fields(request_id = %request.request_id))]
-    pub async fn execute_task(&self, request: ExecuteTaskRequest) -> TransportResult<ExecuteTaskResponse> {
+    pub async fn execute_task(
+        &self,
+        request: ExecuteTaskRequest,
+    ) -> TransportResult<ExecuteTaskResponse> {
         let url = format!("{}/api/v1/execute-task", self.base_url);
 
         debug!(url = %url, "Sending execute-task request");
 
-        let response = self.client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await?;
+        let response = self.client.post(&url).json(&request).send().await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -87,10 +88,7 @@ impl SolverHttpClient {
     pub async fn health(&self) -> TransportResult<HealthResponse> {
         let url = format!("{}/health", self.base_url);
 
-        let response = self.client
-            .get(&url)
-            .send()
-            .await?;
+        let response = self.client.get(&url).send().await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -114,10 +112,7 @@ impl SolverHttpClient {
     pub async fn info(&self) -> TransportResult<SolverInfoResponse> {
         let url = format!("{}/api/v1/info", self.base_url);
 
-        let response = self.client
-            .get(&url)
-            .send()
-            .await?;
+        let response = self.client.get(&url).send().await?;
 
         let status = response.status();
         if !status.is_success() {

@@ -69,10 +69,7 @@ pub enum SparseMerkleNode {
         value_hash: HashValue,
     },
     /// An internal node with left and right children
-    Internal {
-        left: HashValue,
-        right: HashValue,
-    },
+    Internal { left: HashValue, right: HashValue },
 }
 
 impl SparseMerkleNode {
@@ -178,7 +175,7 @@ impl SparseMerkleProof {
         value: &[u8],
     ) -> MerkleResult<()> {
         let value_hash = hash_value(value);
-        
+
         // Must have a leaf that matches
         let leaf = self.leaf.as_ref().ok_or_else(|| {
             MerkleError::InvalidProof("Inclusion proof must have a leaf".to_string())
@@ -192,14 +189,12 @@ impl SparseMerkleProof {
         }
 
         if leaf.value_hash != value_hash {
-            return Err(MerkleError::InvalidProof(
-                "Value hash mismatch".to_string()
-            ));
+            return Err(MerkleError::InvalidProof("Value hash mismatch".to_string()));
         }
 
         // Compute root from proof
         let computed_root = self.compute_root_from_leaf(key, &leaf.hash())?;
-        
+
         if &computed_root == root {
             Ok(())
         } else {
@@ -231,18 +226,18 @@ impl SparseMerkleProof {
                 // There's a different leaf at this position
                 if &leaf.key == key {
                     return Err(MerkleError::InvalidProof(
-                        "Key exists in tree, cannot prove non-inclusion".to_string()
+                        "Key exists in tree, cannot prove non-inclusion".to_string(),
                     ));
                 }
-                
+
                 // Verify the existing leaf is on the same path
                 let common_prefix = key.common_prefix_bits(&leaf.key);
                 if common_prefix < self.siblings.len() {
                     return Err(MerkleError::InvalidProof(
-                        "Proof path doesn't match key".to_string()
+                        "Proof path doesn't match key".to_string(),
                     ));
                 }
-                
+
                 let computed = self.compute_root_from_leaf(&leaf.key, &leaf.hash())?;
                 (leaf.hash(), computed)
             }
@@ -262,16 +257,20 @@ impl SparseMerkleProof {
     ///
     /// Siblings are stored top-down (from root level towards leaf).
     /// We need to traverse in reverse order (bottom-up) to compute the root.
-    fn compute_root_from_leaf(&self, key: &HashValue, leaf_hash: &HashValue) -> MerkleResult<HashValue> {
+    fn compute_root_from_leaf(
+        &self,
+        key: &HashValue,
+        leaf_hash: &HashValue,
+    ) -> MerkleResult<HashValue> {
         let mut current = *leaf_hash;
-        
+
         // Traverse from bottom (leaf) to top (root)
         // siblings are stored top-down, so we iterate in reverse
         for (i, sibling) in self.siblings.iter().enumerate().rev() {
             // Bit index corresponds to the depth level
             // siblings[0] is at depth 0, siblings[n-1] is at depth n-1
             let bit = key.bit(i);
-            
+
             current = if bit {
                 // Current node is right child, sibling is left
                 hash_internal(sibling, &current)
@@ -280,7 +279,7 @@ impl SparseMerkleProof {
                 hash_internal(&current, sibling)
             };
         }
-        
+
         Ok(current)
     }
 }
@@ -402,7 +401,8 @@ impl SparseMerkleTree {
         }
 
         // Collect all leaf nodes with their hashes
-        let leaf_nodes: Vec<(HashValue, HashValue)> = self.leaves
+        let leaf_nodes: Vec<(HashValue, HashValue)> = self
+            .leaves
             .iter()
             .map(|(k, v)| {
                 let value_hash = hash_value(v);
@@ -415,11 +415,9 @@ impl SparseMerkleTree {
             .collect();
 
         // Find the target leaf (if exists)
-        let target_leaf = self.leaves.get(key).map(|v| {
-            SparseMerkleLeafNode {
-                key: *key,
-                value_hash: hash_value(v),
-            }
+        let target_leaf = self.leaves.get(key).map(|v| SparseMerkleLeafNode {
+            key: *key,
+            value_hash: hash_value(v),
         });
 
         let key_exists = target_leaf.is_some();
@@ -429,7 +427,8 @@ impl SparseMerkleTree {
             target_leaf
         } else {
             // Find leaf with longest common prefix
-            leaf_nodes.iter()
+            leaf_nodes
+                .iter()
                 .max_by_key(|(k, _)| k.common_prefix_bits(key))
                 .map(|(k, _)| {
                     let v = self.leaves.get(k).unwrap();
@@ -479,10 +478,8 @@ impl SparseMerkleTree {
         }
 
         // Partition leaves by bit at current depth
-        let (left_leaves, right_leaves): (Vec<_>, Vec<_>) = leaves
-            .iter()
-            .cloned()
-            .partition(|(k, _)| !k.bit(depth));
+        let (left_leaves, right_leaves): (Vec<_>, Vec<_>) =
+            leaves.iter().cloned().partition(|(k, _)| !k.bit(depth));
 
         let target_goes_left = !target_key.bit(depth);
 
@@ -514,10 +511,8 @@ impl SparseMerkleTree {
         }
 
         // Partition by bit at current depth
-        let (left_leaves, right_leaves): (Vec<_>, Vec<_>) = leaves
-            .iter()
-            .cloned()
-            .partition(|(k, _)| !k.bit(depth));
+        let (left_leaves, right_leaves): (Vec<_>, Vec<_>) =
+            leaves.iter().cloned().partition(|(k, _)| !k.bit(depth));
 
         let left_hash = self.compute_subtree_hash(&left_leaves, depth + 1);
         let right_hash = self.compute_subtree_hash(&right_leaves, depth + 1);
@@ -537,7 +532,8 @@ impl SparseMerkleTree {
         }
 
         // Collect all leaf hashes with their keys
-        let mut leaf_hashes: Vec<(HashValue, HashValue)> = self.leaves
+        let mut leaf_hashes: Vec<(HashValue, HashValue)> = self
+            .leaves
             .iter()
             .map(|(k, v)| {
                 let value_hash = hash_value(v);
@@ -572,9 +568,8 @@ impl SparseMerkleTree {
         }
 
         // Partition leaves by bit at current depth
-        let (left_leaves, right_leaves): (Vec<_>, Vec<_>) = leaves
-            .iter()
-            .partition(|(k, _)| !k.bit(depth));
+        let (left_leaves, right_leaves): (Vec<_>, Vec<_>) =
+            leaves.iter().partition(|(k, _)| !k.bit(depth));
 
         let left_hash = self.build_subtree(&left_leaves, depth + 1);
         let right_hash = self.build_subtree(&right_leaves, depth + 1);
@@ -791,7 +786,7 @@ mod tests {
             let key = test_key(i);
             let value = format!("value{}", i).into_bytes();
             let proof = tree.get_proof(&key);
-            
+
             assert!(
                 proof.verify_inclusion(&root, &key, &value).is_ok(),
                 "Inclusion proof failed for key {}",
@@ -829,7 +824,7 @@ mod tests {
         let root = tree.root();
 
         let proof = tree.get_proof(&key);
-        
+
         // Verifying with wrong value should fail
         let result = proof.verify_inclusion(&root, &key, b"wrong");
         assert!(result.is_err());
@@ -898,12 +893,20 @@ impl TreeNode {
             bytes.copy_from_slice(&result);
             HashValue::new(bytes)
         };
-        TreeNode::Leaf { key, value_hash, node_hash }
+        TreeNode::Leaf {
+            key,
+            value_hash,
+            node_hash,
+        }
     }
 
     fn new_internal(left: HashValue, right: HashValue) -> Self {
         let node_hash = hash_internal(&left, &right);
-        TreeNode::Internal { left, right, node_hash }
+        TreeNode::Internal {
+            left,
+            right,
+            node_hash,
+        }
     }
 }
 
@@ -989,14 +992,14 @@ impl IncrementalSparseMerkleTree {
     /// nodes along the path from the leaf to the root.
     pub fn insert(&mut self, key: HashValue, value: Vec<u8>) -> Option<Vec<u8>> {
         let old_value = self.leaves.insert(key, value.clone());
-        
+
         // Compute value hash and create leaf node
         let value_hash = hash_value(&value);
         let new_leaf = TreeNode::new_leaf(key, value_hash);
-        
+
         // Update the tree incrementally
         self.root_hash = self.insert_at_node(self.root_hash, &key, new_leaf, 0);
-        
+
         old_value
     }
 
@@ -1005,10 +1008,10 @@ impl IncrementalSparseMerkleTree {
     /// This performs an O(log n) incremental update.
     pub fn remove(&mut self, key: &HashValue) -> Option<Vec<u8>> {
         let old_value = self.leaves.remove(key)?;
-        
+
         // Update the tree incrementally
         self.root_hash = self.remove_at_node(self.root_hash, key, 0);
-        
+
         Some(old_value)
     }
 
@@ -1041,7 +1044,10 @@ impl IncrementalSparseMerkleTree {
         let current_node = if current_hash == empty_hash() {
             TreeNode::Empty
         } else {
-            self.nodes.get(&current_hash).cloned().unwrap_or(TreeNode::Empty)
+            self.nodes
+                .get(&current_hash)
+                .cloned()
+                .unwrap_or(TreeNode::Empty)
         };
 
         match current_node {
@@ -1051,7 +1057,11 @@ impl IncrementalSparseMerkleTree {
                 self.nodes.insert(hash, new_leaf);
                 hash
             }
-            TreeNode::Leaf { key: existing_key, value_hash: existing_vh, .. } => {
+            TreeNode::Leaf {
+                key: existing_key,
+                value_hash: existing_vh,
+                ..
+            } => {
                 if existing_key == *key {
                     // Same key, replace the value
                     let hash = new_leaf.hash();
@@ -1059,17 +1069,13 @@ impl IncrementalSparseMerkleTree {
                     hash
                 } else {
                     // Different key, need to split
-                    self.split_leaf(
-                        &existing_key, existing_vh,
-                        key, new_leaf,
-                        depth,
-                    )
+                    self.split_leaf(&existing_key, existing_vh, key, new_leaf, depth)
                 }
             }
             TreeNode::Internal { left, right, .. } => {
                 // Traverse down the appropriate branch
                 let key_bit = key.bit(depth);
-                
+
                 let (new_left, new_right) = if key_bit {
                     // Go right
                     let new_right = self.insert_at_node(right, key, new_leaf, depth + 1);
@@ -1079,7 +1085,7 @@ impl IncrementalSparseMerkleTree {
                     let new_left = self.insert_at_node(left, key, new_leaf, depth + 1);
                     (new_left, right)
                 };
-                
+
                 // Create new internal node
                 let new_internal = TreeNode::new_internal(new_left, new_right);
                 let hash = new_internal.hash();
@@ -1109,13 +1115,13 @@ impl IncrementalSparseMerkleTree {
         if existing_bit == new_bit {
             // Same bit, need to go deeper
             let subtree = self.split_leaf(existing_key, existing_vh, new_key, new_leaf, depth + 1);
-            
+
             let (left, right) = if existing_bit {
                 (empty_hash(), subtree)
             } else {
                 (subtree, empty_hash())
             };
-            
+
             let internal = TreeNode::new_internal(left, right);
             let hash = internal.hash();
             self.nodes.insert(hash, internal);
@@ -1125,16 +1131,16 @@ impl IncrementalSparseMerkleTree {
             let existing_leaf = TreeNode::new_leaf(*existing_key, existing_vh);
             let existing_hash = existing_leaf.hash();
             self.nodes.insert(existing_hash, existing_leaf);
-            
+
             let new_hash = new_leaf.hash();
             self.nodes.insert(new_hash, new_leaf);
-            
+
             let (left, right) = if new_bit {
                 (existing_hash, new_hash)
             } else {
                 (new_hash, existing_hash)
             };
-            
+
             let internal = TreeNode::new_internal(left, right);
             let hash = internal.hash();
             self.nodes.insert(hash, internal);
@@ -1170,7 +1176,7 @@ impl IncrementalSparseMerkleTree {
             }
             TreeNode::Internal { left, right, .. } => {
                 let key_bit = key.bit(depth);
-                
+
                 let (new_left, new_right) = if key_bit {
                     let new_right = self.remove_at_node(right, key, depth + 1);
                     (left, new_right)
@@ -1178,11 +1184,11 @@ impl IncrementalSparseMerkleTree {
                     let new_left = self.remove_at_node(left, key, depth + 1);
                     (new_left, right)
                 };
-                
+
                 // Check if we can collapse
                 let left_empty = new_left == empty_hash();
                 let right_empty = new_right == empty_hash();
-                
+
                 if left_empty && right_empty {
                     empty_hash()
                 } else if left_empty {
@@ -1219,20 +1225,24 @@ impl IncrementalSparseMerkleTree {
     pub fn get_proof(&self, key: &HashValue) -> SparseMerkleProof {
         let mut siblings = Vec::new();
         let mut current_hash = self.root_hash;
-        
+
         for depth in 0..256 {
             if current_hash == empty_hash() {
                 break;
             }
-            
+
             let node = match self.nodes.get(&current_hash) {
                 Some(n) => n,
                 None => break,
             };
-            
+
             match node {
                 TreeNode::Empty => break,
-                TreeNode::Leaf { key: leaf_key, value_hash, .. } => {
+                TreeNode::Leaf {
+                    key: leaf_key,
+                    value_hash,
+                    ..
+                } => {
                     // Found a leaf
                     let proof_leaf = SparseMerkleLeafNode {
                         key: *leaf_key,
@@ -1252,7 +1262,7 @@ impl IncrementalSparseMerkleTree {
                 }
             }
         }
-        
+
         // Empty tree or no leaf found
         SparseMerkleProof::new(siblings, None)
     }
@@ -1268,17 +1278,21 @@ impl IncrementalSparseMerkleTree {
     pub fn gc(&mut self) {
         let mut reachable = std::collections::HashSet::new();
         self.mark_reachable(self.root_hash, &mut reachable);
-        
+
         self.nodes.retain(|hash, _| reachable.contains(hash));
     }
 
-    fn mark_reachable(&self, hash: HashValue, reachable: &mut std::collections::HashSet<HashValue>) {
+    fn mark_reachable(
+        &self,
+        hash: HashValue,
+        reachable: &mut std::collections::HashSet<HashValue>,
+    ) {
         if hash == empty_hash() || reachable.contains(&hash) {
             return;
         }
-        
+
         reachable.insert(hash);
-        
+
         if let Some(node) = self.nodes.get(&hash) {
             if let TreeNode::Internal { left, right, .. } = node {
                 self.mark_reachable(*left, reachable);
@@ -1392,7 +1406,7 @@ mod incremental_tests {
             let key = test_key(i);
             let value = format!("value{}", i).into_bytes();
             let proof = tree.get_proof(&key);
-            
+
             assert!(
                 proof.verify_inclusion(&root, &key, &value).is_ok(),
                 "Inclusion proof failed for key {}",
@@ -1409,7 +1423,7 @@ mod incremental_tests {
         for i in 0..5u8 {
             tree.insert(test_key(i), format!("value{}", i).into_bytes());
         }
-        
+
         let nodes_before = tree.node_count();
 
         // Update values (creates new nodes, old ones become garbage)
@@ -1423,7 +1437,7 @@ mod incremental_tests {
         // Run GC
         tree.gc();
         let nodes_after_gc = tree.node_count();
-        
+
         assert!(nodes_after_gc <= nodes_after_update);
     }
 

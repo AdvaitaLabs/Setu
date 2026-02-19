@@ -46,18 +46,16 @@ mod server;
 mod store;
 
 pub use builder::{Builder, UnstartedStateSync};
-pub use server::{StateSync, StateSyncServer, Server};
 pub use server::{
-    GetEventsRequest, GetEventsResponse,
-    GetConsensusFramesRequest, GetConsensusFramesResponse,
-    PushEventsRequest, PushEventsResponse,
-    PushConsensusFrameRequest, PushConsensusFrameResponse,
-    GetSyncStateRequest, GetSyncStateResponse,
+    GetConsensusFramesRequest, GetConsensusFramesResponse, GetEventsRequest, GetEventsResponse,
+    GetSyncStateRequest, GetSyncStateResponse, PushConsensusFrameRequest,
+    PushConsensusFrameResponse, PushEventsRequest, PushEventsResponse,
 };
+pub use server::{Server, StateSync, StateSyncServer};
 pub use store::{InMemoryStateSyncStore, InMemoryStoreError};
 
 // Re-export from setu-protocol
-pub use setu_protocol::{SerializedEvent, SerializedConsensusFrame, SerializedVote};
+pub use setu_protocol::{SerializedConsensusFrame, SerializedEvent, SerializedVote};
 
 use anemo::PeerId;
 use async_trait::async_trait;
@@ -72,19 +70,19 @@ use tokio::sync::RwLock;
 // ============================================================================
 
 /// Storage trait for state synchronization
-/// 
+///
 /// This trait abstracts the storage operations needed for state sync,
 /// allowing the sync system to work with different storage backends.
 ///
 /// ## Three-Layer Query Requirement
-/// 
-/// Production implementations MUST support three-layer query (DAG → EventStore) 
+///
+/// Production implementations MUST support three-layer query (DAG → EventStore)
 /// for `get_events_by_ids()` to ensure events can be found even after GC.
-/// 
+///
 /// The query pattern should be:
 /// 1. First query the Active DAG (hot data, pending events)
 /// 2. For DAG misses, query the EventStore (cold data, persisted events)
-/// 
+///
 /// ```ignore
 /// async fn get_events_by_ids(&self, ids: &[String]) -> Result<Vec<SerializedEvent>, Self::Error> {
 ///     let mut results = Vec::new();
@@ -111,8 +109,8 @@ use tokio::sync::RwLock;
 ///     Ok(results)
 /// }
 /// ```
-/// 
-/// This ensures that follower nodes can sync events that have been GC'd from 
+///
+/// This ensures that follower nodes can sync events that have been GC'd from
 /// the leader's active DAG but are still in persistent storage.
 #[async_trait]
 pub trait StateSyncStore: Clone + Send + Sync + 'static {
@@ -120,26 +118,26 @@ pub trait StateSyncStore: Clone + Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
 
     // ===== Event Storage =====
-    
+
     /// Get events starting from a sequence number
-    /// 
+    ///
     /// Returns (events, has_more, highest_seq)
     async fn get_events_from_seq(
         &self,
         start_seq: u64,
         limit: u32,
     ) -> Result<(Vec<SerializedEvent>, bool, u64), Self::Error>;
-    
+
     /// Store events received from peers
-    /// 
+    ///
     /// Returns (accepted_count, rejected_ids)
     async fn store_events(
         &self,
         events: Vec<SerializedEvent>,
     ) -> Result<(u32, Vec<String>), Self::Error>;
-    
+
     /// Get events by their IDs
-    /// 
+    ///
     /// **IMPORTANT**: Production implementations must use three-layer query
     /// (DAG → EventStore) to find events that may have been GC'd from the active DAG.
     /// See trait-level documentation for the required query pattern.
@@ -147,30 +145,30 @@ pub trait StateSyncStore: Clone + Send + Sync + 'static {
         &self,
         event_ids: &[String],
     ) -> Result<Vec<SerializedEvent>, Self::Error>;
-    
+
     /// Get the highest event sequence number
     async fn highest_event_seq(&self) -> u64;
 
     // ===== ConsensusFrame Storage =====
-    
+
     /// Get consensus frames starting from a sequence number
-    /// 
+    ///
     /// Returns (frames, has_more, highest_seq)
     async fn get_cfs_from_seq(
         &self,
         start_seq: u64,
         limit: u32,
     ) -> Result<(Vec<SerializedConsensusFrame>, bool, u64), Self::Error>;
-    
+
     /// Store a consensus frame with its votes
-    /// 
+    ///
     /// Returns whether the CF was accepted
     async fn store_cf(
         &self,
         frame: SerializedConsensusFrame,
         votes: Vec<SerializedVote>,
     ) -> Result<(bool, Option<String>), Self::Error>;
-    
+
     /// Get the highest finalized CF sequence number
     async fn highest_finalized_cf_seq(&self) -> u64;
 }
@@ -258,7 +256,10 @@ impl PeerSyncState {
 
     /// Get all peers with their sync info
     pub fn all_peers(&self) -> Vec<(PeerId, PeerSyncInfo)> {
-        self.peers.iter().map(|r| (*r.key(), r.value().clone())).collect()
+        self.peers
+            .iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect()
     }
 
     /// Find the peer with the highest CF height
@@ -309,7 +310,7 @@ pub struct StateSyncConfig {
 impl Default for StateSyncConfig {
     fn default() -> Self {
         Self {
-            tick_interval_ms: 5_000, // 5 seconds, matches MVP CF timeout
+            tick_interval_ms: 5_000,     // 5 seconds, matches MVP CF timeout
             max_events_per_request: 100, // Match MVP max 1000 events per CF
             max_cfs_per_request: 10,
             sync_timeout_ms: 30_000,
@@ -394,7 +395,9 @@ impl Handle {
 
     /// Request sync with a specific peer
     pub fn sync_with_peer(&self, peer_id: PeerId) {
-        let _ = self.sender.try_send(StateSyncMessage::SyncWithPeer(peer_id));
+        let _ = self
+            .sender
+            .try_send(StateSyncMessage::SyncWithPeer(peer_id));
     }
 }
 
@@ -443,7 +446,10 @@ where
         let mut interval = tokio::time::interval(tick_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        tracing::info!("State sync event loop started with {:?} tick interval", tick_interval);
+        tracing::info!(
+            "State sync event loop started with {:?} tick interval",
+            tick_interval
+        );
 
         loop {
             tokio::select! {
@@ -468,11 +474,13 @@ where
         };
 
         let connected_peers: Vec<PeerId> = network.peers().into_iter().collect();
-        
+
         // Update peer list
         for peer_id in &connected_peers {
             if self.state.peer_heights.get_peer(peer_id).is_none() {
-                self.state.peer_heights.update_peer(*peer_id, PeerSyncInfo::default());
+                self.state
+                    .peer_heights
+                    .update_peer(*peer_id, PeerSyncInfo::default());
             }
         }
 
@@ -489,7 +497,7 @@ where
 
     async fn check_and_sync(&self, peers: &[PeerId]) {
         let local = self.state.local.read().await;
-        
+
         // Find peer with highest CF
         if let Some((best_peer, highest_cf)) = self.state.peer_heights.highest_cf_peer() {
             if highest_cf > local.highest_finalized_cf && peers.contains(&best_peer) {
@@ -519,7 +527,9 @@ where
                 // TODO: Initiate sync
             }
             StateSyncMessage::PeerConnected(peer_id) => {
-                self.state.peer_heights.update_peer(peer_id, PeerSyncInfo::default());
+                self.state
+                    .peer_heights
+                    .update_peer(peer_id, PeerSyncInfo::default());
             }
             StateSyncMessage::PeerDisconnected(peer_id) => {
                 self.state.peer_heights.remove_peer(&peer_id);
