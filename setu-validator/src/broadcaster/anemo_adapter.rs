@@ -15,7 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::protocol::{SetuMessage, MessageCodec};
+use crate::protocol::{MessageCodec, SetuMessage};
 
 /// The route used for Setu consensus messages
 const SETU_ROUTE: &str = "/setu";
@@ -64,7 +64,7 @@ impl ConsensusBroadcaster for AnemoConsensusBroadcaster {
     async fn broadcast_cf(&self, cf: &ConsensusFrame) -> Result<BroadcastResult, BroadcastError> {
         let peers = self.network.get_connected_peers();
         let total_peers = peers.len();
-        
+
         if total_peers == 0 {
             debug!(cf_id = %cf.id, "No peers to broadcast CF to");
             return Ok(BroadcastResult::success(0, 0));
@@ -93,7 +93,7 @@ impl ConsensusBroadcaster for AnemoConsensusBroadcaster {
     async fn broadcast_vote(&self, vote: &Vote) -> Result<BroadcastResult, BroadcastError> {
         let peers = self.network.get_connected_peers();
         let total_peers = peers.len();
-        
+
         if total_peers == 0 {
             debug!(cf_id = %vote.cf_id, "No peers to broadcast vote to");
             return Ok(BroadcastResult::success(0, 0));
@@ -120,7 +120,7 @@ impl ConsensusBroadcaster for AnemoConsensusBroadcaster {
         // For finalization, we notify the network layer
         let peers = self.network.get_connected_peers();
         let total_peers = peers.len();
-        
+
         if total_peers == 0 {
             debug!(cf_id = %cf_id, "No peers to broadcast finalization to");
             return Ok(BroadcastResult::success(0, 0));
@@ -128,13 +128,13 @@ impl ConsensusBroadcaster for AnemoConsensusBroadcaster {
 
         // For MVP, finalization is implicitly communicated through vote quorum
         debug!(cf_id = %cf_id, peer_count = total_peers, "CF finalization acknowledged (implicit via votes)");
-        
+
         Ok(BroadcastResult::success(total_peers, total_peers))
     }
 
     async fn broadcast_event(&self, event: &Event) -> Result<BroadcastResult, BroadcastError> {
         let total_peers = self.network.get_peer_count();
-        
+
         if total_peers == 0 {
             debug!(event_id = %event.id, "No peers to broadcast event to");
             return Ok(BroadcastResult::success(0, 0));
@@ -196,9 +196,15 @@ impl ConsensusBroadcaster for AnemoConsensusBroadcaster {
                 Err(_) => continue,
             };
 
-            match self.network.send_to_peer(peer_id, SETU_ROUTE, bytes.clone()).await {
+            match self
+                .network
+                .send_to_peer(peer_id, SETU_ROUTE, bytes.clone())
+                .await
+            {
                 Ok(response) => {
-                    if let Ok(SetuMessage::EventsResponse { events, .. }) = Self::deserialize(&response) {
+                    if let Ok(SetuMessage::EventsResponse { events, .. }) =
+                        Self::deserialize(&response)
+                    {
                         for event in events {
                             if !seen_ids.contains(&event.id) {
                                 seen_ids.insert(event.id.clone());
@@ -240,9 +246,11 @@ impl ConsensusBroadcaster for AnemoConsensusBroadcaster {
 fn parse_peer_id(peer_id_str: &str) -> Result<PeerId, BroadcastError> {
     let bytes = hex::decode(peer_id_str)
         .map_err(|e| BroadcastError::NetworkError(format!("Invalid peer ID: {}", e)))?;
-    
+
     if bytes.len() != 32 {
-        return Err(BroadcastError::NetworkError("Peer ID must be 32 bytes".to_string()));
+        return Err(BroadcastError::NetworkError(
+            "Peer ID must be 32 bytes".to_string(),
+        ));
     }
 
     let mut array = [0u8; 32];

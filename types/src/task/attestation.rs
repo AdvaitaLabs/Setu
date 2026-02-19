@@ -11,31 +11,31 @@ use thiserror::Error;
 pub enum AttestationError {
     #[error("Signature verification failed")]
     InvalidSignature,
-    
+
     #[error("Certificate chain validation failed: {0}")]
     InvalidCertificateChain(String),
-    
+
     #[error("Enclave measurement not in allowlist: {measurement}")]
     UnknownMeasurement { measurement: String },
-    
+
     #[error("User data mismatch: expected {expected}, got {actual}")]
     UserDataMismatch { expected: String, actual: String },
-    
+
     #[error("Task ID mismatch in attestation")]
     TaskIdMismatch,
-    
+
     #[error("Input hash mismatch in attestation")]
     InputHashMismatch,
-    
+
     #[error("Pre-state root mismatch in attestation")]
     PreStateRootMismatch,
-    
+
     #[error("Attestation expired")]
     Expired,
-    
+
     #[error("Unsupported attestation type: {0}")]
     UnsupportedType(String),
-    
+
     #[error("Document parsing failed: {0}")]
     ParseError(String),
 }
@@ -47,13 +47,13 @@ pub type AttestationResult<T> = Result<T, AttestationError>;
 pub struct AttestationData {
     /// Unique task identifier (for replay protection)
     pub task_id: [u8; 32],
-    
+
     /// Hash of all inputs (for tampering protection)
     pub input_hash: [u8; 32],
-    
+
     /// State root before execution (for consistency verification)
     pub pre_state_root: [u8; 32],
-    
+
     /// State root after execution (result commitment)
     pub post_state_root: [u8; 32],
 }
@@ -72,20 +72,20 @@ impl AttestationData {
             post_state_root,
         }
     }
-    
+
     /// Compute the user_data hash from this attestation data
     pub fn to_user_data(&self) -> [u8; 32] {
-        use sha2::{Sha256, Digest};
-        
+        use sha2::{Digest, Sha256};
+
         let mut hasher = Sha256::new();
         hasher.update(&self.task_id);
         hasher.update(&self.input_hash);
         hasher.update(&self.pre_state_root);
         hasher.update(&self.post_state_root);
-        
+
         hasher.finalize().into()
     }
-    
+
     /// Verify that this AttestationData matches the given user_data
     pub fn verify(&self, user_data: &[u8; 32]) -> bool {
         self.to_user_data() == *user_data
@@ -122,25 +122,25 @@ impl std::fmt::Display for AttestationType {
 pub struct Attestation {
     /// Type of attestation
     pub attestation_type: AttestationType,
-    
+
     /// Enclave measurement (PCR0 for Nitro, MRENCLAVE for SGX)
     pub measurement: [u8; 32],
-    
+
     /// User data (hash of AttestationData)
     pub user_data: [u8; 32],
-    
+
     /// Structured attestation data (task binding information)
     pub attestation_data: Option<AttestationData>,
-    
+
     /// Raw attestation document (format depends on type)
     pub document: Vec<u8>,
-    
+
     /// Timestamp when attestation was generated (Unix epoch seconds)
     pub timestamp: u64,
-    
+
     /// Optional: solver ID that generated this attestation
     pub solver_id: Option<String>,
-    
+
     // === Fields for easy DTO conversion ===
     /// Enclave ID (for DTO compatibility)
     pub enclave_id: String,
@@ -168,7 +168,7 @@ impl Attestation {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-            
+
         Self {
             attestation_type,
             measurement,
@@ -185,7 +185,7 @@ impl Attestation {
             signature: document,
         }
     }
-    
+
     /// Create from AttestationData (recommended)
     pub fn from_data(
         attestation_type: AttestationType,
@@ -198,7 +198,7 @@ impl Attestation {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-            
+
         Self {
             attestation_type,
             measurement,
@@ -215,44 +215,44 @@ impl Attestation {
             solver_id: None,
         }
     }
-    
+
     /// Create a mock attestation for testing
     pub fn mock(user_data: [u8; 32]) -> Self {
-        use sha2::{Sha256, Digest};
-        
+        use sha2::{Digest, Sha256};
+
         let mut hasher = Sha256::new();
         hasher.update(b"mock_enclave_v1");
         let measurement: [u8; 32] = hasher.finalize().into();
-        
+
         let document = b"MOCK_ATTESTATION_DOCUMENT".to_vec();
-        
+
         Self::new(AttestationType::Mock, measurement, user_data, document)
     }
-    
+
     /// Create a mock attestation with AttestationData binding
     pub fn mock_with_data(data: AttestationData) -> Self {
-        use sha2::{Sha256, Digest};
-        
+        use sha2::{Digest, Sha256};
+
         let mut hasher = Sha256::new();
         hasher.update(b"mock_enclave_v1");
         let measurement: [u8; 32] = hasher.finalize().into();
-        
+
         let document = b"MOCK_ATTESTATION_DOCUMENT".to_vec();
-        
+
         Self::from_data(AttestationType::Mock, measurement, data, document)
     }
-    
+
     /// Set the solver ID (builder pattern)
     pub fn with_solver_id(mut self, solver_id: String) -> Self {
         self.solver_id = Some(solver_id);
         self
     }
-    
+
     /// Check if this is a mock attestation
     pub fn is_mock(&self) -> bool {
         self.attestation_type == AttestationType::Mock
     }
-    
+
     /// Verify that the attestation data matches the user_data hash
     pub fn verify_data(&self) -> bool {
         match &self.attestation_data {
@@ -260,35 +260,35 @@ impl Attestation {
             None => false,
         }
     }
-    
+
     /// Get measurement as hex string
     pub fn measurement_hex(&self) -> String {
         hex::encode(self.measurement)
     }
-    
+
     /// Get user data as hex string  
     pub fn user_data_hex(&self) -> String {
         hex::encode(self.user_data)
     }
-    
+
     /// Compute hash of this attestation for signing/verification
     pub fn hash(&self) -> [u8; 32] {
-        use sha2::{Sha256, Digest};
-        
+        use sha2::{Digest, Sha256};
+
         let mut hasher = Sha256::new();
         hasher.update(&[self.attestation_type as u8]);
         hasher.update(self.measurement);
         hasher.update(self.user_data);
         hasher.update(&self.timestamp.to_le_bytes());
-        
+
         hasher.finalize().into()
     }
-    
+
     /// Get the task_id if attestation_data is present
     pub fn task_id(&self) -> Option<&[u8; 32]> {
         self.attestation_data.as_ref().map(|d| &d.task_id)
     }
-    
+
     /// Set attestation data (for binding after creation)
     pub fn with_attestation_data(mut self, data: AttestationData) -> Self {
         self.attestation_data = Some(data);
@@ -312,20 +312,15 @@ pub struct VerifiedAttestation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_attestation_data_hash() {
-        let data = AttestationData::new(
-            [1u8; 32],
-            [2u8; 32],
-            [3u8; 32],
-            [4u8; 32],
-        );
-        
+        let data = AttestationData::new([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
+
         let user_data = data.to_user_data();
         assert!(data.verify(&user_data));
     }
-    
+
     #[test]
     fn test_mock_attestation() {
         let att = Attestation::mock([0u8; 32]);

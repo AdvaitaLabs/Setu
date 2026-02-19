@@ -64,7 +64,7 @@ impl CoinState {
     pub fn new(owner: String, balance: u64) -> Self {
         Self::new_with_type(owner, balance, "SETU".to_string())
     }
-    
+
     pub fn new_with_type(owner: String, balance: u64, coin_type: String) -> Self {
         Self {
             owner,
@@ -86,7 +86,7 @@ impl CoinState {
 }
 
 /// Merkle proof in a simple, serializable format
-/// 
+///
 /// This is the format used for passing proofs between components.
 /// It's simpler than SparseMerkleProof and easily serializable.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -128,9 +128,9 @@ impl SimpleMerkleProof {
 pub trait StateProvider: Send + Sync {
     /// Get all coins owned by an address (all types)
     fn get_coins_for_address(&self, address: &str) -> Vec<CoinInfo>;
-    
+
     /// Get coins owned by an address filtered by coin type
-    /// 
+    ///
     /// This is essential for multi-subnet scenarios where each subnet
     /// application may have its own token type.
     fn get_coins_for_address_by_type(&self, address: &str, coin_type: &str) -> Vec<CoinInfo> {
@@ -155,7 +155,7 @@ pub trait StateProvider: Send + Sync {
     /// Used for deriving event dependencies from input objects.
     /// Returns None for genesis objects or if tracking is not available.
     fn get_last_modifying_event(&self, object_id: &ObjectId) -> Option<String>;
-    
+
     /// Get object with its proof (convenience method)
     fn get_object_with_proof(&self, object_id: &ObjectId) -> Option<(Vec<u8>, SimpleMerkleProof)> {
         let data = self.get_object(object_id)?;
@@ -195,7 +195,10 @@ impl MerkleStateProvider {
     }
 
     /// Create with a specific default subnet
-    pub fn with_subnet(state_manager: Arc<RwLock<GlobalStateManager>>, subnet_id: SubnetId) -> Self {
+    pub fn with_subnet(
+        state_manager: Arc<RwLock<GlobalStateManager>>,
+        subnet_id: SubnetId,
+    ) -> Self {
         Self {
             state_manager,
             default_subnet: subnet_id,
@@ -229,7 +232,7 @@ impl MerkleStateProvider {
     // ------------------------------------------------------------------------
 
     /// Generate object ID for a coin owned by an address
-    /// 
+    ///
     /// Convention: coin_object_id = SHA256("coin:" || address)
     fn coin_object_id(address: &str) -> [u8; 32] {
         let mut hasher = Sha256::new();
@@ -265,14 +268,19 @@ impl MerkleStateProvider {
     fn get_object_internal(&self, object_id_bytes: &[u8; 32]) -> Option<Vec<u8>> {
         let manager = self.state_manager.read().unwrap();
         let hash = HashValue::from_slice(object_id_bytes).ok()?;
-        manager.get_subnet(&self.default_subnet)?.get(&hash).cloned()
+        manager
+            .get_subnet(&self.default_subnet)?
+            .get(&hash)
+            .cloned()
     }
 
     /// Get Merkle proof from the default subnet
     fn get_proof_internal(&self, object_id_bytes: &[u8; 32]) -> Option<SparseMerkleProof> {
         let manager = self.state_manager.read().unwrap();
         let hash = HashValue::from_slice(object_id_bytes).ok()?;
-        manager.get_subnet(&self.default_subnet).map(|smt| smt.prove(&hash))
+        manager
+            .get_subnet(&self.default_subnet)
+            .map(|smt| smt.prove(&hash))
     }
 }
 
@@ -325,20 +333,12 @@ impl StateProvider for MerkleStateProvider {
 // ============================================================================
 
 /// Initialize a coin in the state (for testing/genesis)
-pub fn init_coin(
-    state_manager: &mut GlobalStateManager,
-    owner: &str,
-    balance: u64,
-) -> ObjectId {
+pub fn init_coin(state_manager: &mut GlobalStateManager, owner: &str, balance: u64) -> ObjectId {
     let object_id_bytes = MerkleStateProvider::coin_object_id(owner);
     let coin_state = CoinState::new(owner.to_string(), balance);
-    
-    state_manager.upsert_object(
-        SubnetId::ROOT,
-        object_id_bytes,
-        coin_state.to_bytes(),
-    );
-    
+
+    state_manager.upsert_object(SubnetId::ROOT, object_id_bytes, coin_state.to_bytes());
+
     ObjectId::new(object_id_bytes)
 }
 

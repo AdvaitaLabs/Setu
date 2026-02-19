@@ -109,16 +109,18 @@ pub fn derive_key_pair_from_path(
         SignatureScheme::Secp256k1 => {
             let child_xprv = XPrv::derive_from_path(seed, &path)
                 .map_err(|e| KeyError::KeyGeneration(e.to_string()))?;
-            let sk = Secp256k1SigningKey::from_slice(child_xprv.private_key().to_bytes().as_slice())
-                .map_err(|e| KeyError::KeyGeneration(e.to_string()))?;
+            let sk =
+                Secp256k1SigningKey::from_slice(child_xprv.private_key().to_bytes().as_slice())
+                    .map_err(|e| KeyError::KeyGeneration(e.to_string()))?;
             let kp = SetuKeyPair::secp256k1(sk);
             Ok((kp.address(), kp))
         }
         SignatureScheme::Secp256r1 => {
             let child_xprv = XPrv::derive_from_path(seed, &path)
                 .map_err(|e| KeyError::KeyGeneration(e.to_string()))?;
-            let sk = Secp256r1SigningKey::from_slice(child_xprv.private_key().to_bytes().as_slice())
-                .map_err(|e| KeyError::KeyGeneration(e.to_string()))?;
+            let sk =
+                Secp256r1SigningKey::from_slice(child_xprv.private_key().to_bytes().as_slice())
+                    .map_err(|e| KeyError::KeyGeneration(e.to_string()))?;
             let kp = SetuKeyPair::secp256r1(sk);
             Ok((kp.address(), kp))
         }
@@ -160,15 +162,11 @@ pub fn validate_path(
                     // Default path: m/44'/99999'/0'/0'/0'
                     let path_str = format!(
                         "m/{}'/{}'/{}'/{}'/{}'",
-                        DERIVATION_PATH_PURPOSE_ED25519,
-                        DERIVATION_PATH_COIN_TYPE,
-                        0,
-                        0,
-                        0
+                        DERIVATION_PATH_PURPOSE_ED25519, DERIVATION_PATH_COIN_TYPE, 0, 0, 0
                     );
-                    path_str
-                        .parse()
-                        .map_err(|_| KeyError::InvalidDerivationPath("Cannot parse default path".to_string()))
+                    path_str.parse().map_err(|_| {
+                        KeyError::InvalidDerivationPath("Cannot parse default path".to_string())
+                    })
                 }
             }
         }
@@ -201,15 +199,11 @@ pub fn validate_path(
                     // Default path: m/54'/99999'/0'/0/0
                     let path_str = format!(
                         "m/{}'/{}'/{}'/{}/{}",
-                        DERIVATION_PATH_PURPOSE_SECP256K1,
-                        DERIVATION_PATH_COIN_TYPE,
-                        0,
-                        0,
-                        0
+                        DERIVATION_PATH_PURPOSE_SECP256K1, DERIVATION_PATH_COIN_TYPE, 0, 0, 0
                     );
-                    path_str
-                        .parse()
-                        .map_err(|_| KeyError::InvalidDerivationPath("Cannot parse default path".to_string()))
+                    path_str.parse().map_err(|_| {
+                        KeyError::InvalidDerivationPath("Cannot parse default path".to_string())
+                    })
                 }
             }
         }
@@ -242,15 +236,11 @@ pub fn validate_path(
                     // Default path: m/74'/99999'/0'/0/0
                     let path_str = format!(
                         "m/{}'/{}'/{}'/{}/{}",
-                        DERIVATION_PATH_PURPOSE_SECP256R1,
-                        DERIVATION_PATH_COIN_TYPE,
-                        0,
-                        0,
-                        0
+                        DERIVATION_PATH_PURPOSE_SECP256R1, DERIVATION_PATH_COIN_TYPE, 0, 0, 0
                     );
-                    path_str
-                        .parse()
-                        .map_err(|_| KeyError::InvalidDerivationPath("Cannot parse default path".to_string()))
+                    path_str.parse().map_err(|_| {
+                        KeyError::InvalidDerivationPath("Cannot parse default path".to_string())
+                    })
                 }
             }
         }
@@ -288,31 +278,22 @@ pub fn derive_key_pair_from_mnemonic(
 }
 
 /// Get the default derivation path for a given scheme and index.
-pub fn default_derivation_path(scheme: &SignatureScheme, index: u32) -> Result<DerivationPath, KeyError> {
+pub fn default_derivation_path(
+    scheme: &SignatureScheme,
+    index: u32,
+) -> Result<DerivationPath, KeyError> {
     let path_str = match scheme {
         SignatureScheme::ED25519 => format!(
             "m/{}'/{}'/{}'/{}'/{}'",
-            DERIVATION_PATH_PURPOSE_ED25519,
-            DERIVATION_PATH_COIN_TYPE,
-            0,
-            0,
-            index
+            DERIVATION_PATH_PURPOSE_ED25519, DERIVATION_PATH_COIN_TYPE, 0, 0, index
         ),
         SignatureScheme::Secp256k1 => format!(
             "m/{}'/{}'/{}'/{}/{}",
-            DERIVATION_PATH_PURPOSE_SECP256K1,
-            DERIVATION_PATH_COIN_TYPE,
-            0,
-            0,
-            index
+            DERIVATION_PATH_PURPOSE_SECP256K1, DERIVATION_PATH_COIN_TYPE, 0, 0, index
         ),
         SignatureScheme::Secp256r1 => format!(
             "m/{}'/{}'/{}'/{}/{}",
-            DERIVATION_PATH_PURPOSE_SECP256R1,
-            DERIVATION_PATH_COIN_TYPE,
-            0,
-            0,
-            index
+            DERIVATION_PATH_PURPOSE_SECP256R1, DERIVATION_PATH_COIN_TYPE, 0, 0, index
         ),
     };
     path_str
@@ -345,7 +326,8 @@ mod tests {
     #[test]
     fn test_derive_secp256k1() {
         let (addr, kp) =
-            derive_key_pair_from_mnemonic(TEST_MNEMONIC, &SignatureScheme::Secp256k1, None).unwrap();
+            derive_key_pair_from_mnemonic(TEST_MNEMONIC, &SignatureScheme::Secp256k1, None)
+                .unwrap();
         assert_eq!(kp.scheme(), SignatureScheme::Secp256k1);
         assert_eq!(addr, kp.address());
     }
@@ -353,7 +335,8 @@ mod tests {
     #[test]
     fn test_derive_secp256r1() {
         let (addr, kp) =
-            derive_key_pair_from_mnemonic(TEST_MNEMONIC, &SignatureScheme::Secp256r1, None).unwrap();
+            derive_key_pair_from_mnemonic(TEST_MNEMONIC, &SignatureScheme::Secp256r1, None)
+                .unwrap();
         assert_eq!(kp.scheme(), SignatureScheme::Secp256r1);
         assert_eq!(addr, kp.address());
     }

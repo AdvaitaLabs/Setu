@@ -39,7 +39,11 @@ impl ProtocolVersion {
 
     /// Create a new protocol version
     pub const fn new(major: u16, minor: u16, patch: u16) -> Self {
-        Self { major, minor, patch }
+        Self {
+            major,
+            minor,
+            patch,
+        }
     }
 
     /// Check if this version is compatible with another version

@@ -20,19 +20,19 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub struct Dag {
     /// All events in the DAG
     events: HashMap<EventId, Event>,
-    
+
     /// Children of each event (event_id -> set of child event_ids)
     children: HashMap<EventId, HashSet<EventId>>,
-    
+
     /// Depth of each event (distance from genesis)
     depths: HashMap<EventId, u64>,
-    
+
     /// Current tips (events with no children)
     tips: HashSet<EventId>,
-    
+
     /// Maximum depth in the DAG
     max_depth: u64,
-    
+
     /// Events pending confirmation
     pending: HashSet<EventId>,
 }
@@ -210,9 +210,9 @@ impl Dag {
     /// Parents may be in Cache/Store rather than DAG.
     ///
     /// Used by: DagManager.add_event() Phase 3 write stage
-    /// 
+    ///
     /// # Visibility
-    /// 
+    ///
     /// This is `pub(crate)` to prevent external crates from bypassing
     /// DagManager's parent validation. All external callers MUST use
     /// DagManager.add_event() or add_event_with_retry().
@@ -302,12 +302,12 @@ impl Dag {
     pub fn gc_finalized_events(&mut self, event_ids: &[EventId]) -> GCStats {
         let mut removed = 0;
         let mut retained = 0;
-        
+
         let initial_targets: HashSet<EventId> = event_ids.iter().cloned().collect();
         let mut queue: VecDeque<EventId> = event_ids.iter().cloned().collect();
 
         while let Some(event_id) = queue.pop_front() {
-            // Note: We do NOT track 'checked' events to prevent cycles, 
+            // Note: We do NOT track 'checked' events to prevent cycles,
             // because a parent might fail to remove initially (due to active children),
             // but succeed later in the queue when those children are removed.
             // DAG acyclic property guarantees termination.
@@ -317,7 +317,7 @@ impl Dag {
                     removed += 1;
                     // Successfully removed, now check parents
                     for parent_id in parent_ids {
-                        // Optimization: Only queue parent if it looks removable 
+                        // Optimization: Only queue parent if it looks removable
                         // (exists and is Finalized)
                         if let Some(parent) = self.events.get(&parent_id) {
                             if parent.status == EventStatus::Finalized {
@@ -493,7 +493,7 @@ mod tests {
     fn test_dag_add_genesis() {
         let mut dag = Dag::new();
         let event = create_event("genesis", vec![], "node1");
-        
+
         let result = dag.add_event(event);
         assert!(result.is_ok());
         assert_eq!(dag.node_count(), 1);
@@ -503,13 +503,13 @@ mod tests {
     #[test]
     fn test_dag_add_with_parent() {
         let mut dag = Dag::new();
-        
+
         let genesis = create_event("genesis", vec![], "node1");
         dag.add_event(genesis).unwrap();
-        
+
         let event1 = create_event("event1", vec!["genesis"], "node1");
         dag.add_event(event1).unwrap();
-        
+
         assert_eq!(dag.node_count(), 2);
         assert_eq!(dag.max_depth(), 1);
         assert_eq!(dag.get_depth(&"event1".to_string()), Some(1));
@@ -518,25 +518,25 @@ mod tests {
     #[test]
     fn test_dag_missing_parent() {
         let mut dag = Dag::new();
-        
+
         let event = create_event("event1", vec!["missing"], "node1");
         let result = dag.add_event(event);
-        
+
         assert!(matches!(result, Err(DagError::MissingParent(_))));
     }
 
     #[test]
     fn test_dag_tips() {
         let mut dag = Dag::new();
-        
+
         let genesis = create_event("genesis", vec![], "node1");
         dag.add_event(genesis).unwrap();
-        
+
         assert!(dag.get_tips().contains(&"genesis".to_string()));
-        
+
         let event1 = create_event("event1", vec!["genesis"], "node1");
         dag.add_event(event1).unwrap();
-        
+
         // genesis is no longer a tip
         assert!(!dag.get_tips().contains(&"genesis".to_string()));
         assert!(dag.get_tips().contains(&"event1".to_string()));
@@ -545,16 +545,16 @@ mod tests {
     #[test]
     fn test_dag_is_ancestor() {
         let mut dag = Dag::new();
-        
+
         let genesis = create_event("genesis", vec![], "node1");
         dag.add_event(genesis).unwrap();
-        
+
         let event1 = create_event("event1", vec!["genesis"], "node1");
         dag.add_event(event1).unwrap();
-        
+
         let event2 = create_event("event2", vec!["event1"], "node1");
         dag.add_event(event2).unwrap();
-        
+
         assert!(dag.is_ancestor(&"genesis".to_string(), &"event2".to_string()));
         assert!(dag.is_ancestor(&"event1".to_string(), &"event2".to_string()));
         assert!(!dag.is_ancestor(&"event2".to_string(), &"genesis".to_string()));
@@ -563,19 +563,19 @@ mod tests {
     #[test]
     fn test_dag_get_events_in_range() {
         let mut dag = Dag::new();
-        
+
         let genesis = create_event("genesis", vec![], "node1");
         dag.add_event(genesis).unwrap();
-        
+
         let event1 = create_event("event1", vec!["genesis"], "node1");
         dag.add_event(event1).unwrap();
-        
+
         let event2 = create_event("event2", vec!["event1"], "node1");
         dag.add_event(event2).unwrap();
-        
+
         let events = dag.get_events_in_range(0, 1);
         assert_eq!(events.len(), 2);
-        
+
         let events = dag.get_events_in_range(1, 2);
         assert_eq!(events.len(), 2);
     }

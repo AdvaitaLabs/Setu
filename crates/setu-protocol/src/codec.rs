@@ -30,10 +30,10 @@ use crate::error::ProtocolError;
 pub trait GenericCodec: Send + Sync {
     /// Encode a message to bytes
     fn encode<T: Serialize>(&self, msg: &T) -> Result<Bytes, ProtocolError>;
-    
+
     /// Decode bytes to a message
     fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, ProtocolError>;
-    
+
     /// Encode a message to a Vec<u8>
     fn encode_to_vec<T: Serialize>(&self, msg: &T) -> Result<Vec<u8>, ProtocolError>;
 }
@@ -47,19 +47,16 @@ pub struct BincodeCodec;
 
 impl GenericCodec for BincodeCodec {
     fn encode<T: Serialize>(&self, msg: &T) -> Result<Bytes, ProtocolError> {
-        let bytes = bincode::serialize(msg)
-            .map_err(|e| ProtocolError::Encode(e.to_string()))?;
+        let bytes = bincode::serialize(msg).map_err(|e| ProtocolError::Encode(e.to_string()))?;
         Ok(Bytes::from(bytes))
     }
-    
+
     fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, ProtocolError> {
-        bincode::deserialize(bytes)
-            .map_err(|e| ProtocolError::Decode(e.to_string()))
+        bincode::deserialize(bytes).map_err(|e| ProtocolError::Decode(e.to_string()))
     }
-    
+
     fn encode_to_vec<T: Serialize>(&self, msg: &T) -> Result<Vec<u8>, ProtocolError> {
-        bincode::serialize(msg)
-            .map_err(|e| ProtocolError::Encode(e.to_string()))
+        bincode::serialize(msg).map_err(|e| ProtocolError::Encode(e.to_string()))
     }
 }
 

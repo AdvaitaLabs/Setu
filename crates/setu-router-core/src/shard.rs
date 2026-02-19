@@ -12,10 +12,10 @@ use crate::types::{LegacyShardId, DEFAULT_SHARD_ID};
 pub struct ShardConfig {
     /// Shard identifier
     pub id: LegacyShardId,
-    
+
     /// Human-readable name
     pub name: String,
-    
+
     /// Maximum number of solvers in this shard
     pub max_solvers: usize,
 }
@@ -29,7 +29,7 @@ impl ShardConfig {
             max_solvers: 6,
         }
     }
-    
+
     /// Create a new shard config
     pub fn new(id: LegacyShardId, name: String) -> Self {
         Self {
@@ -51,7 +51,7 @@ impl Default for ShardConfig {
 // =============================================================================
 
 /// Trait for shard routing strategy (future use)
-/// 
+///
 /// In MVP, all transactions go to the default shard.
 /// In the future, implement this trait to route based on resources.
 #[allow(dead_code)]
@@ -84,9 +84,12 @@ mod tests {
     #[test]
     fn test_single_shard_router() {
         let router = SingleShardRouter;
-        
+
         // All resources route to default shard
-        assert_eq!(router.route(&["account:alice".to_string()]), DEFAULT_SHARD_ID);
+        assert_eq!(
+            router.route(&["account:alice".to_string()]),
+            DEFAULT_SHARD_ID
+        );
         assert_eq!(router.route(&["nft:token1".to_string()]), DEFAULT_SHARD_ID);
         assert_eq!(router.route(&[]), DEFAULT_SHARD_ID);
     }

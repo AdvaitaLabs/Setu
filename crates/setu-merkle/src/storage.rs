@@ -39,10 +39,19 @@ pub type AnchorId = u64;
 /// implementations for testing, production, and various database systems.
 pub trait MerkleNodeStore: Send + Sync {
     /// Store a node by its hash.
-    fn put_node(&self, subnet_id: &SubnetId, hash: &HashValue, node: &SparseMerkleNode) -> MerkleResult<()>;
+    fn put_node(
+        &self,
+        subnet_id: &SubnetId,
+        hash: &HashValue,
+        node: &SparseMerkleNode,
+    ) -> MerkleResult<()>;
 
     /// Retrieve a node by its hash.
-    fn get_node(&self, subnet_id: &SubnetId, hash: &HashValue) -> MerkleResult<Option<SparseMerkleNode>>;
+    fn get_node(
+        &self,
+        subnet_id: &SubnetId,
+        hash: &HashValue,
+    ) -> MerkleResult<Option<SparseMerkleNode>>;
 
     /// Check if a node exists.
     fn has_node(&self, subnet_id: &SubnetId, hash: &HashValue) -> MerkleResult<bool>;
@@ -51,19 +60,35 @@ pub trait MerkleNodeStore: Send + Sync {
     fn delete_node(&self, subnet_id: &SubnetId, hash: &HashValue) -> MerkleResult<()>;
 
     /// Batch put multiple nodes atomically.
-    fn batch_put_nodes(&self, subnet_id: &SubnetId, nodes: &[(HashValue, SparseMerkleNode)]) -> MerkleResult<()>;
+    fn batch_put_nodes(
+        &self,
+        subnet_id: &SubnetId,
+        nodes: &[(HashValue, SparseMerkleNode)],
+    ) -> MerkleResult<()>;
 }
 
 /// A trait for storing subnet state roots with versioning.
 pub trait MerkleRootStore: Send + Sync {
     /// Store a subnet's state root for a specific anchor.
-    fn put_subnet_root(&self, subnet_id: &SubnetId, anchor_id: AnchorId, root: &HashValue) -> MerkleResult<()>;
+    fn put_subnet_root(
+        &self,
+        subnet_id: &SubnetId,
+        anchor_id: AnchorId,
+        root: &HashValue,
+    ) -> MerkleResult<()>;
 
     /// Get a subnet's state root at a specific anchor.
-    fn get_subnet_root(&self, subnet_id: &SubnetId, anchor_id: AnchorId) -> MerkleResult<Option<HashValue>>;
+    fn get_subnet_root(
+        &self,
+        subnet_id: &SubnetId,
+        anchor_id: AnchorId,
+    ) -> MerkleResult<Option<HashValue>>;
 
     /// Get the latest state root for a subnet.
-    fn get_latest_subnet_root(&self, subnet_id: &SubnetId) -> MerkleResult<Option<(AnchorId, HashValue)>>;
+    fn get_latest_subnet_root(
+        &self,
+        subnet_id: &SubnetId,
+    ) -> MerkleResult<Option<(AnchorId, HashValue)>>;
 
     /// Store the global state root for an anchor.
     fn put_global_root(&self, anchor_id: AnchorId, root: &HashValue) -> MerkleResult<()>;
@@ -75,7 +100,12 @@ pub trait MerkleRootStore: Send + Sync {
     fn get_latest_global_root(&self) -> MerkleResult<Option<(AnchorId, HashValue)>>;
 
     /// List all anchors for a subnet within a range.
-    fn list_anchors(&self, subnet_id: &SubnetId, start: AnchorId, end: AnchorId) -> MerkleResult<Vec<AnchorId>>;
+    fn list_anchors(
+        &self,
+        subnet_id: &SubnetId,
+        start: AnchorId,
+        end: AnchorId,
+    ) -> MerkleResult<Vec<AnchorId>>;
 }
 
 /// Combined storage interface for Merkle trees.
@@ -93,8 +123,10 @@ pub trait MerkleStore: MerkleNodeStore + MerkleRootStore {
 /// An in-memory implementation of MerkleStore for testing.
 #[derive(Clone, Default)]
 pub struct InMemoryMerkleStore {
-    nodes: Arc<std::sync::RwLock<std::collections::HashMap<(SubnetId, HashValue), SparseMerkleNode>>>,
-    subnet_roots: Arc<std::sync::RwLock<std::collections::HashMap<(SubnetId, AnchorId), HashValue>>>,
+    nodes:
+        Arc<std::sync::RwLock<std::collections::HashMap<(SubnetId, HashValue), SparseMerkleNode>>>,
+    subnet_roots:
+        Arc<std::sync::RwLock<std::collections::HashMap<(SubnetId, AnchorId), HashValue>>>,
     global_roots: Arc<std::sync::RwLock<std::collections::HashMap<AnchorId, HashValue>>>,
 }
 
@@ -111,17 +143,38 @@ impl InMemoryMerkleStore {
 }
 
 impl MerkleNodeStore for InMemoryMerkleStore {
-    fn put_node(&self, subnet_id: &SubnetId, hash: &HashValue, node: &SparseMerkleNode) -> MerkleResult<()> {
-        self.nodes.write().unwrap().insert((*subnet_id, *hash), node.clone());
+    fn put_node(
+        &self,
+        subnet_id: &SubnetId,
+        hash: &HashValue,
+        node: &SparseMerkleNode,
+    ) -> MerkleResult<()> {
+        self.nodes
+            .write()
+            .unwrap()
+            .insert((*subnet_id, *hash), node.clone());
         Ok(())
     }
 
-    fn get_node(&self, subnet_id: &SubnetId, hash: &HashValue) -> MerkleResult<Option<SparseMerkleNode>> {
-        Ok(self.nodes.read().unwrap().get(&(*subnet_id, *hash)).cloned())
+    fn get_node(
+        &self,
+        subnet_id: &SubnetId,
+        hash: &HashValue,
+    ) -> MerkleResult<Option<SparseMerkleNode>> {
+        Ok(self
+            .nodes
+            .read()
+            .unwrap()
+            .get(&(*subnet_id, *hash))
+            .cloned())
     }
 
     fn has_node(&self, subnet_id: &SubnetId, hash: &HashValue) -> MerkleResult<bool> {
-        Ok(self.nodes.read().unwrap().contains_key(&(*subnet_id, *hash)))
+        Ok(self
+            .nodes
+            .read()
+            .unwrap()
+            .contains_key(&(*subnet_id, *hash)))
     }
 
     fn delete_node(&self, subnet_id: &SubnetId, hash: &HashValue) -> MerkleResult<()> {
@@ -129,7 +182,11 @@ impl MerkleNodeStore for InMemoryMerkleStore {
         Ok(())
     }
 
-    fn batch_put_nodes(&self, subnet_id: &SubnetId, nodes: &[(HashValue, SparseMerkleNode)]) -> MerkleResult<()> {
+    fn batch_put_nodes(
+        &self,
+        subnet_id: &SubnetId,
+        nodes: &[(HashValue, SparseMerkleNode)],
+    ) -> MerkleResult<()> {
         let mut store = self.nodes.write().unwrap();
         for (hash, node) in nodes {
             store.insert((*subnet_id, *hash), node.clone());
@@ -139,16 +196,36 @@ impl MerkleNodeStore for InMemoryMerkleStore {
 }
 
 impl MerkleRootStore for InMemoryMerkleStore {
-    fn put_subnet_root(&self, subnet_id: &SubnetId, anchor_id: AnchorId, root: &HashValue) -> MerkleResult<()> {
-        self.subnet_roots.write().unwrap().insert((*subnet_id, anchor_id), *root);
+    fn put_subnet_root(
+        &self,
+        subnet_id: &SubnetId,
+        anchor_id: AnchorId,
+        root: &HashValue,
+    ) -> MerkleResult<()> {
+        self.subnet_roots
+            .write()
+            .unwrap()
+            .insert((*subnet_id, anchor_id), *root);
         Ok(())
     }
 
-    fn get_subnet_root(&self, subnet_id: &SubnetId, anchor_id: AnchorId) -> MerkleResult<Option<HashValue>> {
-        Ok(self.subnet_roots.read().unwrap().get(&(*subnet_id, anchor_id)).copied())
+    fn get_subnet_root(
+        &self,
+        subnet_id: &SubnetId,
+        anchor_id: AnchorId,
+    ) -> MerkleResult<Option<HashValue>> {
+        Ok(self
+            .subnet_roots
+            .read()
+            .unwrap()
+            .get(&(*subnet_id, anchor_id))
+            .copied())
     }
 
-    fn get_latest_subnet_root(&self, subnet_id: &SubnetId) -> MerkleResult<Option<(AnchorId, HashValue)>> {
+    fn get_latest_subnet_root(
+        &self,
+        subnet_id: &SubnetId,
+    ) -> MerkleResult<Option<(AnchorId, HashValue)>> {
         let store = self.subnet_roots.read().unwrap();
         let result = store
             .iter()
@@ -176,7 +253,12 @@ impl MerkleRootStore for InMemoryMerkleStore {
         Ok(result)
     }
 
-    fn list_anchors(&self, subnet_id: &SubnetId, start: AnchorId, end: AnchorId) -> MerkleResult<Vec<AnchorId>> {
+    fn list_anchors(
+        &self,
+        subnet_id: &SubnetId,
+        start: AnchorId,
+        end: AnchorId,
+    ) -> MerkleResult<Vec<AnchorId>> {
         let store = self.subnet_roots.read().unwrap();
         let mut anchors: Vec<AnchorId> = store
             .keys()
@@ -288,7 +370,10 @@ mod tests {
         // Store node
         store.put_node(&TEST_SUBNET, &hash, &node).unwrap();
         assert!(store.has_node(&TEST_SUBNET, &hash).unwrap());
-        assert_eq!(store.get_node(&TEST_SUBNET, &hash).unwrap(), Some(node.clone()));
+        assert_eq!(
+            store.get_node(&TEST_SUBNET, &hash).unwrap(),
+            Some(node.clone())
+        );
 
         // Different subnet shouldn't have it
         assert!(!store.has_node(&APP_SUBNET, &hash).unwrap());
@@ -302,15 +387,17 @@ mod tests {
     fn test_in_memory_batch_put() {
         let store = InMemoryMerkleStore::new();
 
-        let nodes: Vec<(HashValue, SparseMerkleNode)> = (1..5)
-            .map(|i| (make_hash(i), make_leaf_node(i)))
-            .collect();
+        let nodes: Vec<(HashValue, SparseMerkleNode)> =
+            (1..5).map(|i| (make_hash(i), make_leaf_node(i))).collect();
 
         store.batch_put_nodes(&TEST_SUBNET, &nodes).unwrap();
 
         assert_eq!(store.node_count(), 4);
         for (hash, node) in &nodes {
-            assert_eq!(store.get_node(&TEST_SUBNET, hash).unwrap(), Some(node.clone()));
+            assert_eq!(
+                store.get_node(&TEST_SUBNET, hash).unwrap(),
+                Some(node.clone())
+            );
         }
     }
 
@@ -319,9 +406,15 @@ mod tests {
         let store = InMemoryMerkleStore::new();
 
         // Store subnet roots
-        store.put_subnet_root(&TEST_SUBNET, 1, &make_hash(10)).unwrap();
-        store.put_subnet_root(&TEST_SUBNET, 2, &make_hash(20)).unwrap();
-        store.put_subnet_root(&TEST_SUBNET, 3, &make_hash(30)).unwrap();
+        store
+            .put_subnet_root(&TEST_SUBNET, 1, &make_hash(10))
+            .unwrap();
+        store
+            .put_subnet_root(&TEST_SUBNET, 2, &make_hash(20))
+            .unwrap();
+        store
+            .put_subnet_root(&TEST_SUBNET, 3, &make_hash(30))
+            .unwrap();
 
         // Get specific version
         assert_eq!(
@@ -358,9 +451,15 @@ mod tests {
         let store = InMemoryMerkleStore::new();
 
         // Add data at various anchors
-        store.put_subnet_root(&TEST_SUBNET, 1, &make_hash(1)).unwrap();
-        store.put_subnet_root(&TEST_SUBNET, 2, &make_hash(2)).unwrap();
-        store.put_subnet_root(&TEST_SUBNET, 5, &make_hash(5)).unwrap();
+        store
+            .put_subnet_root(&TEST_SUBNET, 1, &make_hash(1))
+            .unwrap();
+        store
+            .put_subnet_root(&TEST_SUBNET, 2, &make_hash(2))
+            .unwrap();
+        store
+            .put_subnet_root(&TEST_SUBNET, 5, &make_hash(5))
+            .unwrap();
         store.put_global_root(1, &make_hash(10)).unwrap();
         store.put_global_root(3, &make_hash(30)).unwrap();
 

@@ -99,7 +99,7 @@ impl BenchmarkConfig {
         info!("  Validator URL:    {}", self.validator_url);
         info!("  Mode:             {:?}", self.mode);
         info!("  Concurrency:      {}", self.concurrency);
-        
+
         match self.mode {
             BenchmarkMode::Burst => {
                 info!("  Total Txns:       {}", self.total);
@@ -115,7 +115,7 @@ impl BenchmarkConfig {
                 info!("  Step Duration:    {}s", self.ramp_step_duration);
             }
         }
-        
+
         info!("  Warmup Txns:      {}", self.warmup);
         info!("  Timeout:          {}s", self.timeout);
         info!("");

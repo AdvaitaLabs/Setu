@@ -4,18 +4,17 @@
 //! They form a DAG (Directed Acyclic Graph) with causal ordering.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 // Re-export VLC types from setu-vlc (single source of truth)
-pub use setu_vlc::{VectorClock, VLCSnapshot};
+pub use setu_vlc::{VLCSnapshot, VectorClock};
 
 // Import from sibling modules
-use crate::transfer::Transfer;
 use crate::registration::{
-    ValidatorRegistration, SolverRegistration, Unregistration,
-    SubnetRegistration, UserRegistration,
-    PowerConsumption, TaskSubmission,
+    PowerConsumption, SolverRegistration, SubnetRegistration, TaskSubmission, Unregistration,
+    UserRegistration, ValidatorRegistration,
 };
+use crate::transfer::Transfer;
 
 // ========== Event ID ==========
 
@@ -94,7 +93,7 @@ impl EventType {
                 | EventType::TaskSubmit
         )
     }
-    
+
     /// Check if this event should be routed to ROOT subnet
     /// These events are executed by validators directly, not solvers
     pub fn is_root_event(&self) -> bool {
@@ -108,12 +107,12 @@ impl EventType {
                 | EventType::SolverUnregister
         )
     }
-    
+
     /// Check if this event should be executed by validators (ROOT) or solvers (App)
     pub fn is_validator_executed(&self) -> bool {
         self.is_root_event()
     }
-    
+
     /// Get human-readable name
     pub fn name(&self) -> &'static str {
         match self {
@@ -174,7 +173,7 @@ impl ExecutionResult {
             state_changes: vec![],
         }
     }
-    
+
     pub fn failure(message: impl Into<String>) -> Self {
         Self {
             success: false,
@@ -182,7 +181,7 @@ impl ExecutionResult {
             state_changes: vec![],
         }
     }
-    
+
     pub fn with_changes(mut self, changes: Vec<StateChange>) -> Self {
         self.state_changes = changes;
         self
@@ -197,22 +196,26 @@ pub struct StateChange {
 }
 
 impl StateChange {
-    pub fn new(key: impl Into<String>, old_value: Option<Vec<u8>>, new_value: Option<Vec<u8>>) -> Self {
+    pub fn new(
+        key: impl Into<String>,
+        old_value: Option<Vec<u8>>,
+        new_value: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             key: key.into(),
             old_value,
             new_value,
         }
     }
-    
+
     pub fn insert(key: impl Into<String>, value: Vec<u8>) -> Self {
         Self::new(key, None, Some(value))
     }
-    
+
     pub fn delete(key: impl Into<String>, old_value: Vec<u8>) -> Self {
         Self::new(key, Some(old_value), None)
     }
-    
+
     pub fn update(key: impl Into<String>, old_value: Vec<u8>, new_value: Vec<u8>) -> Self {
         Self::new(key, Some(old_value), Some(new_value))
     }
@@ -224,38 +227,38 @@ impl StateChange {
 pub struct Event {
     /// Unique event identifier (hash-based)
     pub id: EventId,
-    
+
     /// Type of this event
     pub event_type: EventType,
-    
+
     /// Parent event IDs (DAG edges)
     pub parent_ids: Vec<EventId>,
-    
+
     /// The subnet this event belongs to (determines routing)
     #[serde(default)]
     pub subnet_id: Option<crate::subnet::SubnetId>,
-    
+
     /// Legacy transfer field (for backward compatibility)
     #[serde(default)]
     pub transfer: Option<Transfer>,
-    
+
     /// Unified payload field
     #[serde(default)]
     pub payload: EventPayload,
-    
+
     /// VLC snapshot at event creation
     pub vlc_snapshot: VLCSnapshot,
-    
+
     /// Creator node ID
     pub creator: String,
-    
+
     /// Current status
     pub status: EventStatus,
-    
+
     /// Execution result (if executed)
     #[serde(default)]
     pub execution_result: Option<ExecutionResult>,
-    
+
     /// Creation timestamp (milliseconds since epoch)
     pub timestamp: u64,
 }
@@ -272,16 +275,16 @@ impl Event {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
+
         let id = Self::compute_id(&parent_ids, &vlc_snapshot, &creator, timestamp);
-        
+
         // Infer subnet_id from event_type
         let subnet_id = if event_type.is_root_event() {
             Some(crate::subnet::SubnetId::ROOT)
         } else {
             None
         };
-        
+
         Self {
             id,
             event_type,
@@ -301,7 +304,7 @@ impl Event {
     pub fn genesis(creator: String, vlc_snapshot: VLCSnapshot) -> Self {
         Self::new(EventType::Genesis, vec![], vlc_snapshot, creator)
     }
-    
+
     /// Create a transfer event
     pub fn transfer(
         transfer: Transfer,
@@ -314,7 +317,7 @@ impl Event {
         event.payload = EventPayload::Transfer(transfer);
         event
     }
-    
+
     /// Create a validator registration event
     pub fn validator_register(
         registration: ValidatorRegistration,
@@ -322,11 +325,16 @@ impl Event {
         vlc_snapshot: VLCSnapshot,
         creator: String,
     ) -> Self {
-        let mut event = Self::new(EventType::ValidatorRegister, parent_ids, vlc_snapshot, creator);
+        let mut event = Self::new(
+            EventType::ValidatorRegister,
+            parent_ids,
+            vlc_snapshot,
+            creator,
+        );
         event.payload = EventPayload::ValidatorRegister(registration);
         event
     }
-    
+
     /// Create a solver registration event
     pub fn solver_register(
         registration: SolverRegistration,
@@ -338,7 +346,7 @@ impl Event {
         event.payload = EventPayload::SolverRegister(registration);
         event
     }
-    
+
     /// Create a validator unregistration event
     pub fn validator_unregister(
         unregistration: Unregistration,
@@ -346,11 +354,16 @@ impl Event {
         vlc_snapshot: VLCSnapshot,
         creator: String,
     ) -> Self {
-        let mut event = Self::new(EventType::ValidatorUnregister, parent_ids, vlc_snapshot, creator);
+        let mut event = Self::new(
+            EventType::ValidatorUnregister,
+            parent_ids,
+            vlc_snapshot,
+            creator,
+        );
         event.payload = EventPayload::ValidatorUnregister(unregistration);
         event
     }
-    
+
     /// Create a solver unregistration event
     pub fn solver_unregister(
         unregistration: Unregistration,
@@ -358,11 +371,16 @@ impl Event {
         vlc_snapshot: VLCSnapshot,
         creator: String,
     ) -> Self {
-        let mut event = Self::new(EventType::SolverUnregister, parent_ids, vlc_snapshot, creator);
+        let mut event = Self::new(
+            EventType::SolverUnregister,
+            parent_ids,
+            vlc_snapshot,
+            creator,
+        );
         event.payload = EventPayload::SolverUnregister(unregistration);
         event
     }
-    
+
     /// Create a power consumption event
     pub fn power_consume(
         consumption: PowerConsumption,
@@ -374,7 +392,7 @@ impl Event {
         event.payload = EventPayload::PowerConsume(consumption);
         event
     }
-    
+
     /// Create a task submission event
     pub fn task_submit(
         task: TaskSubmission,
@@ -386,7 +404,7 @@ impl Event {
         event.payload = EventPayload::TaskSubmit(task);
         event
     }
-    
+
     /// Create a subnet registration event
     pub fn subnet_register(
         registration: SubnetRegistration,
@@ -398,7 +416,7 @@ impl Event {
         event.payload = EventPayload::SubnetRegister(registration);
         event
     }
-    
+
     /// Create a user registration event
     pub fn user_register(
         registration: UserRegistration,
@@ -426,12 +444,12 @@ impl Event {
         hasher.update(timestamp.to_le_bytes());
         hex::encode(hasher.finalize())
     }
-    
+
     /// Verify that the event ID matches the content (anti-tampering check)
-    /// 
+    ///
     /// This should be called when receiving events from untrusted sources
     /// (e.g., network peers) to ensure the event wasn't tampered with.
-    /// 
+    ///
     /// Returns `true` if the ID is valid, `false` if tampered.
     pub fn verify_id(&self) -> bool {
         let computed = Self::compute_id(
@@ -449,7 +467,7 @@ impl Event {
         self.payload = EventPayload::Transfer(transfer);
         self
     }
-    
+
     /// Set payload
     pub fn with_payload(mut self, payload: EventPayload) -> Self {
         self.payload = payload;
@@ -463,7 +481,11 @@ impl Event {
     pub fn set_execution_result(&mut self, result: ExecutionResult) {
         let success = result.success;
         self.execution_result = Some(result);
-        self.status = if success { EventStatus::Executed } else { EventStatus::Failed };
+        self.status = if success {
+            EventStatus::Executed
+        } else {
+            EventStatus::Failed
+        };
     }
 
     pub fn is_genesis(&self) -> bool {
@@ -477,18 +499,18 @@ impl Event {
     pub fn depends_on(&self, event_id: &EventId) -> bool {
         self.parent_ids.contains(event_id)
     }
-    
+
     /// Check if this event is a registration event
     pub fn is_registration(&self) -> bool {
         matches!(
             self.event_type,
-            EventType::ValidatorRegister 
+            EventType::ValidatorRegister
                 | EventType::SolverRegister
                 | EventType::SubnetRegister
                 | EventType::UserRegister
         )
     }
-    
+
     /// Check if this event is an unregistration event
     pub fn is_unregistration(&self) -> bool {
         matches!(
@@ -496,7 +518,7 @@ impl Event {
             EventType::ValidatorUnregister | EventType::SolverUnregister
         )
     }
-    
+
     /// Get the subnet this event belongs to
     pub fn get_subnet_id(&self) -> crate::subnet::SubnetId {
         self.subnet_id.unwrap_or_else(|| {
@@ -507,23 +529,23 @@ impl Event {
             }
         })
     }
-    
+
     /// Set the subnet for this event
     pub fn with_subnet(mut self, subnet_id: crate::subnet::SubnetId) -> Self {
         self.subnet_id = Some(subnet_id);
         self
     }
-    
+
     /// Check if this event has an explicit subnet assignment
     pub fn has_subnet(&self) -> bool {
         self.subnet_id.is_some()
     }
-    
+
     /// Check if this event should be executed by validators
     pub fn is_validator_executed(&self) -> bool {
         self.event_type.is_validator_executed()
     }
-    
+
     /// Get resources affected by this event (for dependency tracking)
     pub fn affected_resources(&self) -> Vec<String> {
         match &self.payload {
@@ -588,12 +610,12 @@ mod tests {
         assert!(event.is_genesis());
         assert!(!event.has_parents());
     }
-    
+
     #[test]
     fn test_transfer_event() {
-        let transfer = Transfer::new("tx-1", "alice", "bob", 100)
-            .with_type(TransferType::FluxTransfer);
-        
+        let transfer =
+            Transfer::new("tx-1", "alice", "bob", 100).with_type(TransferType::FluxTransfer);
+
         let event = Event::transfer(
             transfer,
             vec![],
@@ -602,12 +624,12 @@ mod tests {
         );
         assert_eq!(event.event_type, EventType::Transfer);
         assert!(event.transfer.is_some());
-        
+
         let resources = event.affected_resources();
         assert!(resources.contains(&"account:alice".to_string()));
         assert!(resources.contains(&"account:bob".to_string()));
     }
-    
+
     #[test]
     fn test_solver_register_event() {
         let registration = SolverRegistration::new(
@@ -618,9 +640,9 @@ mod tests {
             vec![1, 2, 3],
             vec![4, 5, 6],
         )
-            .with_shard("shard-0")
-            .with_resources(vec!["ETH".to_string()]);
-        
+        .with_shard("shard-0")
+        .with_resources(vec!["ETH".to_string()]);
+
         let event = Event::solver_register(
             registration,
             vec![],
@@ -629,11 +651,11 @@ mod tests {
         );
         assert_eq!(event.event_type, EventType::SolverRegister);
         assert!(event.is_registration());
-        
+
         let resources = event.affected_resources();
         assert!(resources.contains(&"solver:solver-1".to_string()));
     }
-    
+
     #[test]
     fn test_event_type_requires_solver() {
         assert!(EventType::Transfer.requires_solver_execution());
@@ -644,19 +666,19 @@ mod tests {
         assert!(!EventType::Genesis.requires_solver_execution());
         assert!(!EventType::System.requires_solver_execution());
     }
-    
+
     #[test]
     fn test_subnet_register_event() {
         use crate::registration::SubnetResourceLimits;
-        
+
         let limits = SubnetResourceLimits::new()
             .with_tps(1000)
             .with_storage(1024 * 1024 * 1024);
-        
+
         let registration = SubnetRegistration::new("subnet-1", "DeFi App", "alice")
             .with_limits(limits)
             .with_solvers(vec!["solver-1".to_string(), "solver-2".to_string()]);
-        
+
         let event = Event::subnet_register(
             registration,
             vec![],
@@ -665,22 +687,22 @@ mod tests {
         );
         assert_eq!(event.event_type, EventType::SubnetRegister);
         assert!(event.is_registration());
-        
+
         let resources = event.affected_resources();
         assert!(resources.contains(&"subnet:subnet-1".to_string()));
     }
-    
+
     #[test]
     fn test_user_register_event() {
         let registration = UserRegistration::from_nostr(
-            "0x1234567890abcdef",  // address
-            vec![1; 32],            // nostr_pubkey (32 bytes)
-            vec![4, 5, 6],          // signature
-            1234567890,             // timestamp
+            "0x1234567890abcdef", // address
+            vec![1; 32],          // nostr_pubkey (32 bytes)
+            vec![4, 5, 6],        // signature
+            1234567890,           // timestamp
         )
-            .with_subnet("subnet-1")
-            .with_display_name("Alice");
-        
+        .with_subnet("subnet-1")
+        .with_display_name("Alice");
+
         let event = Event::user_register(
             registration,
             vec![],
@@ -689,12 +711,12 @@ mod tests {
         );
         assert_eq!(event.event_type, EventType::UserRegister);
         assert!(event.is_registration());
-        
+
         let resources = event.affected_resources();
         assert!(resources.contains(&"user:0x1234567890abcdef".to_string()));
         assert!(resources.contains(&"subnet:subnet-1".to_string()));
     }
-    
+
     #[test]
     fn test_execution_result() {
         let result = ExecutionResult::success()

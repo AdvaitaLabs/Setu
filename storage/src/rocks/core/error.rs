@@ -21,8 +21,8 @@
 //!     .with_cf("users");
 //! ```
 
-use thiserror::Error;
 use std::fmt;
+use thiserror::Error;
 
 /// The type of storage operation that failed
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,15 +140,13 @@ impl StorageError {
     /// Create a column family not found error
     pub fn cf_not_found(cf_name: impl Into<String>) -> Self {
         let name = cf_name.into();
-        Self::new(StorageErrorKind::ColumnFamilyNotFound(name.clone()))
-            .with_cf(name)
+        Self::new(StorageErrorKind::ColumnFamilyNotFound(name.clone())).with_cf(name)
     }
 
     /// Create a key not found error
     pub fn key_not_found(key: impl Into<String>) -> Self {
         let k = key.into();
-        Self::new(StorageErrorKind::KeyNotFound(k.clone()))
-            .with_key(k)
+        Self::new(StorageErrorKind::KeyNotFound(k.clone())).with_key(k)
     }
 
     /// Create an invalid data error
@@ -256,7 +254,7 @@ impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Build context string
         let mut context_parts = Vec::new();
-        
+
         if let Some(op) = &self.operation {
             context_parts.push(format!("op={}", op));
         }
@@ -336,16 +334,16 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 pub trait StorageResultExt<T> {
     /// Add operation context to the error
     fn with_operation(self, op: StorageOperation) -> Result<T>;
-    
+
     /// Add key context to the error
     fn with_key(self, key: impl Into<String>) -> Result<T>;
-    
+
     /// Add key context from bytes
     fn with_key_bytes(self, key: &[u8]) -> Result<T>;
-    
+
     /// Add column family context
     fn with_cf(self, cf: impl Into<String>) -> Result<T>;
-    
+
     /// Add full context
     fn with_context(
         self,
@@ -359,19 +357,19 @@ impl<T> StorageResultExt<T> for Result<T> {
     fn with_operation(self, op: StorageOperation) -> Result<T> {
         self.map_err(|e| e.with_operation(op))
     }
-    
+
     fn with_key(self, key: impl Into<String>) -> Result<T> {
         self.map_err(|e| e.with_key(key))
     }
-    
+
     fn with_key_bytes(self, key: &[u8]) -> Result<T> {
         self.map_err(|e| e.with_key_bytes(key))
     }
-    
+
     fn with_cf(self, cf: impl Into<String>) -> Result<T> {
         self.map_err(|e| e.with_cf(cf))
     }
-    
+
     fn with_context(
         self,
         op: StorageOperation,
@@ -425,7 +423,7 @@ mod tests {
             .with_operation(StorageOperation::Put)
             .with_cf("users")
             .with_key("user:123");
-        
+
         let display = format!("{}", err);
         assert!(display.contains("something went wrong"));
         assert!(display.contains("op=put"));
@@ -437,7 +435,7 @@ mod tests {
     fn test_long_key_truncation() {
         let long_key = "a".repeat(100);
         let err = StorageError::key_not_found(&long_key);
-        
+
         let display = format!("{}", err);
         assert!(display.contains("..."));
         assert!(display.len() < 200); // Should be truncated
@@ -445,7 +443,10 @@ mod tests {
 
     #[test]
     fn test_error_code() {
-        assert_eq!(StorageError::key_not_found("x").error_code(), "KEY_NOT_FOUND");
+        assert_eq!(
+            StorageError::key_not_found("x").error_code(),
+            "KEY_NOT_FOUND"
+        );
         assert_eq!(StorageError::serialization("x").error_code(), "SERIALIZE");
         assert_eq!(StorageError::cf_not_found("x").error_code(), "CF_NOT_FOUND");
     }
@@ -459,8 +460,10 @@ mod tests {
     #[test]
     fn test_result_extension() {
         let result: Result<()> = Err(StorageError::other("test"));
-        let result = result.with_operation(StorageOperation::Get).with_cf("test_cf");
-        
+        let result = result
+            .with_operation(StorageOperation::Get)
+            .with_cf("test_cf");
+
         if let Err(e) = result {
             assert_eq!(e.operation, Some(StorageOperation::Get));
             assert_eq!(e.column_family, Some("test_cf".to_string()));
@@ -484,10 +487,10 @@ mod tests {
         let storage_err = StorageError::key_not_found("user:123")
             .with_operation(StorageOperation::Get)
             .with_cf("users");
-        
+
         let setu_err: SetuError = storage_err.into();
         let msg = format!("{}", setu_err);
-        
+
         // The SetuError message should contain the full context
         assert!(msg.contains("Storage error"));
         assert!(msg.contains("Key not found"));

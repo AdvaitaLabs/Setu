@@ -7,16 +7,15 @@
 //!
 //! Uses setu-transport for HTTP abstractions and DTO types.
 
+use crate::tee::{TeeExecutionResult, TeeExecutor};
 use async_trait::async_trait;
 use setu_transport::http::{
-    ExecuteTaskRequest, ExecuteTaskResponse,
-    TeeExecutionResultDto, StateChangeDto, AttestationDto,
-    SolverHttpHandler, HealthResponse, SolverInfoResponse, EnclaveInfoDto,
+    AttestationDto, EnclaveInfoDto, ExecuteTaskRequest, ExecuteTaskResponse, HealthResponse,
+    SolverHttpHandler, SolverInfoResponse, StateChangeDto, TeeExecutionResultDto,
 };
-use crate::tee::{TeeExecutor, TeeExecutionResult};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{info, error};
+use tracing::{error, info};
 
 /// Solver HTTP Handler implementation
 ///
@@ -53,7 +52,11 @@ impl SolverHttpHandler for SolverHandler {
         );
 
         // Execute in TEE
-        match self.tee_executor.execute_solver_task(request.solver_task).await {
+        match self
+            .tee_executor
+            .execute_solver_task(request.solver_task)
+            .await
+        {
             Ok(result) => {
                 let execution_time_us = start.elapsed().as_micros() as u64;
 
@@ -96,10 +99,11 @@ impl SolverHttpHandler for SolverHandler {
     }
 
     async fn health(&self) -> HealthResponse {
-        HealthResponse::healthy(&self.solver_id, "solver-tee3-sync-http")
-            .with_metadata(serde_json::json!({
+        HealthResponse::healthy(&self.solver_id, "solver-tee3-sync-http").with_metadata(
+            serde_json::json!({
                 "mode": "solver-tee3-sync-http"
-            }))
+            }),
+        )
     }
 
     async fn info(&self) -> SolverInfoResponse {
@@ -124,11 +128,15 @@ fn convert_to_dto(result: &TeeExecutionResult) -> TeeExecutionResultDto {
         task_id: result.task_id,
         subnet_id: result.subnet_id.to_string(),
         post_state_root: result.post_state_root,
-        state_changes: result.state_changes.iter().map(|sc| StateChangeDto {
-            key: sc.key.clone(),
-            old_value: sc.old_value.clone(),
-            new_value: sc.new_value.clone(),
-        }).collect(),
+        state_changes: result
+            .state_changes
+            .iter()
+            .map(|sc| StateChangeDto {
+                key: sc.key.clone(),
+                old_value: sc.old_value.clone(),
+                new_value: sc.new_value.clone(),
+            })
+            .collect(),
         events_processed: result.events_processed,
         events_failed: result.events_failed,
         gas_used: result.gas_usage.gas_used,

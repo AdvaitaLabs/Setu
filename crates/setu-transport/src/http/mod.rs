@@ -2,15 +2,14 @@
 //!
 //! Provides HTTP client/server abstractions for Validator ↔ Solver communication.
 
-pub mod types;
 pub mod client;
-pub mod server;
 pub mod middleware;
+pub mod server;
+pub mod types;
 
-pub use types::{
-    ExecuteTaskRequest, ExecuteTaskResponse,
-    TeeExecutionResultDto, StateChangeDto, AttestationDto,
-    HealthResponse, SolverInfoResponse, EnclaveInfoDto,
-};
 pub use client::{SolverHttpClient, SolverHttpClientConfig};
-pub use server::{SolverHttpHandler, create_router, start_server, HttpServerConfig};
+pub use server::{create_router, start_server, HttpServerConfig, SolverHttpHandler};
+pub use types::{
+    AttestationDto, EnclaveInfoDto, ExecuteTaskRequest, ExecuteTaskResponse, HealthResponse,
+    SolverInfoResponse, StateChangeDto, TeeExecutionResultDto,
+};

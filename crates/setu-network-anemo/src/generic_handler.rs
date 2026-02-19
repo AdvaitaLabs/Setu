@@ -20,13 +20,13 @@ pub type HandleResult = Result<Option<Bytes>, HandlerError>;
 pub enum HandlerError {
     #[error("Failed to deserialize message: {0}")]
     Deserialize(String),
-    
+
     #[error("Failed to serialize response: {0}")]
     Serialize(String),
-    
+
     #[error("Message handler error: {0}")]
     Handler(String),
-    
+
     #[error("Storage error: {0}")]
     Storage(String),
 }
@@ -75,7 +75,7 @@ pub trait GenericMessageHandler: Send + Sync + 'static {
     /// * `Ok(None)` - No response needed (for one-way messages)
     /// * `Err(e)` - An error occurred during handling
     async fn handle(&self, route: &str, body: Bytes) -> HandleResult;
-    
+
     /// Get the routes this handler should be registered for
     fn routes(&self) -> Vec<&'static str>;
 }
@@ -90,25 +90,21 @@ where
 {
     use std::convert::Infallible;
     use tower::util::BoxCloneService;
-    
+
     let routes = handler.routes();
     let mut router = anemo::Router::new();
-    
+
     for route in routes {
         let handler = handler.clone();
         let route_owned = route.to_string();
-        
+
         let service = tower::service_fn(move |request: Request<Bytes>| {
             let handler = handler.clone();
             let route = route_owned.clone();
             async move {
                 match handler.handle(&route, request.into_body()).await {
-                    Ok(Some(response_bytes)) => {
-                        Ok::<_, Infallible>(Response::new(response_bytes))
-                    }
-                    Ok(None) => {
-                        Ok(Response::new(Bytes::new()))
-                    }
+                    Ok(Some(response_bytes)) => Ok::<_, Infallible>(Response::new(response_bytes)),
+                    Ok(None) => Ok(Response::new(Bytes::new())),
                     Err(e) => {
                         tracing::warn!("Handler error: {}", e);
                         Ok(Response::new(Bytes::new()))
@@ -116,10 +112,10 @@ where
                 }
             }
         });
-        
+
         router = router.route(route, BoxCloneService::new(service));
     }
-    
+
     router
 }
 
@@ -129,7 +125,7 @@ impl<H: GenericMessageHandler> GenericMessageHandler for Arc<H> {
     async fn handle(&self, route: &str, body: Bytes) -> HandleResult {
         (**self).handle(route, body).await
     }
-    
+
     fn routes(&self) -> Vec<&'static str> {
         (**self).routes()
     }
@@ -138,9 +134,9 @@ impl<H: GenericMessageHandler> GenericMessageHandler for Arc<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     struct TestHandler;
-    
+
     #[async_trait]
     impl GenericMessageHandler for TestHandler {
         async fn handle(&self, route: &str, body: Bytes) -> HandleResult {
@@ -152,27 +148,27 @@ mod tests {
                 _ => Ok(None),
             }
         }
-        
+
         fn routes(&self) -> Vec<&'static str> {
             vec!["/test"]
         }
     }
-    
+
     #[test]
     fn test_handler_routes() {
         let handler = TestHandler;
         assert_eq!(handler.routes(), vec!["/test"]);
     }
-    
+
     #[tokio::test]
     async fn test_handler_echo() {
         let handler = TestHandler;
         let input = Bytes::from("hello");
-        
+
         let result = handler.handle("/test", input.clone()).await.unwrap();
         assert_eq!(result, Some(input));
     }
-    
+
     #[tokio::test]
     async fn test_unknown_route() {
         let handler = TestHandler;

@@ -19,11 +19,11 @@
 //! ```
 
 // Module declarations
-pub mod types;
 pub mod backends;
 pub mod memory;
 pub mod rocks;
 pub mod state;
+pub mod types;
 
 // ============================================================================
 // Re-exports for backward compatibility (100% API compatible)
@@ -33,20 +33,20 @@ pub mod state;
 pub use types::*;
 
 // Backend traits
-pub use backends::{EventStoreBackend, AnchorStoreBackend, CFStoreBackend, ObjectStore};
+pub use backends::{AnchorStoreBackend, CFStoreBackend, EventStoreBackend, ObjectStore};
 
 // Memory implementations
-pub use memory::{EventStore, AnchorStore, CFStore, MemoryObjectStore};
+pub use memory::{AnchorStore, CFStore, EventStore, MemoryObjectStore};
 
 // RocksDB types and implementations
-pub use rocks::{SetuDB, RocksDBConfig, ColumnFamily, StorageError};
-pub use rocks::{RocksDBEventStore, RocksDBAnchorStore, RocksDBCFStore};
-pub use rocks::{RocksObjectStore, RebuildIndexResult, RocksDBMerkleStore};
+pub use rocks::{ColumnFamily, RocksDBConfig, SetuDB, StorageError};
+pub use rocks::{RebuildIndexResult, RocksDBMerkleStore, RocksObjectStore};
+pub use rocks::{RocksDBAnchorStore, RocksDBCFStore, RocksDBEventStore};
 
 // State management
-pub use state::{SubnetStateSMT, GlobalStateManager, StateApplySummary, StateApplyError};
-pub use state::{StateProvider, MerkleStateProvider, CoinInfo, CoinState, SimpleMerkleProof};
-pub use state::{init_coin, get_coin_state};
+pub use state::{get_coin_state, init_coin};
+pub use state::{CoinInfo, CoinState, MerkleStateProvider, SimpleMerkleProof, StateProvider};
+pub use state::{GlobalStateManager, StateApplyError, StateApplySummary, SubnetStateSMT};
 
 // Re-export MerkleStore trait from setu-merkle for convenience
 pub use setu_merkle::storage::MerkleStore;

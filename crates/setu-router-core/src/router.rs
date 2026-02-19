@@ -2,16 +2,16 @@
 //!
 //! MVP: Single-level routing to 6 solvers using consistent hash.
 
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{debug, info};
 
 use setu_types::Transfer;
 
 use crate::error::RouterError;
-use crate::types::DEFAULT_SHARD_ID;
 use crate::solver::{SolverId, SolverInfo, SolverRegistry};
 use crate::strategy::{ConsistentHashStrategy, LoadBalancedStrategy, SolverStrategy};
+use crate::types::DEFAULT_SHARD_ID;
 
 /// Router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,10 +91,8 @@ impl Router {
 
         // Register 6 solvers for MVP
         for i in 1..=6 {
-            let solver = SolverInfo::new(
-                format!("solver-{}", i),
-                format!("127.0.0.1:{}", 9000 + i),
-            );
+            let solver =
+                SolverInfo::new(format!("solver-{}", i), format!("127.0.0.1:{}", 9000 + i));
             solvers.register(solver);
         }
 
@@ -149,7 +147,9 @@ impl Router {
     /// Get routing key from a transfer
     /// Priority: first write resource > first read resource > transfer id
     fn get_routing_key(transfer: &Transfer) -> String {
-        transfer.resources.first()
+        transfer
+            .resources
+            .first()
             .cloned()
             .unwrap_or_else(|| transfer.id.clone())
     }
@@ -165,9 +165,8 @@ impl Router {
         }
 
         // Calculate average load
-        let avg_load: f64 = available.iter()
-            .map(|s| s.load_ratio())
-            .sum::<f64>() / available.len() as f64;
+        let avg_load: f64 =
+            available.iter().map(|s| s.load_ratio()).sum::<f64>() / available.len() as f64;
 
         avg_load > self.config.load_threshold
     }

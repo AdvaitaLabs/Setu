@@ -12,6 +12,7 @@
 //!
 //! The service follows Sui's patterns using the builder pattern for construction.
 
+use crate::node_info::NodeInfo;
 use crate::{
     config::NetworkConfig,
     discovery::{self, DiscoveryConfig, NodeType},
@@ -24,10 +25,8 @@ use crate::{
 };
 use anemo::PeerId;
 use bytes::Bytes;
-use crate::node_info::NodeInfo;
 use std::sync::Arc;
 use tracing::{debug, info};
-
 
 /// Anemo-based network service for Setu
 ///
@@ -60,7 +59,7 @@ pub struct AnemoNetworkService {
 impl AnemoNetworkService {
     /// Create a new network service with a custom message handler
     ///
-    /// This is the standard constructor. It allows the application layer to 
+    /// This is the standard constructor. It allows the application layer to
     /// provide its own message handler implementation.
     ///
     /// # Example
@@ -80,7 +79,10 @@ impl AnemoNetworkService {
     where
         H: GenericMessageHandler,
     {
-        info!("Creating Anemo network service with handler for node {}", local_node_info.id);
+        info!(
+            "Creating Anemo network service with handler for node {}",
+            local_node_info.id
+        );
 
         // Create router from the generic handler
         let router = crate::generic_handler::create_router_from_handler(handler);
@@ -93,13 +95,15 @@ impl AnemoNetworkService {
 
         // Build and start discovery
         let discovery_config = DiscoveryConfig::default();
-        let (unstarted_discovery, _discovery_server) = discovery::Builder::new()
-            .config(discovery_config)
-            .build();
+        let (unstarted_discovery, _discovery_server) =
+            discovery::Builder::new().config(discovery_config).build();
         let network_ref = transport.network().downgrade();
         let (discovery_handle, _join_handle) = unstarted_discovery.start(network_ref);
 
-        info!("Anemo network service created for node {}", local_node_info.id);
+        info!(
+            "Anemo network service created for node {}",
+            local_node_info.id
+        );
 
         Ok(Self {
             transport,
@@ -133,9 +137,11 @@ impl AnemoNetworkService {
             .parse()
             .map_err(|e| AnemoError::InvalidConfig(format!("Invalid address: {}", e)))?;
         let peer_id = self.transport.connect(socket_addr).await?;
-        
+
         // Add to peer manager
-        self.peer_manager.add_peer(node_info.clone(), peer_id).await?;
+        self.peer_manager
+            .add_peer(node_info.clone(), peer_id)
+            .await?;
 
         Ok(peer_id)
     }
@@ -152,12 +158,17 @@ impl AnemoNetworkService {
     /// This is the generic send method. Message serialization should be
     /// handled by the application layer.
     pub async fn send_to_peer(&self, peer_id: PeerId, route: &str, data: Bytes) -> Result<Bytes> {
-        debug!("Sending {} bytes to peer {} on route {}", data.len(), peer_id, route);
-        
+        debug!(
+            "Sending {} bytes to peer {} on route {}",
+            data.len(),
+            peer_id,
+            route
+        );
+
         let mut request = anemo::Request::new(data);
         *request.route_mut() = route.into();
         let response = self.transport.rpc(peer_id, request).await?;
-        
+
         Ok(response.into_body())
     }
 
@@ -167,11 +178,11 @@ impl AnemoNetworkService {
     /// Returns (success_count, total_peers) for partial failure tracking.
     pub async fn broadcast(&self, route: &str, data: Bytes) -> Result<(usize, usize)> {
         debug!("Broadcasting {} bytes on route {}", data.len(), route);
-        
+
         let peers = self.peer_manager.get_connected_peers();
         let total = peers.len();
         let mut success = 0;
-        
+
         for peer_info in peers {
             let mut request = anemo::Request::new(data.clone());
             *request.route_mut() = route.into();
@@ -216,11 +227,11 @@ impl AnemoNetworkService {
     /// Shutdown the network service
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down network service");
-        
+
         // Handles are dropped, which signals shutdown
         // Transport shutdown
         self.transport.shutdown().await?;
-        
+
         info!("Network service shutdown complete");
         Ok(())
     }
@@ -274,11 +285,8 @@ mod tests {
             ..Default::default()
         };
 
-        let node_info = NodeInfo::new_validator(
-            "test-node".to_string(),
-            "127.0.0.1".to_string(),
-            9000,
-        );
+        let node_info =
+            NodeInfo::new_validator("test-node".to_string(), "127.0.0.1".to_string(), 9000);
 
         let handler = Arc::new(TestHandler);
         let service = AnemoNetworkService::with_handler(config, node_info, handler)
@@ -288,4 +296,3 @@ mod tests {
         assert_eq!(service.get_peer_count(), 0);
     }
 }
-

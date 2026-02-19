@@ -72,9 +72,9 @@ impl std::fmt::Display for SubnetType {
 }
 
 /// Unique identifier for a subnet (32 bytes)
-/// 
+///
 /// # Encoding
-/// 
+///
 /// SubnetId uses first byte as type marker:
 /// - `0x00`: ROOT subnet (all zeros)
 /// - `0x01`: System reserved subnets
@@ -85,18 +85,18 @@ pub struct SubnetId([u8; 32]);
 impl SubnetId {
     /// The root/system subnet (for global operations)
     pub const ROOT: SubnetId = SubnetId([0u8; 32]);
-    
+
     /// Type byte for system reserved subnets
     pub const SYSTEM_PREFIX: u8 = 0x01;
-    
+
     /// Type byte for application subnets
     pub const APP_PREFIX: u8 = 0x02;
-    
+
     /// Create from raw bytes
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
-    
+
     /// Create from a string identifier (hashes the string)
     /// Note: This creates an APP type subnet by default
     pub fn from_str_id(id: &str) -> Self {
@@ -110,7 +110,7 @@ impl SubnetId {
         bytes[0] = Self::APP_PREFIX;
         Self(bytes)
     }
-    
+
     /// Create a new app subnet ID from creator address, name and nonce
     pub fn new_app(creator: &Address, name: &str, nonce: u64) -> Self {
         let mut hasher = Sha256::new();
@@ -124,7 +124,7 @@ impl SubnetId {
         bytes[1..].copy_from_slice(&result[..31]);
         Self(bytes)
     }
-    
+
     /// Create a simple app subnet for testing (uses id as seed)
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_app_simple(id: u64) -> Self {
@@ -137,7 +137,7 @@ impl SubnetId {
         bytes[1..].copy_from_slice(&result[..31]);
         Self(bytes)
     }
-    
+
     /// Create a system reserved subnet
     pub fn new_system(id: u8) -> Self {
         let mut bytes = [0u8; 32];
@@ -145,7 +145,7 @@ impl SubnetId {
         bytes[1] = id;
         Self(bytes)
     }
-    
+
     /// Create from hex string
     pub fn from_hex(hex_str: &str) -> Result<Self, &'static str> {
         let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
@@ -157,36 +157,36 @@ impl SubnetId {
         arr.copy_from_slice(&bytes);
         Ok(Self(arr))
     }
-    
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
-    
+
     /// Get owned copy of bytes
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0
     }
-    
+
     /// Get shard hint - first 2 bytes can be used for shard routing
     pub fn shard_hint(&self) -> u16 {
         u16::from_be_bytes([self.0[0], self.0[1]])
     }
-    
+
     /// Check if this is the root subnet
     pub fn is_root(&self) -> bool {
         *self == Self::ROOT
     }
-    
+
     /// Check if this is a system/reserved subnet (type byte = 0x00 or 0x01)
     pub fn is_system(&self) -> bool {
         self.0[0] <= Self::SYSTEM_PREFIX
     }
-    
+
     /// Check if this is an app subnet (type byte = 0x02)
     pub fn is_app(&self) -> bool {
         self.0[0] == Self::APP_PREFIX
     }
-    
+
     /// Get the type of this subnet
     pub fn subnet_type(&self) -> SubnetType {
         match self.0[0] {
@@ -196,7 +196,7 @@ impl SubnetId {
             _ => SubnetType::Unknown,
         }
     }
-    
+
     /// Get the type byte
     pub fn type_byte(&self) -> u8 {
         self.0[0]
@@ -226,22 +226,22 @@ impl From<&str> for SubnetId {
 pub struct SubnetConfig {
     /// Subnet identifier
     pub id: SubnetId,
-    
+
     /// Human-readable name
     pub name: String,
-    
+
     /// Description
     pub description: String,
-    
+
     /// Native token symbol for this subnet (if any)
     pub native_token: Option<String>,
-    
+
     /// Whether the subnet is active
     pub is_active: bool,
-    
+
     /// Creation timestamp
     pub created_at: u64,
-    
+
     /// Creator address
     pub creator: Address,
 }
@@ -254,7 +254,7 @@ impl SubnetConfig {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
+
         Self {
             id,
             name,
@@ -265,12 +265,12 @@ impl SubnetConfig {
             creator,
         }
     }
-    
+
     pub fn with_token(mut self, symbol: impl Into<String>) -> Self {
         self.native_token = Some(symbol.into());
         self
     }
-    
+
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
         self.description = desc.into();
         self
@@ -278,20 +278,20 @@ impl SubnetConfig {
 }
 
 /// User's subnet participation record
-/// 
+///
 /// This tracks which subnets a user has joined and their status in each.
 /// Can be stored as part of Profile or as a separate index.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserSubnetMembership {
     /// User's address
     pub user: Address,
-    
+
     /// Set of subnet IDs the user has joined
     pub joined_subnets: HashSet<SubnetId>,
-    
+
     /// Primary/default subnet for this user
     pub primary_subnet: Option<SubnetId>,
-    
+
     /// Last activity timestamp per subnet
     pub last_activity: std::collections::HashMap<SubnetId, u64>,
 }
@@ -305,7 +305,7 @@ impl UserSubnetMembership {
             last_activity: std::collections::HashMap::new(),
         }
     }
-    
+
     /// Join a subnet
     pub fn join(&mut self, subnet_id: SubnetId) {
         self.joined_subnets.insert(subnet_id);
@@ -314,7 +314,7 @@ impl UserSubnetMembership {
         }
         self.touch(subnet_id);
     }
-    
+
     /// Leave a subnet
     pub fn leave(&mut self, subnet_id: &SubnetId) {
         self.joined_subnets.remove(subnet_id);
@@ -323,12 +323,12 @@ impl UserSubnetMembership {
             self.primary_subnet = self.joined_subnets.iter().next().copied();
         }
     }
-    
+
     /// Check if user is in a subnet
     pub fn is_member(&self, subnet_id: &SubnetId) -> bool {
         self.joined_subnets.contains(subnet_id)
     }
-    
+
     /// Update last activity time
     pub fn touch(&mut self, subnet_id: SubnetId) {
         let now = std::time::SystemTime::now()
@@ -337,12 +337,12 @@ impl UserSubnetMembership {
             .as_millis() as u64;
         self.last_activity.insert(subnet_id, now);
     }
-    
+
     /// Get all joined subnets
     pub fn subnets(&self) -> impl Iterator<Item = &SubnetId> {
         self.joined_subnets.iter()
     }
-    
+
     /// Number of subnets joined
     pub fn subnet_count(&self) -> usize {
         self.joined_subnets.len()
@@ -417,7 +417,7 @@ impl SubnetInteraction {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
+
         Self {
             with_user,
             interaction_type,
@@ -426,12 +426,12 @@ impl SubnetInteraction {
             event_id: None,
         }
     }
-    
+
     pub fn with_metadata(mut self, metadata: String) -> Self {
         self.metadata = Some(metadata);
         self
     }
-    
+
     pub fn with_event_id(mut self, event_id: String) -> Self {
         self.event_id = Some(event_id);
         self
@@ -461,7 +461,7 @@ impl LocalRelation {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
+
         Self {
             target,
             relation_type: relation_type.into(),
@@ -471,18 +471,18 @@ impl LocalRelation {
             source_interactions: Vec::new(),
         }
     }
-    
+
     pub fn mark_synced(&mut self) {
         self.synced_to_global = true;
     }
-    
+
     pub fn add_source_interaction(&mut self, event_id: String) {
         self.source_interactions.push(event_id);
     }
 }
 
 /// Extended user subnet membership with interaction tracking
-/// 
+///
 /// This extends the basic UserSubnetMembership with:
 /// - Detailed interaction history within each subnet
 /// - Local relations built through interactions
@@ -510,13 +510,13 @@ pub struct UserSubnetActivity {
 impl UserSubnetActivity {
     /// Maximum number of recent interactions to store
     const MAX_RECENT_INTERACTIONS: usize = 100;
-    
+
     pub fn new(user: Address, subnet_id: SubnetId) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
+
         Self {
             user,
             subnet_id,
@@ -528,32 +528,34 @@ impl UserSubnetActivity {
             last_activity: now,
         }
     }
-    
+
     /// Record a new interaction
     pub fn record_interaction(&mut self, interaction: SubnetInteraction) {
         // Check if this is a new unique user
-        let is_new_user = !self.recent_interactions
+        let is_new_user = !self
+            .recent_interactions
             .iter()
             .any(|i| i.with_user == interaction.with_user);
-        
+
         if is_new_user {
             self.unique_users_count += 1;
         }
-        
+
         // Add to recent interactions (with limit)
         if self.recent_interactions.len() >= Self::MAX_RECENT_INTERACTIONS {
             self.recent_interactions.remove(0);
         }
         self.recent_interactions.push(interaction);
-        
+
         self.total_interaction_count += 1;
         self.touch();
     }
-    
+
     /// Add or update a local relation
     pub fn add_local_relation(&mut self, relation: LocalRelation) {
         // Check if relation already exists
-        if let Some(existing) = self.local_relations
+        if let Some(existing) = self
+            .local_relations
             .iter_mut()
             .find(|r| r.target == relation.target && r.relation_type == relation.relation_type)
         {
@@ -567,7 +569,7 @@ impl UserSubnetActivity {
         }
         self.touch();
     }
-    
+
     /// Get unsynced local relations
     pub fn get_unsynced_relations(&self) -> Vec<&LocalRelation> {
         self.local_relations
@@ -575,14 +577,14 @@ impl UserSubnetActivity {
             .filter(|r| !r.synced_to_global)
             .collect()
     }
-    
+
     /// Mark all relations as synced
     pub fn mark_all_synced(&mut self) {
         for relation in &mut self.local_relations {
             relation.synced_to_global = true;
         }
     }
-    
+
     /// Get interactions with a specific user
     pub fn get_interactions_with(&self, user: &Address) -> Vec<&SubnetInteraction> {
         self.recent_interactions
@@ -590,15 +592,18 @@ impl UserSubnetActivity {
             .filter(|i| &i.with_user == user)
             .collect()
     }
-    
+
     /// Get interactions by type
-    pub fn get_interactions_by_type(&self, interaction_type: &InteractionType) -> Vec<&SubnetInteraction> {
+    pub fn get_interactions_by_type(
+        &self,
+        interaction_type: &InteractionType,
+    ) -> Vec<&SubnetInteraction> {
         self.recent_interactions
             .iter()
             .filter(|i| &i.interaction_type == interaction_type)
             .collect()
     }
-    
+
     fn touch(&mut self) {
         self.last_activity = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -608,16 +613,16 @@ impl UserSubnetActivity {
 }
 
 /// Cross-subnet transaction marker
-/// 
+///
 /// When a transaction involves multiple subnets, it needs special handling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossSubnetContext {
     /// Source subnet
     pub source_subnet: SubnetId,
-    
+
     /// Target subnet(s)
     pub target_subnets: Vec<SubnetId>,
-    
+
     /// Whether this requires 2-phase commit
     pub requires_2pc: bool,
 }
@@ -631,58 +636,58 @@ impl CrossSubnetContext {
             requires_2pc,
         }
     }
-    
+
     /// Check if this is a single-subnet transaction
     pub fn is_single_subnet(&self) -> bool {
-        self.target_subnets.is_empty() || 
-        self.target_subnets.iter().all(|t| t == &self.source_subnet)
+        self.target_subnets.is_empty()
+            || self.target_subnets.iter().all(|t| t == &self.source_subnet)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_subnet_id_creation() {
         let id1 = SubnetId::from_str_id("defi-app");
         let id2 = SubnetId::from_str_id("defi-app");
         let id3 = SubnetId::from_str_id("gaming-app");
-        
+
         assert_eq!(id1, id2);
         assert_ne!(id1, id3);
     }
-    
+
     #[test]
     fn test_user_membership() {
         let user = Address::from("alice");
         let mut membership = UserSubnetMembership::new(user);
-        
+
         let defi = SubnetId::from_str_id("defi");
         let gaming = SubnetId::from_str_id("gaming");
-        
+
         membership.join(defi);
         membership.join(gaming);
-        
+
         assert!(membership.is_member(&defi));
         assert!(membership.is_member(&gaming));
         assert_eq!(membership.subnet_count(), 2);
-        
+
         membership.leave(&defi);
         assert!(!membership.is_member(&defi));
         assert_eq!(membership.subnet_count(), 1);
     }
-    
+
     #[test]
     fn test_cross_subnet_context() {
         let defi = SubnetId::from_str_id("defi");
         let gaming = SubnetId::from_str_id("gaming");
-        
+
         // Single subnet transaction
         let ctx1 = CrossSubnetContext::new(defi, vec![defi]);
         assert!(ctx1.is_single_subnet());
         assert!(!ctx1.requires_2pc);
-        
+
         // Cross subnet transaction
         let ctx2 = CrossSubnetContext::new(defi, vec![gaming]);
         assert!(!ctx2.is_single_subnet());

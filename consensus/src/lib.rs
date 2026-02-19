@@ -48,38 +48,38 @@ pub mod vlc;
 
 // Re-export main types
 pub use anchor_builder::{
-    AnchorBuilder, AnchorBuildResult, AnchorBuildError,
-    PendingAnchorBuild, BuilderStateSnapshot, StateChangeEntry,
+    AnchorBuildError, AnchorBuildResult, AnchorBuilder, BuilderStateSnapshot, PendingAnchorBuild,
+    StateChangeEntry,
 };
 pub use broadcaster::{
-    ConsensusBroadcaster, BroadcastError, BroadcastResult,
-    NoOpBroadcaster, MockBroadcaster, OptionalBroadcaster,
+    BroadcastError, BroadcastResult, ConsensusBroadcaster, MockBroadcaster, NoOpBroadcaster,
+    OptionalBroadcaster,
 };
 pub use dag::{Dag, DagError, GCStats};
 pub use dag_manager::{
-    DagManager, DagManagerConfig, DagManagerError,
-    ParentInfo, ResolvedParents, GcStats, WarmupStats, DagStatsSnapshot,
+    DagManager, DagManagerConfig, DagManagerError, DagStatsSnapshot, GcStats, ParentInfo,
+    ResolvedParents, WarmupStats,
 };
 pub use engine::{ConsensusEngine, ConsensusMessage, DagStats};
 pub use folder::{ConsensusManager, DagFolder};
 pub use merkle_integration::{
-    compute_events_root, compute_anchor_chain_root, compute_global_state_root,
+    compute_anchor_chain_root, compute_events_root, compute_global_state_root,
     AnchorMerkleRootsBuilder,
 };
-pub use root_executor::{RootSubnetExecutor, RootExecutorError, RootExecutionResult};
-pub use router::{EventRouter, RoutedEvents, SubnetExecutionBatch, create_execution_batches};
-pub use recent_cache::{RecentEventCache, FinalizedEventMeta, CacheStats, CacheStatsSnapshot};
-pub use tee_verifier::{TeeVerifier, TeeAttestation, VerificationResult, SolverRegistry, SolverInfo};
+pub use recent_cache::{CacheStats, CacheStatsSnapshot, FinalizedEventMeta, RecentEventCache};
+pub use root_executor::{RootExecutionResult, RootExecutorError, RootSubnetExecutor};
+pub use router::{create_execution_batches, EventRouter, RoutedEvents, SubnetExecutionBatch};
+pub use tee_verifier::{
+    SolverInfo, SolverRegistry, TeeAttestation, TeeVerifier, VerificationResult,
+};
 pub use validator_set::{ElectionStrategy, ValidatorSet};
 pub use vlc::VLC;
 
 // Re-export liveness types
 pub use liveness::{
-    choose_index, choose_leader, create_default_election,
-    create_election_with_contiguous_rounds, create_reputation_election,
-    ConsensusFrameAggregation, ConsensusFrameMetadata, InMemoryMetadataBackend,
-    LeaderReputation, MetadataBackend, ProposerAndVoterHeuristic, ProposerElection,
-    ReputationConfig, ReputationHeuristic, RotatingProposer, Round, ValidatorId,
+    choose_index, choose_leader, create_default_election, create_election_with_contiguous_rounds,
+    create_reputation_election, ConsensusFrameAggregation, ConsensusFrameMetadata,
+    InMemoryMetadataBackend, LeaderReputation, MetadataBackend, ProposerAndVoterHeuristic,
+    ProposerElection, ReputationConfig, ReputationHeuristic, RotatingProposer, Round, ValidatorId,
     VotingPower, VotingPowerRatio,
 };
-

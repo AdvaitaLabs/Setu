@@ -9,17 +9,17 @@
 //! - `registration.rs` - Registration handler implementation
 //! - `solver_client.rs` - Solver HTTP client types
 
-mod types;
-mod service;
-mod registration;
-mod solver_client;
-mod transfer_handler;
-mod tee_executor;
 mod event_handler;
+mod registration;
+mod service;
+mod solver_client;
+mod tee_executor;
+mod transfer_handler;
+mod types;
 
-pub use types::*;
-pub use service::*;
 pub use registration::ValidatorRegistrationHandler;
+pub use service::*;
+pub use types::*;
 
 // Internal modules - not re-exported as they are implementation details
 // pub use solver_client::*;

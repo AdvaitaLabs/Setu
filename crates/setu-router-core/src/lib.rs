@@ -48,9 +48,9 @@
 
 // Core modules
 mod error;
-mod types;
 mod shard;
 mod solver;
+mod types;
 
 // Strategy module (contains all routing strategies)
 mod strategy;
@@ -67,31 +67,35 @@ pub use error::RouterError;
 
 // Re-exports: Core types
 pub use types::{
-    SubnetId, ObjectId, ShardId, LegacyShardId, RoutingMethod,
-    ROOT_SUBNET, DEFAULT_SHARD_COUNT, DEFAULT_SHARD_ID,
+    LegacyShardId, ObjectId, RoutingMethod, ShardId, SubnetId, DEFAULT_SHARD_COUNT,
+    DEFAULT_SHARD_ID, ROOT_SUBNET,
 };
 
 // Re-exports: Shard management
 pub use shard::{ShardConfig, ShardRouter, SingleShardRouter};
 
-// Re-exports: Solver management  
-pub use solver::{SolverInfo, SolverId, SolverRegistry, SolverStatus};
+// Re-exports: Solver management
+pub use solver::{SolverId, SolverInfo, SolverRegistry, SolverStatus};
 
 // Re-exports: Strategy traits and implementations
 pub use strategy::{
-    // Traits
-    SolverStrategy, ShardStrategy,
     // Solver selection strategies
-    ConsistentHashStrategy, LoadBalancedStrategy,
+    ConsistentHashStrategy,
+    CrossSubnetRoutingDecision,
+    LoadBalancedStrategy,
+    ObjectShardStrategy,
+    ShardLoadMetrics,
+    ShardStrategy,
+    // Traits
+    SolverStrategy,
+    SubnetShardRouter,
     // Shard selection strategies
-    SubnetShardStrategy, SubnetShardRouter, ObjectShardStrategy,
-    CrossSubnetRoutingDecision, ShardLoadMetrics,
+    SubnetShardStrategy,
 };
 
 // Re-exports: Routers
 pub use router::{Router, RouterConfig, RoutingDecision};
 pub use unified_router::{
-    UnifiedRouter, UnifiedRoutingStrategy, RoutingContext,
-    ShardRoutingResult, DetailedRoutingResult,
+    DetailedRoutingResult, RoutingContext, ShardRoutingResult, UnifiedRouter,
+    UnifiedRoutingStrategy,
 };
-

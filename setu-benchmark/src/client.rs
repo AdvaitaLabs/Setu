@@ -69,12 +69,7 @@ impl BenchClient {
         let url = format!("{}/api/v1/transfer", self.base_url);
         let start = Instant::now();
 
-        let result = self
-            .client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await;
+        let result = self.client.post(&url).json(&request).send().await;
 
         let latency = start.elapsed();
 
@@ -131,7 +126,7 @@ impl BenchClient {
 }
 
 /// Generate a random transfer request
-/// 
+///
 /// NOTE: Each request gets a unique resource key based on seq to ensure
 /// consistent hash routing distributes requests evenly across solvers.
 pub fn generate_transfer(
@@ -155,10 +150,10 @@ pub fn generate_transfer(
 }
 
 /// Generate a transfer using pre-initialized test accounts (20 accounts)
-/// 
+///
 /// Accounts: alice, bob, charlie, user_01 to user_17
 /// This distributes load across many accounts to avoid state lock contention.
-/// 
+///
 /// NOTE: Each request gets a unique resource key based on seq to ensure
 /// consistent hash routing distributes requests evenly across solvers.
 /// Without this, all requests from the same 'from' address would route
@@ -166,24 +161,22 @@ pub fn generate_transfer(
 pub fn generate_transfer_with_test_accounts(amount: u64, seq: u64) -> BenchTransferRequest {
     // 20 test accounts for better load distribution
     const ACCOUNTS: &[&str] = &[
-        "alice", "bob", "charlie",
-        "user_01", "user_02", "user_03", "user_04", "user_05",
-        "user_06", "user_07", "user_08", "user_09", "user_10",
-        "user_11", "user_12", "user_13", "user_14", "user_15",
-        "user_16", "user_17",
+        "alice", "bob", "charlie", "user_01", "user_02", "user_03", "user_04", "user_05",
+        "user_06", "user_07", "user_08", "user_09", "user_10", "user_11", "user_12", "user_13",
+        "user_14", "user_15", "user_16", "user_17",
     ];
-    
+
     // Use different indices for sender and receiver to ensure they're different
     let sender_idx = seq as usize % ACCOUNTS.len();
     let receiver_idx = (seq as usize + 1 + (seq as usize / ACCOUNTS.len())) % ACCOUNTS.len();
-    
+
     // Ensure sender != receiver
     let receiver_idx = if receiver_idx == sender_idx {
         (receiver_idx + 1) % ACCOUNTS.len()
     } else {
         receiver_idx
     };
-    
+
     BenchTransferRequest {
         from: ACCOUNTS[sender_idx].to_string(),
         to: ACCOUNTS[receiver_idx].to_string(),

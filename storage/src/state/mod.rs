@@ -9,9 +9,8 @@
 pub mod manager;
 pub mod provider;
 
-pub use manager::{SubnetStateSMT, GlobalStateManager, StateApplySummary, StateApplyError};
+pub use manager::{GlobalStateManager, StateApplyError, StateApplySummary, SubnetStateSMT};
 pub use provider::{
-    StateProvider, MerkleStateProvider,
-    CoinInfo, CoinState, SimpleMerkleProof,
-    init_coin, get_coin_state,
+    get_coin_state, init_coin, CoinInfo, CoinState, MerkleStateProvider, SimpleMerkleProof,
+    StateProvider,
 };

@@ -52,6 +52,5 @@ mod setu_handler;
 mod sync_protocol;
 
 pub use router::{MessageRouter, NetworkEventHandler};
-pub use setu_handler::{SetuMessageHandler, MessageHandlerStore, SETU_ROUTE};
-pub use sync_protocol::{SyncProtocol, SyncStore, InMemorySyncStore};
-
+pub use setu_handler::{MessageHandlerStore, SetuMessageHandler, SETU_ROUTE};
+pub use sync_protocol::{InMemorySyncStore, SyncProtocol, SyncStore};

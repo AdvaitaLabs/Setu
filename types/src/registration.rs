@@ -16,13 +16,13 @@ pub struct ValidatorRegistration {
     // ========== Identity Layer ==========
     /// Unique validator identifier (for logging, routing)
     pub validator_id: String,
-    
+
     // ========== Network Layer ==========
     /// Network address (IP or hostname) for P2P communication
     pub address: String,
     /// Network port for P2P communication
     pub port: u16,
-    
+
     // ========== Economic Layer ==========
     /// Ethereum-style account address (0x...) for staking and rewards
     pub account_address: String,
@@ -30,7 +30,7 @@ pub struct ValidatorRegistration {
     pub public_key: Vec<u8>,
     /// Registration signature proving ownership of the account
     pub signature: Vec<u8>,
-    
+
     // ========== Economic Parameters ==========
     /// Stake amount in Flux (minimum required for validator)
     pub stake_amount: u64,
@@ -60,12 +60,12 @@ impl ValidatorRegistration {
             commission_rate: 10, // Default 10%
         }
     }
-    
+
     pub fn with_commission_rate(mut self, rate: u8) -> Self {
         self.commission_rate = rate.min(100); // Cap at 100%
         self
     }
-    
+
     /// Verify the registration signature
     pub fn verify_signature(&self) -> bool {
         // TODO: Implement actual ECDSA signature verification
@@ -82,13 +82,13 @@ pub struct SolverRegistration {
     // ========== Identity Layer ==========
     /// Unique solver identifier (for logging, routing)
     pub solver_id: String,
-    
+
     // ========== Network Layer ==========
     /// Network address (IP or hostname) for P2P communication
     pub address: String,
     /// Network port for P2P communication
     pub port: u16,
-    
+
     // ========== Economic Layer ==========
     /// Ethereum-style account address (0x...) for receiving task fees
     pub account_address: String,
@@ -96,7 +96,7 @@ pub struct SolverRegistration {
     pub public_key: Vec<u8>,
     /// Registration signature proving ownership of the account
     pub signature: Vec<u8>,
-    
+
     // ========== Capability Parameters ==========
     /// Maximum concurrent tasks capacity
     pub capacity: u32,
@@ -128,22 +128,22 @@ impl SolverRegistration {
             resources: vec![],
         }
     }
-    
+
     pub fn with_capacity(mut self, capacity: u32) -> Self {
         self.capacity = capacity;
         self
     }
-    
+
     pub fn with_shard(mut self, shard_id: impl Into<String>) -> Self {
         self.shard_id = Some(shard_id.into());
         self
     }
-    
+
     pub fn with_resources(mut self, resources: Vec<String>) -> Self {
         self.resources = resources;
         self
     }
-    
+
     /// Verify the registration signature
     pub fn verify_signature(&self) -> bool {
         // TODO: Implement actual ECDSA signature verification
@@ -186,18 +186,18 @@ impl Unregistration {
             node_type: NodeType::Validator,
         }
     }
-    
+
     pub fn solver(node_id: impl Into<String>) -> Self {
         Self {
             node_id: node_id.into(),
             node_type: NodeType::Solver,
         }
     }
-    
+
     pub fn is_validator(&self) -> bool {
         self.node_type == NodeType::Validator
     }
-    
+
     pub fn is_solver(&self) -> bool {
         self.node_type == NodeType::Solver
     }
@@ -230,17 +230,17 @@ impl SubnetResourceLimits {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     pub fn with_tps(mut self, tps: u64) -> Self {
         self.max_tps = Some(tps);
         self
     }
-    
+
     pub fn with_storage(mut self, bytes: u64) -> Self {
         self.max_storage_bytes = Some(bytes);
         self
     }
-    
+
     pub fn with_compute(mut self, units: u64) -> Self {
         self.max_compute_units = Some(units);
         self
@@ -271,7 +271,11 @@ pub struct SubnetRegistration {
 }
 
 impl SubnetRegistration {
-    pub fn new(subnet_id: impl Into<String>, name: impl Into<String>, owner: impl Into<String>) -> Self {
+    pub fn new(
+        subnet_id: impl Into<String>,
+        name: impl Into<String>,
+        owner: impl Into<String>,
+    ) -> Self {
         Self {
             subnet_id: subnet_id.into(),
             name: name.into(),
@@ -284,32 +288,32 @@ impl SubnetRegistration {
             parent_subnet_id: None,
         }
     }
-    
+
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
         self.description = Some(desc.into());
         self
     }
-    
+
     pub fn with_max_users(mut self, max: u64) -> Self {
         self.max_users = Some(max);
         self
     }
-    
+
     pub fn with_limits(mut self, limits: SubnetResourceLimits) -> Self {
         self.resource_limits = Some(limits);
         self
     }
-    
+
     pub fn with_solvers(mut self, solvers: Vec<String>) -> Self {
         self.assigned_solvers = solvers;
         self
     }
-    
+
     pub fn with_type(mut self, subnet_type: SubnetType) -> Self {
         self.subnet_type = subnet_type;
         self
     }
-    
+
     pub fn with_parent(mut self, parent_id: impl Into<String>) -> Self {
         self.parent_subnet_id = Some(parent_id.into());
         self
@@ -319,11 +323,11 @@ impl SubnetRegistration {
 // ========== User Registration ==========
 
 /// User registration data
-/// 
+///
 /// Supports two registration methods:
 /// 1. MetaMask (Ethereum wallet): address + ECDSA signature
 /// 2. Nostr: nostr_pubkey + Schnorr signature (address derived from pubkey)
-/// 
+///
 /// The middle layer (Nostr Relay adapter) converts events to registration requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserRegistration {
@@ -331,48 +335,45 @@ pub struct UserRegistration {
     /// - For MetaMask: directly from wallet
     /// - For Nostr: derived from nostr_pubkey via Keccak256
     pub address: String,
-    
+
     /// Optional: Nostr public key (32 bytes, Schnorr x-only public key)
     /// Only present for Nostr-based registrations
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nostr_pubkey: Option<Vec<u8>>,
-    
+
     /// Signature proving ownership
     /// - For MetaMask: ECDSA signature (65 bytes)
     /// - For Nostr: Schnorr signature (64 bytes)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<Vec<u8>>,
-    
+
     /// Signed message (for verification)
     /// Format: "Register to Setu: {timestamp}"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    
+
     /// Timestamp (for replay attack prevention)
     pub timestamp: u64,
-    
+
     /// Subnet ID to register in (None = root subnet)
     pub subnet_id: Option<String>,
-    
+
     /// Optional display name
     pub display_name: Option<String>,
-    
+
     /// Optional metadata (JSON string)
     pub metadata: Option<String>,
-    
+
     /// Inviter's address (resolved from invite code by middle layer)
     pub invited_by: Option<String>,
-    
+
     /// Invite code used for registration
     pub invite_code: Option<String>,
 }
 
 impl UserRegistration {
     /// Create a new user registration from MetaMask (Ethereum wallet)
-    pub fn from_metamask(
-        address: impl Into<String>,
-        timestamp: u64,
-    ) -> Self {
+    pub fn from_metamask(address: impl Into<String>, timestamp: u64) -> Self {
         Self {
             address: address.into(),
             nostr_pubkey: None,
@@ -386,7 +387,7 @@ impl UserRegistration {
             invite_code: None,
         }
     }
-    
+
     /// Create a new user registration from Nostr credentials
     pub fn from_nostr(
         address: impl Into<String>,
@@ -407,53 +408,53 @@ impl UserRegistration {
             invite_code: None,
         }
     }
-    
+
     pub fn with_signature(mut self, signature: Vec<u8>) -> Self {
         self.signature = Some(signature);
         self
     }
-    
+
     pub fn with_message(mut self, message: impl Into<String>) -> Self {
         self.message = Some(message.into());
         self
     }
-    
+
     pub fn with_subnet(mut self, subnet_id: impl Into<String>) -> Self {
         self.subnet_id = Some(subnet_id.into());
         self
     }
-    
+
     pub fn with_display_name(mut self, name: impl Into<String>) -> Self {
         self.display_name = Some(name.into());
         self
     }
-    
+
     pub fn with_invite(mut self, inviter: impl Into<String>, code: impl Into<String>) -> Self {
         self.invited_by = Some(inviter.into());
         self.invite_code = Some(code.into());
         self
     }
-    
+
     pub fn with_metadata(mut self, metadata: impl Into<String>) -> Self {
         self.metadata = Some(metadata.into());
         self
     }
-    
+
     /// Get the subnet this user is registering in (defaults to root)
     pub fn get_subnet(&self) -> &str {
         self.subnet_id.as_deref().unwrap_or("subnet-0")
     }
-    
+
     /// Check if this is a Nostr-based registration
     pub fn is_nostr(&self) -> bool {
         self.nostr_pubkey.is_some()
     }
-    
+
     /// Check if this is a MetaMask-based registration
     pub fn is_metamask(&self) -> bool {
         self.nostr_pubkey.is_none()
     }
-    
+
     /// Verify the signature and address derivation
     pub fn verify(&self) -> bool {
         if let Some(nostr_pubkey) = &self.nostr_pubkey {
@@ -507,7 +508,11 @@ pub struct TaskSubmission {
 }
 
 impl TaskSubmission {
-    pub fn new(task_id: impl Into<String>, task_type: impl Into<String>, submitter: impl Into<String>) -> Self {
+    pub fn new(
+        task_id: impl Into<String>,
+        task_type: impl Into<String>,
+        submitter: impl Into<String>,
+    ) -> Self {
         Self {
             task_id: task_id.into(),
             task_type: task_type.into(),
@@ -515,7 +520,7 @@ impl TaskSubmission {
             payload: vec![],
         }
     }
-    
+
     pub fn with_payload(mut self, payload: Vec<u8>) -> Self {
         self.payload = payload;
         self
@@ -525,7 +530,7 @@ impl TaskSubmission {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_validator_registration() {
         let reg = ValidatorRegistration::new(
@@ -536,13 +541,14 @@ mod tests {
             vec![1, 2, 3],
             vec![4, 5, 6],
             10000,
-        ).with_commission_rate(15);
+        )
+        .with_commission_rate(15);
         assert_eq!(reg.validator_id, "v1");
         assert_eq!(reg.account_address, "0xabcd1234");
         assert_eq!(reg.stake_amount, 10000);
         assert_eq!(reg.commission_rate, 15);
     }
-    
+
     #[test]
     fn test_solver_registration() {
         let reg = SolverRegistration::new(
@@ -553,21 +559,21 @@ mod tests {
             vec![1, 2, 3],
             vec![4, 5, 6],
         )
-            .with_capacity(50)
-            .with_shard("shard-0");
+        .with_capacity(50)
+        .with_shard("shard-0");
         assert_eq!(reg.solver_id, "s1");
         assert_eq!(reg.account_address, "0xef123456");
         assert_eq!(reg.capacity, 50);
         assert_eq!(reg.shard_id, Some("shard-0".to_string()));
     }
-    
+
     #[test]
     fn test_unregistration() {
         let unreg = Unregistration::validator("v1");
         assert!(unreg.is_validator());
         assert!(!unreg.is_solver());
     }
-    
+
     #[test]
     fn test_subnet_registration() {
         let reg = SubnetRegistration::new("subnet-1", "My App", "alice")
@@ -576,7 +582,7 @@ mod tests {
         assert_eq!(reg.subnet_id, "subnet-1");
         assert_eq!(reg.subnet_type, SubnetType::App);
     }
-    
+
     #[test]
     fn test_user_registration_metamask() {
         let reg = UserRegistration::from_metamask("0x1234abcd", 1234567890)
@@ -590,20 +596,21 @@ mod tests {
         assert!(!reg.is_nostr());
         assert!(reg.verify());
     }
-    
+
     #[test]
     fn test_user_registration_nostr() {
         let nostr_pubkey = vec![1; 32]; // 32 bytes Nostr pubkey
-        let reg = UserRegistration::from_nostr("0x1234abcd", nostr_pubkey, vec![4, 5, 6], 1234567890)
-            .with_subnet("subnet-1")
-            .with_display_name("Alice");
+        let reg =
+            UserRegistration::from_nostr("0x1234abcd", nostr_pubkey, vec![4, 5, 6], 1234567890)
+                .with_subnet("subnet-1")
+                .with_display_name("Alice");
         assert_eq!(reg.address, "0x1234abcd");
         assert_eq!(reg.get_subnet(), "subnet-1");
         assert!(reg.is_nostr());
         assert!(!reg.is_metamask());
         assert!(reg.verify());
     }
-    
+
     #[test]
     fn test_user_default_subnet() {
         let reg = UserRegistration::from_metamask("0xabcd", 1234567890);

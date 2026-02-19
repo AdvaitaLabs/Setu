@@ -34,26 +34,26 @@ impl Default for SolverStatus {
 pub struct SolverInfo {
     /// Unique solver identifier
     pub id: SolverId,
-    
+
     /// Network address (e.g., "127.0.0.1:9001")
     pub address: String,
-    
+
     /// Current status
     pub status: SolverStatus,
-    
+
     /// Resource domains this solver handles
     /// Empty means solver can handle any resource
     pub resource_domains: Vec<String>,
-    
+
     /// Current load (number of pending transactions)
     pub pending_load: u64,
-    
+
     /// Maximum capacity
     pub max_capacity: u64,
-    
+
     /// Weight for load balancing (higher = more traffic)
     pub weight: u32,
-    
+
     /// Last heartbeat timestamp (milliseconds since epoch)
     #[serde(skip)]
     pub last_heartbeat: Option<Instant>,
@@ -94,8 +94,7 @@ impl SolverInfo {
 
     /// Check if solver is available for routing
     pub fn is_available(&self) -> bool {
-        matches!(self.status, SolverStatus::Online) 
-            && self.pending_load < self.max_capacity
+        matches!(self.status, SolverStatus::Online) && self.pending_load < self.max_capacity
     }
 
     /// Get load ratio (0.0 - 1.0)
@@ -113,11 +112,11 @@ impl SolverInfo {
         if self.resource_domains.is_empty() {
             return true;
         }
-        
+
         // Check if resource matches any domain
-        self.resource_domains.iter().any(|domain| {
-            resource.starts_with(domain) || domain == "*"
-        })
+        self.resource_domains
+            .iter()
+            .any(|domain| resource.starts_with(domain) || domain == "*")
     }
 }
 
@@ -126,7 +125,7 @@ impl SolverInfo {
 pub struct SolverRegistry {
     /// Map of solver ID to solver info
     solvers: Arc<RwLock<HashMap<SolverId, SolverInfo>>>,
-    
+
     /// Heartbeat timeout duration
     heartbeat_timeout: Duration,
 }
@@ -156,7 +155,7 @@ impl SolverRegistry {
             address = %solver.address,
             "Registering solver"
         );
-        
+
         let mut solvers = self.solvers.write();
         solvers.insert(solver.id.clone(), solver);
     }
@@ -221,7 +220,7 @@ impl SolverRegistry {
     /// Get all available solvers (online and not at capacity)
     pub fn get_available(&self) -> Vec<SolverInfo> {
         self.check_timeouts();
-        
+
         let solvers = self.solvers.read();
         solvers
             .values()
@@ -233,7 +232,7 @@ impl SolverRegistry {
     /// Get available solvers that can handle a specific resource
     pub fn get_available_for_resource(&self, resource: &str) -> Vec<SolverInfo> {
         self.check_timeouts();
-        
+
         let solvers = self.solvers.read();
         solvers
             .values()
@@ -246,7 +245,7 @@ impl SolverRegistry {
     fn check_timeouts(&self) {
         let mut solvers = self.solvers.write();
         let now = Instant::now();
-        
+
         for solver in solvers.values_mut() {
             if let Some(last_hb) = solver.last_heartbeat {
                 if now.duration_since(last_hb) > self.heartbeat_timeout {
@@ -287,7 +286,7 @@ mod tests {
     #[test]
     fn test_solver_info_creation() {
         let solver = SolverInfo::new("solver-1".to_string(), "127.0.0.1:9001".to_string());
-        
+
         assert_eq!(solver.id, "solver-1");
         assert_eq!(solver.status, SolverStatus::Online);
         assert!(solver.is_available());
@@ -297,7 +296,7 @@ mod tests {
     fn test_solver_resource_handling() {
         let solver = SolverInfo::new("solver-1".to_string(), "127.0.0.1:9001".to_string())
             .with_domains(vec!["account:".to_string(), "coin:".to_string()]);
-        
+
         assert!(solver.can_handle_resource("account:alice"));
         assert!(solver.can_handle_resource("coin:btc"));
         assert!(!solver.can_handle_resource("nft:token1"));
@@ -306,16 +305,16 @@ mod tests {
     #[test]
     fn test_registry_operations() {
         let registry = SolverRegistry::new();
-        
+
         let solver1 = SolverInfo::new("solver-1".to_string(), "127.0.0.1:9001".to_string());
         let solver2 = SolverInfo::new("solver-2".to_string(), "127.0.0.1:9002".to_string());
-        
+
         registry.register(solver1);
         registry.register(solver2);
-        
+
         assert_eq!(registry.count(), 2);
         assert_eq!(registry.available_count(), 2);
-        
+
         registry.unregister(&"solver-1".to_string());
         assert_eq!(registry.count(), 1);
     }
@@ -324,10 +323,10 @@ mod tests {
     fn test_load_ratio() {
         let mut solver = SolverInfo::new("solver-1".to_string(), "127.0.0.1:9001".to_string())
             .with_capacity(1000);
-        
+
         solver.pending_load = 500;
         assert!((solver.load_ratio() - 0.5).abs() < 0.001);
-        
+
         solver.pending_load = 1000;
         assert!(!solver.is_available());
     }

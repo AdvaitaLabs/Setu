@@ -40,7 +40,10 @@ impl BenchmarkRunner {
             }
             Err(e) => {
                 error!("✗ Failed to connect to validator: {}", e);
-                bail!("Cannot connect to validator at {}", self.config.validator_url);
+                bail!(
+                    "Cannot connect to validator at {}",
+                    self.config.validator_url
+                );
             }
         }
 
@@ -127,11 +130,11 @@ impl BenchmarkRunner {
                 let success = progress_metrics.success_count.load(Ordering::Relaxed);
                 let tps = current - last_count;
                 last_count = current;
-                
+
                 if current >= total_for_progress {
                     break;
                 }
-                
+
                 info!(
                     "Progress: {}/{} ({:.1}%) | TPS: {} | Success: {}",
                     current,
@@ -219,7 +222,7 @@ impl BenchmarkRunner {
                 } else {
                     0
                 };
-                
+
                 info!(
                     "Elapsed: {:.1}s | Sent: {} | Success: {} | Fail: {} | Actual TPS: {}",
                     elapsed as f64 / 1000.0,

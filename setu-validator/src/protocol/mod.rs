@@ -32,20 +32,18 @@
 //! let decoded: SetuMessage = MessageCodec::decode(&bytes)?;
 //! ```
 
-pub mod message;
-pub mod event;
-pub mod sync;
 pub mod codec;
+pub mod event;
+pub mod message;
+pub mod sync;
 
 // Re-export main types for convenience
-pub use message::{SetuMessage, MessageType};
+pub use codec::{Decodable, Encodable, MessageCodec, MessageCodecError};
 pub use event::NetworkEvent;
+pub use message::{MessageType, SetuMessage};
 pub use sync::{
-    SerializedEvent, SerializedConsensusFrame, SerializedVote,
+    GetSyncStateRequest, GetSyncStateResponse, PeerSyncInfo, PushConsensusFrameRequest,
+    PushConsensusFrameResponse, PushEventsRequest, PushEventsResponse, SerializedConsensusFrame,
+    SerializedEvent, SerializedVote, SyncConsensusFramesRequest, SyncConsensusFramesResponse,
     SyncEventsRequest, SyncEventsResponse,
-    SyncConsensusFramesRequest, SyncConsensusFramesResponse,
-    PushEventsRequest, PushEventsResponse,
-    PushConsensusFrameRequest, PushConsensusFrameResponse,
-    PeerSyncInfo, GetSyncStateRequest, GetSyncStateResponse,
 };
-pub use codec::{MessageCodec, MessageCodecError, Encodable, Decodable};

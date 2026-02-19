@@ -59,7 +59,7 @@ async fn handle_execute_task<H: SolverHttpHandler>(
     Json(request): Json<ExecuteTaskRequest>,
 ) -> Json<ExecuteTaskResponse> {
     let task_id_hex = hex::encode(&request.solver_task.task_id[..8]);
-    
+
     info!(
         task_id = %task_id_hex,
         validator_id = %request.validator_id,

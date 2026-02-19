@@ -105,7 +105,10 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         }
     }
 
-    async fn register_validator(&self, request: RegisterValidatorRequest) -> RegisterValidatorResponse {
+    async fn register_validator(
+        &self,
+        request: RegisterValidatorRequest,
+    ) -> RegisterValidatorResponse {
         info!(
             validator_id = %request.validator_id,
             address = %request.address,
@@ -246,7 +249,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
                     .nth(1)
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(0),
-                account_address: None,  // TODO: 从 SolverInfo 中获取
+                account_address: None, // TODO: 从 SolverInfo 中获取
                 capacity: s.capacity,
                 current_load: s.current_load,
                 status: format!("{:?}", s.status),
@@ -259,7 +262,10 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         }
     }
 
-    async fn get_validator_list(&self, _request: GetValidatorListRequest) -> GetValidatorListResponse {
+    async fn get_validator_list(
+        &self,
+        _request: GetValidatorListRequest,
+    ) -> GetValidatorListResponse {
         GetValidatorListResponse {
             validators: self.service.get_validator_list(),
         }

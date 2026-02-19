@@ -24,10 +24,7 @@ use setu_types::{ConsensusFrame, Event, Vote};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SetuMessage {
     /// Event broadcast - propagate a new event to peers
-    EventBroadcast {
-        event: Event,
-        sender_id: String,
-    },
+    EventBroadcast { event: Event, sender_id: String },
 
     /// Consensus frame proposal - propose a new CF for voting
     CFProposal {
@@ -36,9 +33,7 @@ pub enum SetuMessage {
     },
 
     /// Vote for a consensus frame
-    CFVote {
-        vote: Vote,
-    },
+    CFVote { vote: Vote },
 
     /// Notification that a consensus frame has been finalized
     CFFinalized {
@@ -60,16 +55,10 @@ pub enum SetuMessage {
     },
 
     /// Ping message for health check and latency measurement
-    Ping {
-        timestamp: u64,
-        nonce: u64,
-    },
+    Ping { timestamp: u64, nonce: u64 },
 
     /// Pong response to a ping
-    Pong {
-        timestamp: u64,
-        nonce: u64,
-    },
+    Pong { timestamp: u64, nonce: u64 },
 }
 
 /// Message type identifier
@@ -119,7 +108,7 @@ impl SetuMessage {
                 | SetuMessage::CFFinalized { .. }
         )
     }
-    
+
     /// Get the route path for this message type
     ///
     /// Used by the network layer to route messages to appropriate handlers.
@@ -155,24 +144,23 @@ mod tests {
 
     #[test]
     fn test_consensus_message_check() {
-        let vote = Vote::new(
-            "v1".to_string(),
-            "cf1".to_string(),
-            true,
-        );
+        let vote = Vote::new("v1".to_string(), "cf1".to_string(), true);
         let msg = SetuMessage::CFVote { vote };
         assert!(msg.is_consensus_message());
     }
-    
+
     #[test]
     fn test_route_paths() {
-        let msg = SetuMessage::Ping { timestamp: 0, nonce: 0 };
+        let msg = SetuMessage::Ping {
+            timestamp: 0,
+            nonce: 0,
+        };
         assert_eq!(msg.route_path(), "/ping");
-        
+
         let event = Event::genesis("test".to_string(), VLCSnapshot::default());
-        let msg = SetuMessage::EventBroadcast { 
-            event, 
-            sender_id: "s1".to_string() 
+        let msg = SetuMessage::EventBroadcast {
+            event,
+            sender_id: "s1".to_string(),
         };
         assert_eq!(msg.route_path(), "/setu/event");
     }

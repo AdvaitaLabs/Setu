@@ -264,11 +264,7 @@ impl SubnetAggregationTree {
         let binary_proof = self.tree.get_proof(index)?;
 
         // Extract sibling hashes
-        let siblings: Vec<HashValue> = binary_proof
-            .siblings()
-            .iter()
-            .map(|n| n.hash())
-            .collect();
+        let siblings: Vec<HashValue> = binary_proof.siblings().iter().map(|n| n.hash()).collect();
 
         Ok(SubnetAggregationProof {
             entry,

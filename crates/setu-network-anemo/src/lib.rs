@@ -74,8 +74,7 @@ pub mod transport;
 
 // Re-export generic handler types
 pub use generic_handler::{
-    GenericMessageHandler, HandlerError, HandleResult,
-    create_router_from_handler,
+    create_router_from_handler, GenericMessageHandler, HandleResult, HandlerError,
 };
 
 // Re-export node info types
@@ -91,34 +90,20 @@ pub use transport::AnemoTransport;
 
 // Re-export discovery types
 pub use discovery::{
-    Builder as DiscoveryBuilder,
-    DiscoveryConfig,
-    DiscoveryEventLoop,
-    DiscoveryServer,
-    Handle as DiscoveryHandle,
-    NodeInfo,
-    NodeType,
-    SignedNodeInfo,
-    State as DiscoveryState,
+    Builder as DiscoveryBuilder, DiscoveryConfig, DiscoveryEventLoop, DiscoveryServer,
+    Handle as DiscoveryHandle, NodeInfo, NodeType, SignedNodeInfo, State as DiscoveryState,
     UnstartedDiscovery,
 };
 
 // Re-export state sync types
 pub use state_sync::{
-    Builder as StateSyncBuilder,
-    Handle as StateSyncHandle,
-    LocalState,
-    PeerSyncInfo,
-    PeerSyncState,
-    StateSyncConfig,
-    StateSyncEventLoop,
-    StateSyncServer,
-    SyncState,
+    Builder as StateSyncBuilder, Handle as StateSyncHandle, LocalState, PeerSyncInfo,
+    PeerSyncState, StateSyncConfig, StateSyncEventLoop, StateSyncServer, SyncState,
     UnstartedStateSync,
 };
 
 // Re-export core protocol types from setu-protocol
-pub use setu_protocol::{GenericCodec, BincodeCodec, ProtocolError, ProtocolVersion};
+pub use setu_protocol::{BincodeCodec, GenericCodec, ProtocolError, ProtocolVersion};
 
 // Re-export commonly used Anemo types
 pub use anemo::{Network, PeerId, Request, Response};

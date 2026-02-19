@@ -25,11 +25,11 @@ use super::proposer_election::{ProposerElection, Round, ValidatorId, VotingPower
 pub struct RotatingProposer {
     /// Ordered list of validators (all honest replicas must agree on this order)
     proposers: Vec<ValidatorId>,
-    
+
     /// Number of contiguous rounds a proposer is active in a row.
     /// Default is 1, meaning the proposer changes every round.
     contiguous_rounds: u32,
-    
+
     /// Optional voting power for each validator (for weighted rotation in future)
     voting_powers: Vec<VotingPower>,
 }
@@ -111,13 +111,14 @@ impl RotatingProposer {
 
     /// Sort proposers deterministically (by ID).
     fn sort_proposers(&mut self) {
-        let mut combined: Vec<_> = self.proposers
+        let mut combined: Vec<_> = self
+            .proposers
             .iter()
             .cloned()
             .zip(self.voting_powers.iter().cloned())
             .collect();
         combined.sort_by(|a, b| a.0.cmp(&b.0));
-        
+
         self.proposers = combined.iter().map(|(id, _)| id.clone()).collect();
         self.voting_powers = combined.iter().map(|(_, power)| *power).collect();
     }

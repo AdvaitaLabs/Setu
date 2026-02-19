@@ -17,23 +17,24 @@
 //! 6. All validators vote on CF
 //! 7. Final confirmation and anchor storage
 
-use consensus::{
-    ConsensusEngine, ConsensusMessage, DagStats as ConsensusDagStats,
-    ValidatorSet, TeeVerifier, VerificationResult,
-    liveness::Round, ConsensusBroadcaster,
-};
-use crate::protocol::NetworkEvent;
-use setu_types::{
-    Anchor, ConsensusConfig, ConsensusFrame, Event, EventId, Vote,
-    NodeInfo, ValidatorInfo, SetuResult, SetuError, SubnetId,
-};
-use setu_storage::subnet_state::GlobalStateManager;
-use setu_storage::{EventStore, CFStore, AnchorStore, EventStoreBackend, AnchorStoreBackend, CFStoreBackend};
 use crate::network_adapter::MessageRouter;
 use crate::persistence::FinalizationPersister;
+use crate::protocol::NetworkEvent;
+use consensus::{
+    liveness::Round, ConsensusBroadcaster, ConsensusEngine, ConsensusMessage,
+    DagStats as ConsensusDagStats, TeeVerifier, ValidatorSet, VerificationResult,
+};
+use setu_storage::subnet_state::GlobalStateManager;
+use setu_storage::{
+    AnchorStore, AnchorStoreBackend, CFStore, CFStoreBackend, EventStore, EventStoreBackend,
+};
+use setu_types::{
+    Anchor, ConsensusConfig, ConsensusFrame, Event, EventId, NodeInfo, SetuError, SetuResult,
+    SubnetId, ValidatorInfo, Vote,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock, Mutex, broadcast};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 /// Configuration for the consensus-integrated validator
@@ -80,7 +81,7 @@ pub struct ConsensusValidator {
     validator_set: Arc<RwLock<ValidatorSet>>,
     /// TEE verifier for attestation verification
     tee_verifier: Arc<TeeVerifier>,
-    
+
     /// Persistent store for events (supports both in-memory and RocksDB backends)
     event_store: Arc<dyn EventStoreBackend>,
     /// Persistent store for consensus frames (supports both in-memory and RocksDB backends)
@@ -106,19 +107,19 @@ pub struct ConsensusValidator {
 
 impl ConsensusValidator {
     /// Create a new consensus validator
-    /// 
+    ///
     /// Note: This creates a shared EventStore instance that is used by both
     /// ConsensusValidator and ConsensusEngine.dag_manager, ensuring the three-layer
     /// storage design works correctly (Layer3 fallback to EventStore).
     pub fn new(config: ConsensusValidatorConfig) -> Self {
         let (msg_tx, msg_rx) = mpsc::channel(config.message_buffer_size);
         let (finalization_tx, _) = broadcast::channel(100);
-        
+
         // Initialize validator set
         let mut validator_set = ValidatorSet::new();
         let validator_info = ValidatorInfo::new(config.node_info.clone(), config.is_leader);
         validator_set.add_validator(validator_info);
-        
+
         // CRITICAL: Create shared EventStore FIRST
         // This same instance is used by both ConsensusValidator and ConsensusEngine.dag_manager
         // to ensure three-layer storage works correctly (Layer3 fallback)
@@ -126,26 +127,26 @@ impl ConsensusValidator {
         let event_store: Arc<dyn EventStoreBackend> = Arc::new(EventStore::new());
         let cf_store: Arc<dyn CFStoreBackend> = Arc::new(CFStore::new());
         let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(AnchorStore::new());
-        
+
         // Create consensus engine with shared EventStore
         // Using with_stores() to inject the shared EventStore instance
         let engine = Arc::new(ConsensusEngine::with_stores(
             config.consensus.clone(),
             config.node_info.id.clone(),
             validator_set.clone(),
-            GlobalStateManager::default(),  // Use default state manager
-            Arc::clone(&event_store),        // Share the same EventStore!
+            GlobalStateManager::default(), // Use default state manager
+            Arc::clone(&event_store),      // Share the same EventStore!
         ));
-        
+
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
-        
+
         Self {
             config,
             engine,
             validator_set: Arc::new(RwLock::new(validator_set)),
             tee_verifier,
-            event_store,  // Use the shared instance
+            event_store, // Use the shared instance
             cf_store,
             anchor_store,
             message_tx: msg_tx,
@@ -155,9 +156,9 @@ impl ConsensusValidator {
             running: Arc::new(RwLock::new(false)),
         }
     }
-    
+
     /// Create with a persistent state manager for Merkle tree persistence
-    /// 
+    ///
     /// Note: This creates a shared EventStore instance that is used by both
     /// ConsensusValidator and ConsensusEngine.dag_manager, ensuring the three-layer
     /// storage design works correctly (Layer3 fallback to EventStore).
@@ -167,11 +168,11 @@ impl ConsensusValidator {
     ) -> Self {
         let (msg_tx, msg_rx) = mpsc::channel(config.message_buffer_size);
         let (finalization_tx, _) = broadcast::channel(100);
-        
+
         let mut validator_set = ValidatorSet::new();
         let validator_info = ValidatorInfo::new(config.node_info.clone(), config.is_leader);
         validator_set.add_validator(validator_info);
-        
+
         // CRITICAL: Create shared EventStore FIRST
         // This same instance is used by both ConsensusValidator and ConsensusEngine.dag_manager
         // to ensure three-layer storage works correctly (Layer3 fallback)
@@ -179,25 +180,25 @@ impl ConsensusValidator {
         let event_store: Arc<dyn EventStoreBackend> = Arc::new(EventStore::new());
         let cf_store: Arc<dyn CFStoreBackend> = Arc::new(CFStore::new());
         let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(AnchorStore::new());
-        
+
         // Create consensus engine with shared EventStore
         let engine = Arc::new(ConsensusEngine::with_stores(
             config.consensus.clone(),
             config.node_info.id.clone(),
             validator_set.clone(),
             state_manager,
-            Arc::clone(&event_store),  // Share the same EventStore!
+            Arc::clone(&event_store), // Share the same EventStore!
         ));
-        
+
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
-        
+
         Self {
             config,
             engine,
             validator_set: Arc::new(RwLock::new(validator_set)),
             tee_verifier,
-            event_store,  // Use the shared instance
+            event_store, // Use the shared instance
             cf_store,
             anchor_store,
             message_tx: msg_tx,
@@ -207,12 +208,12 @@ impl ConsensusValidator {
             running: Arc::new(RwLock::new(false)),
         }
     }
-    
+
     /// Create with a custom EventStoreBackend (for RocksDB persistence)
-    /// 
+    ///
     /// This constructor allows injecting any EventStoreBackend implementation,
     /// enabling full persistence with RocksDB.
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let db = Arc::new(SetuDB::open_default(&db_path)?);
@@ -226,26 +227,26 @@ impl ConsensusValidator {
     ) -> Self {
         let (msg_tx, msg_rx) = mpsc::channel(config.message_buffer_size);
         let (finalization_tx, _) = broadcast::channel(100);
-        
+
         let mut validator_set = ValidatorSet::new();
         let validator_info = ValidatorInfo::new(config.node_info.clone(), config.is_leader);
         validator_set.add_validator(validator_info);
-        
+
         let cf_store: Arc<dyn CFStoreBackend> = Arc::new(CFStore::new());
         let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(AnchorStore::new());
-        
+
         // Create consensus engine with the provided EventStore backend
         let engine = Arc::new(ConsensusEngine::with_stores(
             config.consensus.clone(),
             config.node_info.id.clone(),
             validator_set.clone(),
             state_manager,
-            Arc::clone(&event_store),  // Share the same EventStore!
+            Arc::clone(&event_store), // Share the same EventStore!
         ));
-        
+
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
-        
+
         Self {
             config,
             engine,
@@ -261,26 +262,26 @@ impl ConsensusValidator {
             running: Arc::new(RwLock::new(false)),
         }
     }
-    
+
     /// Create with all custom backends for full RocksDB persistence
-    /// 
+    ///
     /// This constructor allows injecting all store backends, enabling complete
     /// persistence with RocksDB for events, consensus frames, anchors, and
     /// Merkle tree nodes (via GlobalStateManager).
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// use setu_storage::{SetuDB, RocksDBEventStore, RocksDBCFStore, RocksDBAnchorStore, RocksDBMerkleStore};
     /// use setu_storage::subnet_state::GlobalStateManager;
     /// use setu_merkle::MerkleStore;
-    /// 
+    ///
     /// let db = Arc::new(SetuDB::open_default(&db_path)?);
     /// let event_store: Arc<dyn EventStoreBackend> = Arc::new(RocksDBEventStore::from_shared(db.clone()));
     /// let cf_store: Arc<dyn CFStoreBackend> = Arc::new(RocksDBCFStore::from_shared(db.clone()));
     /// let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(RocksDBAnchorStore::from_shared(db.clone()));
     /// let merkle_store: Arc<dyn MerkleStore> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
     /// let state_manager = GlobalStateManager::with_store(merkle_store);
-    /// 
+    ///
     /// let validator = ConsensusValidator::with_all_backends(
     ///     config,
     ///     state_manager,
@@ -298,23 +299,23 @@ impl ConsensusValidator {
     ) -> Self {
         let (msg_tx, msg_rx) = mpsc::channel(config.message_buffer_size);
         let (finalization_tx, _) = broadcast::channel(100);
-        
+
         let mut validator_set = ValidatorSet::new();
         let validator_info = ValidatorInfo::new(config.node_info.clone(), config.is_leader);
         validator_set.add_validator(validator_info);
-        
+
         // Create consensus engine with the provided EventStore backend
         let engine = Arc::new(ConsensusEngine::with_stores(
             config.consensus.clone(),
             config.node_info.id.clone(),
             validator_set.clone(),
             state_manager,
-            Arc::clone(&event_store),  // Share the same EventStore!
+            Arc::clone(&event_store), // Share the same EventStore!
         ));
-        
+
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
-        
+
         Self {
             config,
             engine,
@@ -330,7 +331,7 @@ impl ConsensusValidator {
             running: Arc::new(RwLock::new(false)),
         }
     }
-    
+
     /// Set the network broadcaster for P2P message delivery
     ///
     /// This should be called after the network layer is initialized.
@@ -339,12 +340,12 @@ impl ConsensusValidator {
         self.engine.set_broadcaster(broadcaster).await;
         info!("Consensus broadcaster configured for validator");
     }
-    
+
     /// Check if a broadcaster is configured
     pub async fn has_broadcaster(&self) -> bool {
         self.engine.has_broadcaster().await
     }
-    
+
     /// Start the network event handler using MessageRouter
     ///
     /// This creates a MessageRouter that consumes NetworkEvents from the network
@@ -365,79 +366,82 @@ impl ConsensusValidator {
             self.event_store.clone(),
             self.anchor_store.clone(),
         ));
-        
+
         info!(
             validator_id = %self.config.node_info.id,
             "Starting network event handler with MessageRouter (events persist on CF finalization)"
         );
-        
+
         router.start(event_rx)
     }
-    
+
     /// Get the underlying consensus engine (for advanced use cases)
     pub fn engine(&self) -> Arc<ConsensusEngine> {
         self.engine.clone()
     }
-    
+
     /// Get the event store (for queries of finalized events)
     pub fn event_store(&self) -> Arc<dyn EventStoreBackend> {
         Arc::clone(&self.event_store)
     }
-    
+
     /// Get the anchor store (for queries of finalized anchors)
     pub fn anchor_store(&self) -> Arc<dyn AnchorStoreBackend> {
         Arc::clone(&self.anchor_store)
     }
-    
+
     /// Recover state from persistent storage after restart
-    /// 
+    ///
     /// This method should be called after ConsensusValidator is created and
     /// before starting the network event handler. It restores:
-    /// 
+    ///
     /// 1. DagManager's RecentCache - pre-warms with recent finalized events
     /// 2. AnchorBuilder state - restores chain root, depth, count
     /// 3. VLC state - restores logical time from latest anchor
-    /// 
+    ///
     /// # Returns
     /// - `Ok(())` if recovery succeeded or no data to recover
     /// - `Err(...)` if critical failure occurred
-    /// 
+    ///
     /// # Notes
     /// - Safe to call even with empty storage (fresh start)
     /// - Idempotent - can be called multiple times safely
     pub async fn recover_from_storage(&self) -> SetuResult<()> {
         info!("Starting recovery from storage...");
-        
+
         // 1. Load recent anchors for cache warmup
         let recent_anchors = self.anchor_store.get_recent_anchors(10).await;
         if recent_anchors.is_empty() {
             info!("No anchors found in storage, starting fresh");
             return Ok(());
         }
-        
+
         info!("Found {} recent anchors for recovery", recent_anchors.len());
-        
+
         // 2. Warm up DagManager's RecentCache with finalized event metadata
-        let warmup_stats = self.engine.dag_manager()
-            .warmup_from_anchors(&recent_anchors).await;
+        let warmup_stats = self
+            .engine
+            .dag_manager()
+            .warmup_from_anchors(&recent_anchors)
+            .await;
         info!(
             "Cache warmup complete: {} events loaded (took {}ms)",
-            warmup_stats.events_loaded,
-            warmup_stats.duration_ms
+            warmup_stats.events_loaded, warmup_stats.duration_ms
         );
-        
+
         // 3. Restore AnchorBuilder state (chain root, depth, count)
-        if let Some((chain_root, depth, count, vlc_time)) = 
-            self.anchor_store.get_recovery_state().await 
+        if let Some((chain_root, depth, count, vlc_time)) =
+            self.anchor_store.get_recovery_state().await
         {
             let mut cm = self.engine.consensus_manager().write().await;
-            cm.anchor_builder_mut().restore_state(chain_root, depth, count, vlc_time);
+            cm.anchor_builder_mut()
+                .restore_state(chain_root, depth, count, vlc_time);
             info!(
                 "AnchorBuilder restored: depth={}, anchor_count={}, vlc_time={}",
                 depth, count, vlc_time
             );
         }
-        
+
         // 4. Restore VLC state from latest anchor
         if let Some(latest_anchor) = self.anchor_store.get_latest().await {
             let mut vlc = self.engine.vlc().write().await;
@@ -447,7 +451,7 @@ impl ConsensusValidator {
                 latest_anchor.vlc_snapshot.logical_time
             );
         }
-        
+
         info!("Recovery from storage completed successfully");
         Ok(())
     }
@@ -455,16 +459,16 @@ impl ConsensusValidator {
     // =========================================================================
     // Core Operations
     // =========================================================================
-    
+
     /// Submit an event from a solver (after TEE execution)
-    /// 
+    ///
     /// This is the main entry point for solver events:
     /// 1. Verify TEE attestation (via execution result)
     /// 2. Add to DAG
     /// 3. Update VLC
     /// 4. Try to create CF if we're the leader
     /// 5. Broadcast event to other validators
-    /// 
+    ///
     /// Note: Events are NOT persisted here. They stay in DAG memory until CF is finalized.
     /// Persistence happens in receive_vote() when quorum is reached.
     pub async fn submit_event(&self, event: Event) -> SetuResult<EventId> {
@@ -473,39 +477,40 @@ impl ConsensusValidator {
             creator = %event.creator,
             "Submitting event to consensus"
         );
-        
+
         // Step 0: Verify event ID matches content (anti-tampering)
         if !event.verify_id() {
-            return Err(SetuError::InvalidData(
-                format!("Event ID verification failed - possible tampering: {}", event.id)
-            ));
+            return Err(SetuError::InvalidData(format!(
+                "Event ID verification failed - possible tampering: {}",
+                event.id
+            )));
         }
-        
+
         // Step 1: Verify execution result is present and successful
         // TEE attestation verification is done by the TeeVerifier when enabled
         if let Some(ref exec_result) = event.execution_result {
             if !exec_result.success {
                 return Err(SetuError::InvalidData(
-                    "Event execution result is not successful".to_string()
+                    "Event execution result is not successful".to_string(),
                 ));
             }
         }
-        
+
         // Step 2: Add event to DAG (this also updates VLC and broadcasts)
         // Note: engine.add_event handles network broadcasting if a broadcaster is configured
         // Event stays in DAG memory until CF is finalized
         let event_id = self.engine.add_event(event.clone()).await?;
-        
+
         info!(
             event_id = %event_id,
             "Event added to DAG (pending finalization)"
         );
-        
+
         Ok(event_id)
     }
-    
+
     /// Receive an event from another validator
-    /// 
+    ///
     /// Note: Events are NOT persisted here. They stay in DAG memory until CF is finalized.
     /// Persistence happens in receive_vote() when quorum is reached.
     pub async fn receive_event(&self, event: Event) -> SetuResult<EventId> {
@@ -514,16 +519,16 @@ impl ConsensusValidator {
             from = %event.creator,
             "Receiving event from network"
         );
-        
+
         // Use the dedicated network receive method (no re-broadcast)
         // Event stays in DAG memory until CF is finalized
         let event_id = self.engine.receive_event_from_network(event).await?;
-        
+
         Ok(event_id)
     }
-    
+
     /// Receive a ConsensusFrame proposal from the leader
-    /// 
+    ///
     /// This processes the CF, votes for it, and checks for finalization.
     /// If our vote causes finalization, persists the anchor and events.
     pub async fn receive_cf(&self, cf: ConsensusFrame) -> SetuResult<(bool, Option<Anchor>)> {
@@ -532,11 +537,11 @@ impl ConsensusValidator {
             proposer = %cf.proposer,
             "Receiving CF proposal"
         );
-        
+
         // Verify, process, and vote for the CF
         // Returns (finalized, anchor) if our vote causes finalization
         let (finalized, anchor) = self.engine.receive_cf(cf).await?;
-        
+
         if finalized {
             if let Some(ref a) = anchor {
                 info!(
@@ -553,12 +558,12 @@ impl ConsensusValidator {
                 }
             }
         }
-        
+
         Ok((finalized, anchor))
     }
-    
+
     /// Receive a vote from another validator
-    /// 
+    ///
     /// When a CF is finalized (quorum reached), this method:
     /// 1. Persists the finalized Anchor
     /// 2. Batch-persists all Events included in the CF
@@ -569,9 +574,9 @@ impl ConsensusValidator {
             approve = vote.approve,
             "Receiving vote"
         );
-        
+
         let (finalized, anchor) = self.engine.receive_vote(vote).await?;
-        
+
         if finalized {
             if let Some(ref a) = anchor {
                 info!(
@@ -588,75 +593,75 @@ impl ConsensusValidator {
                 }
             }
         }
-        
+
         Ok((finalized, anchor))
     }
-    
+
     // =========================================================================
     // Leader Election
     // =========================================================================
-    
+
     /// Check if this validator is the current leader
     pub async fn is_leader(&self) -> bool {
         self.engine.is_current_leader().await
     }
-    
+
     /// Get the current round number
     pub async fn current_round(&self) -> Round {
         self.engine.current_round().await
     }
-    
+
     /// Get the leader for a specific round
     pub async fn get_leader_for_round(&self, round: Round) -> Option<String> {
         self.engine.get_valid_proposer(round).await
     }
-    
+
     /// Advance to the next round (called after CF finalization)
     pub async fn advance_round(&self) -> Round {
         self.engine.advance_round().await
     }
-    
+
     // =========================================================================
     // Validator Set Management
     // =========================================================================
-    
+
     /// Add a peer validator
     pub async fn add_validator(&self, info: ValidatorInfo) {
         let mut vs = self.validator_set.write().await;
         vs.add_validator(info.clone());
-        
+
         // Also register in TEE verifier if they have a public key
         // (This would be extended in a real implementation)
-        
+
         info!(
             validator_id = %info.node.id,
             "Added validator to consensus set"
         );
     }
-    
+
     /// Remove a validator
     pub async fn remove_validator(&self, validator_id: &str) {
         let mut vs = self.validator_set.write().await;
         vs.remove_validator(validator_id);
-        
+
         info!(
             validator_id = %validator_id,
             "Removed validator from consensus set"
         );
     }
-    
+
     /// Get validator count
     pub async fn validator_count(&self) -> usize {
         let vs = self.validator_set.read().await;
         vs.all_validators().len()
     }
-    
+
     // =========================================================================
     // TEE Verification
     // =========================================================================
-    
+
     /// Verify TEE attestation for an event
-    /// 
+    ///
     /// Uses the TeeVerifier to verify the event's execution result and attestation.
     #[allow(dead_code)]
     fn verify_tee_attestation(&self, event: &Event) -> SetuResult<()> {
@@ -666,92 +671,93 @@ impl ConsensusValidator {
                 // TEE verification not required for this event type (e.g., ROOT subnet)
                 Ok(())
             }
-            VerificationResult::Failed(err) => {
-                Err(SetuError::InvalidData(format!("TEE attestation invalid: {}", err)))
-            }
+            VerificationResult::Failed(err) => Err(SetuError::InvalidData(format!(
+                "TEE attestation invalid: {}",
+                err
+            ))),
         }
     }
-    
+
     // =========================================================================
     // State Access
     // =========================================================================
-    
+
     /// Get DAG statistics
     pub async fn dag_stats(&self) -> ConsensusDagStats {
         self.engine.get_dag_stats().await
     }
-    
+
     /// Get current VLC snapshot (read-only)
     pub async fn vlc_snapshot(&self) -> setu_vlc::VLCSnapshot {
         self.engine.get_vlc_snapshot().await
     }
-    
+
     /// Allocate a logical time using lock-free atomic counter (FAST PATH)
-    /// 
+    ///
     /// This is the preferred method for high-performance local event creation.
     /// It uses an atomic counter instead of acquiring the VLC write lock,
     /// providing O(1) performance even under high concurrency.
-    /// 
+    ///
     /// Use this for `get_vlc_time()` in submit_transfer path.
     #[inline]
     pub fn allocate_logical_time(&self) -> u64 {
         self.engine.allocate_logical_time()
     }
-    
+
     /// Atomically increment VLC and return the new snapshot
-    /// 
+    ///
     /// Use this when assigning VLC to new events to ensure uniqueness.
-    /// 
+    ///
     /// NOTE: For high-performance scenarios where only logical_time is needed,
     /// prefer `allocate_logical_time()` which is lock-free.
     pub async fn tick_and_get_vlc(&self) -> setu_vlc::VLCSnapshot {
         self.engine.tick_and_get_vlc().await
     }
-    
+
     /// Get current DAG tips
     pub async fn get_tips(&self) -> Vec<EventId> {
         self.engine.get_tips().await
     }
-    
+
     /// Get anchor count
     pub async fn anchor_count(&self) -> usize {
         self.engine.get_anchor_count().await
     }
-    
+
     /// Get global state root
     pub async fn global_state_root(&self) -> [u8; 32] {
         self.engine.get_global_state_root().await
     }
-    
+
     /// Get subnet state root
     pub async fn subnet_state_root(&self, subnet_id: &SubnetId) -> Option<[u8; 32]> {
         self.engine.get_subnet_state_root(subnet_id).await
     }
-    
+
     /// Mark an anchor as persisted (for safe GC)
     pub async fn mark_anchor_persisted(&self, anchor_id: &str) {
         self.engine.mark_anchor_persisted(anchor_id).await;
     }
-    
+
     // =========================================================================
     // Message Handling
     // =========================================================================
-    
+
     /// Get a sender for consensus messages (for network layer)
     pub fn message_sender(&self) -> mpsc::Sender<ConsensusMessage> {
         self.message_tx.clone()
     }
-    
+
     /// Subscribe to CF finalization notifications
     pub fn subscribe_finalization(&self) -> broadcast::Receiver<ConsensusFrame> {
         self.finalization_tx.subscribe()
     }
-    
+
     /// Get the local validator ID
     pub fn validator_id(&self) -> &str {
         self.engine.local_validator_id()
     }
-    
+
     /// Get configuration
     pub fn config(&self) -> &ConsensusValidatorConfig {
         &self.config
@@ -777,7 +783,7 @@ impl ConsensusValidator {
     pub async fn stats(&self) -> ConsensusValidatorStats {
         let dag_stats = self.dag_stats().await;
         let vlc = self.vlc_snapshot().await;
-        
+
         ConsensusValidatorStats {
             validator_id: self.validator_id().to_string(),
             is_leader: self.is_leader().await,
@@ -793,18 +799,18 @@ impl ConsensusValidator {
 }
 
 /// Implement FinalizationPersister for ConsensusValidator
-/// 
+///
 /// This provides the shared persist_finalized_anchor() implementation
 #[async_trait::async_trait]
 impl FinalizationPersister for ConsensusValidator {
     fn engine(&self) -> &Arc<ConsensusEngine> {
         &self.engine
     }
-    
+
     fn event_store(&self) -> &Arc<dyn EventStoreBackend> {
         &self.event_store
     }
-    
+
     fn anchor_store(&self) -> &Arc<dyn AnchorStoreBackend> {
         &self.anchor_store
     }
@@ -823,13 +829,13 @@ impl ConsensusMessageHandler {
             running: Arc::new(RwLock::new(false)),
         }
     }
-    
+
     /// Start the message handling loop
     pub async fn start(&self, mut message_rx: mpsc::Receiver<ConsensusMessage>) {
         *self.running.write().await = true;
-        
+
         info!("Starting consensus message handler");
-        
+
         while *self.running.read().await {
             tokio::select! {
                 Some(msg) = message_rx.recv() => {
@@ -843,10 +849,10 @@ impl ConsensusMessageHandler {
                 }
             }
         }
-        
+
         info!("Consensus message handler stopped");
     }
-    
+
     async fn handle_message(&self, msg: ConsensusMessage) {
         match msg {
             ConsensusMessage::NewEvent(event) => {
@@ -897,7 +903,7 @@ impl ConsensusMessageHandler {
             }
         }
     }
-    
+
     /// Stop the handler
     pub async fn stop(&self) {
         *self.running.write().await = false;
@@ -927,7 +933,7 @@ mod tests {
             message_buffer_size: 100,
         }
     }
-    
+
     fn create_test_event(creator: &str) -> Event {
         Event::genesis(
             creator.to_string(),
@@ -943,7 +949,7 @@ mod tests {
     async fn test_consensus_validator_creation() {
         let config = create_test_config();
         let validator = ConsensusValidator::new(config);
-        
+
         assert_eq!(validator.validator_id(), "test-validator");
         assert!(validator.is_leader().await);
     }
@@ -952,12 +958,12 @@ mod tests {
     async fn test_submit_event() {
         let config = create_test_config();
         let validator = ConsensusValidator::new(config);
-        
+
         let event = create_test_event("solver-1");
         let event_id = validator.submit_event(event).await.unwrap();
-        
+
         assert!(!event_id.is_empty());
-        
+
         let stats = validator.dag_stats().await;
         assert_eq!(stats.node_count, 1);
     }
@@ -966,9 +972,9 @@ mod tests {
     async fn test_round_advancement() {
         let config = create_test_config();
         let validator = ConsensusValidator::new(config);
-        
+
         assert_eq!(validator.current_round().await, 0);
-        
+
         let new_round = validator.advance_round().await;
         assert_eq!(new_round, 1);
     }
@@ -977,48 +983,51 @@ mod tests {
     async fn test_stats() {
         let config = create_test_config();
         let validator = ConsensusValidator::new(config);
-        
+
         let stats = validator.stats().await;
         assert_eq!(stats.validator_id, "test-validator");
         assert!(stats.is_leader);
         assert_eq!(stats.current_round, 0);
     }
-    
+
     #[tokio::test]
     async fn test_network_event_handler_integration() {
         use crate::protocol::NetworkEvent;
         use tokio::sync::mpsc;
-        
+
         let config = create_test_config();
         let validator = ConsensusValidator::new(config);
-        
+
         // Create event channel
         let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(100);
-        
+
         // Start the network event handler
         let handle = validator.start_network_event_handler(event_rx);
-        
+
         // Send a test event through the channel
         let test_event = create_test_event("remote-solver");
-        event_tx.send(NetworkEvent::EventReceived {
-            peer_id: "peer-1".to_string(),
-            event: test_event.clone(),
-        }).await.unwrap();
-        
+        event_tx
+            .send(NetworkEvent::EventReceived {
+                peer_id: "peer-1".to_string(),
+                event: test_event.clone(),
+            })
+            .await
+            .unwrap();
+
         // Give some time for the event to be processed
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        
+
         // Verify the event was added to DAG
         let stats = validator.dag_stats().await;
-        assert_eq!(stats.node_count, 1, "Event should be added to DAG via network handler");
-        
+        assert_eq!(
+            stats.node_count, 1,
+            "Event should be added to DAG via network handler"
+        );
+
         // Clean up - drop the sender to close the channel
         drop(event_tx);
-        
+
         // Wait for the handler to finish
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_millis(100),
-            handle
-        ).await;
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(100), handle).await;
     }
 }

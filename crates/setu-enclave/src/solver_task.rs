@@ -8,7 +8,6 @@
 
 // Re-export all types from setu_types::task for backward compatibility
 pub use setu_types::task::{
-    SolverTask, ResolvedInputs, OperationType, ResolvedObject,
-    ReadSetEntry, MerkleProof,
-    GasBudget, GasUsage,
+    GasBudget, GasUsage, MerkleProof, OperationType, ReadSetEntry, ResolvedInputs, ResolvedObject,
+    SolverTask,
 };

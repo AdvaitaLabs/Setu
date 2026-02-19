@@ -24,7 +24,7 @@
 //! ```
 
 use setu_types::event::{Event, ExecutionResult, StateChange};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 /// TEE attestation attached to an execution result
@@ -72,7 +72,7 @@ impl TeeAttestation {
             timestamp: current_timestamp(),
         }
     }
-    
+
     /// Compute commitment for a set of state changes (write-set)
     pub fn compute_write_set_commitment(changes: &[StateChange]) -> [u8; 32] {
         let mut hasher = Sha256::new();
@@ -137,7 +137,9 @@ impl std::fmt::Display for VerificationError {
         match self {
             VerificationError::MissingAttestation => write!(f, "Missing TEE attestation"),
             VerificationError::InvalidSignature => write!(f, "Invalid attestation signature"),
-            VerificationError::QuoteVerificationFailed(msg) => write!(f, "Quote verification failed: {}", msg),
+            VerificationError::QuoteVerificationFailed(msg) => {
+                write!(f, "Quote verification failed: {}", msg)
+            }
             VerificationError::ReadSetMismatch => write!(f, "Read-set commitment mismatch"),
             VerificationError::WriteSetMismatch => write!(f, "Write-set commitment mismatch"),
             VerificationError::StateRootMismatch => write!(f, "Post-state root mismatch"),
@@ -168,15 +170,15 @@ impl SolverRegistry {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     pub fn register(&mut self, info: SolverInfo) {
         self.solvers.insert(info.solver_id.clone(), info);
     }
-    
+
     pub fn get(&self, solver_id: &str) -> Option<&SolverInfo> {
         self.solvers.get(solver_id)
     }
-    
+
     pub fn is_registered(&self, solver_id: &str) -> bool {
         self.solvers.contains_key(solver_id)
     }
@@ -203,7 +205,7 @@ impl TeeVerifier {
             skip_verification: false,
         }
     }
-    
+
     /// Create a permissive verifier for testing
     pub fn permissive() -> Self {
         Self {
@@ -212,38 +214,38 @@ impl TeeVerifier {
             skip_verification: true,
         }
     }
-    
+
     /// Verify an event's execution result
     ///
     /// For ROOT subnet events (validator-executed), returns NotApplicable.
     /// For App subnet events, verifies the TEE attestation.
     pub fn verify_event(&self, event: &Event) -> VerificationResult {
         let subnet_id = event.get_subnet_id();
-        
+
         // ROOT subnet events are executed by validators, no TEE needed
         if subnet_id.is_root() || event.is_validator_executed() {
             return VerificationResult::NotApplicable;
         }
-        
+
         // App subnet events require TEE attestation
         // For now, we use a simplified verification
         if self.skip_verification {
             return VerificationResult::Verified;
         }
-        
+
         // Check if execution result exists
         let result = match &event.execution_result {
             Some(r) => r,
             None => return VerificationResult::Failed(VerificationError::MissingAttestation),
         };
-        
+
         // Verify execution was successful
         if !result.success {
             // Failed executions don't need attestation verification
             // (they won't have state changes applied)
             return VerificationResult::Verified;
         }
-        
+
         // In a full implementation, we would:
         // 1. Extract TeeAttestation from the event
         // 2. Verify the attestation quote
@@ -251,11 +253,11 @@ impl TeeVerifier {
         // 4. Check solver is registered
         // 5. Verify enclave measurement
         // 6. Verify write-set commitment matches state_changes
-        
+
         // For now, accept if execution result exists
         VerificationResult::Verified
     }
-    
+
     /// Verify a batch of events
     pub fn verify_events(&self, events: &[Event]) -> Vec<(String, VerificationResult)> {
         events
@@ -263,7 +265,7 @@ impl TeeVerifier {
             .map(|e| (e.id.clone(), self.verify_event(e)))
             .collect()
     }
-    
+
     /// Verify attestation against an execution result
     pub fn verify_attestation(
         &self,
@@ -273,43 +275,44 @@ impl TeeVerifier {
         if self.skip_verification {
             return VerificationResult::Verified;
         }
-        
+
         // Check solver is registered
         if !self.solver_registry.is_registered(&attestation.solver_id) {
-            return VerificationResult::Failed(
-                VerificationError::UnknownSolver(attestation.solver_id.clone())
-            );
+            return VerificationResult::Failed(VerificationError::UnknownSolver(
+                attestation.solver_id.clone(),
+            ));
         }
-        
+
         // Check attestation age
         let now = current_timestamp();
         if now > attestation.timestamp + self.max_attestation_age_ms {
             return VerificationResult::Failed(VerificationError::ExpiredAttestation);
         }
-        
+
         // Verify write-set commitment
-        let expected_commitment = TeeAttestation::compute_write_set_commitment(&result.state_changes);
+        let expected_commitment =
+            TeeAttestation::compute_write_set_commitment(&result.state_changes);
         if expected_commitment != attestation.write_set_commitment {
             return VerificationResult::Failed(VerificationError::WriteSetMismatch);
         }
-        
+
         // Check enclave measurement
         let solver_info = self.solver_registry.get(&attestation.solver_id).unwrap();
         if attestation.measurement != solver_info.expected_measurement {
             return VerificationResult::Failed(VerificationError::MeasurementMismatch);
         }
-        
+
         // In production: verify quote and signature
         // For now, we skip these checks
-        
+
         VerificationResult::Verified
     }
-    
+
     /// Get the solver registry
     pub fn solver_registry(&self) -> &SolverRegistry {
         &self.solver_registry
     }
-    
+
     /// Get mutable access to solver registry
     pub fn solver_registry_mut(&mut self) -> &mut SolverRegistry {
         &mut self.solver_registry
@@ -327,9 +330,9 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_types::{EventType, SubnetId};
     use setu_types::event::VLCSnapshot;
-    
+    use setu_types::{EventType, SubnetId};
+
     fn create_app_event() -> Event {
         let app_subnet = SubnetId::from_str_id("test-app");
         let mut event = Event::new(
@@ -342,17 +345,15 @@ mod tests {
         event.execution_result = Some(ExecutionResult {
             success: true,
             message: None,
-            state_changes: vec![
-                StateChange {
-                    key: "balance:alice".to_string(),
-                    old_value: Some(vec![100]),
-                    new_value: Some(vec![90]),
-                },
-            ],
+            state_changes: vec![StateChange {
+                key: "balance:alice".to_string(),
+                old_value: Some(vec![100]),
+                new_value: Some(vec![90]),
+            }],
         });
         event
     }
-    
+
     fn create_root_event() -> Event {
         let mut event = Event::new(
             EventType::ValidatorRegister,
@@ -363,62 +364,58 @@ mod tests {
         event = event.with_subnet(SubnetId::ROOT);
         event
     }
-    
+
     #[test]
     fn test_root_events_not_applicable() {
         let verifier = TeeVerifier::new(SolverRegistry::new());
         let event = create_root_event();
-        
+
         match verifier.verify_event(&event) {
             VerificationResult::NotApplicable => {}
             other => panic!("Expected NotApplicable, got {:?}", other),
         }
     }
-    
+
     #[test]
     fn test_app_events_need_verification() {
         // With skip_verification = true
         let verifier = TeeVerifier::permissive();
         let event = create_app_event();
-        
+
         match verifier.verify_event(&event) {
             VerificationResult::Verified => {}
             other => panic!("Expected Verified, got {:?}", other),
         }
     }
-    
+
     #[test]
     fn test_write_set_commitment() {
-        let changes = vec![
-            StateChange {
-                key: "balance:alice".to_string(),
-                old_value: Some(vec![100]),
-                new_value: Some(vec![90]),
-            },
-        ];
-        
+        let changes = vec![StateChange {
+            key: "balance:alice".to_string(),
+            old_value: Some(vec![100]),
+            new_value: Some(vec![90]),
+        }];
+
         let commitment1 = TeeAttestation::compute_write_set_commitment(&changes);
         let commitment2 = TeeAttestation::compute_write_set_commitment(&changes);
-        
+
         assert_eq!(commitment1, commitment2);
-        
+
         // Different changes should produce different commitment
-        let changes2 = vec![
-            StateChange {
-                key: "balance:bob".to_string(),
-                old_value: Some(vec![50]),
-                new_value: Some(vec![60]),
-            },
-        ];
-        
+        let changes2 = vec![StateChange {
+            key: "balance:bob".to_string(),
+            old_value: Some(vec![50]),
+            new_value: Some(vec![60]),
+        }];
+
         let commitment3 = TeeAttestation::compute_write_set_commitment(&changes2);
         assert_ne!(commitment1, commitment3);
     }
-    
+
     #[test]
     fn test_solver_registry() {
         let mut registry = SolverRegistry::new();
-        
+
         registry.register(SolverInfo {
             solver_id: "solver-1".to_string(),
             public_key: vec![1, 2, 3],
@@ -426,7 +423,7 @@ mod tests {
             platform: "SGX".to_string(),
             registered_at: 0,
         });
-        
+
         assert!(registry.is_registered("solver-1"));
         assert!(!registry.is_registered("solver-2"));
     }

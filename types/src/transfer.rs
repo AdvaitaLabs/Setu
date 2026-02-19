@@ -60,38 +60,36 @@ pub struct AssignedVlc {
 pub struct Transfer {
     /// Unique transfer identifier
     pub id: TransferId,
-    
+
     /// Logical sender (owner) of the transfer
     pub from: String,
-    
+
     /// Logical recipient; may be empty for some system transfers
     pub to: String,
-    
+
     /// Transfer amount in smallest unit (e.g., 1 Flux = 10^18)
     pub amount: u64,
-    
+
     /// Application-level classification of this transfer
     pub transfer_type: TransferType,
-    
+
     /// Resources affected by this transfer (for conflict detection)
     pub resources: Vec<ResourceKey>,
-    
+
     /// Power/work score used for tie-breaks in ordering
     pub power: u64,
-    
+
     // ========== Routing Hints ==========
-    
     /// Optional: Preferred solver ID for manual routing
     pub preferred_solver: Option<String>,
-    
+
     /// Optional: Shard ID for shard-based routing
     pub shard_id: Option<String>,
-    
+
     /// Optional: Subnet ID for subnet-based routing
     pub subnet_id: Option<String>,
-    
+
     // ========== VLC Fields ==========
-    
     /// VLC assigned by Validator when receiving the transfer.
     /// Solver should use this VLC when creating Event, NOT generate its own.
     pub assigned_vlc: Option<AssignedVlc>,
@@ -99,7 +97,12 @@ pub struct Transfer {
 
 impl Transfer {
     /// Create a new transfer with minimal required fields
-    pub fn new(id: impl Into<String>, from: impl Into<String>, to: impl Into<String>, amount: u64) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        from: impl Into<String>,
+        to: impl Into<String>,
+        amount: u64,
+    ) -> Self {
         Self {
             id: id.into(),
             from: from.into(),
@@ -114,61 +117,61 @@ impl Transfer {
             assigned_vlc: None,
         }
     }
-    
+
     /// Set transfer type
     pub fn with_type(mut self, transfer_type: TransferType) -> Self {
         self.transfer_type = transfer_type;
         self
     }
-    
+
     /// Set resources for conflict detection
     pub fn with_resources(mut self, resources: Vec<ResourceKey>) -> Self {
         self.resources = resources;
         self
     }
-    
+
     /// Set power score
     pub fn with_power(mut self, power: u64) -> Self {
         self.power = power;
         self
     }
-    
+
     /// Set preferred solver
     pub fn with_preferred_solver(mut self, solver_id: impl Into<String>) -> Self {
         self.preferred_solver = Some(solver_id.into());
         self
     }
-    
+
     /// Set preferred solver (Option variant)
     pub fn with_preferred_solver_opt(mut self, solver_id: Option<String>) -> Self {
         self.preferred_solver = solver_id;
         self
     }
-    
+
     /// Set shard ID
     pub fn with_shard_id(mut self, shard_id: Option<String>) -> Self {
         self.shard_id = shard_id;
         self
     }
-    
+
     /// Set subnet ID
     pub fn with_subnet(mut self, subnet_id: impl Into<String>) -> Self {
         self.subnet_id = Some(subnet_id.into());
         self
     }
-    
+
     /// Set subnet ID (Option variant)
     pub fn with_subnet_id(mut self, subnet_id: Option<String>) -> Self {
         self.subnet_id = subnet_id;
         self
     }
-    
+
     /// Set assigned VLC from validator
     pub fn with_assigned_vlc(mut self, vlc: AssignedVlc) -> Self {
         self.assigned_vlc = Some(vlc);
         self
     }
-    
+
     /// Get affected account resources
     pub fn affected_accounts(&self) -> Vec<String> {
         vec![
@@ -199,7 +202,7 @@ impl Default for Transfer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_transfer_creation() {
         let transfer = Transfer::new("tx-1", "alice", "bob", 1000);
@@ -209,19 +212,19 @@ mod tests {
         assert_eq!(transfer.amount, 1000);
         assert_eq!(transfer.transfer_type, TransferType::FluxTransfer);
     }
-    
+
     #[test]
     fn test_transfer_builder() {
         let transfer = Transfer::new("tx-2", "alice", "bob", 500)
             .with_type(TransferType::PowerConsume)
             .with_power(10)
             .with_subnet("subnet-1");
-        
+
         assert_eq!(transfer.transfer_type, TransferType::PowerConsume);
         assert_eq!(transfer.power, 10);
         assert_eq!(transfer.subnet_id, Some("subnet-1".to_string()));
     }
-    
+
     #[test]
     fn test_affected_accounts() {
         let transfer = Transfer::new("tx-1", "alice", "bob", 100);

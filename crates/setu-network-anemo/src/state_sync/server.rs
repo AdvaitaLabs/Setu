@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 // Re-export from setu-protocol
-pub use setu_protocol::{SerializedEvent, SerializedConsensusFrame, SerializedVote};
+pub use setu_protocol::{SerializedConsensusFrame, SerializedEvent, SerializedVote};
 
 /// State Sync RPC trait
 ///
@@ -158,7 +158,11 @@ pub struct Server<S> {
 impl<S> Server<S> {
     /// Create a new server instance
     pub fn new(state: Arc<SyncState>, store: S, config: StateSyncConfig) -> Self {
-        Self { state, store, config }
+        Self {
+            state,
+            store,
+            config,
+        }
     }
 }
 
@@ -175,7 +179,7 @@ where
     ) -> Result<Response<GetEventsResponse>> {
         let req = request.into_body();
         let limit = req.limit.min(self.config.max_events_per_request);
-        
+
         match self.store.get_events_from_seq(req.start_seq, limit).await {
             Ok((events, has_more, highest_seq)) => {
                 tracing::debug!(
@@ -207,7 +211,7 @@ where
     ) -> Result<Response<GetConsensusFramesResponse>> {
         let req = request.into_body();
         let limit = req.limit.min(self.config.max_cfs_per_request);
-        
+
         match self.store.get_cfs_from_seq(req.start_seq, limit).await {
             Ok((frames, has_more, highest_seq)) => {
                 tracing::debug!(
@@ -239,7 +243,7 @@ where
     ) -> Result<Response<PushEventsResponse>> {
         let req = request.into_body();
         let event_count = req.events.len();
-        
+
         match self.store.store_events(req.events).await {
             Ok((accepted, rejected)) => {
                 tracing::debug!(
@@ -248,14 +252,14 @@ where
                     accepted,
                     rejected.len()
                 );
-                
+
                 // Update local state if we accepted any events
                 if accepted > 0 {
                     let new_seq = self.store.highest_event_seq().await;
                     let mut local = self.state.local.write().await;
                     local.highest_event_seq = local.highest_event_seq.max(new_seq);
                 }
-                
+
                 Ok(Response::new(PushEventsResponse { accepted, rejected }))
             }
             Err(e) => {
@@ -274,7 +278,7 @@ where
     ) -> Result<Response<PushConsensusFrameResponse>> {
         let req = request.into_body();
         let cf_id = req.frame.id.clone();
-        
+
         match self.store.store_cf(req.frame, req.votes).await {
             Ok((accepted, reason)) => {
                 tracing::debug!(
@@ -282,15 +286,18 @@ where
                     cf_id,
                     accepted
                 );
-                
+
                 // Update local state if accepted
                 if accepted {
                     let new_seq = self.store.highest_finalized_cf_seq().await;
                     let mut local = self.state.local.write().await;
                     local.highest_finalized_cf = local.highest_finalized_cf.max(new_seq);
                 }
-                
-                Ok(Response::new(PushConsensusFrameResponse { accepted, reason }))
+
+                Ok(Response::new(PushConsensusFrameResponse {
+                    accepted,
+                    reason,
+                }))
             }
             Err(e) => {
                 tracing::error!("push_consensus_frame error: {}", e);
@@ -307,7 +314,7 @@ where
         _request: Request<GetSyncStateRequest>,
     ) -> Result<Response<GetSyncStateResponse>> {
         let local = self.state.local.read().await;
-        
+
         let sync_info = PeerSyncInfo {
             highest_event_seq: local.highest_event_seq,
             highest_synced_cf: local.highest_finalized_cf,
@@ -318,7 +325,7 @@ where
                 .unwrap_or_default()
                 .as_millis() as u64,
         };
-        
+
         Ok(Response::new(GetSyncStateResponse { sync_info }))
     }
 }

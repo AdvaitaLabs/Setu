@@ -32,79 +32,76 @@
 //!   - `sync_protocol` - Event/CF synchronization protocol
 //! - `consensus_integration` - ConsensusValidator wrapping ConsensusEngine
 
-mod router_manager;
-mod network;
-pub mod task_preparer;
-mod user_handler;
-pub mod consensus_integration;
 pub mod broadcaster;
+pub mod consensus_integration;
+mod network;
 pub mod network_adapter;
 pub mod persistence;
 pub mod protocol;
+mod router_manager;
+pub mod task_preparer;
+mod user_handler;
 
-pub use router_manager::{RouterManager, RouterError, SolverConnection};
 pub use network::{
-    ValidatorNetworkService, ValidatorRegistrationHandler, NetworkServiceConfig,
-    ValidatorInfo, TransferTracker, SubmitEventRequest, SubmitEventResponse,
-    GetBalanceResponse, GetObjectResponse, current_timestamp_secs, current_timestamp_millis,
+    current_timestamp_millis, current_timestamp_secs, GetBalanceResponse, GetObjectResponse,
+    NetworkServiceConfig, SubmitEventRequest, SubmitEventResponse, TransferTracker, ValidatorInfo,
+    ValidatorNetworkService, ValidatorRegistrationHandler,
 };
-pub use task_preparer::{TaskPreparer, TaskPrepareError};
+pub use router_manager::{RouterError, RouterManager, SolverConnection};
+pub use task_preparer::{TaskPrepareError, TaskPreparer};
 pub use user_handler::ValidatorUserHandler;
 
 // Re-export consensus integration types
 pub use consensus_integration::{
-    ConsensusValidator, ConsensusValidatorConfig, ConsensusValidatorStats,
-    ConsensusMessageHandler,
+    ConsensusMessageHandler, ConsensusValidator, ConsensusValidatorConfig, ConsensusValidatorStats,
 };
 
 // Re-export broadcaster types
 pub use broadcaster::{
-    AnemoConsensusBroadcaster, ConsensusBroadcaster, BroadcastError, BroadcastResult,
-    NoOpBroadcaster, MockBroadcaster,
+    AnemoConsensusBroadcaster, BroadcastError, BroadcastResult, ConsensusBroadcaster,
+    MockBroadcaster, NoOpBroadcaster,
 };
 
 // Re-export network adapter types
 pub use network_adapter::{
-    MessageRouter, NetworkEventHandler, SyncProtocol, SyncStore, InMemorySyncStore,
+    InMemorySyncStore, MessageRouter, NetworkEventHandler, SyncProtocol, SyncStore,
 };
 
 // Re-export protocol types (consensus-specific message definitions)
 pub use protocol::{
-    SetuMessage, MessageType, NetworkEvent, MessageCodec, MessageCodecError,
-    SerializedEvent, SerializedConsensusFrame, SerializedVote,
-    SyncEventsRequest, SyncEventsResponse,
-    SyncConsensusFramesRequest, SyncConsensusFramesResponse,
+    MessageCodec, MessageCodecError, MessageType, NetworkEvent, SerializedConsensusFrame,
+    SerializedEvent, SerializedVote, SetuMessage, SyncConsensusFramesRequest,
+    SyncConsensusFramesResponse, SyncEventsRequest, SyncEventsResponse,
 };
 
 // Re-export consensus types from the consensus crate
 pub use consensus::{
-    ConsensusEngine, ConsensusMessage, ConsensusManager,
-    Dag as ConsensusDag, DagError as ConsensusDagError, DagStats as ConsensusDagStats,
-    ValidatorSet, VLC, AnchorBuilder,
-    TeeVerifier, TeeAttestation, VerificationResult,
+    AnchorBuilder, ConsensusEngine, ConsensusManager, ConsensusMessage, Dag as ConsensusDag,
+    DagError as ConsensusDagError, DagStats as ConsensusDagStats, TeeAttestation, TeeVerifier,
+    ValidatorSet, VerificationResult, VLC,
 };
 
 // Re-export StateProvider types from storage (canonical location)
-pub use setu_storage::{StateProvider, CoinInfo, SimpleMerkleProof, MerkleStateProvider};
+pub use setu_storage::{CoinInfo, MerkleStateProvider, SimpleMerkleProof, StateProvider};
 
 /// Event verification error
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error("Event has no execution result")]
     NoExecutionResult,
-    
+
     #[error("Event execution failed: {0}")]
     ExecutionFailed(String),
-    
+
     #[error("Invalid event creator: {0}")]
     InvalidCreator(String),
-    
+
     #[error("Event timestamp is in the future")]
     FutureTimestamp,
-    
+
     #[error("Missing parent event: {0}")]
     MissingParent(String),
-    
+
     #[error("Invalid VLC snapshot")]
     InvalidVLC,
 }

@@ -35,7 +35,7 @@ pub mod object_type {
     pub const CREDENTIAL: u8 = 2;
     /// Social relation graph object
     pub const RELATION_GRAPH: u8 = 3;
-    
+
     // System objects (stored in ROOT subnet)
     /// Validator information
     pub const VALIDATOR_INFO: u8 = 10;
@@ -90,16 +90,12 @@ impl ObjectStateValue {
             subnet_id,
         }
     }
-    
+
     /// Create a system object (owned by the system)
-    pub fn system_object(
-        version: u64,
-        type_tag: u8,
-        data_hash: HashValue,
-    ) -> Self {
+    pub fn system_object(version: u64, type_tag: u8, data_hash: HashValue) -> Self {
         Self::new([0u8; 32], version, type_tag, data_hash, SubnetId::ROOT)
     }
-    
+
     /// Compute the hash of this state value
     pub fn hash(&self) -> HashValue {
         let mut hasher = Sha256::new();
@@ -113,12 +109,12 @@ impl ObjectStateValue {
         hash.copy_from_slice(&result);
         hash
     }
-    
+
     /// Check if this is a system object
     pub fn is_system_object(&self) -> bool {
         self.type_tag >= object_type::VALIDATOR_INFO
     }
-    
+
     /// Check if this object belongs to ROOT subnet
     pub fn is_root_object(&self) -> bool {
         self.subnet_id.is_root()
@@ -168,12 +164,12 @@ impl SubnetStateRoot {
             last_updated_anchor,
         }
     }
-    
+
     /// Create an empty subnet state root
     pub fn empty(subnet_id: SubnetId) -> Self {
         Self::new(subnet_id, ZERO_HASH, 0, 0)
     }
-    
+
     /// Check if the subnet is empty
     pub fn is_empty(&self) -> bool {
         self.object_count == 0 && self.object_state_root == ZERO_HASH
@@ -201,7 +197,7 @@ impl AnchorMerkleRoots {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Create with initial values
     pub fn with_roots(
         events_root: HashValue,
@@ -215,34 +211,34 @@ impl AnchorMerkleRoots {
             subnet_roots: HashMap::new(),
         }
     }
-    
+
     /// Check if the global state is empty
     pub fn is_empty(&self) -> bool {
         self.global_state_root == ZERO_HASH
     }
-    
+
     /// Get a specific subnet's root
     pub fn get_subnet_root(&self, subnet_id: &SubnetId) -> Option<&HashValue> {
         self.subnet_roots.get(subnet_id)
     }
-    
+
     /// Set a subnet's root
     pub fn set_subnet_root(&mut self, subnet_id: SubnetId, root: HashValue) {
         self.subnet_roots.insert(subnet_id, root);
     }
-    
+
     /// Get ROOT subnet's state root
     pub fn root_subnet_root(&self) -> Option<&HashValue> {
         self.subnet_roots.get(&SubnetId::ROOT)
     }
-    
+
     /// Compute a digest of all Merkle roots for signing
     pub fn digest(&self) -> HashValue {
         let mut hasher = Sha256::new();
         hasher.update(&self.events_root);
         hasher.update(&self.global_state_root);
         hasher.update(&self.anchor_chain_root);
-        
+
         // Include sorted subnet roots for determinism
         let mut subnet_ids: Vec<_> = self.subnet_roots.keys().collect();
         subnet_ids.sort();
@@ -250,7 +246,7 @@ impl AnchorMerkleRoots {
             hasher.update(subnet_id.as_bytes());
             hasher.update(self.subnet_roots.get(subnet_id).unwrap());
         }
-        
+
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
@@ -302,13 +298,9 @@ impl MerkleExecutionResult {
             error_message: None,
         }
     }
-    
+
     /// Create a failed execution result
-    pub fn failure(
-        event_ids: Vec<String>,
-        subnet_id: SubnetId,
-        error: String,
-    ) -> Self {
+    pub fn failure(event_ids: Vec<String>, subnet_id: SubnetId, error: String) -> Self {
         Self {
             event_ids,
             subnet_id,
@@ -320,18 +312,18 @@ impl MerkleExecutionResult {
             error_message: Some(error),
         }
     }
-    
+
     /// Add TEE attestation
     pub fn with_attestation(mut self, attestation: Vec<u8>) -> Self {
         self.tee_attestation = Some(attestation);
         self
     }
-    
+
     /// Check if this is a ROOT subnet execution
     pub fn is_root_execution(&self) -> bool {
         self.subnet_id.is_root()
     }
-    
+
     /// Count the number of state changes
     pub fn change_count(&self) -> usize {
         self.write_set.len()
@@ -379,7 +371,8 @@ impl CrossSubnetLock {
         expiry: u64,
         creator: [u8; 32],
     ) -> Self {
-        let lock_id = Self::compute_lock_id(&source_subnet, &target_subnet, &locked_objects, expiry);
+        let lock_id =
+            Self::compute_lock_id(&source_subnet, &target_subnet, &locked_objects, expiry);
         Self {
             lock_id,
             source_subnet,
@@ -390,7 +383,7 @@ impl CrossSubnetLock {
             creator,
         }
     }
-    
+
     fn compute_lock_id(
         source: &SubnetId,
         target: &SubnetId,
@@ -410,12 +403,12 @@ impl CrossSubnetLock {
         hash.copy_from_slice(&result);
         hash
     }
-    
+
     /// Check if the lock is expired
     pub fn is_expired(&self, current_time: u64) -> bool {
         current_time > self.expiry
     }
-    
+
     /// Check if the lock is active
     pub fn is_active(&self) -> bool {
         self.status == CrossSubnetLockStatus::Active
@@ -425,75 +418,59 @@ impl CrossSubnetLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_object_state_value_hash() {
-        let state = ObjectStateValue::new(
-            [1u8; 32],
-            1,
-            object_type::COIN,
-            [2u8; 32],
-            SubnetId::ROOT,
-        );
-        
+        let state =
+            ObjectStateValue::new([1u8; 32], 1, object_type::COIN, [2u8; 32], SubnetId::ROOT);
+
         let hash = state.hash();
         assert_ne!(hash, ZERO_HASH);
-        
+
         // Same state should produce same hash
         let state2 = state.clone();
         assert_eq!(state.hash(), state2.hash());
-        
+
         // Different version should produce different hash
         let mut state3 = state.clone();
         state3.version = 2;
         assert_ne!(state.hash(), state3.hash());
     }
-    
+
     #[test]
     fn test_anchor_merkle_roots() {
         let mut roots = AnchorMerkleRoots::new();
         assert!(roots.is_empty());
-        
+
         roots.global_state_root = [1u8; 32];
         assert!(!roots.is_empty());
-        
+
         roots.set_subnet_root(SubnetId::ROOT, [2u8; 32]);
         assert_eq!(roots.get_subnet_root(&SubnetId::ROOT), Some(&[2u8; 32]));
-        
+
         let digest = roots.digest();
         assert_ne!(digest, ZERO_HASH);
     }
-    
+
     #[test]
     fn test_subnet_state_root() {
         let root = SubnetStateRoot::empty(SubnetId::ROOT);
         assert!(root.is_empty());
-        
-        let root2 = SubnetStateRoot::new(
-            SubnetId::ROOT,
-            [1u8; 32],
-            10,
-            5,
-        );
+
+        let root2 = SubnetStateRoot::new(SubnetId::ROOT, [1u8; 32], 10, 5);
         assert!(!root2.is_empty());
         assert_eq!(root2.object_count, 10);
     }
-    
+
     #[test]
     fn test_cross_subnet_lock() {
         let source = SubnetId::ROOT;
         let target = SubnetId::from_str_id("app1");
         let objects = vec![[1u8; 32], [2u8; 32]];
         let expiry = 1000;
-        
-        let lock = CrossSubnetLock::new(
-            source,
-            target,
-            objects,
-            expiry,
-            [0u8; 32],
-        );
-        
+
+        let lock = CrossSubnetLock::new(source, target, objects, expiry, [0u8; 32]);
+
         assert!(lock.is_active());
         assert!(!lock.is_expired(500));
         assert!(lock.is_expired(1001));

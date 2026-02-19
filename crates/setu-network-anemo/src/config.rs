@@ -115,11 +115,11 @@ impl Default for QuicConfig {
         Self {
             max_concurrent_bidi_streams: 100,
             max_concurrent_uni_streams: 100,
-            stream_receive_window: 1_250_000,      // 1.25MB
-            receive_window: 0,                      // Unlimited
-            send_window: 10_000_000,                // 10MB
-            max_idle_timeout_ms: 30_000,            // 30 seconds
-            keep_alive_interval_ms: Some(5_000),    // 5 seconds
+            stream_receive_window: 1_250_000,    // 1.25MB
+            receive_window: 0,                   // Unlimited
+            send_window: 10_000_000,             // 10MB
+            max_idle_timeout_ms: 30_000,         // 30 seconds
+            keep_alive_interval_ms: Some(5_000), // 5 seconds
             // Use smaller buffer sizes for better compatibility
             socket_send_buffer_size: Some(2 << 20), // 2MB (was 20MB)
             socket_receive_buffer_size: Some(2 << 20), // 2MB (was 20MB)
@@ -141,12 +141,12 @@ impl Default for ConnectionLimits {
 impl Default for TimeoutConfig {
     fn default() -> Self {
         Self {
-            connection_timeout_ms: 30_000,          // 30 seconds
-            inbound_request_timeout_ms: 30_000,     // 30 seconds
-            outbound_request_timeout_ms: 30_000,    // 30 seconds
-            connectivity_check_interval_ms: 5_000,   // 5 seconds
-            connection_backoff_ms: 100,             // 100ms
-            max_connection_backoff_ms: 60_000,      // 60 seconds
+            connection_timeout_ms: 30_000,         // 30 seconds
+            inbound_request_timeout_ms: 30_000,    // 30 seconds
+            outbound_request_timeout_ms: 30_000,   // 30 seconds
+            connectivity_check_interval_ms: 5_000, // 5 seconds
+            connection_backoff_ms: 100,            // 100ms
+            max_connection_backoff_ms: 60_000,     // 60 seconds
         }
     }
 }
@@ -171,11 +171,13 @@ impl AnemoConfig {
 
         // Connection limits
         config.max_concurrent_connections = self.connection_limits.max_concurrent_connections;
-        config.max_concurrent_outstanding_connecting_connections = 
-            Some(self.connection_limits.max_concurrent_outstanding_connecting_connections);
-        config.connection_manager_channel_capacity = 
+        config.max_concurrent_outstanding_connecting_connections = Some(
+            self.connection_limits
+                .max_concurrent_outstanding_connecting_connections,
+        );
+        config.connection_manager_channel_capacity =
             Some(self.connection_limits.connection_manager_channel_capacity);
-        config.peer_event_broadcast_channel_capacity = 
+        config.peer_event_broadcast_channel_capacity =
             Some(self.connection_limits.peer_event_broadcast_channel_capacity);
 
         // Timeouts

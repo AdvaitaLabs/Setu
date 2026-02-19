@@ -4,8 +4,8 @@
 //! Builder pattern for Discovery service
 
 use super::{
-    DiscoveryConfig, DiscoveryEventLoop, Handle, Server, State, SignedNodeInfo,
-    metrics::DiscoveryMetrics,
+    metrics::DiscoveryMetrics, DiscoveryConfig, DiscoveryEventLoop, Handle, Server, SignedNodeInfo,
+    State,
 };
 use anemo::NetworkRef;
 use std::collections::HashMap;
@@ -126,12 +126,8 @@ impl UnstartedDiscovery {
     /// Returns a handle that keeps the discovery alive. When all handles are
     /// dropped, the discovery service will gracefully shut down.
     pub fn start(self, network: NetworkRef) -> (Handle, tokio::task::JoinHandle<()>) {
-        let event_loop = DiscoveryEventLoop::new(
-            self.config,
-            self.state,
-            network,
-            self.shutdown_rx,
-        );
+        let event_loop =
+            DiscoveryEventLoop::new(self.config, self.state, network, self.shutdown_rx);
 
         let join_handle = tokio::spawn(async move {
             event_loop.run().await;

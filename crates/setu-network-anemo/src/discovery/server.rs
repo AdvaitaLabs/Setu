@@ -77,15 +77,11 @@ impl Discovery for Server {
         let limit = req.limit.unwrap_or(self.config.max_peers_to_return);
 
         let state = self.state.read().unwrap();
-        
+
         let own_info = state.our_info.clone();
-        
-        let known_peers: Vec<SignedNodeInfo> = state
-            .known_peers
-            .values()
-            .take(limit)
-            .cloned()
-            .collect();
+
+        let known_peers: Vec<SignedNodeInfo> =
+            state.known_peers.values().take(limit).cloned().collect();
 
         Ok(Response::new(GetKnownPeersResponse {
             own_info,
@@ -105,7 +101,7 @@ impl Discovery for Server {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        
+
         let skew = if info.info.timestamp_ms > now_ms {
             info.info.timestamp_ms - now_ms
         } else {
@@ -124,7 +120,7 @@ impl Discovery for Server {
         // Store the peer info
         {
             let mut state = self.state.write().unwrap();
-            
+
             // Check if we already have newer info
             if let Some(existing) = state.known_peers.get(&info.info.peer_id) {
                 if existing.info.timestamp_ms >= info.info.timestamp_ms {
@@ -134,7 +130,7 @@ impl Discovery for Server {
                     }));
                 }
             }
-            
+
             state.known_peers.insert(info.info.peer_id, info);
         }
 

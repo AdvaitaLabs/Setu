@@ -62,10 +62,10 @@ impl AnchorStore {
     pub async fn get_chain(&self) -> Vec<AnchorId> {
         self.chain.read().await.clone()
     }
-    
+
     /// Get the latest anchor_chain_root for recovery after restart
     /// Returns (anchor_chain_root, depth, total_count, last_fold_vlc)
-    /// 
+    ///
     /// Note: The stored `anchor.merkle_roots.anchor_chain_root` represents the chain root
     /// BEFORE this anchor was created. To get the chain root AFTER (including this anchor),
     /// we recompute: final_root = chain_hash(stored_root, anchor_hash)
@@ -90,11 +90,11 @@ impl AnchorStore {
             })
         })
     }
-    
+
     /// Chain hash: combines previous chain root with new anchor hash
     /// new_root = SHA256(prev_root || anchor_hash)
     fn chain_hash(prev_root: &[u8; 32], anchor_hash: &[u8; 32]) -> [u8; 32] {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(prev_root);
         hasher.update(anchor_hash);
@@ -103,11 +103,11 @@ impl AnchorStore {
         output.copy_from_slice(&result);
         output
     }
-    
+
     // =========================================================================
     // Warmup support methods (for DagManager cache warmup)
     // =========================================================================
-    
+
     /// Get the N most recent finalized anchors (for cache warmup)
     ///
     /// Returns anchors sorted by finalized_at descending (most recent first)
@@ -142,7 +142,7 @@ impl Default for AnchorStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_types::{VectorClock, VLCSnapshot};
+    use setu_types::{VLCSnapshot, VectorClock};
 
     fn create_anchor(depth: u64) -> Anchor {
         Anchor::new(
@@ -161,7 +161,7 @@ mod tests {
     #[tokio::test]
     async fn test_anchor_store() {
         let store = AnchorStore::new();
-        
+
         let anchor1 = create_anchor(0);
         let anchor2 = create_anchor(1);
 
@@ -169,7 +169,7 @@ mod tests {
         store.store(anchor2.clone()).await.unwrap();
 
         assert_eq!(store.count().await, 2);
-        
+
         let latest = store.get_latest().await.unwrap();
         assert_eq!(latest.depth, 1);
     }

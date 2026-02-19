@@ -6,14 +6,14 @@
 //! This module manages the set of validators participating in consensus.
 //! It integrates with the liveness module for leader election.
 
-use setu_types::ValidatorInfo;
 #[cfg(test)]
 use setu_types::NodeInfo;
+use setu_types::ValidatorInfo;
 use std::collections::HashMap;
 
 use crate::liveness::{
-    choose_leader, create_default_election, ProposerElection, ReputationConfig,
-    RotatingProposer, Round, ValidatorId, VotingPower,
+    choose_leader, create_default_election, ProposerElection, ReputationConfig, RotatingProposer,
+    Round, ValidatorId, VotingPower,
 };
 
 /// Election strategy configuration
@@ -43,16 +43,16 @@ impl Default for ElectionStrategy {
 pub struct ValidatorSet {
     /// All registered validators
     validators: HashMap<ValidatorId, ValidatorInfo>,
-    
+
     /// Current leader ID
     leader_id: Option<ValidatorId>,
-    
+
     /// Current round number
     current_round: Round,
-    
+
     /// Election strategy
     strategy: ElectionStrategy,
-    
+
     /// Cached proposer election instance
     election: Option<RotatingProposer>,
 }
@@ -83,15 +83,15 @@ impl ValidatorSet {
     /// Add a validator to the set.
     pub fn add_validator(&mut self, mut info: ValidatorInfo) {
         let is_first = self.validators.is_empty();
-        
+
         // First validator becomes the initial leader
         if is_first {
             info.is_leader = true;
             self.leader_id = Some(info.node.id.clone());
         }
-        
+
         self.validators.insert(info.node.id.clone(), info);
-        
+
         // Rebuild election when validators change
         self.rebuild_election();
     }
@@ -99,15 +99,15 @@ impl ValidatorSet {
     /// Remove a validator from the set.
     pub fn remove_validator(&mut self, validator_id: &str) -> Option<ValidatorInfo> {
         let removed = self.validators.remove(validator_id);
-        
+
         // Rebuild election when validators change (must be done before electing new leader)
         self.rebuild_election();
-        
+
         // If the removed validator was the leader, elect a new one
         if self.leader_id.as_deref() == Some(validator_id) {
             self.elect_next_leader();
         }
-        
+
         removed
     }
 
@@ -232,9 +232,9 @@ impl ValidatorSet {
         ids.sort();
 
         self.election = match &self.strategy {
-            ElectionStrategy::Rotating { contiguous_rounds } => {
-                Some(RotatingProposer::with_contiguous_rounds(ids, *contiguous_rounds))
-            }
+            ElectionStrategy::Rotating { contiguous_rounds } => Some(
+                RotatingProposer::with_contiguous_rounds(ids, *contiguous_rounds),
+            ),
             ElectionStrategy::Fixed(_) => None,
             ElectionStrategy::Reputation(_config) => {
                 // TODO: Implement reputation-based election
@@ -454,7 +454,7 @@ mod tests {
         set.add_validator(create_validator("v2"));
 
         assert_eq!(set.current_round(), 0);
-        
+
         let new_round = set.advance_round();
         assert_eq!(new_round, 1);
         assert_eq!(set.current_round(), 1);

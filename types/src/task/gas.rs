@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 pub struct GasBudget {
     /// Maximum gas units allowed
     pub max_gas_units: u64,
-    
+
     /// Gas price per unit (optional, for fee calculation)
     pub gas_price: Option<u64>,
-    
+
     /// Estimated total fee
     pub estimated_fee: u64,
 }
@@ -35,7 +35,7 @@ impl GasBudget {
             estimated_fee: max_gas_units.saturating_mul(gas_price),
         }
     }
-    
+
     /// Create unlimited gas budget (for testing/MVP)
     pub fn unlimited() -> Self {
         Self::default()
@@ -47,7 +47,7 @@ impl GasBudget {
 pub struct GasUsage {
     /// Gas units consumed
     pub gas_used: u64,
-    
+
     /// Actual fee charged (gas_used * gas_price)
     pub fee_charged: u64,
 }
@@ -64,21 +64,21 @@ impl GasUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_gas_budget_default() {
         let budget = GasBudget::default();
         assert_eq!(budget.max_gas_units, u64::MAX);
         assert_eq!(budget.estimated_fee, 0);
     }
-    
+
     #[test]
     fn test_gas_budget_new() {
         let budget = GasBudget::new(1000, 10);
         assert_eq!(budget.max_gas_units, 1000);
         assert_eq!(budget.estimated_fee, 10000);
     }
-    
+
     #[test]
     fn test_gas_usage() {
         let usage = GasUsage::new(500, Some(10));

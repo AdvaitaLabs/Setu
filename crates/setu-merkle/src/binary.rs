@@ -284,7 +284,10 @@ impl BinaryMerkleTree {
 
     /// Get the root hash of the tree.
     pub fn root(&self) -> HashValue {
-        self.nodes.last().map(|n| n.hash()).unwrap_or(HashValue::zero())
+        self.nodes
+            .last()
+            .map(|n| n.hash())
+            .unwrap_or(HashValue::zero())
     }
 
     /// Get the number of leaves in the tree.
@@ -337,7 +340,10 @@ impl BinaryMerkleTree {
 
             // Get sibling node (might be empty if we're at the edge)
             let sibling = if sibling_index < level_start + padded_size {
-                self.nodes.get(sibling_index).cloned().unwrap_or(Node::Empty)
+                self.nodes
+                    .get(sibling_index)
+                    .cloned()
+                    .unwrap_or(Node::Empty)
             } else {
                 Node::Empty
             };

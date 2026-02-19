@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use crate::event::{EventId, VLCSnapshot};
@@ -55,7 +55,7 @@ impl Anchor {
             timestamp,
         }
     }
-    
+
     /// Create a new anchor with full Merkle roots
     pub fn with_merkle_roots(
         event_ids: Vec<EventId>,
@@ -104,36 +104,36 @@ impl Anchor {
     pub fn event_count(&self) -> usize {
         self.event_ids.len()
     }
-    
+
     /// Get the global state root (from merkle_roots if available)
     pub fn global_state_root(&self) -> Option<&[u8; 32]> {
         self.merkle_roots.as_ref().map(|m| &m.global_state_root)
     }
-    
+
     /// Get the events root
     pub fn events_root(&self) -> Option<&[u8; 32]> {
         self.merkle_roots.as_ref().map(|m| &m.events_root)
     }
-    
+
     /// Get the anchor chain root
     pub fn anchor_chain_root(&self) -> Option<&[u8; 32]> {
         self.merkle_roots.as_ref().map(|m| &m.anchor_chain_root)
     }
-    
+
     /// Check if this anchor has full Merkle roots
     pub fn has_merkle_roots(&self) -> bool {
         self.merkle_roots.is_some()
     }
-    
+
     /// Get a specific subnet's state root
     pub fn get_subnet_root(&self, subnet_id: &crate::subnet::SubnetId) -> Option<&[u8; 32]> {
         self.merkle_roots
             .as_ref()
             .and_then(|m| m.get_subnet_root(subnet_id))
     }
-    
+
     /// Compute a hash of this anchor for anchor chain tree
-    /// 
+    ///
     /// This hash includes all critical fields:
     /// - id, depth, previous_anchor (chain structure)
     /// - events_root, global_state_root, anchor_chain_root (Merkle commitments)
@@ -154,7 +154,7 @@ impl Anchor {
         }
         hasher.update(self.vlc_snapshot.logical_time.to_le_bytes());
         hasher.update(self.timestamp.to_le_bytes());
-        
+
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
@@ -198,71 +198,75 @@ impl Vote {
         self.signature = signature;
         self
     }
-    
+
     /// Sign the vote with a private key (ed25519)
-    /// 
+    ///
     /// This creates a signature over the vote content (cf_id + validator_id + approve + timestamp)
     /// using the validator's private key.
     pub fn sign(&mut self, private_key: &[u8]) -> Result<(), String> {
         use ed25519_dalek::{Signer, SigningKey};
-        
+
         if private_key.len() != 32 {
-            return Err(format!("Invalid private key length: expected 32, got {}", private_key.len()));
+            return Err(format!(
+                "Invalid private key length: expected 32, got {}",
+                private_key.len()
+            ));
         }
-        
+
         let signing_key = SigningKey::from_bytes(
-            private_key.try_into().map_err(|_| "Failed to convert key")?   
+            private_key
+                .try_into()
+                .map_err(|_| "Failed to convert key")?,
         );
-        
+
         // Create deterministic message to sign
         let message = self.signing_message();
-        
+
         // Sign the message
         let signature = signing_key.sign(&message);
         self.signature = signature.to_bytes().to_vec();
-        
+
         Ok(())
     }
-    
+
     /// Verify the vote signature with a public key (ed25519)
-    /// 
+    ///
     /// Returns true if the signature is valid for the given public key.
     pub fn verify_signature(&self, public_key: &[u8]) -> bool {
-        use ed25519_dalek::{Verifier, VerifyingKey, Signature as Ed25519Signature};
-        
+        use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
+
         // Check signature is not empty
         if self.signature.is_empty() {
             return false;
         }
-        
+
         // Check public key length
         if public_key.len() != 32 {
             return false;
         }
-        
+
         // Parse public key
-        let verifying_key = match VerifyingKey::from_bytes(
-            public_key.try_into().unwrap_or(&[0u8; 32])
-        ) {
-            Ok(key) => key,
-            Err(_) => return false,
-        };
-        
+        let verifying_key =
+            match VerifyingKey::from_bytes(public_key.try_into().unwrap_or(&[0u8; 32])) {
+                Ok(key) => key,
+                Err(_) => return false,
+            };
+
         // Parse signature
         let signature = match Ed25519Signature::from_slice(&self.signature) {
             Ok(sig) => sig,
             Err(_) => return false,
         };
-        
+
         // Create message and verify
         let message = self.signing_message();
         verifying_key.verify(&message, &signature).is_ok()
     }
-    
+
     /// Create the deterministic message for signing
-    /// 
+    ///
     /// Message format: protocol_id || cf_id || validator_id || approve || timestamp
-    /// 
+    ///
     /// The protocol identifier prevents cross-protocol signature attacks where
     /// a signature from one protocol could be replayed in another context.
     fn signing_message(&self) -> Vec<u8> {
@@ -334,7 +338,7 @@ impl ConsensusFrame {
     }
 
     /// Check if CF should be rejected (1/3+1 validators rejected)
-    /// 
+    ///
     /// In BFT consensus, if f+1 nodes reject a CF (where f = n/3),
     /// it should be explicitly rejected to prevent indefinite pending.
     pub fn check_rejection(&self, total_validators: usize) -> bool {
@@ -343,7 +347,7 @@ impl ConsensusFrame {
     }
 
     /// Check if CF has timed out
-    /// 
+    ///
     /// Returns true if the CF has been pending longer than the timeout threshold.
     /// Used for garbage collection of stale CFs that never reached quorum.
     pub fn is_timeout(&self, timeout_ms: u64) -> bool {
@@ -367,9 +371,9 @@ impl ConsensusFrame {
     pub fn reject(&mut self) {
         self.status = CFStatus::Rejected;
     }
-    
+
     /// Verify that the CF ID matches the content
-    /// 
+    ///
     /// This prevents malicious nodes from constructing CFs with mismatched IDs.
     pub fn verify_id(&self) -> bool {
         let expected_id = Self::compute_id(&self.anchor, &self.proposer, self.created_at);

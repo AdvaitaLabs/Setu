@@ -8,4 +8,3 @@ pub mod shard;
 
 pub use config::NodeConfig;
 pub use shard::{Shard, ShardId, ShardManager};
-

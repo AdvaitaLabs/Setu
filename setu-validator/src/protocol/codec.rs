@@ -52,7 +52,7 @@ impl MessageCodec {
         bincode::deserialize(bytes)
             .map_err(|e| MessageCodecError::DeserializationError(e.to_string()))
     }
-    
+
     /// Encode to a Vec<u8> instead of Bytes (useful for some APIs)
     pub fn encode_to_vec<T: Serialize>(message: &T) -> Result<Vec<u8>, MessageCodecError> {
         bincode::serialize(message)
@@ -69,7 +69,7 @@ pub trait Encodable: Serialize + Sized {
     fn encode(&self) -> Result<Bytes, MessageCodecError> {
         MessageCodec::encode_generic(self)
     }
-    
+
     /// Encode this value to a Vec<u8>
     fn encode_to_vec(&self) -> Result<Vec<u8>, MessageCodecError> {
         MessageCodec::encode_to_vec(self)
@@ -132,6 +132,12 @@ mod tests {
         let encoded = msg.encode().unwrap();
         let decoded = SetuMessage::decode(&encoded).unwrap();
 
-        assert!(matches!(decoded, SetuMessage::Ping { timestamp: 123, nonce: 456 }));
+        assert!(matches!(
+            decoded,
+            SetuMessage::Ping {
+                timestamp: 123,
+                nonce: 456
+            }
+        ));
     }
 }
