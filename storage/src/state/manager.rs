@@ -364,13 +364,20 @@ impl GlobalStateManager {
     /// Apply a single StateChange to a subnet's SMT
     ///
     /// This is called when processing Solver execution results.
-    /// The key is hashed to create a 32-byte ObjectId for the SMT.
+    /// 
+    /// ## Key Format Support
+    /// 
+    /// - `"oid:{hex}"`: Direct ObjectId hex (from TEE output) → decode directly
+    /// - Other formats: Hash the key to create a 32-byte ObjectId (legacy)
+    /// 
+    /// The "oid:" prefix allows TEE outputs to specify exact SMT keys,
+    /// ensuring state changes are applied to the correct objects.
     pub fn apply_state_change(
         &mut self,
         subnet_id: SubnetId,
         change: &StateChange,
     ) -> ApplyResult {
-        let object_id = Self::key_to_object_id(&change.key);
+        let object_id = Self::parse_state_change_key(&change.key);
         let smt = self.get_subnet_mut(subnet_id);
         
         match &change.new_value {
@@ -495,7 +502,41 @@ impl GlobalStateManager {
         Ok((anchor_roots, summary))
     }
     
-    /// Convert a string key to a 32-byte ObjectId using SHA-256
+    /// Parse a StateChange key to extract the ObjectId for SMT storage
+    /// 
+    /// ## Supported Formats
+    /// 
+    /// - `"oid:{hex}"`: Direct ObjectId hex from TEE output → decode directly
+    /// - Other: Hash the key with SHA-256 (legacy fallback)
+    /// 
+    /// ## Example
+    /// 
+    /// ```ignore
+    /// // TEE output key (new format)
+    /// parse_state_change_key("oid:abcd1234...") → HashValue([0xab, 0xcd, ...])
+    /// 
+    /// // Legacy key (hashed)
+    /// parse_state_change_key("event:some-id") → SHA256("event:some-id")
+    /// ```
+    fn parse_state_change_key(key: &str) -> HashValue {
+        if let Some(hex_str) = key.strip_prefix("oid:") {
+            // Direct ObjectId hex → decode to bytes
+            if let Ok(bytes) = hex::decode(hex_str) {
+                if bytes.len() == 32 {
+                    return HashValue::from_slice(&bytes).expect("32 bytes");
+                }
+            }
+            // If decode fails, fall through to SHA256
+            tracing::warn!(
+                key = %key,
+                "Invalid oid: format, falling back to SHA256"
+            );
+        }
+        // Legacy: hash the key
+        Self::key_to_object_id(key)
+    }
+    
+    /// Convert a string key to a 32-byte ObjectId using SHA-256 (legacy)
     fn key_to_object_id(key: &str) -> HashValue {
         let mut hasher = Sha256::new();
         hasher.update(key.as_bytes());
@@ -680,5 +721,43 @@ mod tests {
         
         smt.batch_update(updates);
         assert_eq!(smt.object_count(), 10);
+    }
+    
+    #[test]
+    fn test_parse_state_change_key_oid_format() {
+        // Test "oid:{hex}" format - should decode directly to ObjectId
+        let object_id_bytes = [
+            0xab, 0xcd, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
+            0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+            0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+        ];
+        let hex_str = hex::encode(object_id_bytes);
+        let key = format!("oid:{}", hex_str);
+        
+        let parsed = GlobalStateManager::parse_state_change_key(&key);
+        assert_eq!(parsed.as_bytes(), &object_id_bytes);
+    }
+    
+    #[test]
+    fn test_parse_state_change_key_legacy_format() {
+        // Test legacy format - should hash the key
+        let key = "event:some-event-id";
+        let parsed = GlobalStateManager::parse_state_change_key(key);
+        
+        // Verify it matches SHA256 hash
+        let expected = GlobalStateManager::key_to_object_id(key);
+        assert_eq!(parsed, expected);
+    }
+    
+    #[test]
+    fn test_parse_state_change_key_invalid_oid() {
+        // Test invalid oid format - should fall back to SHA256
+        let key = "oid:not-valid-hex";
+        let parsed = GlobalStateManager::parse_state_change_key(key);
+        
+        // Should hash the whole key as fallback
+        let expected = GlobalStateManager::key_to_object_id(key);
+        assert_eq!(parsed, expected);
     }
 }
