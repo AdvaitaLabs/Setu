@@ -47,6 +47,7 @@ pub use rocks::{RocksObjectStore, RebuildIndexResult, RocksDBMerkleStore};
 pub use state::{SubnetStateSMT, GlobalStateManager, StateApplySummary, StateApplyError};
 pub use state::{StateProvider, MerkleStateProvider, CoinInfo, CoinState, SimpleMerkleProof};
 pub use state::{init_coin, get_coin_state};
+pub use state::{BatchStateSnapshot, BatchSnapshotStats};
 
 // Re-export MerkleStore trait from setu-merkle for convenience
 pub use setu_merkle::storage::MerkleStore;
