@@ -92,14 +92,17 @@ pub(crate) fn to_enclave_proof(proof: &SimpleMerkleProof) -> MerkleProof {
 // Shared Test Utilities
 // ============================================================================
 
-/// Create a MerkleStateProvider with pre-initialized test accounts.
+/// Create a MerkleStateProvider with pre-initialized seed accounts.
 ///
 /// This is a shared utility function to avoid code duplication between
 /// `TaskPreparer::new_for_testing()` and `BatchTaskPreparer::new_for_testing()`.
 ///
-/// ## Initialized accounts (20 total):
-/// - `alice`, `bob`, `charlie`: 10,000,000 balance each
-/// - `user_01` to `user_17`: 5,000,000 balance each
+/// ## Initialized accounts (3 seed accounts):
+/// - `alice`, `bob`, `charlie`: 1,000,000,000 balance each (1B tokens)
+///
+/// These seed accounts have high balances to support:
+/// 1. Direct benchmark testing with 3 accounts
+/// 2. Funding test accounts via transfers (benchmark --init-accounts)
 ///
 /// ## Usage
 ///
@@ -107,27 +110,45 @@ pub(crate) fn to_enclave_proof(proof: &SimpleMerkleProof) -> MerkleProof {
 /// let state_provider = create_test_state_provider();
 /// let preparer = TaskPreparer::new("validator-1".to_string(), state_provider);
 /// ```
+///
+/// ## Note
+/// This returns a shared Arc to a singleton MerkleStateProvider.
+/// All callers will get the same state provider instance.
+///
+/// ## For High-Concurrency Testing
+/// Use `setu-benchmark --init-accounts N` to create N test accounts by
+/// transferring from these seed accounts. This decouples Validator from
+/// benchmark-specific account requirements.
 pub fn create_test_state_provider() -> std::sync::Arc<setu_storage::MerkleStateProvider> {
+    use once_cell::sync::Lazy;
     use setu_storage::{GlobalStateManager, MerkleStateProvider, init_coin};
     use std::sync::{Arc, RwLock};
 
-    let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
+    // Singleton state provider - shared across all TaskPreparer and BatchTaskPreparer instances
+    static TEST_STATE_PROVIDER: Lazy<Arc<MerkleStateProvider>> = Lazy::new(|| {
+        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
 
-    // Initialize test accounts with real Merkle state
-    // 20 accounts with sufficient balance for large-scale benchmarks
-    // This reduces state lock contention compared to just 3 accounts
-    {
-        let mut manager = state_manager.write()
-            .expect("Failed to acquire write lock on GlobalStateManager during test initialization");
-        // Primary accounts with higher balance
-        init_coin(&mut manager, "alice", 10_000_000);
-        init_coin(&mut manager, "bob", 10_000_000);
-        init_coin(&mut manager, "charlie", 10_000_000);
-        // Additional test accounts (user_01 to user_17)
-        for i in 1..=17 {
-            init_coin(&mut manager, &format!("user_{:02}", i), 5_000_000);
+        // Initialize ONLY seed accounts with very high balance
+        // These accounts are used to fund test accounts via transfers
+        // 
+        // Design rationale:
+        // - Validator only knows about seed accounts
+        // - Benchmark creates test accounts dynamically via --init-accounts
+        // - This decouples Validator from benchmark-specific requirements
+        {
+            let mut manager = state_manager.write()
+                .expect("Failed to acquire write lock on GlobalStateManager during test initialization");
+            
+            // Seed accounts with very high balance (1B each)
+            // This allows funding up to 10,000 test accounts with 100,000 balance each
+            init_coin(&mut manager, "alice", 1_000_000_000);
+            init_coin(&mut manager, "bob", 1_000_000_000);
+            init_coin(&mut manager, "charlie", 1_000_000_000);
         }
-    }
 
-    Arc::new(MerkleStateProvider::new(state_manager))
+        tracing::info!("Initialized shared test state provider with 3 seed accounts (alice, bob, charlie)");
+        Arc::new(MerkleStateProvider::new(state_manager))
+    });
+
+    Arc::clone(&TEST_STATE_PROVIDER)
 }

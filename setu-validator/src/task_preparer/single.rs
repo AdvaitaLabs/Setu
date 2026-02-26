@@ -41,6 +41,20 @@ impl TaskPreparer {
         }
     }
     
+    /// Get the underlying state provider
+    /// 
+    /// This is used to share the state provider with BatchTaskPreparer.
+    #[allow(dead_code)]
+    pub fn state_provider(&self) -> &Arc<dyn StateProvider> {
+        &self.state_provider
+    }
+    
+    /// Get the validator ID
+    #[allow(dead_code)]
+    pub fn validator_id(&self) -> &str {
+        &self.validator_id
+    }
+    
     /// Create a TaskPreparer with pre-initialized test accounts
     /// 
     /// This creates a real `MerkleStateProvider` backed by `GlobalStateManager`

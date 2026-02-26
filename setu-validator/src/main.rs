@@ -15,11 +15,12 @@ use setu_validator::{
 };
 use setu_storage::{
     SetuDB, RocksDBEventStore, RocksDBCFStore, RocksDBAnchorStore, RocksDBMerkleStore,
-    GlobalStateManager, EventStoreBackend, CFStoreBackend, AnchorStoreBackend, MerkleStore,
+    GlobalStateManager, EventStoreBackend, CFStoreBackend, AnchorStoreBackend, B4StoreExt,
+    init_coin,
 };
-use setu_types::NodeInfo;
+use setu_types::{NodeInfo, ConsensusConfig};
 use setu_keys::{load_keypair};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::net::SocketAddr;
 use tracing::{info, error, warn, Level};
 use tracing_subscriber;
@@ -149,30 +150,66 @@ async fn main() -> anyhow::Result<()> {
     // Create router manager (shared between NetworkService components)
     let router_manager = Arc::new(RouterManager::new());
     
-    // Create task preparer (solver-tee3 architecture)
-    // Uses real MerkleStateProvider with pre-initialized test accounts
-    let task_preparer = Arc::new(setu_validator::TaskPreparer::new_for_testing(
-        config.node_config.node_id.clone(),
-    ));
-    
-    info!("✓ TaskPreparer initialized with test accounts (alice, bob, charlie)");
-    
     // Create ConsensusValidator for DAG + VLC + Consensus
     let node_info = NodeInfo::new_validator(
         config.node_config.node_id.clone(),
         config.http_addr.ip().to_string(),
         config.http_addr.port(),
     );
+    
+    // Single node mode: set validator_count = 1 for quorum to work
+    // quorum = (1 * 2) / 3 + 1 = 1, so single validator can finalize
+    let mut consensus = ConsensusConfig::default();
+    consensus.validator_count = 1;
+    
     let consensus_config = ConsensusValidatorConfig {
         node_info,
+        consensus,
         is_leader: true, // Single node mode: always leader
         ..Default::default()
     };
     
+    // Create SHARED GlobalStateManager (used by both TaskPreparer and ConsensusValidator)
+    // This is the key fix: both components now share the same state!
+    let shared_state_manager: Arc<RwLock<GlobalStateManager>> = if let Some(ref db_path) = config.db_path {
+        // RocksDB persistence mode
+        info!("Opening RocksDB at: {}", db_path);
+        let db = match SetuDB::open_default(db_path) {
+            Ok(db) => Arc::new(db),
+            Err(e) => {
+                error!("Failed to open RocksDB at {}: {}", db_path, e);
+                return Err(anyhow::anyhow!("Database open failed: {}", e));
+            }
+        };
+        
+        let merkle_store: Arc<dyn B4StoreExt> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
+        Arc::new(RwLock::new(GlobalStateManager::with_store(merkle_store)))
+    } else {
+        // Memory mode
+        Arc::new(RwLock::new(GlobalStateManager::new()))
+    };
+    
+    // Initialize seed accounts in the shared state manager
+    // These are the accounts used for testing/benchmarking
+    {
+        let mut gsm = shared_state_manager.write()
+            .expect("Failed to acquire write lock on GlobalStateManager");
+        init_coin(&mut gsm, "alice", 1_000_000_000);
+        init_coin(&mut gsm, "bob", 1_000_000_000);
+        init_coin(&mut gsm, "charlie", 1_000_000_000);
+    }
+    info!("✓ Shared GlobalStateManager initialized with seed accounts (alice, bob, charlie)");
+    
+    // Create task preparer with the SHARED state manager
+    let task_preparer = Arc::new(setu_validator::TaskPreparer::new_with_state_manager(
+        config.node_config.node_id.clone(),
+        Arc::clone(&shared_state_manager),
+    ));
+    info!("✓ TaskPreparer initialized with shared state manager");
+    
     // Create ConsensusValidator with appropriate storage backend
     let consensus_validator = if let Some(ref db_path) = config.db_path {
         // RocksDB persistence mode - open database and create all backends
-        info!("Opening RocksDB at: {}", db_path);
         let db = match SetuDB::open_default(db_path) {
             Ok(db) => Arc::new(db),
             Err(e) => {
@@ -185,26 +222,26 @@ async fn main() -> anyhow::Result<()> {
         let event_store: Arc<dyn EventStoreBackend> = Arc::new(RocksDBEventStore::from_shared(db.clone()));
         let cf_store: Arc<dyn CFStoreBackend> = Arc::new(RocksDBCFStore::from_shared(db.clone()));
         let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(RocksDBAnchorStore::from_shared(db.clone()));
-        let merkle_store: Arc<dyn MerkleStore> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
-        
-        // Create GlobalStateManager with Merkle persistence
-        let state_manager = GlobalStateManager::with_store(merkle_store);
         
         info!("✓ RocksDB backends initialized (Events, CF, Anchors, Merkle)");
         
+        // Use the SHARED state manager
         Arc::new(ConsensusValidator::with_all_backends(
             consensus_config,
-            state_manager,
+            Arc::clone(&shared_state_manager),
             event_store,
             cf_store,
             anchor_store,
         ))
     } else {
-        // Memory mode - use default in-memory stores
-        Arc::new(ConsensusValidator::new(consensus_config))
+        // Memory mode - use shared state manager
+        Arc::new(ConsensusValidator::with_shared_state_manager(
+            consensus_config, 
+            Arc::clone(&shared_state_manager),
+        ))
     };
     
-    info!("✓ ConsensusValidator initialized (single node mode)");
+    info!("✓ ConsensusValidator initialized with shared state manager (single node mode)");
     
     // Attempt to recover state from storage (if any)
     // This is safe to call even with empty storage (fresh start)
