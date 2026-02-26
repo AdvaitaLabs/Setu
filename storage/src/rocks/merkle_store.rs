@@ -34,10 +34,15 @@
 
 use crate::rocks::core::{ColumnFamily, SetuDB, StorageError};
 use setu_merkle::error::{MerkleError, MerkleResult};
-use setu_merkle::storage::{AnchorId, MerkleNodeStore, MerkleRootStore, MerkleStore, SubnetId};
+use setu_merkle::storage::{
+    AnchorId, B4Store, MerkleLeafStore, MerkleMetaStore, MerkleNodeStore, MerkleRootStore,
+    MerkleStore, SubnetId,
+};
 use setu_merkle::sparse::SparseMerkleNode;
 use setu_merkle::HashValue;
-use std::sync::Arc;
+use rocksdb::WriteBatch;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 
 /// Key for storing Merkle nodes: (subnet_id, node_hash)
 #[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
@@ -80,23 +85,92 @@ struct LatestAnchorKey {
 const LATEST_SUBNET_PREFIX: u8 = 0x01;
 const LATEST_GLOBAL_PREFIX: u8 = 0x02;
 
+/// Key for storing leaf data: (subnet_id, object_id) - B4 scheme
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
+struct LeafKey {
+    subnet_id: [u8; 32],
+    object_id: [u8; 32],
+}
+
+/// Key for subnet registry in MerkleMeta
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
+struct SubnetRegistryKey {
+    prefix: u8,  // 0x01 for subnet registry
+    subnet_id: [u8; 32],
+}
+
+/// Key for last anchor per subnet in MerkleMeta
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
+struct LastAnchorMetaKey {
+    prefix: u8,  // 0x02 for last anchor
+    subnet_id: [u8; 32],
+}
+
+/// Key for global metadata in MerkleMeta
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
+struct GlobalMetaKey {
+    prefix: u8,  // 0x03 for global meta
+    key_len: u16,
+    key_bytes: Vec<u8>,
+}
+
+const META_SUBNET_REGISTRY_PREFIX: u8 = 0x01;
+const META_LAST_ANCHOR_PREFIX: u8 = 0x02;
+const META_GLOBAL_PREFIX: u8 = 0x03;
+
 /// RocksDB-backed implementation of MerkleStore.
 ///
 /// This provides persistent storage for Merkle tree nodes and roots,
 /// suitable for production use in the Setu network.
+///
+/// ## B4 Scheme Support
+///
+/// This store implements the B4Store trait for atomic batch persistence:
+/// - `begin_batch()` creates a RocksDB WriteBatch
+/// - `batch_*` methods accumulate operations into the batch
+/// - `commit_batch()` writes all operations atomically
+///
+/// ## Subnet Cache (P1 optimization)
+///
+/// Maintains an in-memory cache of registered subnet IDs to avoid
+/// repeated DB reads during commit operations.
 pub struct RocksDBMerkleStore {
     db: Arc<SetuDB>,
+    /// In-memory cache of registered subnet IDs (P1 optimization)
+    registered_subnets_cache: Arc<RwLock<HashSet<SubnetId>>>,
 }
 
 impl RocksDBMerkleStore {
     /// Create a new RocksDB merkle store from an existing database handle.
     pub fn new(db: SetuDB) -> Self {
-        Self { db: Arc::new(db) }
+        let store = Self {
+            db: Arc::new(db),
+            registered_subnets_cache: Arc::new(RwLock::new(HashSet::new())),
+        };
+        // Load existing registered subnets into cache
+        if let Ok(subnets) = store.list_registered_subnets() {
+            let mut cache = store.registered_subnets_cache.write().unwrap();
+            for subnet_id in subnets {
+                cache.insert(subnet_id);
+            }
+        }
+        store
     }
 
     /// Create from a shared database handle.
     pub fn from_shared(db: Arc<SetuDB>) -> Self {
-        Self { db }
+        let store = Self {
+            db,
+            registered_subnets_cache: Arc::new(RwLock::new(HashSet::new())),
+        };
+        // Load existing registered subnets into cache
+        if let Ok(subnets) = store.list_registered_subnets() {
+            let mut cache = store.registered_subnets_cache.write().unwrap();
+            for subnet_id in subnets {
+                cache.insert(subnet_id);
+            }
+        }
+        store
     }
 
     /// Open a new database at the given path.
@@ -214,11 +288,18 @@ impl MerkleNodeStore for RocksDBMerkleStore {
     }
 
     fn batch_put_nodes(&self, subnet_id: &SubnetId, nodes: &[(HashValue, SparseMerkleNode)]) -> MerkleResult<()> {
-        // Use write batch for atomicity
+        // Use WriteBatch for true atomic batch operation
+        let mut batch = self.db.batch();
         for (hash, node) in nodes {
-            self.put_node(subnet_id, hash, node)?;
+            let key = NodeKey {
+                subnet_id: *subnet_id,
+                node_hash: Self::hash_to_bytes(hash),
+            };
+            self.db
+                .batch_put(&mut batch, ColumnFamily::MerkleNodes, &key, node)
+                .map_err(Self::to_merkle_error)?;
         }
-        Ok(())
+        self.db.write_batch(batch).map_err(Self::to_merkle_error)
     }
 }
 
@@ -335,6 +416,386 @@ impl MerkleStore for RocksDBMerkleStore {
         // Delete old data before the given anchor
         // This is a no-op for now - full implementation would iterate and delete
         Ok(0)
+    }
+}
+
+impl MerkleLeafStore for RocksDBMerkleStore {
+    fn batch_put_leaves(
+        &self,
+        subnet_id: &SubnetId,
+        leaves: &[(&HashValue, &[u8])],
+    ) -> MerkleResult<()> {
+        // Use WriteBatch for true atomic batch operation
+        let mut batch = self.db.batch();
+        for (object_id, value) in leaves {
+            let key = LeafKey {
+                subnet_id: *subnet_id,
+                object_id: Self::hash_to_bytes(object_id),
+            };
+            self.db
+                .batch_put(&mut batch, ColumnFamily::MerkleLeaves, &key, &value.to_vec())
+                .map_err(Self::to_merkle_error)?;
+        }
+        self.db.write_batch(batch).map_err(Self::to_merkle_error)
+    }
+
+    fn batch_delete_leaves(
+        &self,
+        subnet_id: &SubnetId,
+        object_ids: &[&HashValue],
+    ) -> MerkleResult<()> {
+        // Use WriteBatch for true atomic batch operation
+        let mut batch = self.db.batch();
+        for object_id in object_ids {
+            let key = LeafKey {
+                subnet_id: *subnet_id,
+                object_id: Self::hash_to_bytes(object_id),
+            };
+            self.db
+                .batch_delete(&mut batch, ColumnFamily::MerkleLeaves, &key)
+                .map_err(Self::to_merkle_error)?;
+        }
+        self.db.write_batch(batch).map_err(Self::to_merkle_error)
+    }
+
+    fn load_all_leaves(&self, subnet_id: &SubnetId) -> MerkleResult<HashMap<HashValue, Vec<u8>>> {
+        // Use prefix iteration to load all leaves for a subnet
+        // The key format is (subnet_id, object_id), so we iterate with subnet_id prefix
+        let mut result = HashMap::new();
+
+        // Get an iterator with prefix matching subnet_id
+        let prefix = subnet_id.as_slice();
+        let iter = self
+            .db
+            .prefix_iterator(ColumnFamily::MerkleLeaves, prefix)
+            .map_err(Self::to_merkle_error)?;
+
+        for item in iter {
+            let (key_bytes, value_bytes) = item.map_err(|e| {
+                MerkleError::StorageError(format!("Iterator error: {}", e))
+            })?;
+
+            // Decode the key to extract object_id
+            if key_bytes.len() >= 64 {
+                // 32 bytes subnet_id + 32 bytes object_id
+                let mut object_id_bytes = [0u8; 32];
+                object_id_bytes.copy_from_slice(&key_bytes[32..64]);
+                let object_id = Self::bytes_to_hash(object_id_bytes);
+                result.insert(object_id, value_bytes.to_vec());
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn list_subnets(&self) -> MerkleResult<Vec<SubnetId>> {
+        // Get subnets from the registry instead of scanning leaves
+        self.list_registered_subnets()
+    }
+
+    fn get_leaf(&self, subnet_id: &SubnetId, object_id: &HashValue) -> MerkleResult<Option<Vec<u8>>> {
+        let key = LeafKey {
+            subnet_id: *subnet_id,
+            object_id: Self::hash_to_bytes(object_id),
+        };
+        self.db
+            .get(ColumnFamily::MerkleLeaves, &key)
+            .map_err(Self::to_merkle_error)
+    }
+
+    fn has_leaf(&self, subnet_id: &SubnetId, object_id: &HashValue) -> MerkleResult<bool> {
+        let key = LeafKey {
+            subnet_id: *subnet_id,
+            object_id: Self::hash_to_bytes(object_id),
+        };
+        self.db
+            .exists(ColumnFamily::MerkleLeaves, &key)
+            .map_err(Self::to_merkle_error)
+    }
+
+    fn leaf_count(&self, subnet_id: &SubnetId) -> MerkleResult<usize> {
+        // Count leaves by iterating (expensive, but accurate)
+        let prefix = subnet_id.as_slice();
+        let iter = self
+            .db
+            .prefix_iterator(ColumnFamily::MerkleLeaves, prefix)
+            .map_err(Self::to_merkle_error)?;
+        
+        let mut count = 0;
+        for item in iter {
+            item.map_err(|e| MerkleError::StorageError(format!("Iterator error: {}", e)))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
+impl MerkleMetaStore for RocksDBMerkleStore {
+    fn register_subnet(&self, subnet_id: &SubnetId) -> MerkleResult<()> {
+        let key = SubnetRegistryKey {
+            prefix: META_SUBNET_REGISTRY_PREFIX,
+            subnet_id: *subnet_id,
+        };
+        // Store empty value to indicate registration
+        self.db
+            .put(ColumnFamily::MerkleMeta, &key, &())
+            .map_err(Self::to_merkle_error)
+    }
+
+    fn unregister_subnet(&self, subnet_id: &SubnetId) -> MerkleResult<()> {
+        let key = SubnetRegistryKey {
+            prefix: META_SUBNET_REGISTRY_PREFIX,
+            subnet_id: *subnet_id,
+        };
+        self.db
+            .delete(ColumnFamily::MerkleMeta, &key)
+            .map_err(Self::to_merkle_error)
+    }
+
+    fn is_subnet_registered(&self, subnet_id: &SubnetId) -> MerkleResult<bool> {
+        let key = SubnetRegistryKey {
+            prefix: META_SUBNET_REGISTRY_PREFIX,
+            subnet_id: *subnet_id,
+        };
+        self.db
+            .exists(ColumnFamily::MerkleMeta, &key)
+            .map_err(Self::to_merkle_error)
+    }
+
+    fn list_registered_subnets(&self) -> MerkleResult<Vec<SubnetId>> {
+        // Iterate with prefix to find all registered subnets
+        let prefix = &[META_SUBNET_REGISTRY_PREFIX];
+        let iter = self
+            .db
+            .prefix_iterator(ColumnFamily::MerkleMeta, prefix)
+            .map_err(Self::to_merkle_error)?;
+
+        let mut subnets = Vec::new();
+        for item in iter {
+            let (key_bytes, _) = item.map_err(|e| {
+                MerkleError::StorageError(format!("Iterator error: {}", e))
+            })?;
+
+            // Extract subnet_id from key (skip prefix byte)
+            if key_bytes.len() >= 33 {
+                let mut subnet_id = [0u8; 32];
+                subnet_id.copy_from_slice(&key_bytes[1..33]);
+                subnets.push(subnet_id);
+            }
+        }
+        subnets.sort();
+        Ok(subnets)
+    }
+
+    fn set_last_anchor(&self, subnet_id: &SubnetId, anchor_id: AnchorId) -> MerkleResult<()> {
+        let key = LastAnchorMetaKey {
+            prefix: META_LAST_ANCHOR_PREFIX,
+            subnet_id: *subnet_id,
+        };
+        self.db
+            .put(ColumnFamily::MerkleMeta, &key, &anchor_id)
+            .map_err(Self::to_merkle_error)
+    }
+
+    fn get_last_anchor(&self, subnet_id: &SubnetId) -> MerkleResult<Option<AnchorId>> {
+        let key = LastAnchorMetaKey {
+            prefix: META_LAST_ANCHOR_PREFIX,
+            subnet_id: *subnet_id,
+        };
+        self.db
+            .get(ColumnFamily::MerkleMeta, &key)
+            .map_err(Self::to_merkle_error)
+    }
+
+    fn set_meta(&self, key: &str, value: &[u8]) -> MerkleResult<()> {
+        let meta_key = GlobalMetaKey {
+            prefix: META_GLOBAL_PREFIX,
+            key_len: key.len() as u16,
+            key_bytes: key.as_bytes().to_vec(),
+        };
+        self.db
+            .put(ColumnFamily::MerkleMeta, &meta_key, &value.to_vec())
+            .map_err(Self::to_merkle_error)
+    }
+
+    fn get_meta(&self, key: &str) -> MerkleResult<Option<Vec<u8>>> {
+        let meta_key = GlobalMetaKey {
+            prefix: META_GLOBAL_PREFIX,
+            key_len: key.len() as u16,
+            key_bytes: key.as_bytes().to_vec(),
+        };
+        self.db
+            .get(ColumnFamily::MerkleMeta, &meta_key)
+            .map_err(Self::to_merkle_error)
+    }
+}
+
+/// B4Store implementation for RocksDBMerkleStore.
+///
+/// This provides true atomic commit capability using RocksDB's WriteBatch.
+/// All operations within a single `commit_batch()` call are guaranteed to
+/// either all succeed or all fail atomically.
+impl B4Store for RocksDBMerkleStore {
+    fn begin_batch(&self) -> MerkleResult<Box<dyn std::any::Any + Send>> {
+        Ok(Box::new(self.db.batch()))
+    }
+
+    fn commit_batch(&self, batch: Box<dyn std::any::Any + Send>) -> MerkleResult<()> {
+        let batch = batch.downcast::<WriteBatch>()
+            .map_err(|_| MerkleError::InvalidInput("Invalid batch type".to_string()))?;
+        self.db.write_batch(*batch).map_err(Self::to_merkle_error)
+    }
+
+    fn batch_put_leaves_to_batch(
+        &self,
+        batch: &mut Box<dyn std::any::Any + Send>,
+        subnet_id: &SubnetId,
+        leaves: &[(&HashValue, &[u8])],
+    ) -> MerkleResult<()> {
+        let batch = batch.downcast_mut::<WriteBatch>()
+            .ok_or_else(|| MerkleError::InvalidInput("Invalid batch type".to_string()))?;
+        for (object_id, value) in leaves {
+            let key = LeafKey {
+                subnet_id: *subnet_id,
+                object_id: Self::hash_to_bytes(object_id),
+            };
+            self.db
+                .batch_put(batch, ColumnFamily::MerkleLeaves, &key, &value.to_vec())
+                .map_err(Self::to_merkle_error)?;
+        }
+        Ok(())
+    }
+
+    fn batch_delete_leaves_to_batch(
+        &self,
+        batch: &mut Box<dyn std::any::Any + Send>,
+        subnet_id: &SubnetId,
+        object_ids: &[&HashValue],
+    ) -> MerkleResult<()> {
+        let batch = batch.downcast_mut::<WriteBatch>()
+            .ok_or_else(|| MerkleError::InvalidInput("Invalid batch type".to_string()))?;
+        for object_id in object_ids {
+            let key = LeafKey {
+                subnet_id: *subnet_id,
+                object_id: Self::hash_to_bytes(object_id),
+            };
+            self.db
+                .batch_delete(batch, ColumnFamily::MerkleLeaves, &key)
+                .map_err(Self::to_merkle_error)?;
+        }
+        Ok(())
+    }
+
+    fn batch_register_subnet(
+        &self,
+        batch: &mut Box<dyn std::any::Any + Send>,
+        subnet_id: &SubnetId,
+    ) -> MerkleResult<()> {
+        // Check cache first to avoid redundant writes.
+        //
+        // Cache consistency note:
+        // - If commit_batch() fails after cache update, cache and DB may be inconsistent.
+        // - This is acceptable because:
+        //   1. Node typically crashes/restarts on commit failure
+        //   2. On restart, cache is reloaded from DB (see new()/from_shared())
+        //   3. Redundant registration writes are idempotent
+        {
+            let cache = self.registered_subnets_cache.read().unwrap();
+            if cache.contains(subnet_id) {
+                return Ok(());
+            }
+        }
+
+        let batch = batch.downcast_mut::<WriteBatch>()
+            .ok_or_else(|| MerkleError::InvalidInput("Invalid batch type".to_string()))?;
+
+        // Add to batch
+        let key = SubnetRegistryKey {
+            prefix: META_SUBNET_REGISTRY_PREFIX,
+            subnet_id: *subnet_id,
+        };
+        self.db
+            .batch_put(batch, ColumnFamily::MerkleMeta, &key, &())
+            .map_err(Self::to_merkle_error)?;
+
+        // Update cache optimistically.
+        // If commit fails, next commit retry will skip this (already in cache),
+        // but the subnet registration is already in the new batch from the caller.
+        {
+            let mut cache = self.registered_subnets_cache.write().unwrap();
+            cache.insert(*subnet_id);
+        }
+
+        Ok(())
+    }
+
+    fn batch_set_last_anchor(
+        &self,
+        batch: &mut Box<dyn std::any::Any + Send>,
+        subnet_id: &SubnetId,
+        anchor_id: AnchorId,
+    ) -> MerkleResult<()> {
+        let batch = batch.downcast_mut::<WriteBatch>()
+            .ok_or_else(|| MerkleError::InvalidInput("Invalid batch type".to_string()))?;
+        let key = LastAnchorMetaKey {
+            prefix: META_LAST_ANCHOR_PREFIX,
+            subnet_id: *subnet_id,
+        };
+        self.db
+            .batch_put(batch, ColumnFamily::MerkleMeta, &key, &anchor_id)
+            .map_err(Self::to_merkle_error)
+    }
+
+    fn batch_put_subnet_root(
+        &self,
+        batch: &mut Box<dyn std::any::Any + Send>,
+        subnet_id: &SubnetId,
+        anchor_id: AnchorId,
+        root: &HashValue,
+    ) -> MerkleResult<()> {
+        let batch = batch.downcast_mut::<WriteBatch>()
+            .ok_or_else(|| MerkleError::InvalidInput("Invalid batch type".to_string()))?;
+        let key = RootKey {
+            subnet_id: *subnet_id,
+            anchor_id,
+        };
+        let root_bytes = Self::hash_to_bytes(root);
+        self.db
+            .batch_put(batch, ColumnFamily::MerkleRoots, &key, &root_bytes)
+            .map_err(Self::to_merkle_error)?;
+
+        // Also update the latest anchor key
+        let latest_key = LatestAnchorKey {
+            prefix: LATEST_SUBNET_PREFIX,
+            subnet_id: *subnet_id,
+        };
+        self.db
+            .batch_put(batch, ColumnFamily::MerkleRoots, &latest_key, &anchor_id)
+            .map_err(Self::to_merkle_error)
+    }
+
+    fn batch_put_global_root(
+        &self,
+        batch: &mut Box<dyn std::any::Any + Send>,
+        anchor_id: AnchorId,
+        root: &HashValue,
+    ) -> MerkleResult<()> {
+        let batch = batch.downcast_mut::<WriteBatch>()
+            .ok_or_else(|| MerkleError::InvalidInput("Invalid batch type".to_string()))?;
+        let key = GlobalRootKey::new(anchor_id);
+        let root_bytes = Self::hash_to_bytes(root);
+        self.db
+            .batch_put(batch, ColumnFamily::MerkleRoots, &key, &root_bytes)
+            .map_err(Self::to_merkle_error)?;
+
+        // Also update the latest global anchor key
+        let latest_key = LatestAnchorKey {
+            prefix: LATEST_GLOBAL_PREFIX,
+            subnet_id: [0u8; 32],
+        };
+        self.db
+            .batch_put(batch, ColumnFamily::MerkleRoots, &latest_key, &anchor_id)
+            .map_err(Self::to_merkle_error)
     }
 }
 

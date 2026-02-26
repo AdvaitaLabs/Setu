@@ -26,6 +26,10 @@ pub enum ColumnFamily {
     // Merkle tree storage
     MerkleNodes,
     MerkleRoots,
+    /// B4 scheme: stores raw leaf data (subnet_id, object_id) -> Vec<u8>
+    MerkleLeaves,
+    /// B4 scheme: stores metadata (subnet registry, last committed anchor)
+    MerkleMeta,
     // ConsensusFrame storage
     ConsensusFrames,
 }
@@ -53,6 +57,8 @@ impl ColumnFamily {
             Self::Checkpoints => "checkpoints",
             Self::MerkleNodes => "merkle_nodes",
             Self::MerkleRoots => "merkle_roots",
+            Self::MerkleLeaves => "merkle_leaves",
+            Self::MerkleMeta => "merkle_meta",
             Self::ConsensusFrames => "consensus_frames",
         }
     }
@@ -79,6 +85,8 @@ impl ColumnFamily {
             Self::Checkpoints,
             Self::MerkleNodes,
             Self::MerkleRoots,
+            Self::MerkleLeaves,
+            Self::MerkleMeta,
             Self::ConsensusFrames,
         ]
     }
@@ -127,6 +135,19 @@ impl ColumnFamily {
                         // Merkle roots: smaller, historical data
                         opts.set_write_buffer_size(16 * 1024 * 1024);
                         opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+                    }
+                    Self::MerkleLeaves => {
+                        // B4 scheme: leaf data, high frequency read/write
+                        // Uses prefix extractor for efficient subnet-based range queries
+                        opts.set_write_buffer_size(128 * 1024 * 1024);
+                        opts.set_max_write_buffer_number(4);
+                        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+                        // Use 32-byte prefix (subnet_id) for bloom filter optimization
+                        opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
+                    }
+                    Self::MerkleMeta => {
+                        // B4 scheme: metadata, small data volume, low frequency access
+                        opts.set_write_buffer_size(8 * 1024 * 1024);
                     }
                     Self::ConsensusFrames => {
                         // Consensus frames: moderate size, frequent read/write during consensus
