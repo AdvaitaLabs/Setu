@@ -524,7 +524,24 @@ impl ValidatorNetworkService {
     // ============================================
 
     pub fn get_balance(&self, account: &str) -> GetBalanceResponse {
-        EventHandler::get_balance(account)
+        // Query real balance from MerkleStateProvider
+        let coins = self.task_preparer.state_provider().get_coins_for_address(account);
+        
+        if coins.is_empty() {
+            GetBalanceResponse {
+                account: account.to_string(),
+                balance: 0,
+                exists: false,
+            }
+        } else {
+            // Sum all coin balances for this account (across all coin types)
+            let total_balance: u64 = coins.iter().map(|c| c.balance).sum();
+            GetBalanceResponse {
+                account: account.to_string(),
+                balance: total_balance as u128,
+                exists: true,
+            }
+        }
     }
 
     pub fn get_object(&self, key: &str) -> GetObjectResponse {
