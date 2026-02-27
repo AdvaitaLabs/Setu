@@ -6,6 +6,7 @@ use crate::dag::Dag;
 use crate::vlc::VLC;
 use setu_storage::subnet_state::GlobalStateManager;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 /// Decision outcome for a ConsensusFrame
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,15 +136,15 @@ impl ConsensusManager {
         }
     }
     
-    /// Create with an existing GlobalStateManager (for state persistence)
-    pub fn with_state_manager(
+    /// Create with a shared GlobalStateManager (for state persistence and sharing)
+    pub fn with_shared_state_manager(
         config: ConsensusConfig, 
         validator_id: String,
-        state_manager: GlobalStateManager,
+        state_manager: Arc<RwLock<GlobalStateManager>>,
     ) -> Self {
         Self {
             config: config.clone(),
-            anchor_builder: AnchorBuilder::with_state_manager(config.clone(), state_manager),
+            anchor_builder: AnchorBuilder::with_shared_state_manager(config.clone(), state_manager),
             legacy_folder: DagFolder::new(config),
             pending_cfs: HashMap::new(),
             pending_builds: HashMap::new(),
@@ -169,6 +170,11 @@ impl ConsensusManager {
         match self.anchor_builder.prepare_build(dag, vlc) {
             Ok(pending_build) => {
                 let anchor = pending_build.anchor.clone();
+                tracing::info!(
+                    anchor_id = %anchor.id,
+                    event_count = anchor.event_ids.len(),
+                    "CF created with anchor"
+                );
                 
                 // Create ConsensusFrame from anchor
                 let cf = ConsensusFrame::new(anchor, self.local_validator_id.clone());
@@ -179,12 +185,21 @@ impl ConsensusManager {
                 
                 Some(cf)
             }
-            Err(AnchorBuildError::DeltaNotReached { .. }) => None,
-            Err(AnchorBuildError::InsufficientEvents { .. }) => None,
-            Err(AnchorBuildError::NoEvents) => None,
+            Err(AnchorBuildError::DeltaNotReached { required, current }) => {
+                tracing::debug!(required, current, "CF not created: DeltaNotReached");
+                None
+            }
+            Err(AnchorBuildError::InsufficientEvents { required, found }) => {
+                tracing::debug!(required, found, "CF not created: InsufficientEvents");
+                None
+            }
+            Err(AnchorBuildError::NoEvents) => {
+                tracing::debug!("CF not created: NoEvents");
+                None
+            }
             Err(e) => {
                 // Log error but don't crash
-                eprintln!("AnchorBuilder error: {}", e);
+                tracing::error!(error = %e, "AnchorBuilder error");
                 None
             }
         }
@@ -299,8 +314,16 @@ impl ConsensusManager {
                     // Check if this is our CF (we have a pending_build for it)
                     if let Some(pending_build) = self.pending_builds.remove(cf_id) {
                         // Leader path: commit the pending build
+                        tracing::info!(cf_id = %cf_id, "Leader path: committing pending build");
                         match self.anchor_builder.commit_build(pending_build.clone()) {
                             Ok(state_summary) => {
+                                tracing::info!(
+                                    cf_id = %cf_id,
+                                    total_events = state_summary.total_events,
+                                    total_changes = state_summary.total_changes,
+                                    conflicted = state_summary.conflicted_events.len(),
+                                    "Leader path: commit_build succeeded"
+                                );
                                 // Store result for diagnostics
                                 self.last_build_result = Some(AnchorBuildResult {
                                     anchor: cf.anchor.clone(),
@@ -310,21 +333,22 @@ impl ConsensusManager {
                             }
                             Err(AnchorBuildError::SnapshotMismatch { .. }) => {
                                 // Another CF was committed first - use Follower path
-                                eprintln!("Snapshot mismatch during commit, falling back to follower path");
+                                tracing::warn!(cf_id = %cf_id, "Snapshot mismatch during commit, falling back to follower path");
                                 let events = pending_build.all_events();
                                 if let Err(e) = self.anchor_builder.apply_follower_finalized_cf(&events, &cf) {
-                                    eprintln!("Follower fallback failed: {}, syncing metadata only", e);
+                                    tracing::error!(cf_id = %cf_id, error = %e, "Follower fallback failed, syncing metadata only");
                                     self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
                                 }
                             }
                             Err(e) => {
                                 // Other error - sync metadata at minimum
-                                eprintln!("Commit failed: {}, syncing metadata only", e);
+                                tracing::error!(cf_id = %cf_id, error = %e, "Commit failed, syncing metadata only");
                                 self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
                             }
                         }
                     } else {
                         // Follower path: we didn't create this CF
+                        tracing::info!(cf_id = %cf_id, "Follower path: no pending_build, syncing metadata only");
                         // For now, just sync metadata. Full state sync requires events from DAG
                         self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
                     }
@@ -460,14 +484,25 @@ impl ConsensusManager {
         &mut self.anchor_builder
     }
     
-    /// Get the GlobalStateManager (read-only)
-    pub fn state_manager(&self) -> &GlobalStateManager {
-        self.anchor_builder.state_manager()
+    /// Get the shared GlobalStateManager
+    pub fn shared_state_manager(&self) -> Arc<RwLock<GlobalStateManager>> {
+        self.anchor_builder.shared_state_manager()
     }
     
-    /// Get the GlobalStateManager (mutable)
-    pub fn state_manager_mut(&mut self) -> &mut GlobalStateManager {
-        self.anchor_builder.state_manager_mut()
+    /// Access the GlobalStateManager with a closure (read-only)
+    pub fn with_state_manager<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&GlobalStateManager) -> R,
+    {
+        self.anchor_builder.with_state_manager(f)
+    }
+    
+    /// Access the GlobalStateManager with a closure (mutable)
+    pub fn with_state_manager_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut GlobalStateManager) -> R,
+    {
+        self.anchor_builder.with_state_manager_mut(f)
     }
     
     /// Get the last build result (for diagnostics)
@@ -519,7 +554,9 @@ impl ConsensusManager {
         }
         
         // Apply state changes from these events
-        let _ = self.anchor_builder.state_manager_mut().apply_committed_events(&events);
+        self.anchor_builder.with_state_manager_mut(|gsm| {
+            let _ = gsm.apply_committed_events(&events);
+        });
         
         // Verify the resulting global state root matches the anchor's
         if let Some(ref merkle_roots) = cf.anchor.merkle_roots {

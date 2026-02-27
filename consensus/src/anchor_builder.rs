@@ -25,6 +25,7 @@ use setu_types::{
 };
 use setu_storage::{GlobalStateManager, StateApplySummary, StateApplyError};
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 // ============================================================================
 // Types for Deferred Commit Mode
@@ -182,8 +183,8 @@ impl From<setu_merkle::MerkleError> for AnchorBuildError {
 /// Anchor Builder with integrated Merkle tree management
 pub struct AnchorBuilder {
     config: ConsensusConfig,
-    /// Global state manager (owns all subnet SMTs)
-    state_manager: GlobalStateManager,
+    /// Global state manager (shared across components)
+    state_manager: Arc<RwLock<GlobalStateManager>>,
     /// Last created anchor
     last_anchor: Option<Anchor>,
     /// Current anchor depth
@@ -201,11 +202,11 @@ pub struct AnchorBuilder {
 }
 
 impl AnchorBuilder {
-    /// Create a new AnchorBuilder
+    /// Create a new AnchorBuilder with its own GlobalStateManager
     pub fn new(config: ConsensusConfig) -> Self {
         Self {
             config,
-            state_manager: GlobalStateManager::new(),
+            state_manager: Arc::new(RwLock::new(GlobalStateManager::new())),
             last_anchor: None,
             anchor_depth: 0,
             last_fold_vlc: 0,
@@ -214,8 +215,10 @@ impl AnchorBuilder {
         }
     }
     
-    /// Create with an existing GlobalStateManager
-    pub fn with_state_manager(config: ConsensusConfig, state_manager: GlobalStateManager) -> Self {
+    /// Create with a shared GlobalStateManager
+    /// 
+    /// This allows sharing state between components (e.g., TaskPreparer and ConsensusValidator)
+    pub fn with_shared_state_manager(config: ConsensusConfig, state_manager: Arc<RwLock<GlobalStateManager>>) -> Self {
         Self {
             config,
             state_manager,
@@ -233,9 +236,9 @@ impl AnchorBuilder {
         delta >= self.config.vlc_delta_threshold
     }
     
-    /// Get the global state manager (read-only)
-    pub fn state_manager(&self) -> &GlobalStateManager {
-        &self.state_manager
+    /// Get the shared global state manager
+    pub fn shared_state_manager(&self) -> Arc<RwLock<GlobalStateManager>> {
+        Arc::clone(&self.state_manager)
     }
     
     /// Restore AnchorBuilder state from storage after restart
@@ -257,9 +260,26 @@ impl AnchorBuilder {
         self.last_fold_vlc = last_fold_vlc;
     }
     
-    /// Get the global state manager (mutable)
-    pub fn state_manager_mut(&mut self) -> &mut GlobalStateManager {
-        &mut self.state_manager
+    /// Get write access to the global state manager
+    /// 
+    /// Note: This acquires the write lock. Caller must ensure not to hold it across await points.
+    pub fn with_state_manager_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut GlobalStateManager) -> R,
+    {
+        let mut guard = self.state_manager.write()
+            .expect("GlobalStateManager lock poisoned");
+        f(&mut guard)
+    }
+    
+    /// Get read access to the global state manager
+    pub fn with_state_manager<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&GlobalStateManager) -> R,
+    {
+        let guard = self.state_manager.read()
+            .expect("GlobalStateManager lock poisoned");
+        f(&guard)
     }
 
     // ========================================================================
@@ -313,6 +333,16 @@ impl AnchorBuilder {
         // Collect events from DAG
         let from_depth = self.anchor_depth;
         let to_depth = dag.max_depth();
+        
+        // Debug: log depth range
+        tracing::debug!(
+            from_depth = from_depth,
+            to_depth = to_depth,
+            dag_node_count = dag.node_count(),
+            dag_pending_count = dag.get_pending_count(),
+            "prepare_build: checking depth range"
+        );
+        
         let events: Vec<Event> = dag.get_events_in_range(from_depth, to_depth)
             .into_iter()
             .cloned()
@@ -428,11 +458,19 @@ impl AnchorBuilder {
         
         // Apply state changes to SMT
         let events = pending.all_events();
-        let state_summary = self.state_manager.apply_committed_events(&events);
+        let state_summary = {
+            let mut guard = self.state_manager.write()
+                .expect("GlobalStateManager lock poisoned");
+            guard.apply_committed_events(&events)
+        };
         
         // Commit state
         let anchor_id = self.anchor_depth + 1;
-        self.state_manager.commit(anchor_id)?;
+        {
+            let mut guard = self.state_manager.write()
+                .expect("GlobalStateManager lock poisoned");
+            guard.commit(anchor_id)?;
+        }
         
         // Update AnchorBuilder state
         self.last_anchor = Some(pending.anchor);
@@ -479,11 +517,19 @@ impl AnchorBuilder {
         }
         
         // 3. Apply state changes
-        let state_summary = self.state_manager.apply_committed_events(events);
+        let state_summary = {
+            let mut guard = self.state_manager.write()
+                .expect("GlobalStateManager lock poisoned");
+            guard.apply_committed_events(events)
+        };
         
         // 4. Commit and update metadata
         let anchor_id = self.anchor_depth + 1;
-        self.state_manager.commit(anchor_id)?;
+        {
+            let mut guard = self.state_manager.write()
+                .expect("GlobalStateManager lock poisoned");
+            guard.commit(anchor_id)?;
+        }
         self.synchronize_finalized_anchor(&cf.anchor);
         
         Ok(state_summary)
@@ -516,7 +562,11 @@ impl AnchorBuilder {
         pending_changes: &HashMap<SubnetId, Vec<StateChangeEntry>>,
     ) -> ([u8; 32], HashMap<SubnetId, [u8; 32]>) {
         // Clone the state manager for temporary computation
-        let mut temp_manager = self.state_manager.clone();
+        let mut temp_manager = {
+            let guard = self.state_manager.read()
+                .expect("GlobalStateManager lock poisoned");
+            guard.clone()
+        };
         
         // Apply pending changes to the clone
         for (subnet_id, entries) in pending_changes {
@@ -592,12 +642,16 @@ impl AnchorBuilder {
     
     /// Get a subnet's current state root
     pub fn get_subnet_root(&self, subnet_id: &SubnetId) -> Option<[u8; 32]> {
-        self.state_manager.get_subnet_root_bytes(subnet_id)
+        let guard = self.state_manager.read()
+            .expect("GlobalStateManager lock poisoned");
+        guard.get_subnet_root_bytes(subnet_id)
     }
     
     /// Get the current global state root
     pub fn get_global_root(&self) -> [u8; 32] {
-        let (root, _) = self.state_manager.compute_global_root_bytes();
+        let guard = self.state_manager.read()
+            .expect("GlobalStateManager lock poisoned");
+        let (root, _) = guard.compute_global_root_bytes();
         root
     }
     
