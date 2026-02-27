@@ -22,11 +22,11 @@ use setu_types::{
 };
 use setu_storage::{
     SetuDB, RocksDBEventStore, RocksDBCFStore, RocksDBAnchorStore, RocksDBMerkleStore,
-    GlobalStateManager, EventStoreBackend, CFStoreBackend, AnchorStoreBackend, MerkleStore,
+    GlobalStateManager, EventStoreBackend, CFStoreBackend, AnchorStoreBackend, B4StoreExt,
     EventStore, AnchorStore,
 };
 use setu_validator::{ConsensusValidator, ConsensusValidatorConfig};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::path::Path;
 use tracing::info;
 
@@ -106,8 +106,8 @@ fn create_rocksdb_validator(db_path: &Path) -> (Arc<ConsensusValidator>, Arc<Set
     let event_store: Arc<dyn EventStoreBackend> = Arc::new(RocksDBEventStore::from_shared(db.clone()));
     let cf_store: Arc<dyn CFStoreBackend> = Arc::new(RocksDBCFStore::from_shared(db.clone()));
     let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(RocksDBAnchorStore::from_shared(db.clone()));
-    let merkle_store: Arc<dyn MerkleStore> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
-    let state_manager = GlobalStateManager::with_store(merkle_store);
+    let merkle_store: Arc<dyn B4StoreExt> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
+    let state_manager = Arc::new(RwLock::new(GlobalStateManager::with_store(merkle_store)));
     
     let config = create_test_config();
     let validator = Arc::new(ConsensusValidator::with_all_backends(
