@@ -6,7 +6,7 @@
 //! - Validator applies state changes and updates DAG
 
 use setu_types::{Transfer, TransferType};
-use setu_solver::{TeeExecutor, TeeExecutionResult, SolverTask, ResolvedInputs, GasBudget};
+use setu_solver::{TeeExecutor, SolverTask, ResolvedInputs, GasBudget};
 use setu_validator::task_preparer::{TaskPreparer, StateProvider, CoinInfo, SimpleMerkleProof};
 use setu_validator::MerkleStateProvider;
 use setu_types::{Event, EventType, VLCSnapshot};

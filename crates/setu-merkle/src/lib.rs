@@ -37,9 +37,12 @@ pub mod storage;
 pub use aggregation::{SubnetAggregationProof, SubnetAggregationTree, SubnetStateEntry};
 pub use binary::{BinaryMerkleProof, BinaryMerkleTree};
 pub use error::{MerkleError, MerkleResult};
-pub use hash::{HashValue, sha256};
-pub use sparse::{IncrementalSparseMerkleTree, SparseMerkleProof, SparseMerkleTree};
-pub use storage::{InMemoryMerkleStore, MerkleNodeStore, MerkleRootStore, MerkleStore};
+pub use hash::{HashValue, blake3_hash};
+pub use sparse::{IncrementalSparseMerkleTree, LeafChanges, SparseMerkleProof, SparseMerkleTree};
+pub use storage::{
+    B4Store, InMemoryBatch, InMemoryMerkleStore, MerkleLeafStore, MerkleMetaStore,
+    MerkleNodeStore, MerkleRootStore, MerkleStore,
+};
 
 /// The length of hash digests used in merkle trees (32 bytes = 256 bits)
 pub const HASH_LENGTH: usize = 32;

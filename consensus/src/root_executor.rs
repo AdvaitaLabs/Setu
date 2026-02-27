@@ -10,7 +10,7 @@
 //! Unlike App subnets which use Solver + TEE execution, ROOT subnet events are
 //! executed directly by validators with deterministic execution.
 
-use setu_merkle::sha256;
+use setu_merkle::blake3_hash;
 use setu_types::{
     Event, EventType, SubnetId, 
     ObjectStateValue, object_type, HashValue as TypesHash, ZERO_HASH,
@@ -150,7 +150,7 @@ impl RootSubnetExecutor {
             self.address_to_bytes(&event.creator),
             1, // Initial version
             object_type::VALIDATOR_INFO,
-            *sha256(event.id.as_bytes()).as_bytes(),
+            *blake3_hash(event.id.as_bytes()).as_bytes(),
             SubnetId::ROOT,
         );
         
@@ -196,7 +196,7 @@ impl RootSubnetExecutor {
             self.address_to_bytes(&event.creator),
             1,
             object_type::SOLVER_INFO,
-            *sha256(event.id.as_bytes()).as_bytes(),
+            *blake3_hash(event.id.as_bytes()).as_bytes(),
             SubnetId::ROOT,
         );
         
@@ -241,7 +241,7 @@ impl RootSubnetExecutor {
             [0u8; 32], // System owned
             1,
             object_type::GLOBAL_CONFIG,
-            *sha256(event.id.as_bytes()).as_bytes(),
+            *blake3_hash(event.id.as_bytes()).as_bytes(),
             SubnetId::ROOT,
         );
         
@@ -265,7 +265,7 @@ impl RootSubnetExecutor {
     fn generate_validator_key(&self, validator_id: &str) -> [u8; 32] {
         let mut key = [0u8; 32];
         key[0] = object_type::VALIDATOR_INFO;
-        let hash = sha256(validator_id.as_bytes());
+        let hash = blake3_hash(validator_id.as_bytes());
         key[1..].copy_from_slice(&hash.as_bytes()[..31]);
         key
     }
@@ -274,7 +274,7 @@ impl RootSubnetExecutor {
     fn generate_solver_key(&self, solver_id: &str) -> [u8; 32] {
         let mut key = [0u8; 32];
         key[0] = object_type::SOLVER_INFO;
-        let hash = sha256(solver_id.as_bytes());
+        let hash = blake3_hash(solver_id.as_bytes());
         key[1..].copy_from_slice(&hash.as_bytes()[..31]);
         key
     }
@@ -283,7 +283,7 @@ impl RootSubnetExecutor {
     fn generate_config_key(&self, config_name: &str) -> [u8; 32] {
         let mut key = [0u8; 32];
         key[0] = object_type::GLOBAL_CONFIG;
-        let hash = sha256(config_name.as_bytes());
+        let hash = blake3_hash(config_name.as_bytes());
         key[1..].copy_from_slice(&hash.as_bytes()[..31]);
         key
     }
@@ -291,7 +291,7 @@ impl RootSubnetExecutor {
     /// Convert address string to bytes
     fn address_to_bytes(&self, address: &str) -> [u8; 32] {
         let mut bytes = [0u8; 32];
-        let hash = sha256(address.as_bytes());
+        let hash = blake3_hash(address.as_bytes());
         bytes.copy_from_slice(hash.as_bytes());
         bytes
     }
@@ -313,7 +313,7 @@ impl RootSubnetExecutor {
             hasher_input.extend_from_slice(&[0xFF; 32]); // Deletion marker
         }
         
-        *sha256(&hasher_input).as_bytes()
+        *blake3_hash(&hasher_input).as_bytes()
     }
     
     /// Commit pending changes

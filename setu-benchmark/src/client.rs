@@ -36,6 +36,47 @@ pub struct BenchTransferResponse {
     pub solver_id: Option<String>,
 }
 
+/// Batch transfer request
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchBatchRequest {
+    pub transfers: Vec<BenchTransferRequest>,
+}
+
+/// Batch transfer result for a single transfer
+#[derive(Debug, Clone, Deserialize)]
+pub struct BenchBatchTransferResult {
+    pub index: usize,
+    pub success: bool,
+    pub transfer_id: Option<String>,
+    pub solver_id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Batch transfer response
+#[derive(Debug, Clone, Deserialize)]
+pub struct BenchBatchResponse {
+    pub success: bool,
+    pub message: String,
+    pub submitted: usize,
+    pub failed: usize,
+    pub results: Vec<BenchBatchTransferResult>,
+    #[allow(dead_code)]
+    pub stats: Option<BenchBatchStats>,
+}
+
+/// Batch preparation statistics
+#[derive(Debug, Clone, Deserialize)]
+pub struct BenchBatchStats {
+    #[allow(dead_code)]
+    pub total_transfers: usize,
+    #[allow(dead_code)]
+    pub unique_sender_subnet_pairs: usize,
+    #[allow(dead_code)]
+    pub coins_selected: usize,
+    #[allow(dead_code)]
+    pub same_sender_conflicts: usize,
+}
+
 /// Benchmark HTTP client
 pub struct BenchClient {
     client: Client,
@@ -128,6 +169,83 @@ impl BenchClient {
         let response = self.client.get(&url).send().await?;
         Ok(response.status().is_success())
     }
+
+    /// Submit a batch of transfers and measure latency
+    /// 
+    /// Returns a vector of RequestMetrics, one for each transfer in the batch.
+    /// The latency is the total batch request latency divided by batch size.
+    pub async fn submit_transfers_batch(&self, requests: Vec<BenchTransferRequest>) -> Vec<RequestMetrics> {
+        let batch_size = requests.len();
+        if batch_size == 0 {
+            return vec![];
+        }
+
+        let url = format!("{}/api/v1/transfers/batch", self.base_url);
+        let start = Instant::now();
+
+        let batch_request = BenchBatchRequest { transfers: requests };
+
+        let result = self
+            .client
+            .post(&url)
+            .json(&batch_request)
+            .send()
+            .await;
+
+        let total_latency = start.elapsed();
+        // Approximate per-transfer latency (batch amortizes overhead)
+        let per_transfer_latency = total_latency / batch_size as u32;
+
+        match result {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    match response.json::<BenchBatchResponse>().await {
+                        Ok(resp) => {
+                            debug!(
+                                submitted = resp.submitted,
+                                failed = resp.failed,
+                                total_latency_ms = total_latency.as_millis(),
+                                "Batch transfer completed"
+                            );
+                            
+                            // Convert batch results to individual metrics
+                            resp.results
+                                .iter()
+                                .map(|r| {
+                                    if r.success {
+                                        RequestMetrics::success(per_transfer_latency)
+                                    } else {
+                                        RequestMetrics::failure(
+                                            per_transfer_latency,
+                                            r.error.clone().unwrap_or_else(|| "Unknown error".to_string()),
+                                        )
+                                    }
+                                })
+                                .collect()
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to parse batch response");
+                            vec![RequestMetrics::failure(total_latency, format!("Parse error: {}", e)); batch_size]
+                        }
+                    }
+                } else {
+                    let body = response.text().await.unwrap_or_default();
+                    warn!(status = %status, body = %body, "HTTP error on batch request");
+                    vec![RequestMetrics::failure(total_latency, format!("HTTP {}: {}", status, body)); batch_size]
+                }
+            }
+            Err(e) => {
+                if e.is_timeout() {
+                    warn!(timeout_ms = self.timeout.as_millis(), "Batch request timeout");
+                    vec![RequestMetrics::timeout(total_latency); batch_size]
+                } else {
+                    warn!(error = %e, "Batch request error");
+                    vec![RequestMetrics::failure(total_latency, format!("Request error: {}", e)); batch_size]
+                }
+            }
+        }
+    }
 }
 
 /// Generate a random transfer request
@@ -154,39 +272,73 @@ pub fn generate_transfer(
     }
 }
 
-/// Generate a transfer using pre-initialized test accounts (20 accounts)
+/// Generate a transfer using test accounts
 /// 
-/// Accounts: alice, bob, charlie, user_01 to user_17
-/// This distributes load across many accounts to avoid state lock contention.
+/// Test accounts are created in two tiers:
+/// 1. Seed accounts: alice, bob, charlie (always available, high balance)
+/// 2. User accounts: user_001, user_002, ... (created via --init-accounts)
 /// 
-/// NOTE: Each request gets a unique resource key based on seq to ensure
+/// If `num_test_accounts` is specified, uses that many user accounts.
+/// Otherwise, falls back to using only the 3 seed accounts.
+/// 
+/// ## IMPORTANT: Setu's 1:1 Coin Binding
+/// 
+/// Setu uses 1:1 binding between (owner, subnet) and coin.
+/// Each account has exactly ONE coin, so concurrent requests from the same
+/// sender will cause reservation conflicts.
+/// 
+/// Success rate formula: min(num_accounts / concurrency, 1) * 100%
+/// - 100 accounts, 100 concurrent → ~100% success
+/// - 3 accounts, 100 concurrent → ~3% success
+/// 
+/// ## NOTE on Solver Distribution
+/// 
+/// Each request gets a unique resource key based on seq to ensure
 /// consistent hash routing distributes requests evenly across solvers.
 /// Without this, all requests from the same 'from' address would route
 /// to the same solver, causing severe load imbalance in multi-solver tests.
+#[allow(dead_code)]
 pub fn generate_transfer_with_test_accounts(amount: u64, seq: u64) -> BenchTransferRequest {
-    // 20 test accounts for better load distribution
-    const ACCOUNTS: &[&str] = &[
-        "alice", "bob", "charlie",
-        "user_01", "user_02", "user_03", "user_04", "user_05",
-        "user_06", "user_07", "user_08", "user_09", "user_10",
-        "user_11", "user_12", "user_13", "user_14", "user_15",
-        "user_16", "user_17",
-    ];
+    generate_transfer_with_n_accounts(amount, seq, None)
+}
+
+/// Generate a transfer using a specified number of test accounts
+/// 
+/// - If `num_accounts` is None or 0, uses only seed accounts (alice, bob, charlie)
+/// - Otherwise, uses user_001 to user_N (must be initialized via --init-accounts first)
+pub fn generate_transfer_with_n_accounts(amount: u64, seq: u64, num_accounts: Option<u64>) -> BenchTransferRequest {
+    // Build account list based on configuration
+    let accounts: Vec<String> = match num_accounts {
+        Some(n) if n > 0 => {
+            // Use initialized user accounts (user_001 to user_N)
+            (1..=n).map(|i| format!("user_{:03}", i)).collect()
+        }
+        _ => {
+            // Fall back to seed accounts only
+            vec![
+                "alice".to_string(),
+                "bob".to_string(),
+                "charlie".to_string(),
+            ]
+        }
+    };
+    
+    let num = accounts.len();
     
     // Use different indices for sender and receiver to ensure they're different
-    let sender_idx = seq as usize % ACCOUNTS.len();
-    let receiver_idx = (seq as usize + 1 + (seq as usize / ACCOUNTS.len())) % ACCOUNTS.len();
+    let sender_idx = seq as usize % num;
+    let receiver_idx = (seq as usize + 1 + (seq as usize / num)) % num;
     
     // Ensure sender != receiver
     let receiver_idx = if receiver_idx == sender_idx {
-        (receiver_idx + 1) % ACCOUNTS.len()
+        (receiver_idx + 1) % num
     } else {
         receiver_idx
     };
     
     BenchTransferRequest {
-        from: ACCOUNTS[sender_idx].to_string(),
-        to: ACCOUNTS[receiver_idx].to_string(),
+        from: accounts[sender_idx].clone(),
+        to: accounts[receiver_idx].clone(),
         amount,
         transfer_type: "flux".to_string(),
         preferred_solver: None,
@@ -195,5 +347,33 @@ pub fn generate_transfer_with_test_accounts(amount: u64, seq: u64) -> BenchTrans
         // Use unique resource key per request to ensure even distribution
         // across solvers via consistent hash routing
         resources: vec![format!("bench_resource_{}", seq)],
+    }
+}
+
+/// Response for balance query
+#[derive(Debug, Deserialize)]
+pub struct GetBalanceResponse {
+    pub account: String,
+    pub balance: u128,
+    pub exists: bool,
+}
+
+impl BenchClient {
+    /// Query account balance
+    /// 
+    /// Returns Some(balance) if the account exists, None otherwise.
+    /// This can be used to check if a transfer has been applied to state.
+    pub async fn get_balance(&self, account: &str) -> Option<u64> {
+        let url = format!("{}/api/v1/state/balance/{}", self.base_url, account);
+        
+        match self.client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<GetBalanceResponse>().await {
+                    Ok(resp) if resp.exists => Some(resp.balance as u64),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 }

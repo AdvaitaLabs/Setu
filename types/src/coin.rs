@@ -4,16 +4,92 @@
 //! - Coin is an independent object that can be owned by SBT
 //! - Supports operations like split, merge, transfer
 //! - Balance is a value type, not an object
+//! 
+//! ## Storage Format
+//! 
+//! Coins are stored in the Merkle tree using `CoinState` format (BCS serialized).
+//! This is the canonical storage format used across all components:
+//! - Runtime outputs `CoinState` via `Coin::to_coin_state()`
+//! - Storage layer reads/writes `CoinState` directly
+//! - Enclave passes through the bytes without parsing
 
 use serde::{Deserialize, Serialize};
-use crate::object::{Object, Address, generate_object_id};
+use sha2::{Sha256, Digest};
+use crate::object::{Object, Address, ObjectId, generate_object_id};
 
-/// Coin type identifier (e.g., "SUI", "USDC", "SETU")
+// ============================================================================
+// CoinState - Canonical Storage Format
+// ============================================================================
+
+/// Storage-layer representation of a Coin.
+/// 
+/// This is the canonical format stored in the Merkle tree (BCS serialized).
+/// All components must use this format for state persistence.
+/// 
+/// ## Why BCS?
+/// - More compact than JSON (~2-3x smaller)
+/// - Faster serialization/deserialization
+/// - Deterministic byte representation (important for Merkle proofs)
+/// 
+/// ## Relationship to Object<CoinData>
+/// - `Object<CoinData>` is the in-memory runtime representation
+/// - `CoinState` is the storage format
+/// - Use `Coin::to_coin_state()` to convert for storage
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoinState {
+    /// Owner address as hex string
+    pub owner: String,
+    /// Balance amount
+    pub balance: u64,
+    /// Version number (for optimistic concurrency)
+    pub version: u64,
+    /// Subnet ID that owns this coin type (1 subnet : 1 token)
+    /// For ROOT subnet, this is "ROOT". For other subnets, it's the subnet_id.
+    pub coin_type: String,
+}
+
+impl CoinState {
+    /// Create a new CoinState for ROOT subnet
+    pub fn new(owner: String, balance: u64) -> Self {
+        Self::new_with_type(owner, balance, "ROOT".to_string())
+    }
+    
+    /// Create a new CoinState with specific subnet_id/coin_type
+    pub fn new_with_type(owner: String, balance: u64, coin_type: String) -> Self {
+        Self {
+            owner,
+            balance,
+            version: 1,
+            coin_type,
+        }
+    }
+    
+    /// Serialize to BCS bytes for storage
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bcs::to_bytes(self).expect("CoinState BCS serialization should not fail")
+    }
+    
+    /// Deserialize from BCS bytes
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        bcs::from_bytes(bytes).ok()
+    }
+}
+
+// ============================================================================
+// CoinType - Token Identifier
+// ============================================================================
+
+/// Coin type identifier - stores subnet_id internally
+/// 
+/// Note: This stores the subnet_id (e.g., "ROOT", "gaming-subnet"), not the display name.
+/// For display name (e.g., "SETU", "GAME"), lookup SubnetConfig.token_symbol.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CoinType(pub String);
 
 impl CoinType {
-    pub const NATIVE: &'static str = "SETU";
+    /// Root subnet ID (internal identifier, not display name)
+    /// Display name "SETU" is stored in SubnetConfig.token_symbol
+    pub const NATIVE: &'static str = "ROOT";
     
     pub fn native() -> Self {
         Self(Self::NATIVE.to_string())
@@ -167,6 +243,39 @@ impl Coin {
     pub fn transfer(&mut self, new_owner: Address) {
         self.transfer_to(new_owner);
     }
+    
+    /// Convert to storage-compatible CoinState format (BCS serialized)
+    /// 
+    /// This is the canonical method for preparing Coin data for Merkle tree storage.
+    /// All runtime state changes should use this method instead of JSON serialization.
+    /// 
+    /// # Returns
+    /// BCS-serialized bytes of CoinState
+    /// 
+    /// # Example
+    /// ```ignore
+    /// let coin = create_coin(owner, 1000);
+    /// let state_bytes = coin.to_coin_state_bytes();
+    /// // Use state_bytes in StateChange.new_state
+    /// ```
+    pub fn to_coin_state(&self) -> CoinState {
+        CoinState {
+            owner: self.metadata.owner
+                .as_ref()
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
+            balance: self.data.balance.value(),
+            version: self.metadata.version,
+            coin_type: self.data.coin_type.as_str().to_string(),
+        }
+    }
+    
+    /// Convert to BCS-serialized bytes for storage
+    /// 
+    /// Convenience method that combines `to_coin_state()` and serialization.
+    pub fn to_coin_state_bytes(&self) -> Vec<u8> {
+        self.to_coin_state().to_bytes()
+    }
 }
 
 /// Helper function: create native Coin
@@ -177,6 +286,41 @@ pub fn create_coin(owner: Address, value: u64) -> Coin {
 /// Helper function: create Coin with specific type
 pub fn create_typed_coin(owner: Address, value: u64, coin_type: impl Into<String>) -> Coin {
     Coin::new_with_type(owner, value, CoinType::new(coin_type))
+}
+
+/// Generate deterministic coin ObjectId for an address and subnet
+/// 
+/// Convention: coin_object_id = SHA256("coin:" || address || ":" || subnet_id)
+/// 
+/// This is the canonical ID generation used by both storage layer and runtime.
+/// Each subnet has exactly one native token (1:1 binding), so subnet_id
+/// uniquely identifies the token type.
+/// 
+/// # Arguments
+/// * `owner` - Owner address (will be converted to hex string)
+/// * `subnet_id` - Subnet ID (e.g., "ROOT", "gaming-subnet")
+/// 
+/// # Returns
+/// Deterministic 32-byte ObjectId
+pub fn deterministic_coin_id(owner: &Address, subnet_id: &str) -> ObjectId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"coin:");
+    hasher.update(owner.to_string().as_bytes());
+    hasher.update(b":");
+    hasher.update(subnet_id.as_bytes());
+    ObjectId::new(hasher.finalize().into())
+}
+
+/// Generate deterministic coin ObjectId from string address
+/// 
+/// Convenience function for when you have a string address instead of Address.
+pub fn deterministic_coin_id_from_str(owner: &str, subnet_id: &str) -> ObjectId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"coin:");
+    hasher.update(owner.as_bytes());
+    hasher.update(b":");
+    hasher.update(subnet_id.as_bytes());
+    ObjectId::new(hasher.finalize().into())
 }
 
 #[cfg(test)]
@@ -285,5 +429,81 @@ mod tests {
         
         assert_eq!(coin.metadata.owner.as_ref().unwrap(), &new_owner);
         assert_eq!(coin.metadata.version, 2);
+    }
+    
+    #[test]
+    fn test_coin_to_coin_state() {
+        // Test conversion from Coin to CoinState
+        let owner = Address::from_str_id("sbt_alice");
+        let coin = Coin::new_with_type(owner, 1000, CoinType::new("ROOT"));
+        
+        let state = coin.to_coin_state();
+        
+        assert_eq!(state.owner, owner.to_string());
+        assert_eq!(state.balance, 1000);
+        assert_eq!(state.version, 1);
+        assert_eq!(state.coin_type, "ROOT");
+    }
+    
+    #[test]
+    fn test_coin_state_bcs_roundtrip() {
+        // Test that CoinState can be serialized and deserialized with BCS
+        let state = CoinState::new_with_type("alice".to_string(), 5000, "gaming-subnet".to_string());
+        
+        let bytes = state.to_bytes();
+        let recovered = CoinState::from_bytes(&bytes).expect("Should deserialize");
+        
+        assert_eq!(recovered.owner, "alice");
+        assert_eq!(recovered.balance, 5000);
+        assert_eq!(recovered.version, 1);
+        assert_eq!(recovered.coin_type, "gaming-subnet");
+    }
+    
+    #[test]
+    fn test_coin_to_coin_state_bytes_compatibility() {
+        // Critical test: Verify runtime output (Coin -> BCS) can be parsed by storage layer
+        let owner = Address::from_str_id("sbt_bob");
+        let coin = Coin::new_with_type(owner, 2500, CoinType::new("ROOT"));
+        
+        // This is what runtime outputs to StateChange.new_state
+        let bytes = coin.to_coin_state_bytes();
+        
+        // This is how storage layer parses it
+        let parsed = CoinState::from_bytes(&bytes).expect("Storage should parse runtime output");
+        
+        // Verify all fields match
+        assert_eq!(parsed.owner, owner.to_string());
+        assert_eq!(parsed.balance, 2500);
+        assert_eq!(parsed.version, coin.metadata.version);
+        assert_eq!(parsed.coin_type, "ROOT");
+    }
+    
+    #[test]
+    fn test_deterministic_coin_id() {
+        use crate::object::ObjectId;
+        
+        // Test deterministic ID generation
+        let id1 = deterministic_coin_id_from_str("alice", "ROOT");
+        let id2 = deterministic_coin_id_from_str("alice", "ROOT");
+        assert_eq!(id1, id2, "Same input should produce same ID");
+        
+        // Different address should produce different ID
+        let id3 = deterministic_coin_id_from_str("bob", "ROOT");
+        assert_ne!(id1, id3, "Different address should produce different ID");
+        
+        // Different subnet should produce different ID
+        let id4 = deterministic_coin_id_from_str("alice", "gaming-subnet");
+        assert_ne!(id1, id4, "Different subnet should produce different ID");
+        
+        // Test Address-based version produces consistent IDs
+        let addr = Address::from_str_id("alice");
+        let id5 = deterministic_coin_id(&addr, "ROOT");
+        let id6 = deterministic_coin_id(&addr, "ROOT");
+        assert_eq!(id5, id6, "Same Address should produce same ID");
+        
+        // Different subnets produce different IDs
+        let id_root = deterministic_coin_id_from_str("alice", "ROOT");
+        let id_other = deterministic_coin_id_from_str("alice", "OTHER");
+        assert_ne!(id_root, id_other, "Different subnets should have different IDs");
     }
 }

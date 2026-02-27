@@ -360,12 +360,22 @@ impl WriteSetEntry {
     /// 
     /// This bridges the internal object-based state changes to the
     /// generic key-value format used by the TEE output.
+    /// 
+    /// ## Key Format
+    /// 
+    /// Uses `"oid:{hex}"` format where hex is the raw ObjectId bytes.
+    /// This allows GlobalStateManager to reconstruct the exact SMT key
+    /// without additional hashing (the hex IS the key).
+    /// 
+    /// Example: ObjectId([0xab, 0xcd, ...]) → key = "oid:abcd1234..."
     pub fn from_state_change(
         object_id: &setu_types::ObjectId,
         old_state: Option<Vec<u8>>,
         new_state: Vec<u8>,
     ) -> Self {
-        let key = format!("object:{}", object_id);
+        // Use "oid:" prefix with raw hex (no 0x) so GlobalStateManager
+        // can directly decode to the SMT key without SHA256
+        let key = format!("oid:{}", hex::encode(object_id.as_bytes()));
         let mut entry = Self::new(key, new_state);
         if let Some(old) = old_state {
             entry = entry.with_old_value(old);

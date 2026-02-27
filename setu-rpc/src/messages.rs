@@ -26,6 +26,7 @@ pub enum MessageType {
     // Transfer messages (0x3x)
     SubmitTransfer = 0x30,
     TransferResult = 0x31,
+    SubmitTransfersBatch = 0x32,
     
     // Event messages (0x4x)
     SubmitEvent = 0x40,
@@ -247,6 +248,65 @@ pub struct SubmitTransferResponse {
     pub solver_id: Option<String>,
     /// Processing steps (for debugging/visualization)
     pub processing_steps: Vec<ProcessingStep>,
+}
+
+// ============================================
+// Batch Transfer Request/Response Types
+// ============================================
+
+/// Request to submit multiple transfers in a batch
+/// 
+/// Use this for high-throughput scenarios (>100 TPS).
+/// Batch processing reduces lock acquisitions from 5-6N to just 2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitTransfersBatchRequest {
+    /// List of transfers to submit
+    pub transfers: Vec<SubmitTransferRequest>,
+}
+
+/// Result for a single transfer in batch
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchTransferResult {
+    /// Original transfer index in the batch
+    pub index: usize,
+    /// Whether this transfer was successful
+    pub success: bool,
+    /// Assigned transfer ID (if successful)
+    pub transfer_id: Option<String>,
+    /// Assigned solver ID (if successful)
+    pub solver_id: Option<String>,
+    /// Error message (if failed)
+    pub error: Option<String>,
+}
+
+/// Response to batch transfer submission
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitTransfersBatchResponse {
+    /// Whether the batch submission was accepted
+    pub success: bool,
+    /// Human-readable message
+    pub message: String,
+    /// Number of successfully submitted transfers
+    pub submitted: usize,
+    /// Number of failed transfers
+    pub failed: usize,
+    /// Results for each transfer in the batch
+    pub results: Vec<BatchTransferResult>,
+    /// Batch preparation statistics
+    pub stats: BatchPrepareStatsResponse,
+}
+
+/// Batch preparation statistics
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BatchPrepareStatsResponse {
+    /// Total transfers in the batch
+    pub total_transfers: usize,
+    /// Unique (sender, subnet) pairs queried
+    pub unique_sender_subnet_pairs: usize,
+    /// Coins selected for transfers
+    pub coins_selected: usize,
+    /// Same-sender balance conflicts detected (overdraft prevention)
+    pub same_sender_conflicts: usize,
 }
 
 /// A processing step in the transfer pipeline

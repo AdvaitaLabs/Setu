@@ -1,6 +1,7 @@
 #!/bin/bash
-# Setu Node Startup Script (assumes keys are already generated)
-# Usage: ./scripts/start_nodes.sh
+# Setu Node Startup Script
+# Usage: ./scripts/start_nodes.sh [--local]
+#   --local: Use local data directory instead of /data
 
 set -e
 
@@ -21,23 +22,69 @@ CLI_BIN="${PROJECT_ROOT}/target/release/setu"
 VALIDATOR_BIN="${PROJECT_ROOT}/target/release/setu-validator"
 SOLVER_BIN="${PROJECT_ROOT}/target/release/setu-solver"
 
-# Configuration
-DATA_DIR=${DATA_DIR:-/data}
+# Check for --local flag
+LOCAL_MODE=false
+for arg in "$@"; do
+    if [ "$arg" = "--local" ]; then
+        LOCAL_MODE=true
+    fi
+done
+
+# Configuration - use local directory for development
+if [ "$LOCAL_MODE" = true ] || [ ! -d "/data" ]; then
+    DATA_DIR=${DATA_DIR:-${PROJECT_ROOT}/.setu-data}
+    echo -e "${YELLOW}Using local data directory: ${DATA_DIR}${NC}"
+else
+    DATA_DIR=${DATA_DIR:-/data}
+fi
+
 KEYS_DIR=${DATA_DIR}/keys
 LOGS_DIR=${DATA_DIR}/logs
 PIDS_DIR=${DATA_DIR}/pids
 
-# Check key files
+# Create directories if needed
+mkdir -p ${KEYS_DIR} ${LOGS_DIR} ${PIDS_DIR}
+
+# Check if binaries exist
+if [ ! -f "${VALIDATOR_BIN}" ]; then
+    echo -e "${YELLOW}Building release binaries...${NC}"
+    cd ${PROJECT_ROOT} && cargo build --release -p setu-validator -p setu-solver
+fi
+
+# Check key files - generate if missing (for local dev)
 if [ ! -f "${KEYS_DIR}/validator-key.json" ]; then
-    echo -e "${RED}Error: Validator key file not found: ${KEYS_DIR}/validator-key.json${NC}"
-    echo -e "${YELLOW}Please run first: ./scripts/deploy_with_keys.sh${NC}"
-    exit 1
+    if [ "$LOCAL_MODE" = true ] || [ ! -d "/data" ]; then
+        echo -e "${YELLOW}Generating validator key for local development...${NC}"
+        # Simple key generation for development
+        cat > ${KEYS_DIR}/validator-key.json << 'EOF'
+{
+  "public_key": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+  "private_key": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+}
+EOF
+        echo -e "${GREEN}  ✓ Generated test validator key${NC}"
+    else
+        echo -e "${RED}Error: Validator key file not found: ${KEYS_DIR}/validator-key.json${NC}"
+        echo -e "${YELLOW}Please run first: ./scripts/deploy_with_keys.sh${NC}"
+        exit 1
+    fi
 fi
 
 if [ ! -f "${KEYS_DIR}/solver-key.json" ]; then
-    echo -e "${RED}Error: Solver key file not found: ${KEYS_DIR}/solver-key.json${NC}"
-    echo -e "${YELLOW}Please run first: ./scripts/deploy_with_keys.sh${NC}"
-    exit 1
+    if [ "$LOCAL_MODE" = true ] || [ ! -d "/data" ]; then
+        echo -e "${YELLOW}Generating solver key for local development...${NC}"
+        cat > ${KEYS_DIR}/solver-key.json << 'EOF'
+{
+  "public_key": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+  "private_key": "0xcafebeefcafebeefcafebeefcafebeefcafebeefcafebeefcafebeefcafebeef"
+}
+EOF
+        echo -e "${GREEN}  ✓ Generated test solver key${NC}"
+    else
+        echo -e "${RED}Error: Solver key file not found: ${KEYS_DIR}/solver-key.json${NC}"
+        echo -e "${YELLOW}Please run first: ./scripts/deploy_with_keys.sh${NC}"
+        exit 1
+    fi
 fi
 
 # ============================================

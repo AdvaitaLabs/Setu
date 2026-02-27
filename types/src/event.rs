@@ -106,6 +106,8 @@ impl EventType {
                 | EventType::ValidatorUnregister
                 | EventType::SolverRegister
                 | EventType::SolverUnregister
+                | EventType::SubnetRegister
+                | EventType::UserRegister
         )
     }
     
@@ -134,12 +136,15 @@ impl EventType {
     }
 }
 
+use crate::genesis::GenesisConfig;
+
 // ========== Event Payload ==========
 
 /// Event payload - contains the actual data for different event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventPayload {
     None,
+    Genesis(GenesisConfig),
     Transfer(Transfer),
     ValidatorRegister(ValidatorRegistration),
     ValidatorUnregister(Unregistration),
@@ -553,6 +558,11 @@ impl Event {
                 vec![format!("task:{}", t.task_id)]
             }
             EventPayload::None => vec![],
+            EventPayload::Genesis(g) => {
+                g.accounts.iter()
+                    .map(|a| format!("account:{}", a.name))
+                    .collect()
+            }
         }
     }
 }
@@ -653,7 +663,7 @@ mod tests {
             .with_tps(1000)
             .with_storage(1024 * 1024 * 1024);
         
-        let registration = SubnetRegistration::new("subnet-1", "DeFi App", "alice")
+        let registration = SubnetRegistration::new("subnet-1", "DeFi App", "alice", "DEFI")
             .with_limits(limits)
             .with_solvers(vec!["solver-1".to_string(), "solver-2".to_string()]);
         

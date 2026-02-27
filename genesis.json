@@ -1,0 +1,19 @@
+{
+  "chain_id": "setu-devnet",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "accounts": [
+    {
+      "name": "alice",
+      "balance": 1000000000
+    },
+    {
+      "name": "bob",
+      "balance": 1000000000
+    },
+    {
+      "name": "charlie",
+      "balance": 1000000000
+    }
+  ],
+  "subnet_id": "ROOT"
+}

@@ -22,6 +22,7 @@ use setu_vlc::VLCSnapshot;
 use setu_storage::{EventStore, EventStoreBackend, subnet_state::GlobalStateManager};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock as StdRwLock;
 use tokio::sync::{mpsc, RwLock, Mutex};
 use tracing::{debug, info, warn};
 
@@ -125,11 +126,11 @@ impl ConsensusEngine {
     /// 
     /// This constructor allows injecting a pre-configured GlobalStateManager
     /// with MerkleStore for persisting state roots.
-    pub fn with_state_manager(
+    pub fn with_shared_state_manager(
         config: ConsensusConfig,
         validator_id: String,
         validator_set: ValidatorSet,
-        state_manager: GlobalStateManager,
+        state_manager: Arc<StdRwLock<GlobalStateManager>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1000);
         
@@ -152,7 +153,7 @@ impl ConsensusEngine {
             vlc: Arc::new(RwLock::new(VLC::new(validator_id.clone()))),
             logical_time_counter: AtomicU64::new(0),
             validator_set: Arc::new(RwLock::new(validator_set)),
-            consensus_manager: Arc::new(RwLock::new(ConsensusManager::with_state_manager(
+            consensus_manager: Arc::new(RwLock::new(ConsensusManager::with_shared_state_manager(
                 config,
                 validator_id.clone(),
                 state_manager,
@@ -205,12 +206,12 @@ impl ConsensusEngine {
         }
     }
     
-    /// Create with both state manager and event store
+    /// Create with both shared state manager and event store
     pub fn with_stores(
         config: ConsensusConfig,
         validator_id: String,
         validator_set: ValidatorSet,
-        state_manager: GlobalStateManager,
+        state_manager: Arc<StdRwLock<GlobalStateManager>>,
         event_store: Arc<dyn EventStoreBackend>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1000);
@@ -231,7 +232,7 @@ impl ConsensusEngine {
             vlc: Arc::new(RwLock::new(VLC::new(validator_id.clone()))),
             logical_time_counter: AtomicU64::new(0),
             validator_set: Arc::new(RwLock::new(validator_set)),
-            consensus_manager: Arc::new(RwLock::new(ConsensusManager::with_state_manager(
+            consensus_manager: Arc::new(RwLock::new(ConsensusManager::with_shared_state_manager(
                 config,
                 validator_id.clone(),
                 state_manager,
@@ -456,7 +457,15 @@ impl ConsensusEngine {
             let round = validator_set.current_round();
 
             // Check if we are the valid proposer for the current round
-            if !validator_set.is_valid_proposer(&self.local_validator_id, round) {
+            let is_valid = validator_set.is_valid_proposer(&self.local_validator_id, round);
+            if !is_valid {
+                debug!(
+                    local_id = %self.local_validator_id,
+                    round = round,
+                    is_valid_proposer = is_valid,
+                    leader_id = ?validator_set.get_leader_id(),
+                    "try_create_cf: not valid proposer"
+                );
                 return Ok(None);
             }
             round
@@ -465,15 +474,58 @@ impl ConsensusEngine {
         let vlc = self.vlc.read().await;
         let mut manager = self.consensus_manager.write().await;
 
-        if !manager.should_fold(&vlc) {
+        let should_fold = manager.should_fold(&vlc);
+        if !should_fold {
+            debug!(
+                vlc_logical_time = vlc.logical_time(),
+                last_fold_vlc = manager.anchor_builder().last_fold_vlc(),
+                should_fold = should_fold,
+                "try_create_cf: should_fold=false"
+            );
             return Ok(None);
         }
+        
+        // Log when we actually start creating CF
+        info!(
+            vlc_logical_time = vlc.logical_time(),
+            "try_create_cf: starting CF creation"
+        );
 
         let dag = self.dag.read().await;
         // AnchorBuilder now handles all Merkle tree computation internally
         let cf = manager.try_create_cf(&dag, &vlc);
 
         if let Some(ref frame) = cf {
+            info!(
+                cf_id = %frame.id,
+                anchor_id = %frame.anchor.id,
+                event_count = frame.anchor.event_ids.len(),
+                "CF created successfully"
+            );
+            
+            // Leader auto-votes for their own CF
+            // Get private key for signing (if available)
+            let private_key = self.private_key.read().await;
+            let key_ref = private_key.as_ref().map(|k| k.as_slice());
+            
+            if let Some(_vote) = manager.vote_for_cf(&frame.id, true, key_ref) {
+                debug!(cf_id = %frame.id, "Leader self-voted for CF");
+                
+                // Check if this vote causes finalization (single-node mode)
+                if manager.check_finalization(&frame.id) {
+                    // Immediately update depth floor so new events land above anchor_depth.
+                    // This is critical: without it, events referencing old parents (e.g., genesis)
+                    // would get a depth below anchor_depth, causing permanent InsufficientEvents.
+                    let new_anchor_depth = manager.anchor_builder().anchor_depth();
+                    self.dag_manager.update_min_depth(new_anchor_depth);
+                    info!(
+                        cf_id = %frame.id,
+                        new_min_depth = new_anchor_depth,
+                        "CF finalized (single-node mode), depth floor updated"
+                    );
+                }
+            }
+            
             // Send to internal channel (legacy)
             let _ = self
                 .message_tx
@@ -788,6 +840,9 @@ impl ConsensusEngine {
             // Advance to next round (ValidatorSet manages rounds)
             let mut validator_set = self.validator_set.write().await;
             validator_set.advance_round();
+
+            // Update depth floor so new events land above anchor_depth
+            self.dag_manager.update_min_depth(anchor.depth + 1);
 
             Some(anchor)
         } else {

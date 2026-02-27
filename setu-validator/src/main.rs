@@ -15,11 +15,16 @@ use setu_validator::{
 };
 use setu_storage::{
     SetuDB, RocksDBEventStore, RocksDBCFStore, RocksDBAnchorStore, RocksDBMerkleStore,
-    GlobalStateManager, EventStoreBackend, CFStoreBackend, AnchorStoreBackend, MerkleStore,
+    GlobalStateManager, EventStoreBackend, CFStoreBackend, AnchorStoreBackend, B4StoreExt,
+    MerkleStateProvider,
 };
-use setu_types::NodeInfo;
+use setu_types::{
+    NodeInfo, ConsensusConfig,
+    GenesisConfig, Event, EventPayload, ExecutionResult, StateChange,
+    CoinState, Address, VLCSnapshot,
+};
 use setu_keys::{load_keypair};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::net::SocketAddr;
 use tracing::{info, error, warn, Level};
 use tracing_subscriber;
@@ -149,30 +154,59 @@ async fn main() -> anyhow::Result<()> {
     // Create router manager (shared between NetworkService components)
     let router_manager = Arc::new(RouterManager::new());
     
-    // Create task preparer (solver-tee3 architecture)
-    // Uses real MerkleStateProvider with pre-initialized test accounts
-    let task_preparer = Arc::new(setu_validator::TaskPreparer::new_for_testing(
-        config.node_config.node_id.clone(),
-    ));
-    
-    info!("✓ TaskPreparer initialized with test accounts (alice, bob, charlie)");
-    
     // Create ConsensusValidator for DAG + VLC + Consensus
     let node_info = NodeInfo::new_validator(
         config.node_config.node_id.clone(),
         config.http_addr.ip().to_string(),
         config.http_addr.port(),
     );
+    
+    // Single node mode: set validator_count = 1 for quorum to work
+    // quorum = (1 * 2) / 3 + 1 = 1, so single validator can finalize
+    let mut consensus = ConsensusConfig::default();
+    consensus.validator_count = 1;
+    // Lower vlc_delta_threshold for testing - allows faster CF creation
+    // Default is 10, which requires 10 VLC ticks to create a CF
+    // For low-throughput scenarios (like account initialization), this causes delays
+    consensus.vlc_delta_threshold = 3;
+    
     let consensus_config = ConsensusValidatorConfig {
         node_info,
+        consensus,
         is_leader: true, // Single node mode: always leader
         ..Default::default()
     };
     
+    // Create SHARED GlobalStateManager (used by both TaskPreparer and ConsensusValidator)
+    // This is the key fix: both components now share the same state!
+    let shared_state_manager: Arc<RwLock<GlobalStateManager>> = if let Some(ref db_path) = config.db_path {
+        // RocksDB persistence mode
+        info!("Opening RocksDB at: {}", db_path);
+        let db = match SetuDB::open_default(db_path) {
+            Ok(db) => Arc::new(db),
+            Err(e) => {
+                error!("Failed to open RocksDB at {}: {}", db_path, e);
+                return Err(anyhow::anyhow!("Database open failed: {}", e));
+            }
+        };
+        
+        let merkle_store: Arc<dyn B4StoreExt> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
+        Arc::new(RwLock::new(GlobalStateManager::with_store(merkle_store)))
+    } else {
+        // Memory mode
+        Arc::new(RwLock::new(GlobalStateManager::new()))
+    };
+    
+    // Create task preparer with the SHARED state manager
+    let task_preparer = Arc::new(setu_validator::TaskPreparer::new_with_state_manager(
+        config.node_config.node_id.clone(),
+        Arc::clone(&shared_state_manager),
+    ));
+    info!("✓ TaskPreparer initialized with shared state manager");
+    
     // Create ConsensusValidator with appropriate storage backend
     let consensus_validator = if let Some(ref db_path) = config.db_path {
         // RocksDB persistence mode - open database and create all backends
-        info!("Opening RocksDB at: {}", db_path);
         let db = match SetuDB::open_default(db_path) {
             Ok(db) => Arc::new(db),
             Err(e) => {
@@ -185,31 +219,153 @@ async fn main() -> anyhow::Result<()> {
         let event_store: Arc<dyn EventStoreBackend> = Arc::new(RocksDBEventStore::from_shared(db.clone()));
         let cf_store: Arc<dyn CFStoreBackend> = Arc::new(RocksDBCFStore::from_shared(db.clone()));
         let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(RocksDBAnchorStore::from_shared(db.clone()));
-        let merkle_store: Arc<dyn MerkleStore> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
-        
-        // Create GlobalStateManager with Merkle persistence
-        let state_manager = GlobalStateManager::with_store(merkle_store);
         
         info!("✓ RocksDB backends initialized (Events, CF, Anchors, Merkle)");
         
+        // Use the SHARED state manager
         Arc::new(ConsensusValidator::with_all_backends(
             consensus_config,
-            state_manager,
+            Arc::clone(&shared_state_manager),
             event_store,
             cf_store,
             anchor_store,
         ))
     } else {
-        // Memory mode - use default in-memory stores
-        Arc::new(ConsensusValidator::new(consensus_config))
+        // Memory mode - use shared state manager
+        Arc::new(ConsensusValidator::with_shared_state_manager(
+            consensus_config, 
+            Arc::clone(&shared_state_manager),
+        ))
     };
     
-    info!("✓ ConsensusValidator initialized (single node mode)");
+    info!("✓ ConsensusValidator initialized with shared state manager (single node mode)");
     
     // Attempt to recover state from storage (if any)
     // This is safe to call even with empty storage (fresh start)
     if let Err(e) = consensus_validator.recover_from_storage().await {
         warn!("Recovery from storage failed: {}, starting fresh", e);
+    }
+
+    // ========================================
+    // Genesis Event: Initialize seed accounts
+    // ========================================
+    // Load genesis.json and create a proper Genesis Event that flows through
+    // the DAG → CF → commit pipeline, replacing the old direct init_coin hack.
+    {
+        let genesis_path = std::env::var("GENESIS_FILE")
+            .unwrap_or_else(|_| "genesis.json".to_string());
+
+        match GenesisConfig::load(&genesis_path) {
+            Ok(genesis_config) => {
+                info!(
+                    chain_id = %genesis_config.chain_id,
+                    accounts = genesis_config.accounts.len(),
+                    subnet = %genesis_config.subnet_id,
+                    "Loaded genesis config from {}",
+                    genesis_path
+                );
+
+                // Build state changes for each genesis account
+                let mut state_changes = Vec::new();
+                for account in &genesis_config.accounts {
+                    let owner_hex = Address::from(account.name.as_str()).to_string();
+                    let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(
+                        &owner_hex,
+                        &genesis_config.subnet_id,
+                    );
+                    let coin_state = CoinState::new_with_type(
+                        owner_hex.clone(),
+                        account.balance,
+                        genesis_config.subnet_id.clone(),
+                    );
+                    let key = format!("oid:{}", hex::encode(object_id_bytes));
+                    state_changes.push(StateChange {
+                        key,
+                        old_value: None,
+                        new_value: Some(coin_state.to_bytes()),
+                    });
+                    info!(
+                        name = %account.name,
+                        owner = %owner_hex,
+                        balance = account.balance,
+                        object_id = %hex::encode(object_id_bytes),
+                        "Genesis account prepared"
+                    );
+                }
+
+                // Build genesis event with pre-computed execution result
+                let vlc_snapshot = VLCSnapshot::default();
+                let mut genesis_event = Event::genesis(
+                    config.node_config.node_id.clone(),
+                    vlc_snapshot,
+                );
+                genesis_event.payload = EventPayload::Genesis(genesis_config.clone());
+                genesis_event.set_execution_result(ExecutionResult {
+                    success: true,
+                    message: Some(format!(
+                        "Genesis: {} accounts initialized on {}",
+                        genesis_config.accounts.len(),
+                        genesis_config.chain_id
+                    )),
+                    state_changes: state_changes.clone(),
+                });
+                // Recompute ID after setting payload and execution_result
+                // (verify_id checks against parent_ids, vlc, creator, timestamp)
+                // The ID is computed from (parent_ids, vlc, creator, timestamp) so
+                // payload/execution_result changes don't invalidate it.
+
+                // Submit genesis event to the DAG
+                match consensus_validator.submit_event(genesis_event.clone()).await {
+                    Ok(event_id) => {
+                        info!(
+                            event_id = %event_id,
+                            "Genesis event submitted to DAG"
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to submit genesis event: {}", e);
+                        return Err(anyhow::anyhow!("Genesis event submission failed: {}", e));
+                    }
+                }
+
+                // Also apply state changes directly to GSM for immediate availability.
+                // The genesis event is in the DAG but the CF won't form until
+                // vlc_delta_threshold more events arrive. We need the coins to be
+                // queryable right away for benchmarks/tests.
+                // When the CF eventually forms and commits, apply_committed_events
+                // will re-apply these changes (upsert is idempotent).
+                {
+                    let genesis_event_id = genesis_event.id.clone();
+                    let mut gsm = shared_state_manager.write()
+                        .expect("Failed to acquire write lock on GlobalStateManager");
+                    for change in &state_changes {
+                        gsm.apply_state_change(
+                            setu_types::subnet::SubnetId::ROOT,
+                            change,
+                        );
+                        // Record this genesis event as the last modifier of each coin object.
+                        // This enables TaskPreparer.derive_dependencies() to set proper
+                        // parent_ids on subsequent transfer events, establishing the causal
+                        // chain: genesis_event → first_transfer → second_transfer → ...
+                        let object_id_hex = change.key.strip_prefix("oid:").unwrap_or("");
+                        if let Ok(bytes) = hex::decode(object_id_hex) {
+                            if bytes.len() == 32 {
+                                let mut arr = [0u8; 32];
+                                arr.copy_from_slice(&bytes);
+                                gsm.record_modification(&genesis_event_id, arr);
+                            }
+                        }
+                    }
+                }
+                info!(
+                    "✓ Genesis state applied: {} seed accounts initialized",
+                    genesis_config.accounts.len()
+                );
+            }
+            Err(e) => {
+                warn!("No genesis config loaded ({}), starting with empty state", e);
+            }
+        }
     }
     
     // Create network service configuration
@@ -256,6 +412,10 @@ async fn main() -> anyhow::Result<()> {
     info!("│             - State persistence ready                      │");
     
     info!("└─────────────────────────────────────────────────────────────┘");
+
+    // Start background reservation cleanup task (prevents memory accumulation)
+    let _cleanup_handle = network_service.start_reservation_cleanup_task();
+    info!("Background reservation cleanup task started (60s interval)");
 
     // Spawn HTTP server
     let http_service = network_service.clone();

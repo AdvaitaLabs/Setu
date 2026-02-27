@@ -1,66 +1,33 @@
-//! SolverTask Preparation Module (solver-tee3 Architecture)
+//! Single-transfer task preparation
 //!
-//! This module handles the preparation of SolverTask for Solver execution.
-//! According to solver-tee3 design:
-//!
-//! - **Validator prepares everything**: coin selection, read_set, Merkle proofs
-//! - **Solver is pass-through**: receives SolverTask, passes to TEE
-//! - **TEE validates and executes**: verifies proofs, executes STF
-//!
-//! ## Flow
-//!
-//! ```text
-//! User Request (Transfer)
-//!       │
-//!       ▼
-//! Validator.prepare_solver_task()
-//!       │
-//!       ├── 1. Convert Transfer to Event (account model)
-//!       ├── 2. Select coins for sender (object model)
-//!       ├── 3. Build ResolvedInputs with object references
-//!       ├── 4. Build read_set with Merkle proofs
-//!       ├── 5. Generate task_id for Attestation binding
-//!       └── 6. Create SolverTask
-//!       │
-//!       ▼
-//! SolverTask → Solver → TEE
-//! ```
-//!
-//! ## StateProvider
-//!
-//! The `StateProvider` trait and `MerkleStateProvider` implementation are
-//! defined in `setu_storage::state_provider`. Use `TaskPreparer::new_for_testing()`
-//! for tests, which creates a real MerkleStateProvider with pre-initialized accounts.
+//! Use [`TaskPreparer`] for preparing individual SolverTasks.
+//! For batch operations, see [`super::BatchTaskPreparer`].
 
 use setu_types::task::{
     SolverTask, ResolvedInputs, ResolvedObject,
-    GasBudget, ReadSetEntry, MerkleProof,
+    GasBudget, ReadSetEntry,
 };
 use setu_types::{Event, EventType, SubnetId, ObjectId};
 use setu_types::event::VLCSnapshot;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-// Re-export StateProvider and CoinInfo from storage
-pub use setu_storage::{StateProvider, CoinInfo, SimpleMerkleProof};
+use super::{TaskPrepareError, CoinInfo, StateProvider};
 
-/// Convert SimpleMerkleProof to MerkleProof
-#[allow(dead_code)]
-fn to_enclave_proof(proof: &SimpleMerkleProof) -> MerkleProof {
-    MerkleProof {
-        siblings: proof.siblings.clone(),
-        path_bits: proof.path_bits.clone(),
-        leaf_index: Some(0),
-    }
-}
-
-/// SolverTask preparer
+/// SolverTask preparer for single transfers
 ///
 /// Prepares SolverTask from Transfer requests by:
 /// 1. Selecting coins for sender
 /// 2. Building object references
 /// 3. Creating read_set with proofs
 /// 4. Generating task_id
+///
+/// ## Example
+///
+/// ```rust,ignore
+/// let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+/// let task = preparer.prepare_transfer_task(&transfer, SubnetId::ROOT)?;
+/// ```
 pub struct TaskPreparer {
     validator_id: String,
     state_provider: Arc<dyn StateProvider>,
@@ -72,6 +39,20 @@ impl TaskPreparer {
             validator_id,
             state_provider,
         }
+    }
+    
+    /// Get the underlying state provider
+    /// 
+    /// This is used to share the state provider with BatchTaskPreparer.
+    #[allow(dead_code)]
+    pub fn state_provider(&self) -> &Arc<dyn StateProvider> {
+        &self.state_provider
+    }
+    
+    /// Get the validator ID
+    #[allow(dead_code)]
+    pub fn validator_id(&self) -> &str {
+        &self.validator_id
     }
     
     /// Create a TaskPreparer with pre-initialized test accounts
@@ -87,30 +68,43 @@ impl TaskPreparer {
     /// 
     /// ```rust,ignore
     /// let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
-    /// let task = preparer.prepare_transfer_task(&transfer)?;
+    /// let task = preparer.prepare_transfer_task(&transfer, SubnetId::ROOT)?;
     /// ```
     pub fn new_for_testing(validator_id: String) -> Self {
-        use setu_storage::{GlobalStateManager, MerkleStateProvider, init_coin};
-        use std::sync::RwLock;
+        // Use shared test utility to avoid code duplication
+        let state_provider = super::create_test_state_provider();
         
-        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
+        // For testing: we don't need to rebuild index since we just created fresh state
+        // For production with persisted state, use new_with_state_manager() which calls rebuild
         
-        // Initialize test accounts with real Merkle state
-        // 20 accounts with sufficient balance for large-scale benchmarks
-        // This reduces state lock contention compared to just 3 accounts
-        {
-            let mut manager = state_manager.write().unwrap();
-            // Primary accounts with higher balance
-            init_coin(&mut manager, "alice", 10_000_000);
-            init_coin(&mut manager, "bob", 10_000_000);
-            init_coin(&mut manager, "charlie", 10_000_000);
-            // Additional test accounts (user_01 to user_17)
-            for i in 1..=17 {
-                init_coin(&mut manager, &format!("user_{:02}", i), 5_000_000);
-            }
-        }
+        Self::new(validator_id, state_provider)
+    }
+    
+    /// Create a TaskPreparer from an existing GlobalStateManager (production use)
+    /// 
+    /// This is used when loading state from persistent storage (RocksDB).
+    /// It will rebuild the coin_type_index from the Merkle Tree state.
+    /// 
+    /// ## Performance
+    /// - Rebuild time: ~1 second per 1M objects
+    /// - Only needs to run once at startup
+    pub fn new_with_state_manager(
+        validator_id: String,
+        state_manager: Arc<std::sync::RwLock<setu_storage::GlobalStateManager>>,
+    ) -> Self {
+        use setu_storage::MerkleStateProvider;
         
-        let state_provider = Arc::new(MerkleStateProvider::new(state_manager));
+        let merkle_provider = MerkleStateProvider::new(state_manager);
+        
+        // Rebuild coin_type_index from persisted Merkle Tree state
+        // This is critical for multi-token support after restart
+        let indexed_count = merkle_provider.rebuild_coin_type_index();
+        tracing::info!(
+            indexed_count = indexed_count,
+            "Rebuilt coin_type_index from Merkle Tree at startup"
+        );
+        
+        let state_provider = Arc::new(merkle_provider);
         Self::new(validator_id, state_provider)
     }
     
@@ -118,47 +112,45 @@ impl TaskPreparer {
     ///
     /// This is the main entry point for task preparation.
     /// Returns a fully prepared SolverTask ready for Solver execution.
+    /// 
+    /// The coin is selected based on the subnet_id (1 subnet : 1 token binding).
+    /// - If `subnet_id` is ROOT, uses ROOT subnet's native token
+    /// - Otherwise, uses the subnet's native token
     pub fn prepare_transfer_task(
         &self,
         transfer: &setu_types::Transfer,
         subnet_id: SubnetId,
     ) -> Result<SolverTask, TaskPrepareError> {
-        // Use default coin type (native SETU)
-        self.prepare_transfer_task_with_coin_type(transfer, subnet_id, None)
-    }
-    
-    /// Prepare a SolverTask from a Transfer request with specified coin type
-    ///
-    /// This variant allows specifying a coin type for multi-subnet scenarios
-    /// where each subnet application may have its own token type.
-    pub fn prepare_transfer_task_with_coin_type(
-        &self,
-        transfer: &setu_types::Transfer,
-        subnet_id: SubnetId,
-        coin_type: Option<&str>,
-    ) -> Result<SolverTask, TaskPrepareError> {
         let amount = transfer.amount;
+        
+        // Use subnet_id as the coin namespace (1:1 binding)
+        // For ROOT subnet, use "ROOT" as the identifier
+        let subnet_id_str = if subnet_id == SubnetId::ROOT {
+            "ROOT".to_string()
+        } else {
+            subnet_id.to_string()
+        };
         
         debug!(
             transfer_id = %transfer.id,
             from = %transfer.from,
             to = %transfer.to,
             amount = amount,
-            coin_type = ?coin_type,
+            subnet_id = %subnet_id_str,
             "Preparing SolverTask for transfer"
         );
         
-        // Step 1: Select coins for sender (filter by coin_type if specified)
-        let sender_coins = match coin_type {
-            Some(ct) => self.state_provider.get_coins_for_address_by_type(&transfer.from, ct),
-            None => self.state_provider.get_coins_for_address(&transfer.from),
-        };
+        // Step 1: Select coins for sender filtered by subnet_id
+        let sender_coins = self.state_provider.get_coins_for_address_by_type(
+            &transfer.from,
+            &subnet_id_str,
+        );
         let selected_coin = self.select_coin_for_transfer(&sender_coins, amount)?;
         
         debug!(
             object_id = ?selected_coin.object_id,
             coin_balance = selected_coin.balance,
-            coin_type = %selected_coin.coin_type,
+            subnet_id = %selected_coin.coin_type,
             "Selected coin for transfer"
         );
         
@@ -222,11 +214,177 @@ impl TaskPreparer {
         
         Ok(task)
     }
+
+    /// Prepare a SolverTask with coin reservation to prevent double-spend
+    ///
+    /// This method is similar to `prepare_transfer_task`, but also reserves the selected
+    /// coin using CoinReservationManager. This prevents concurrent single/batch requests
+    /// from using the same coin.
+    ///
+    /// # Returns
+    /// - `Ok((task, handle))`: Task and reservation handle (must be released after TEE completion)
+    /// - `Err(error)`: Preparation failed (no reservation made)
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let (task, handle) = preparer.prepare_transfer_task_with_reservation(
+    ///     &transfer, SubnetId::ROOT, &reservation_mgr
+    /// )?;
+    /// // ... execute TEE task ...
+    /// reservation_mgr.release(&handle);
+    /// ```
+    pub fn prepare_transfer_task_with_reservation(
+        &self,
+        transfer: &setu_types::Transfer,
+        subnet_id: SubnetId,
+        reservation_mgr: &crate::coin_reservation::CoinReservationManager,
+    ) -> Result<(SolverTask, crate::coin_reservation::ReservationHandle), TaskPrepareError> {
+        let amount = transfer.amount;
+        
+        // Use subnet_id as the coin namespace (1:1 binding)
+        let subnet_id_str = if subnet_id == SubnetId::ROOT {
+            "ROOT".to_string()
+        } else {
+            subnet_id.to_string()
+        };
+        
+        debug!(
+            transfer_id = %transfer.id,
+            from = %transfer.from,
+            to = %transfer.to,
+            amount = amount,
+            subnet_id = %subnet_id_str,
+            "Preparing SolverTask with reservation"
+        );
+        
+        // Step 1: Get all coins for sender filtered by subnet_id
+        let sender_coins = self.state_provider.get_coins_for_address_by_type(
+            &transfer.from,
+            &subnet_id_str,
+        );
+        
+        if sender_coins.is_empty() {
+            return Err(TaskPrepareError::NoCoinsFound(
+                format!("sender {} has no coins in subnet {}", transfer.from, subnet_id_str)
+            ));
+        }
+        
+        // Step 2: Filter eligible coins and sort by balance (ascending)
+        let mut eligible_coins: Vec<_> = sender_coins
+            .iter()
+            .filter(|c| c.balance >= amount)
+            .cloned()
+            .collect();
+        
+        if eligible_coins.is_empty() {
+            let total_balance: u64 = sender_coins.iter().map(|c| c.balance).sum();
+            return Err(TaskPrepareError::InsufficientBalance {
+                required: amount,
+                available: total_balance,
+            });
+        }
+        
+        eligible_coins.sort_by_key(|c| c.balance);
+        
+        // Step 3: Try to reserve each eligible coin until one succeeds
+        let mut selected_coin: Option<CoinInfo> = None;
+        let mut reservation_handle: Option<crate::coin_reservation::ReservationHandle> = None;
+        
+        for coin in &eligible_coins {
+            if let Some(handle) = reservation_mgr.try_reserve(
+                &coin.object_id,
+                amount,
+                &transfer.id,
+            ) {
+                selected_coin = Some(coin.clone());
+                reservation_handle = Some(handle);
+                break;
+            }
+            // Coin already reserved by another transfer, try next one
+            debug!(
+                object_id = %hex::encode(&coin.object_id),
+                "Coin already reserved, trying next"
+            );
+        }
+        
+        let selected_coin = selected_coin.ok_or_else(|| {
+            TaskPrepareError::AllCoinsReserved {
+                sender: transfer.from.clone(),
+                coin_count: eligible_coins.len(),
+            }
+        })?;
+        
+        let reservation_handle = reservation_handle.expect("handle must exist if coin is selected");
+        
+        debug!(
+            object_id = ?selected_coin.object_id,
+            coin_balance = selected_coin.balance,
+            "Selected and reserved coin for transfer"
+        );
+        
+        // Step 4: Build ResolvedObject and ResolvedInputs (same as non-reservation path)
+        let resolved_coin = setu_types::task::ResolvedObject {
+            object_id: selected_coin.object_id,
+            object_type: "Coin".to_string(),
+            expected_version: selected_coin.version,
+        };
+        
+        let resolved_inputs = setu_types::task::ResolvedInputs::transfer(resolved_coin.clone(), amount);
+        
+        // Step 5: Derive event dependencies
+        let input_objects: Vec<&setu_types::ObjectId> = vec![&selected_coin.object_id];
+        let parent_ids = self.derive_dependencies(&input_objects);
+        
+        // Step 6: Build read_set with Merkle proof
+        let coin_data = self.state_provider.get_object(&selected_coin.object_id)
+            .ok_or(TaskPrepareError::ObjectNotFound(hex::encode(&selected_coin.object_id)))?;
+        
+        let merkle_proof = self.state_provider.get_merkle_proof(&selected_coin.object_id);
+        
+        let read_set = vec![
+            setu_types::task::ReadSetEntry::new(
+                format!("coin:{}", hex::encode(&selected_coin.object_id)),
+                coin_data,
+            ).with_proof(
+                merkle_proof
+                    .map(|p| bcs::to_bytes(&p).unwrap_or_default())
+                    .unwrap_or_default()
+            ),
+        ];
+        
+        // Step 7: Create Event
+        let event = self.create_event_from_transfer(transfer, parent_ids)?;
+        
+        // Step 8: Get pre-state root
+        let pre_state_root = self.state_provider.get_state_root();
+        
+        // Step 9: Generate task_id and create SolverTask
+        let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
+        
+        let task = SolverTask::new(
+            task_id,
+            event,
+            resolved_inputs,
+            pre_state_root,
+            subnet_id,
+        )
+        .with_read_set(read_set)
+        .with_gas_budget(setu_types::task::GasBudget::default());
+        
+        info!(
+            transfer_id = %transfer.id,
+            task_id = %hex::encode(&task_id[..8]),
+            reservation_id = %reservation_handle.reservation_id,
+            "SolverTask prepared with reservation"
+        );
+        
+        Ok((task, reservation_handle))
+    }
     
     /// Select the best coin for a transfer
     ///
     /// Strategy: Select the smallest coin that can cover the transfer amount
-    fn select_coin_for_transfer(
+    pub(crate) fn select_coin_for_transfer(
         &self,
         coins: &[CoinInfo],
         amount: u64,
@@ -337,25 +495,6 @@ impl TaskPreparer {
     }
 }
 
-/// Errors during task preparation
-#[derive(Debug, thiserror::Error)]
-pub enum TaskPrepareError {
-    #[error("Insufficient balance: required {required}, available {available}")]
-    InsufficientBalance { required: u64, available: u64 },
-    
-    #[error("No coins found for address {0}")]
-    NoCoinsFound(String),
-    
-    #[error("Object not found: {0}")]
-    ObjectNotFound(String),
-    
-    #[error("Failed to create event: {0}")]
-    EventCreationFailed(String),
-    
-    #[error("Merkle proof not available for object {0}")]
-    MerkleProofNotAvailable(String),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,27 +536,28 @@ mod tests {
     fn test_select_smallest_sufficient_coin() {
         let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
         
+        // coin_type now represents subnet_id (ROOT = root subnet)
         let coins = vec![
             CoinInfo {
                 object_id: ObjectId::new([1u8; 32]),
                 owner: "alice".to_string(),
                 balance: 500,
                 version: 1,
-                coin_type: "SETU".to_string(),
+                coin_type: "ROOT".to_string(),
             },
             CoinInfo {
                 object_id: ObjectId::new([2u8; 32]),
                 owner: "alice".to_string(),
                 balance: 200,
                 version: 1,
-                coin_type: "SETU".to_string(),
+                coin_type: "ROOT".to_string(),
             },
             CoinInfo {
                 object_id: ObjectId::new([3u8; 32]),
                 owner: "alice".to_string(),
                 balance: 1000,
                 version: 1,
-                coin_type: "SETU".to_string(),
+                coin_type: "ROOT".to_string(),
             },
         ];
         
@@ -442,7 +582,7 @@ mod tests {
                 owner: "alice".to_string(),
                 balance: 50,
                 version: 1,
-                coin_type: "SETU".to_string(),
+                coin_type: "ROOT".to_string(),  // subnet_id
             },
         ];
         

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Setu Node Stop Script
-# Usage: ./scripts/stop_nodes.sh
+# Usage: ./scripts/stop_nodes.sh [--local]
 
 set -e
 
@@ -12,8 +12,25 @@ NC='\033[0m'
 
 echo -e "${YELLOW}Stopping Setu nodes...${NC}"
 
-# Configuration
-DATA_DIR=${DATA_DIR:-/data}
+# Get the project root directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Check for --local flag
+LOCAL_MODE=false
+for arg in "$@"; do
+    if [ "$arg" = "--local" ]; then
+        LOCAL_MODE=true
+    fi
+done
+
+# Configuration - use local directory for development
+if [ "$LOCAL_MODE" = true ] || [ ! -d "/data" ]; then
+    DATA_DIR=${DATA_DIR:-${PROJECT_ROOT}/.setu-data}
+else
+    DATA_DIR=${DATA_DIR:-/data}
+fi
+
 PIDS_DIR=${DATA_DIR}/pids
 
 # Stop Solver

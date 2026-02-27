@@ -37,11 +37,15 @@ SOLVER_BASE_PORT=9001     # Solver 起始端口
 TOTAL_REQUESTS=500        # 总请求数
 CONCURRENCY=50            # 并发数
 WARMUP_REQUESTS=50        # 预热请求数
-USE_TEST_ACCOUNTS=true    # 使用预初始化账户
-NUM_TEST_ACCOUNTS=20      # 测试账户数量 (需与代码中一致)
+USE_TEST_ACCOUNTS=true    # 使用测试账户
+INIT_ACCOUNTS=100         # 初始化测试账户数量 (0=不初始化，使用种子账户)
+INIT_ACCOUNT_BALANCE=100000  # 每个测试账户的初始余额
+COINS_PER_ACCOUNT=1       # 每个账户的 coin 对象数 (更多=更高单账户并发)
 BENCHMARK_MODE="burst"    # 模式: burst, sustained, ramp
 SUSTAINED_DURATION=30     # sustained 模式持续时间(秒)
 SUSTAINED_TPS=100         # sustained 模式目标 TPS
+USE_BATCH=false           # 使用批量 API
+BATCH_SIZE=50             # 批量大小
 
 # 其他配置
 MOCK_TEE=true             # 使用 Mock TEE
@@ -84,7 +88,10 @@ Benchmark 配置:
   -t, --requests NUM      总请求数 (默认: $TOTAL_REQUESTS)
   -c, --concurrency NUM   并发数 (默认: $CONCURRENCY)
   -w, --warmup NUM        预热请求数 (默认: $WARMUP_REQUESTS)
-  --no-test-accounts      不使用预初始化账户
+  --no-test-accounts      不使用测试账户
+  --init-accounts NUM     初始化测试账户数量 (默认: $INIT_ACCOUNTS, 0=使用种子账户)
+  --init-balance NUM      每个测试账户初始余额 (默认: $INIT_ACCOUNT_BALANCE)
+  --coins-per-account N   每账户 coin 对象数 (默认: $COINS_PER_ACCOUNT, 更多=更高并发)
 
 Benchmark 模式:
   --burst                 突发模式 (默认)
@@ -92,6 +99,8 @@ Benchmark 模式:
   --sustained-duration S  持续模式时长 (默认: $SUSTAINED_DURATION 秒)
   --sustained-tps TPS     持续模式目标 TPS (默认: $SUSTAINED_TPS)
   --ramp                  渐进模式
+  --batch                 启用批量 API 模式
+  --batch-size SIZE       批量大小 (默认: $BATCH_SIZE)
 
 日志配置:
   -l, --log-level LEVEL   日志级别: error,warn,info,debug,trace (默认: $RUST_LOG_LEVEL)
@@ -106,6 +115,8 @@ Benchmark 模式:
   $0 -s 3 -t 1000 -c 100               # 3个Solver, 1000请求, 100并发
   $0 --solvers 5 --sustained           # 5个Solver, 持续模式
   $0 -s 2 -t 5000 -c 200 -l info       # 高负载测试，info日志
+  $0 --init-accounts 100 -c 100        # 初始化100账户, 100并发
+  $0 --init-accounts 200 -c 200 --batch  # 高并发批量测试
 
 EOF
     exit 0
@@ -150,6 +161,18 @@ while [[ $# -gt 0 ]]; do
             USE_TEST_ACCOUNTS=false
             shift
             ;;
+        --init-accounts)
+            INIT_ACCOUNTS="$2"
+            shift 2
+            ;;
+        --init-balance)
+            INIT_ACCOUNT_BALANCE="$2"
+            shift 2
+            ;;
+        --coins-per-account)
+            COINS_PER_ACCOUNT="$2"
+            shift 2
+            ;;
         --burst)
             BENCHMARK_MODE="burst"
             shift
@@ -169,6 +192,14 @@ while [[ $# -gt 0 ]]; do
         --ramp)
             BENCHMARK_MODE="ramp"
             shift
+            ;;
+        --batch)
+            USE_BATCH=true
+            shift
+            ;;
+        --batch-size)
+            BATCH_SIZE="$2"
+            shift 2
             ;;
         -l|--log-level)
             RUST_LOG_LEVEL="$2"
@@ -234,9 +265,13 @@ create_log_dir() {
         "concurrency": ${CONCURRENCY},
         "warmup_requests": ${WARMUP_REQUESTS},
         "use_test_accounts": ${USE_TEST_ACCOUNTS},
-        "num_test_accounts": ${NUM_TEST_ACCOUNTS},
+        "init_accounts": ${INIT_ACCOUNTS},
+        "init_account_balance": ${INIT_ACCOUNT_BALANCE},
+        "coins_per_account": ${COINS_PER_ACCOUNT},
         "sustained_duration": ${SUSTAINED_DURATION},
-        "sustained_tps": ${SUSTAINED_TPS}
+        "sustained_tps": ${SUSTAINED_TPS},
+        "use_batch": ${USE_BATCH},
+        "batch_size": ${BATCH_SIZE}
     },
     "logging": {
         "rust_log_level": "${RUST_LOG_LEVEL}",
@@ -397,8 +432,18 @@ run_benchmark() {
         benchmark_args="${benchmark_args} --use-test-accounts"
     fi
     
+    # 账户初始化参数
+    if [ "$INIT_ACCOUNTS" -gt 0 ]; then
+        benchmark_args="${benchmark_args} --init-accounts ${INIT_ACCOUNTS} --init-account-balance ${INIT_ACCOUNT_BALANCE} --coins-per-account ${COINS_PER_ACCOUNT}"
+    fi
+    
     if [ "$WARMUP_REQUESTS" -gt 0 ]; then
         benchmark_args="${benchmark_args} --warmup ${WARMUP_REQUESTS}"
+    fi
+    
+    # 批量 API 参数
+    if [ "$USE_BATCH" = true ]; then
+        benchmark_args="${benchmark_args} --use-batch --batch-size ${BATCH_SIZE}"
     fi
     
     # 根据模式添加参数
@@ -442,6 +487,18 @@ collect_results() {
     local p99=$(grep "Final TPS" "${RESULT_FILE}" | grep -o "P99 Latency: [0-9.]*ms" | grep -o "[0-9.]*" || echo "N/A")
     [ "$p99" != "N/A" ] && p99="${p99} ms"
     
+    # 批量模式信息
+    local batch_info=""
+    if [ "$USE_BATCH" = true ]; then
+        batch_info=" (批量: ${BATCH_SIZE})"
+    fi
+    
+    # 账户初始化信息
+    local init_info=""
+    if [ "$INIT_ACCOUNTS" -gt 0 ]; then
+        init_info=" (初始化: ${INIT_ACCOUNTS}账户)"
+    fi
+
     # 生成摘要
     cat >> "${RESULT_FILE}" << EOF
 
@@ -452,7 +509,10 @@ collect_results() {
 Solver 数量:  ${NUM_SOLVERS}
 总请求数:     ${TOTAL_REQUESTS}
 并发数:       ${CONCURRENCY}
-模式:         ${BENCHMARK_MODE}
+模式:         ${BENCHMARK_MODE}${batch_info}${init_info}
+批量API:      ${USE_BATCH}
+批量大小:     ${BATCH_SIZE}
+初始化账户:   ${INIT_ACCOUNTS}
 
 结果:
   TPS:          ${tps}
@@ -472,6 +532,12 @@ EOF
     echo "  Solver数量: ${NUM_SOLVERS}"
     echo "  总请求:     ${TOTAL_REQUESTS}"
     echo "  并发:       ${CONCURRENCY}"
+    if [ "$INIT_ACCOUNTS" -gt 0 ]; then
+        echo "  初始化账户: ${INIT_ACCOUNTS}"
+    fi
+    if [ "$USE_BATCH" = true ]; then
+        echo "  批量模式:   是 (batch_size=${BATCH_SIZE})"
+    fi
     echo ""
     echo -e "  ${CYAN}TPS:${NC}        ${tps}"
     echo -e "  ${CYAN}成功率:${NC}     ${success_rate}"
@@ -510,6 +576,15 @@ show_config() {
     echo "  并发数:         ${CONCURRENCY}"
     echo "  预热请求:       ${WARMUP_REQUESTS}"
     echo "  使用测试账户:   ${USE_TEST_ACCOUNTS}"
+    if [ "$INIT_ACCOUNTS" -gt 0 ]; then
+        echo "  初始化账户:     ${INIT_ACCOUNTS}"
+        echo "  账户初始余额:   ${INIT_ACCOUNT_BALANCE}"
+        echo "  Coins/账户:     ${COINS_PER_ACCOUNT}"
+    fi
+    if [ "$USE_BATCH" = true ]; then
+        echo "  批量模式:       是"
+        echo "  批量大小:       ${BATCH_SIZE}"
+    fi
     if [ "$BENCHMARK_MODE" = "sustained" ]; then
         echo "  持续时间:       ${SUSTAINED_DURATION}s"
         echo "  目标 TPS:       ${SUSTAINED_TPS}"

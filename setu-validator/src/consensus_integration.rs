@@ -33,6 +33,7 @@ use crate::network_adapter::MessageRouter;
 use crate::persistence::FinalizationPersister;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use tokio::sync::{mpsc, RwLock, Mutex, broadcast};
 use tracing::{debug, info, warn};
 
@@ -133,7 +134,7 @@ impl ConsensusValidator {
             config.consensus.clone(),
             config.node_info.id.clone(),
             validator_set.clone(),
-            GlobalStateManager::default(),  // Use default state manager
+            Arc::new(StdRwLock::new(GlobalStateManager::default())),  // Use default state manager
             Arc::clone(&event_store),        // Share the same EventStore!
         ));
         
@@ -156,14 +157,14 @@ impl ConsensusValidator {
         }
     }
     
-    /// Create with a persistent state manager for Merkle tree persistence
+    /// Create with a shared persistent state manager for Merkle tree persistence
     /// 
     /// Note: This creates a shared EventStore instance that is used by both
     /// ConsensusValidator and ConsensusEngine.dag_manager, ensuring the three-layer
     /// storage design works correctly (Layer3 fallback to EventStore).
-    pub fn with_state_manager(
+    pub fn with_shared_state_manager(
         config: ConsensusValidatorConfig,
-        state_manager: GlobalStateManager,
+        state_manager: Arc<StdRwLock<GlobalStateManager>>,
     ) -> Self {
         let (msg_tx, msg_rx) = mpsc::channel(config.message_buffer_size);
         let (finalization_tx, _) = broadcast::channel(100);
@@ -180,7 +181,7 @@ impl ConsensusValidator {
         let cf_store: Arc<dyn CFStoreBackend> = Arc::new(CFStore::new());
         let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(AnchorStore::new());
         
-        // Create consensus engine with shared EventStore
+        // Create consensus engine with shared EventStore and state manager
         let engine = Arc::new(ConsensusEngine::with_stores(
             config.consensus.clone(),
             config.node_info.id.clone(),
@@ -221,7 +222,7 @@ impl ConsensusValidator {
     /// ```
     pub fn with_event_store_backend(
         config: ConsensusValidatorConfig,
-        state_manager: GlobalStateManager,
+        state_manager: Arc<StdRwLock<GlobalStateManager>>,
         event_store: Arc<dyn EventStoreBackend>,
     ) -> Self {
         let (msg_tx, msg_rx) = mpsc::channel(config.message_buffer_size);
@@ -234,7 +235,7 @@ impl ConsensusValidator {
         let cf_store: Arc<dyn CFStoreBackend> = Arc::new(CFStore::new());
         let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(AnchorStore::new());
         
-        // Create consensus engine with the provided EventStore backend
+        // Create consensus engine with the provided EventStore backend and shared state manager
         let engine = Arc::new(ConsensusEngine::with_stores(
             config.consensus.clone(),
             config.node_info.id.clone(),
@@ -279,7 +280,7 @@ impl ConsensusValidator {
     /// let cf_store: Arc<dyn CFStoreBackend> = Arc::new(RocksDBCFStore::from_shared(db.clone()));
     /// let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(RocksDBAnchorStore::from_shared(db.clone()));
     /// let merkle_store: Arc<dyn MerkleStore> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
-    /// let state_manager = GlobalStateManager::with_store(merkle_store);
+    /// let state_manager = Arc::new(StdRwLock::new(GlobalStateManager::with_store(merkle_store)));
     /// 
     /// let validator = ConsensusValidator::with_all_backends(
     ///     config,
@@ -291,7 +292,7 @@ impl ConsensusValidator {
     /// ```
     pub fn with_all_backends(
         config: ConsensusValidatorConfig,
-        state_manager: GlobalStateManager,
+        state_manager: Arc<StdRwLock<GlobalStateManager>>,
         event_store: Arc<dyn EventStoreBackend>,
         cf_store: Arc<dyn CFStoreBackend>,
         anchor_store: Arc<dyn AnchorStoreBackend>,
@@ -303,7 +304,7 @@ impl ConsensusValidator {
         let validator_info = ValidatorInfo::new(config.node_info.clone(), config.is_leader);
         validator_set.add_validator(validator_info);
         
-        // Create consensus engine with the provided EventStore backend
+        // Create consensus engine with the provided EventStore backend and shared state manager
         let engine = Arc::new(ConsensusEngine::with_stores(
             config.consensus.clone(),
             config.node_info.id.clone(),

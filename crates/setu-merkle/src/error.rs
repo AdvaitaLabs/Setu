@@ -39,4 +39,12 @@ pub enum MerkleError {
     /// Invalid input
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    /// Deserialization error  
+    #[error("Deserialization error: {0}")]
+    DeserializationError(String),
+
+    /// Data consistency error (e.g., root hash mismatch during recovery)
+    #[error("Consistency error: {0}")]
+    ConsistencyError(String),
 }

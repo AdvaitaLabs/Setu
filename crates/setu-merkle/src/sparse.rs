@@ -9,6 +9,7 @@
 //! - Efficient empty subtree handling (lazy evaluation)
 //! - Non-inclusion proofs
 //! - Version/snapshot support for state history
+//! - **BLAKE3 hashing** for 3-5x performance improvement over SHA256
 //!
 //! # Design
 //!
@@ -33,15 +34,18 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
+
+// C1 Optimization: Use im::HashMap for O(1) clone via structural sharing
+use im::HashMap as ImHashMap;
 
 use crate::error::{MerkleError, MerkleResult};
-use crate::hash::{prefix, HashValue};
+use crate::hash::{blake3_hash, hash_sparse_internal, hash_sparse_leaf, HashValue};
 use crate::HASH_LENGTH;
 
 /// Placeholder hash for empty subtrees.
-/// This is the hash of an empty node, computed as SHA256("SPARSE_EMPTY").
+/// This is the hash of an empty node, computed as BLAKE3("SPARSE_EMPTY").
 fn empty_hash() -> HashValue {
     lazy_static::initialize(&EMPTY_HASH);
     *EMPTY_HASH
@@ -49,11 +53,8 @@ fn empty_hash() -> HashValue {
 
 lazy_static::lazy_static! {
     static ref EMPTY_HASH: HashValue = {
-        let mut hasher = Sha256::new();
-        hasher.update(b"SPARSE_EMPTY");
-        let result = hasher.finalize();
         let mut bytes = [0u8; HASH_LENGTH];
-        bytes.copy_from_slice(&result);
+        bytes.copy_from_slice(blake3::hash(b"SPARSE_EMPTY").as_bytes());
         HashValue::new(bytes)
     };
 }
@@ -81,24 +82,10 @@ impl SparseMerkleNode {
         match self {
             SparseMerkleNode::Empty => empty_hash(),
             SparseMerkleNode::Leaf { key, value_hash } => {
-                let mut hasher = Sha256::new();
-                hasher.update(prefix::SPARSE_LEAF);
-                hasher.update(key.as_bytes());
-                hasher.update(value_hash.as_bytes());
-                let result = hasher.finalize();
-                let mut bytes = [0u8; HASH_LENGTH];
-                bytes.copy_from_slice(&result);
-                HashValue::new(bytes)
+                hash_sparse_leaf(key, value_hash)
             }
             SparseMerkleNode::Internal { left, right } => {
-                let mut hasher = Sha256::new();
-                hasher.update(prefix::SPARSE_INTERNAL);
-                hasher.update(left.as_bytes());
-                hasher.update(right.as_bytes());
-                let result = hasher.finalize();
-                let mut bytes = [0u8; HASH_LENGTH];
-                bytes.copy_from_slice(&result);
-                HashValue::new(bytes)
+                hash_sparse_internal(left, right)
             }
         }
     }
@@ -123,14 +110,7 @@ pub struct SparseMerkleLeafNode {
 impl SparseMerkleLeafNode {
     /// Compute the hash of this leaf
     pub fn hash(&self) -> HashValue {
-        let mut hasher = Sha256::new();
-        hasher.update(prefix::SPARSE_LEAF);
-        hasher.update(self.key.as_bytes());
-        hasher.update(self.value_hash.as_bytes());
-        let result = hasher.finalize();
-        let mut bytes = [0u8; HASH_LENGTH];
-        bytes.copy_from_slice(&result);
-        HashValue::new(bytes)
+        hash_sparse_leaf(&self.key, &self.value_hash)
     }
 }
 
@@ -284,26 +264,17 @@ impl SparseMerkleProof {
         Ok(current)
     }
 }
-/// Hash a value for storage in the tree
+
+/// Hash a value for storage in the tree (using BLAKE3)
+#[inline]
 fn hash_value(value: &[u8]) -> HashValue {
-    let mut hasher = Sha256::new();
-    hasher.update(value);
-    let result = hasher.finalize();
-    let mut bytes = [0u8; HASH_LENGTH];
-    bytes.copy_from_slice(&result);
-    HashValue::new(bytes)
+    blake3_hash(value)
 }
 
-/// Hash two children to create internal node hash
+/// Hash two children to create internal node hash (using BLAKE3)
+#[inline]
 fn hash_internal(left: &HashValue, right: &HashValue) -> HashValue {
-    let mut hasher = Sha256::new();
-    hasher.update(prefix::SPARSE_INTERNAL);
-    hasher.update(left.as_bytes());
-    hasher.update(right.as_bytes());
-    let result = hasher.finalize();
-    let mut bytes = [0u8; HASH_LENGTH];
-    bytes.copy_from_slice(&result);
-    HashValue::new(bytes)
+    hash_sparse_internal(left, right)
 }
 
 /// A sparse Merkle tree for key-value storage.
@@ -888,16 +859,7 @@ impl TreeNode {
     }
 
     fn new_leaf(key: HashValue, value_hash: HashValue) -> Self {
-        let node_hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(prefix::SPARSE_LEAF);
-            hasher.update(key.as_bytes());
-            hasher.update(value_hash.as_bytes());
-            let result = hasher.finalize();
-            let mut bytes = [0u8; HASH_LENGTH];
-            bytes.copy_from_slice(&result);
-            HashValue::new(bytes)
-        };
+        let node_hash = hash_sparse_leaf(&key, &value_hash);
         TreeNode::Leaf { key, value_hash, node_hash }
     }
 
@@ -932,14 +894,50 @@ impl TreeNode {
 ///
 /// assert_eq!(tree.get(&key), Some(&b"value".to_vec()));
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct IncrementalSparseMerkleTree {
     /// Root hash of the tree
     root_hash: HashValue,
-    /// Key-value pairs (leaves)
-    leaves: HashMap<HashValue, Vec<u8>>,
-    /// Node storage: hash -> TreeNode
-    nodes: HashMap<HashValue, TreeNode>,
+    /// Key-value pairs (leaves) - C1: Uses im::HashMap for O(1) clone
+    /// Values wrapped in Arc for efficient sharing during CoW operations
+    leaves: ImHashMap<HashValue, Arc<Vec<u8>>>,
+    /// Node storage: hash -> TreeNode - C1: Uses im::HashMap for O(1) clone
+    nodes: ImHashMap<HashValue, TreeNode>,
+    /// Dirty leaves tracking: keys that have been inserted/updated since last commit
+    /// Uses std::HashSet - no need for CoW (reset on clone)
+    dirty_leaves: std::collections::HashSet<HashValue>,
+    /// Deleted leaves tracking: keys that have been deleted since last commit
+    /// Uses std::HashSet - no need for CoW (reset on clone)
+    deleted_leaves: std::collections::HashSet<HashValue>,
+}
+
+/// Leaf changes for batch persistence (B4 scheme)
+#[derive(Debug, Clone, Default)]
+pub struct LeafChanges {
+    /// New or updated leaves: (key, value)
+    pub upserts: Vec<(HashValue, Vec<u8>)>,
+    /// Deleted leaf keys
+    pub deletes: Vec<HashValue>,
+}
+
+impl Clone for IncrementalSparseMerkleTree {
+    /// C1 Optimization: O(1) clone via im::HashMap structural sharing.
+    /// 
+    /// Before C1: O(N) deep copy of all leaves and nodes
+    /// After C1:  O(1) reference count increment (data shared until modified)
+    /// 
+    /// Note: dirty_leaves and deleted_leaves are reset (not cloned) because
+    /// clones are used for temporary calculations that don't need persistence.
+    fn clone(&self) -> Self {
+        Self {
+            root_hash: self.root_hash,
+            leaves: self.leaves.clone(),  // O(1) - im::HashMap structural sharing
+            nodes: self.nodes.clone(),    // O(1) - im::HashMap structural sharing
+            // Do NOT clone dirty tracking - clones are for temporary calculations
+            dirty_leaves: std::collections::HashSet::new(),
+            deleted_leaves: std::collections::HashSet::new(),
+        }
+    }
 }
 
 impl Default for IncrementalSparseMerkleTree {
@@ -953,9 +951,34 @@ impl IncrementalSparseMerkleTree {
     pub fn new() -> Self {
         Self {
             root_hash: empty_hash(),
-            leaves: HashMap::new(),
-            nodes: HashMap::new(),
+            leaves: ImHashMap::new(),  // C1: im::HashMap
+            nodes: ImHashMap::new(),   // C1: im::HashMap
+            dirty_leaves: std::collections::HashSet::new(),
+            deleted_leaves: std::collections::HashSet::new(),
         }
+    }
+
+    /// Create a tree from existing leaves (for crash recovery).
+    ///
+    /// This rebuilds the tree structure from persisted leaf data.
+    /// The dirty tracking is NOT set - recovered data is already persisted.
+    /// 
+    /// Accepts std::HashMap for compatibility with persistence layer.
+    pub fn from_leaves(leaves: HashMap<HashValue, Vec<u8>>) -> Self {
+        let mut tree = Self {
+            root_hash: empty_hash(),
+            leaves: ImHashMap::new(),  // C1: im::HashMap
+            nodes: ImHashMap::new(),   // C1: im::HashMap
+            dirty_leaves: std::collections::HashSet::new(),
+            deleted_leaves: std::collections::HashSet::new(),
+        };
+        
+        // Insert all leaves (this rebuilds the tree structure)
+        for (key, value) in leaves {
+            tree.insert_without_tracking(key, value);
+        }
+        
+        tree
     }
 
     /// Get the root hash.
@@ -974,8 +997,10 @@ impl IncrementalSparseMerkleTree {
     }
 
     /// Get a value by key.
+    /// 
+    /// C1: Returns reference to inner Vec<u8> through Arc deref.
     pub fn get(&self, key: &HashValue) -> Option<&Vec<u8>> {
-        self.leaves.get(key)
+        self.leaves.get(key).map(|arc| arc.as_ref())
     }
 
     /// Check if a key exists.
@@ -987,29 +1012,74 @@ impl IncrementalSparseMerkleTree {
     ///
     /// This performs an O(log n) incremental update, only modifying
     /// nodes along the path from the leaf to the root.
+    /// 
+    /// C1: Value is wrapped in Arc for efficient sharing during CoW clone.
     pub fn insert(&mut self, key: HashValue, value: Vec<u8>) -> Option<Vec<u8>> {
-        let old_value = self.leaves.insert(key, value.clone());
+        // Track dirty leaf for persistence (B4 scheme)
+        self.dirty_leaves.insert(key);
+        // Remove from deleted if it was previously marked as deleted
+        self.deleted_leaves.remove(&key);
+        
+        // C1: Wrap value in Arc for efficient CoW sharing
+        let arc_value = Arc::new(value);
+        let old_arc = self.leaves.insert(key, arc_value.clone());
         
         // Compute value hash and create leaf node
-        let value_hash = hash_value(&value);
+        let value_hash = hash_value(&arc_value);
         let new_leaf = TreeNode::new_leaf(key, value_hash);
         
         // Update the tree incrementally
         self.root_hash = self.insert_at_node(self.root_hash, &key, new_leaf, 0);
         
-        old_value
+        // C1: Unwrap Arc to return owned Vec<u8> for API compatibility
+        old_arc.map(|arc| match Arc::try_unwrap(arc) {
+            Ok(v) => v,
+            Err(arc) => arc.as_ref().clone(),
+        })
+    }
+
+    /// Insert without dirty tracking (used for recovery from persisted data).
+    /// 
+    /// C1: Value is wrapped in Arc for efficient sharing during CoW clone.
+    fn insert_without_tracking(&mut self, key: HashValue, value: Vec<u8>) -> Option<Vec<u8>> {
+        // C1: Wrap value in Arc for efficient CoW sharing
+        let arc_value = Arc::new(value);
+        let old_arc = self.leaves.insert(key, arc_value.clone());
+        
+        // Compute value hash and create leaf node
+        let value_hash = hash_value(&arc_value);
+        let new_leaf = TreeNode::new_leaf(key, value_hash);
+        
+        // Update the tree incrementally
+        self.root_hash = self.insert_at_node(self.root_hash, &key, new_leaf, 0);
+        
+        // C1: Unwrap Arc to return owned Vec<u8> for API compatibility
+        old_arc.map(|arc| match Arc::try_unwrap(arc) {
+            Ok(v) => v,
+            Err(arc) => arc.as_ref().clone(),
+        })
     }
 
     /// Remove a key from the tree.
     ///
     /// This performs an O(log n) incremental update.
+    /// 
+    /// C1: Unwraps Arc to return owned Vec<u8> for API compatibility.
     pub fn remove(&mut self, key: &HashValue) -> Option<Vec<u8>> {
-        let old_value = self.leaves.remove(key)?;
+        let old_arc = self.leaves.remove(key)?;
+        
+        // Track deleted leaf for persistence (B4 scheme)
+        self.dirty_leaves.remove(key);
+        self.deleted_leaves.insert(*key);
         
         // Update the tree incrementally
         self.root_hash = self.remove_at_node(self.root_hash, key, 0);
         
-        Some(old_value)
+        // C1: Unwrap Arc to return owned Vec<u8>
+        Some(match Arc::try_unwrap(old_arc) {
+            Ok(v) => v,
+            Err(arc) => arc.as_ref().clone(),
+        })
     }
 
     /// Batch insert multiple key-value pairs.
@@ -1262,6 +1332,11 @@ impl IncrementalSparseMerkleTree {
         self.nodes.len()
     }
 
+    /// Get the number of leaf entries.
+    pub fn leaf_count(&self) -> usize {
+        self.leaves.len()
+    }
+
     /// Clear unused nodes (garbage collection).
     ///
     /// This removes nodes that are no longer reachable from the current root.
@@ -1270,6 +1345,69 @@ impl IncrementalSparseMerkleTree {
         self.mark_reachable(self.root_hash, &mut reachable);
         
         self.nodes.retain(|hash, _| reachable.contains(hash));
+    }
+
+    /// Iterate over all leaf entries (key, value).
+    ///
+    /// This is useful for rebuilding indexes at startup.
+    /// 
+    /// # Performance
+    /// - O(n) where n is the number of leaves
+    /// - Just iterates over the in-memory HashMap, very fast
+    /// 
+    /// C1: Maps Arc<Vec<u8>> to &Vec<u8> for API compatibility.
+    pub fn iter_leaves(&self) -> impl Iterator<Item = (&HashValue, &Vec<u8>)> {
+        self.leaves.iter().map(|(k, arc)| (k, arc.as_ref()))
+    }
+
+    /// Get all leaves as a vector of (key, value) pairs.
+    ///
+    /// Useful when you need ownership of the data.
+    /// 
+    /// C1: Clones inner Vec<u8> from Arc for ownership transfer.
+    pub fn all_leaves(&self) -> Vec<(HashValue, Vec<u8>)> {
+        self.leaves.iter().map(|(k, arc)| (*k, arc.as_ref().clone())).collect()
+    }
+
+    // =========================================================================
+    // B4 Scheme: Dirty Data Tracking for Batch Persistence
+    // =========================================================================
+
+    /// Take all pending changes and clear the tracking (called during commit).
+    ///
+    /// Returns `LeafChanges` containing:
+    /// - `upserts`: All leaves that were inserted or updated since last commit
+    /// - `deletes`: All keys that were deleted since last commit
+    ///
+    /// After calling this, `has_pending_changes()` will return false.
+    /// 
+    /// C1: Clones inner Vec<u8> from Arc for persistence (actual data needed).
+    pub fn take_changes(&mut self) -> LeafChanges {
+        let upserts: Vec<_> = self.dirty_leaves
+            .drain()
+            .filter_map(|k| self.leaves.get(&k).map(|arc| (k, arc.as_ref().clone())))
+            .collect();
+        let deletes: Vec<_> = self.deleted_leaves.drain().collect();
+        
+        LeafChanges { upserts, deletes }
+    }
+
+    /// Check if there are any uncommitted changes.
+    ///
+    /// Returns true if there are dirty or deleted leaves that haven't been
+    /// persisted yet.
+    pub fn has_pending_changes(&self) -> bool {
+        !self.dirty_leaves.is_empty() || !self.deleted_leaves.is_empty()
+    }
+
+    /// Get the number of pending upserts.
+    pub fn pending_upsert_count(&self) -> usize {
+        self.dirty_leaves.len()
+    }
+
+    /// Get the number of pending deletes.
+    pub fn pending_delete_count(&self) -> usize {
+        self.deleted_leaves.len()
     }
 
     fn mark_reachable(&self, hash: HashValue, reachable: &mut std::collections::HashSet<HashValue>) {
@@ -1443,5 +1581,206 @@ mod incremental_tests {
         }
 
         assert_eq!(inc_tree.root(), orig_tree.root());
+    }
+
+    // =========================================================================
+    // C1 Optimization Tests: Clone Independence and Performance
+    // =========================================================================
+
+    #[test]
+    fn test_c1_clone_independence() {
+        // Verify that clone creates an independent copy (CoW behavior)
+        let mut tree = IncrementalSparseMerkleTree::new();
+        let key = test_key(1);
+        tree.insert(key, b"original".to_vec());
+        let original_root = tree.root();
+        
+        // Clone the tree
+        let mut cloned = tree.clone();
+        
+        // Modify the clone
+        cloned.insert(key, b"modified".to_vec());
+        
+        // Original should be unchanged
+        assert_eq!(tree.get(&key), Some(&b"original".to_vec()));
+        assert_eq!(tree.root(), original_root);
+        
+        // Clone should have the new value
+        assert_eq!(cloned.get(&key), Some(&b"modified".to_vec()));
+        assert_ne!(cloned.root(), original_root);
+    }
+
+    #[test]
+    fn test_c1_clone_dirty_tracking_reset() {
+        // Verify that clone resets dirty tracking (for temporary calculations)
+        let mut tree = IncrementalSparseMerkleTree::new();
+        tree.insert(test_key(1), b"value".to_vec());
+        
+        // Original has dirty leaves
+        assert!(tree.has_pending_changes());
+        
+        // Clone should NOT have dirty leaves
+        let cloned = tree.clone();
+        assert!(!cloned.has_pending_changes());
+    }
+
+    #[test]
+    fn test_c1_clone_performance() {
+        // Verify that clone is fast with im::HashMap (O(1) instead of O(N))
+        // Insert 10K entries
+        let mut tree = IncrementalSparseMerkleTree::new();
+        for i in 0..10_000u32 {
+            let mut key_bytes = [0u8; 32];
+            key_bytes[0..4].copy_from_slice(&i.to_le_bytes());
+            let key = HashValue::new(key_bytes);
+            tree.insert(key, vec![i as u8; 100]);
+        }
+        
+        // Clone 100 times and measure - with im::HashMap this should be very fast
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            let _ = tree.clone();
+        }
+        let elapsed = start.elapsed();
+        
+        // 100 clones should complete in < 50ms with im::HashMap
+        // (vs ~1000ms+ with std::HashMap for 10K entries)
+        assert!(
+            elapsed.as_millis() < 50,
+            "C1 Clone too slow: {:?} (expected < 50ms for 100 clones of 10K entries)",
+            elapsed
+        );
+        
+        println!("C1 Clone performance: 100 clones of 10K entries in {:?}", elapsed);
+    }
+
+    #[test]
+    fn test_c1_clone_then_modify_independence() {
+        // Comprehensive test: clone, modify both, verify independence
+        let mut tree = IncrementalSparseMerkleTree::new();
+        
+        // Initial entries
+        for i in 0..5u8 {
+            tree.insert(test_key(i), format!("original{}", i).into_bytes());
+        }
+        
+        // Clone
+        let mut cloned = tree.clone();
+        
+        // Modify original: update existing + add new
+        tree.insert(test_key(0), b"updated_original".to_vec());
+        tree.insert(test_key(100), b"new_in_original".to_vec());
+        
+        // Modify clone: update existing + remove
+        cloned.insert(test_key(1), b"updated_clone".to_vec());
+        cloned.remove(&test_key(2));
+        
+        // Verify original
+        assert_eq!(tree.get(&test_key(0)), Some(&b"updated_original".to_vec()));
+        assert_eq!(tree.get(&test_key(1)), Some(&b"original1".to_vec())); // unchanged
+        assert_eq!(tree.get(&test_key(2)), Some(&b"original2".to_vec())); // not removed
+        assert_eq!(tree.get(&test_key(100)), Some(&b"new_in_original".to_vec()));
+        
+        // Verify clone
+        assert_eq!(cloned.get(&test_key(0)), Some(&b"original0".to_vec())); // unchanged
+        assert_eq!(cloned.get(&test_key(1)), Some(&b"updated_clone".to_vec()));
+        assert_eq!(cloned.get(&test_key(2)), None); // removed
+        assert_eq!(cloned.get(&test_key(100)), None); // not added
+    }
+
+    #[test]
+    fn test_c1_insert_return_old_value() {
+        // Verify insert returns the old value correctly with Arc unwrap
+        let mut tree = IncrementalSparseMerkleTree::new();
+        let key = test_key(1);
+        
+        // First insert - no old value
+        let old1 = tree.insert(key, b"first".to_vec());
+        assert_eq!(old1, None);
+        
+        // Second insert - should return old value
+        let old2 = tree.insert(key, b"second".to_vec());
+        assert_eq!(old2, Some(b"first".to_vec()));
+        
+        // Third insert - should return second value
+        let old3 = tree.insert(key, b"third".to_vec());
+        assert_eq!(old3, Some(b"second".to_vec()));
+        
+        // Current value should be third
+        assert_eq!(tree.get(&key), Some(&b"third".to_vec()));
+    }
+
+    #[test]
+    fn test_c1_take_changes_clones_data() {
+        // Verify take_changes returns actual data (not Arc references)
+        let mut tree = IncrementalSparseMerkleTree::new();
+        tree.insert(test_key(1), b"value1".to_vec());
+        tree.insert(test_key(2), b"value2".to_vec());
+        
+        let changes = tree.take_changes();
+        assert_eq!(changes.upserts.len(), 2);
+        
+        // Verify the data is correct (actual Vec<u8>, not Arc)
+        for (key, value) in &changes.upserts {
+            if *key == test_key(1) {
+                assert_eq!(value, &b"value1".to_vec());
+            } else if *key == test_key(2) {
+                assert_eq!(value, &b"value2".to_vec());
+            }
+        }
+        
+        // Tree should still have the data
+        assert_eq!(tree.get(&test_key(1)), Some(&b"value1".to_vec()));
+        assert_eq!(tree.get(&test_key(2)), Some(&b"value2".to_vec()));
+        
+        // But no more pending changes
+        assert!(!tree.has_pending_changes());
+    }
+
+    #[test]
+    fn test_c1_from_leaves_recovery() {
+        // Verify from_leaves works correctly for crash recovery
+        let mut original = IncrementalSparseMerkleTree::new();
+        for i in 0..10u8 {
+            original.insert(test_key(i), format!("value{}", i).into_bytes());
+        }
+        let original_root = original.root();
+        
+        // Simulate crash recovery: get all leaves as std::HashMap
+        let leaves: HashMap<HashValue, Vec<u8>> = original.all_leaves().into_iter().collect();
+        
+        // Recover from leaves
+        let recovered = IncrementalSparseMerkleTree::from_leaves(leaves);
+        
+        // Should have same root
+        assert_eq!(recovered.root(), original_root);
+        
+        // Should have same data
+        for i in 0..10u8 {
+            let expected = format!("value{}", i).into_bytes();
+            assert_eq!(recovered.get(&test_key(i)), Some(&expected));
+        }
+        
+        // Recovered tree should NOT have pending changes
+        assert!(!recovered.has_pending_changes());
+    }
+
+    #[test]
+    fn test_c1_iter_leaves_type_compatibility() {
+        // Verify iter_leaves returns correct types
+        let mut tree = IncrementalSparseMerkleTree::new();
+        tree.insert(test_key(1), b"value1".to_vec());
+        tree.insert(test_key(2), b"value2".to_vec());
+        
+        // iter_leaves should return (&HashValue, &Vec<u8>)
+        let mut count = 0;
+        for (key, value) in tree.iter_leaves() {
+            // key should be &HashValue
+            let _: &HashValue = key;
+            // value should be &Vec<u8>
+            let _: &Vec<u8> = value;
+            count += 1;
+        }
+        assert_eq!(count, 2);
     }
 }

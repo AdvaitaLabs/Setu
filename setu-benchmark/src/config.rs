@@ -91,6 +91,39 @@ pub struct BenchmarkConfig {
     /// Use pre-initialized test accounts (alice, bob, charlie) instead of random addresses
     #[arg(long, default_value = "false")]
     pub use_test_accounts: bool,
+
+    /// Number of test accounts to initialize before benchmark
+    /// 
+    /// When > 0, transfers funds from seed accounts (alice, bob, charlie) to
+    /// create user_001, user_002, ... user_N test accounts.
+    /// Each test account receives `init_account_balance` tokens.
+    /// 
+    /// This enables high-concurrency testing without requiring Validator
+    /// to pre-initialize all test accounts.
+    #[arg(long, default_value = "0")]
+    pub init_accounts: u64,
+
+    /// Balance to transfer to each initialized test account
+    #[arg(long, default_value = "100000")]
+    pub init_account_balance: u64,
+
+    /// Number of coin objects to create per account (for concurrency)
+    /// 
+    /// Each account's balance is split into N coin objects during init.
+    /// More coins = higher per-account concurrency (each coin can be
+    /// reserved independently for parallel transfers).
+    /// 
+    /// Recommended: set to concurrency / init_accounts * 2 or higher.
+    #[arg(long, default_value = "1")]
+    pub coins_per_account: u64,
+
+    /// Use batch API instead of single transfer API
+    #[arg(long, default_value = "false")]
+    pub use_batch: bool,
+
+    /// Batch size (number of transfers per batch request)
+    #[arg(long, default_value = "50")]
+    pub batch_size: u64,
 }
 
 impl BenchmarkConfig {
@@ -118,6 +151,15 @@ impl BenchmarkConfig {
         
         info!("  Warmup Txns:      {}", self.warmup);
         info!("  Timeout:          {}s", self.timeout);
+        if self.init_accounts > 0 {
+            info!("  Init Accounts:    {} (balance: {} each, {} coins/account)", self.init_accounts, self.init_account_balance, self.coins_per_account);
+        }
+        if self.use_batch {
+            info!("  Batch Mode:       ENABLED");
+            info!("  Batch Size:       {}", self.batch_size);
+        } else {
+            info!("  Batch Mode:       disabled (single transfer API)");
+        }
         info!("");
     }
 }

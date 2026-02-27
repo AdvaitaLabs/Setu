@@ -14,6 +14,7 @@ pub mod coin;           // Coin object (transferable asset)
 pub mod profile;        // Profile & Credential (identity)
 pub mod relation;       // RelationGraph object (social)
 pub mod account_view;   // Account aggregated view
+pub mod genesis;        // Genesis configuration
 
 // Re-export VLC types from setu-vlc (single source of truth)
 pub use setu_vlc::{VectorClock, VLCSnapshot};
@@ -44,7 +45,7 @@ pub use node::*;
 pub use object::{Object, ObjectId, Address, ObjectDigest, ObjectType, ObjectMetadata, Ownership, generate_object_id};
 
 // Coin related
-pub use coin::{Coin, CoinType, CoinData, Balance, create_coin, create_typed_coin};
+pub use coin::{Coin, CoinType, CoinData, CoinState, Balance, create_coin, create_typed_coin, deterministic_coin_id, deterministic_coin_id_from_str};
 
 // Profile & Credential related
 pub use profile::{
@@ -78,6 +79,9 @@ pub use merkle::{
 
 // Aggregated views
 pub use account_view::AccountView;
+
+// Genesis config
+pub use genesis::{GenesisConfig, GenesisAccount, GenesisError};
 
 // Task types for Validator → Solver communication
 pub use task::{

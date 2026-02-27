@@ -263,6 +263,18 @@ impl SetuDB {
         Ok(keys)
     }
     
+    /// Iterate over all key-value pairs with a raw byte prefix.
+    /// Returns an iterator yielding (key_bytes, value_bytes) tuples.
+    /// This is useful for B4 scheme where we need to scan all leaves for a subnet.
+    pub fn prefix_iterator(
+        &self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+    ) -> Result<impl Iterator<Item = std::result::Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>> + '_> {
+        let cf_handle = self.cf_handle(cf)?;
+        Ok(self.db.prefix_iterator_cf(cf_handle, prefix))
+    }
+    
     /// Write a batch atomically
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         self.db.write(batch)?;

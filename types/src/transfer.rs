@@ -88,10 +88,12 @@ pub struct Transfer {
     pub shard_id: Option<String>,
     
     /// Optional: Subnet ID for subnet-based routing
+    /// 
+    /// This also determines the coin type: each subnet has exactly one native token.
+    /// The coin_id is computed as: SHA256("coin:" + owner + ":" + subnet_id)
+    /// For ROOT subnet, use SubnetId::ROOT or leave as None (defaults to "SETU").
     pub subnet_id: Option<String>,
-    
-    // ========== VLC Fields ==========
-    
+
     /// VLC assigned by Validator when receiving the transfer.
     /// Solver should use this VLC when creating Event, NOT generate its own.
     pub assigned_vlc: Option<AssignedVlc>,
@@ -99,6 +101,9 @@ pub struct Transfer {
 
 impl Transfer {
     /// Create a new transfer with minimal required fields
+    /// 
+    /// For subnet transactions, use `with_subnet()` to specify the subnet.
+    /// The coin type is determined by subnet_id (1:1 binding).
     pub fn new(id: impl Into<String>, from: impl Into<String>, to: impl Into<String>, amount: u64) -> Self {
         Self {
             id: id.into(),
@@ -161,6 +166,11 @@ impl Transfer {
     pub fn with_subnet_id(mut self, subnet_id: Option<String>) -> Self {
         self.subnet_id = subnet_id;
         self
+    }
+    
+    /// Get the subnet_id for coin lookup, defaulting to ROOT if not specified
+    pub fn get_subnet_id_or_root(&self) -> &str {
+        self.subnet_id.as_deref().unwrap_or("ROOT")
     }
     
     /// Set assigned VLC from validator

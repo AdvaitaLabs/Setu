@@ -268,10 +268,66 @@ pub struct SubnetRegistration {
     pub subnet_type: SubnetType,
     /// Parent subnet ID (None = root subnet)
     pub parent_subnet_id: Option<String>,
+    
+    // ==================== Token Configuration ====================
+    /// Token symbol for this subnet (e.g., "MYAPP_TOKEN")
+    /// If None, subnet doesn't have its own token (uses parent's token)
+    pub token_symbol: Option<String>,
+    /// Initial token supply to mint to owner
+    pub initial_token_supply: Option<u64>,
+    /// Token configuration (decimals, etc.)
+    pub token_config: Option<TokenConfig>,
+    /// Initial token airdrop amount for new users joining this subnet
+    /// Set to 0 or None to disable airdrop
+    pub user_airdrop_amount: Option<u64>,
+}
+
+/// Token configuration for subnet tokens
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenConfig {
+    /// Number of decimal places (default: 8)
+    pub decimals: u8,
+    /// Maximum supply cap (None = unlimited)
+    pub max_supply: Option<u64>,
+    /// Whether token is mintable after creation
+    pub mintable: bool,
+    /// Whether token is burnable
+    pub burnable: bool,
+}
+
+impl Default for TokenConfig {
+    fn default() -> Self {
+        Self {
+            decimals: 8,
+            max_supply: None,
+            mintable: false,
+            burnable: true,
+        }
+    }
 }
 
 impl SubnetRegistration {
-    pub fn new(subnet_id: impl Into<String>, name: impl Into<String>, owner: impl Into<String>) -> Self {
+    /// Create a new subnet registration with required token symbol
+    /// 
+    /// Every subnet MUST have a native token (1:1 binding).
+    /// This ensures users can always specify the coin_type when transacting.
+    /// 
+    /// # Arguments
+    /// * `subnet_id` - Unique subnet identifier
+    /// * `name` - Human-readable subnet name
+    /// * `owner` - Owner address
+    /// * `token_symbol` - Token symbol (REQUIRED, e.g., "GAME", "SOCIAL")
+    /// 
+    /// # Example
+    /// ```rust,ignore
+    /// let subnet = SubnetRegistration::new("gaming-subnet", "Gaming", "owner", "GAME");
+    /// ```
+    pub fn new(
+        subnet_id: impl Into<String>,
+        name: impl Into<String>,
+        owner: impl Into<String>,
+        token_symbol: impl Into<String>,
+    ) -> Self {
         Self {
             subnet_id: subnet_id.into(),
             name: name.into(),
@@ -282,6 +338,11 @@ impl SubnetRegistration {
             assigned_solvers: vec![],
             subnet_type: SubnetType::App,
             parent_subnet_id: None,
+            // Token symbol is REQUIRED (1 subnet : 1 token)
+            token_symbol: Some(token_symbol.into()),
+            initial_token_supply: None,
+            token_config: Some(TokenConfig::default()),
+            user_airdrop_amount: None,
         }
     }
     
@@ -313,6 +374,57 @@ impl SubnetRegistration {
     pub fn with_parent(mut self, parent_id: impl Into<String>) -> Self {
         self.parent_subnet_id = Some(parent_id.into());
         self
+    }
+    
+    /// Configure initial token supply for the subnet
+    /// 
+    /// Note: token_symbol is already set in `new()` (required).
+    /// This method only sets the initial supply to mint to subnet owner.
+    /// 
+    /// # Arguments
+    /// * `initial_supply` - Initial tokens minted to subnet owner
+    /// 
+    /// # Example
+    /// ```rust,ignore
+    /// let subnet = SubnetRegistration::new("subnet-1", "My App", "owner-addr", "MYAPP")
+    ///     .with_initial_supply(1_000_000_00000000); // 1M tokens with 8 decimals
+    /// ```
+    pub fn with_initial_supply(mut self, initial_supply: u64) -> Self {
+        self.initial_token_supply = Some(initial_supply);
+        self
+    }
+    
+    /// Legacy method for backwards compatibility
+    /// 
+    /// Deprecated: Use `new()` with token_symbol parameter instead.
+    #[deprecated(since = "0.8.0", note = "token_symbol is now required in new()")]
+    pub fn with_token(mut self, symbol: impl Into<String>, initial_supply: u64) -> Self {
+        self.token_symbol = Some(symbol.into());
+        self.initial_token_supply = Some(initial_supply);
+        self.token_config = Some(TokenConfig::default());
+        self
+    }
+    
+    /// Configure custom token settings
+    pub fn with_token_config(mut self, config: TokenConfig) -> Self {
+        self.token_config = Some(config);
+        self
+    }
+    
+    /// Set airdrop amount for new users joining this subnet
+    pub fn with_user_airdrop(mut self, amount: u64) -> Self {
+        self.user_airdrop_amount = Some(amount);
+        self
+    }
+    
+    /// Check if this subnet has its own token
+    pub fn has_token(&self) -> bool {
+        self.token_symbol.is_some()
+    }
+    
+    /// Get the token symbol (returns subnet_id as fallback if token defined but no symbol)
+    pub fn get_token_symbol(&self) -> Option<&str> {
+        self.token_symbol.as_deref()
     }
 }
 
@@ -570,21 +682,22 @@ mod tests {
     
     #[test]
     fn test_subnet_registration() {
-        let reg = SubnetRegistration::new("subnet-1", "My App", "alice")
+        let reg = SubnetRegistration::new("subnet-1", "My App", "alice", "MYAPP")
             .with_type(SubnetType::App)
             .with_max_users(1000);
         assert_eq!(reg.subnet_id, "subnet-1");
         assert_eq!(reg.subnet_type, SubnetType::App);
+        assert_eq!(reg.token_symbol, Some("MYAPP".to_string()));
     }
     
     #[test]
     fn test_user_registration_metamask() {
-        let reg = UserRegistration::from_metamask("0x1234abcd", 1234567890)
+        let reg = UserRegistration::from_metamask("0x1234567890abcdef1234567890abcdef12345678", 1234567890)
             .with_subnet("subnet-1")
             .with_display_name("Alice")
             .with_signature(vec![1, 2, 3])
             .with_message("Register to Setu: 1234567890");
-        assert_eq!(reg.address, "0x1234abcd");
+        assert_eq!(reg.address, "0x1234567890abcdef1234567890abcdef12345678");
         assert_eq!(reg.get_subnet(), "subnet-1");
         assert!(reg.is_metamask());
         assert!(!reg.is_nostr());

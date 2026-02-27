@@ -229,7 +229,7 @@ impl Default for AnchorMerkleRootsBuilder {
 mod tests {
     use super::*;
     use setu_types::{EventType, VLCSnapshot};
-    use setu_merkle::sha256;
+    use setu_merkle::blake3_hash;
 
     fn create_test_event(id: &str) -> Event {
         let mut event = Event::new(
@@ -273,7 +273,7 @@ mod tests {
         
         let roots = AnchorMerkleRootsBuilder::new()
             .with_events(events)
-            .with_subnet_root(SubnetId::ROOT, sha256(b"state1"))
+            .with_subnet_root(SubnetId::ROOT, blake3_hash(b"state1"))
             .build();
         
         assert_ne!(roots.events_root, setu_types::ZERO_HASH);
@@ -283,8 +283,8 @@ mod tests {
     #[test]
     fn test_global_state_root_aggregation() {
         let mut subnet_roots = HashMap::new();
-        subnet_roots.insert(SubnetId::ROOT, sha256(b"root_state"));
-        subnet_roots.insert(SubnetId::new_app_simple(100), sha256(b"app_state"));
+        subnet_roots.insert(SubnetId::ROOT, blake3_hash(b"root_state"));
+        subnet_roots.insert(SubnetId::new_app_simple(100), blake3_hash(b"app_state"));
         
         let global_root = compute_global_state_root(&subnet_roots);
         assert_ne!(global_root, MerkleHash::zero());

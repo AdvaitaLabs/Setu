@@ -1,10 +1,19 @@
 //! Runtime executor - Simple State Transition Executor
+//!
+//! ## State Serialization Format
+//!
+//! **Important**: All Coin state changes use BCS serialization (via `CoinState`),
+//! not JSON. This ensures compatibility with the storage layer's Merkle tree.
+//!
+//! - Use `coin.to_coin_state_bytes()` for StateChange.new_state
+//! - Non-Coin objects (SubnetMetadata, UserMembership) still use JSON
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, debug, warn};
 use setu_types::{
-    ObjectId, Address, CoinType, create_typed_coin,
+    ObjectId, Address, CoinType, create_typed_coin, deterministic_coin_id,
 };
+// Note: Coin::to_coin_state_bytes() is used via trait method on Object<CoinData>
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::state::StateStore;
 use crate::transaction::{Transaction, TransactionType, TransferTx, QueryTx, QueryType};
@@ -145,8 +154,8 @@ impl<S: StateStore> RuntimeExecutor<S> {
             });
         }
         
-        // 记录旧状态
-        let old_state = serde_json::to_vec(&coin)?;
+        // 记录旧状态 (BCS format for Merkle tree compatibility)
+        let old_state = coin.to_coin_state_bytes();
         
         let mut state_changes = Vec::new();
         let mut created_objects = Vec::new();
@@ -168,7 +177,8 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 coin.metadata.owner = Some(recipient.clone());
                 coin.metadata.version += 1;
                 
-                let new_state = serde_json::to_vec(&coin)?;
+                // Use BCS serialization for storage compatibility
+                let new_state = coin.to_coin_state_bytes();
                 
                 // 保存更新后的对象
                 self.state.set_object(coin_id, coin)?;
@@ -196,9 +206,9 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 let transferred_balance = coin.data.balance.withdraw(amount)
                     .map_err(|e| RuntimeError::InvalidTransaction(e))?;
                 
-                // 更新原 Coin
+                // 更新原 Coin (BCS format)
                 coin.metadata.version += 1;
-                let new_state = serde_json::to_vec(&coin)?;
+                let new_state = coin.to_coin_state_bytes();
                 self.state.set_object(coin_id, coin.clone())?;
                 
                 state_changes.push(StateChange {
@@ -215,7 +225,8 @@ impl<S: StateStore> RuntimeExecutor<S> {
                     coin.data.coin_type.as_str(),
                 );
                 let new_coin_id = *new_coin.id();
-                let new_coin_state = serde_json::to_vec(&new_coin)?;
+                // Use BCS serialization for new coin
+                let new_coin_state = new_coin.to_coin_state_bytes();
                 
                 self.state.set_object(new_coin_id, new_coin)?;
                 
@@ -450,6 +461,295 @@ impl<S: StateStore> RuntimeExecutor<S> {
         );
         
         self.execute_transaction(&tx, ctx)
+    }
+    
+    // ========== Subnet & User Registration Handlers ==========
+    
+    /// Execute subnet registration - initializes subnet token if configured
+    /// 
+    /// This handles the SubnetRegister event and:
+    /// 1. Records subnet metadata
+    /// 2. Mints initial token supply to subnet owner (if token configured)
+    /// 3. Returns state changes for both subnet registration and token creation
+    pub fn execute_subnet_register(
+        &mut self,
+        subnet_id: &str,
+        name: &str,
+        owner: &Address,
+        token_symbol: Option<&str>,
+        initial_supply: Option<u64>,
+        _ctx: &ExecutionContext,
+    ) -> RuntimeResult<ExecutionOutput> {
+        let mut state_changes = Vec::new();
+        let mut created_objects = Vec::new();
+        
+        // 1. Record subnet metadata
+        let subnet_key = format!("subnet:{}", subnet_id);
+        let subnet_data = serde_json::json!({
+            "subnet_id": subnet_id,
+            "name": name,
+            "owner": owner.to_string(),
+            "token_symbol": token_symbol,
+            "created_at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        });
+        
+        // Generate deterministic ObjectId from subnet key
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(subnet_key.as_bytes());
+        let hash: [u8; 32] = hasher.finalize().into();
+        let subnet_object_id = ObjectId::new(hash);
+        
+        // Note: SubnetMetadata is NOT a Coin, so we keep JSON format for it
+        // Only Coin objects use BCS format
+        state_changes.push(StateChange {
+            change_type: StateChangeType::Create,
+            object_id: subnet_object_id,
+            old_state: None,
+            new_state: Some(serde_json::to_vec(&subnet_data)?),
+        });
+        
+        // 2. Mint initial token supply to owner if configured
+        // Note: token_symbol is for display only, we use subnet_id as the coin namespace
+        if let Some(supply) = initial_supply {
+            if supply > 0 {
+                // Use subnet_id as the coin namespace (1:1 binding)
+                // token_symbol is only for display purposes (stored in SubnetConfig)
+                let coin_id = deterministic_coin_id(owner, subnet_id);
+                
+                // Create token coin for subnet owner
+                let token_coin = create_typed_coin(
+                    owner.clone(),
+                    supply,
+                    subnet_id,  // Use subnet_id as coin_type internally
+                );
+                // Use BCS serialization for Coin storage
+                let coin_state = token_coin.to_coin_state_bytes();
+                
+                self.state.set_object(coin_id, token_coin)?;
+                
+                created_objects.push(coin_id);
+                state_changes.push(StateChange {
+                    change_type: StateChangeType::Create,
+                    object_id: coin_id,
+                    old_state: None,
+                    new_state: Some(coin_state),
+                });
+                
+                info!(
+                    subnet_id = %subnet_id,
+                    owner = %owner,
+                    token_symbol = ?token_symbol,
+                    initial_supply = supply,
+                    "Minted initial subnet token supply"
+                );
+            }
+        }
+        
+        Ok(ExecutionOutput {
+            success: true,
+            message: Some(format!(
+                "Subnet '{}' registered with owner {}{}",
+                name,
+                owner,
+                token_symbol.map_or(String::new(), |s| format!(", token: {}", s))
+            )),
+            state_changes,
+            created_objects,
+            deleted_objects: vec![],
+            query_result: None,
+        })
+    }
+    
+    /// Execute user registration (pure infrastructure primitive)
+    /// 
+    /// This is a basic infrastructure operation that only records user membership.
+    /// 
+    /// **Note**: Token airdrops are application-layer logic and should be handled
+    /// by Subnet applications (future: MoveVM smart contracts). The Setu core
+    /// only provides primitives like `mint_tokens()` and `transfer()` that
+    /// applications can compose.
+    /// 
+    /// # Arguments
+    /// * `user_address` - Address of the user to register
+    /// * `subnet_id` - Subnet the user is joining
+    /// * `ctx` - Execution context
+    pub fn execute_user_register(
+        &mut self,
+        user_address: &Address,
+        subnet_id: &str,
+        _ctx: &ExecutionContext,
+    ) -> RuntimeResult<ExecutionOutput> {
+        let mut state_changes = Vec::new();
+        
+        // Record user membership (pure infrastructure operation)
+        let membership_key = format!("user:{}:subnet:{}", user_address, subnet_id);
+        let membership_data = serde_json::json!({
+            "user": user_address.to_string(),
+            "subnet_id": subnet_id,
+            "joined_at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        });
+        
+        // Generate deterministic ObjectId from membership key
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(membership_key.as_bytes());
+        let hash: [u8; 32] = hasher.finalize().into();
+        let membership_object_id = ObjectId::new(hash);
+        
+        state_changes.push(StateChange {
+            change_type: StateChangeType::Create,
+            object_id: membership_object_id,
+            old_state: None,
+            new_state: Some(serde_json::to_vec(&membership_data)?),
+        });
+        
+        info!(
+            user = %user_address,
+            subnet_id = %subnet_id,
+            "User registered in subnet"
+        );
+        
+        Ok(ExecutionOutput {
+            success: true,
+            message: Some(format!(
+                "User {} registered in subnet '{}'",
+                user_address,
+                subnet_id,
+            )),
+            state_changes,
+            created_objects: vec![],
+            deleted_objects: vec![],
+            query_result: None,
+        })
+    }
+    
+    /// Mint tokens to an address (pure infrastructure primitive)
+    /// 
+    /// This is a basic token minting operation. Applications can use this
+    /// to implement airdrops, rewards, or other token distribution logic.
+    /// 
+    /// # Arguments
+    /// * `to` - Address to mint tokens to
+    /// * `subnet_id` - Subnet ID (determines token type, 1:1 binding)
+    /// * `amount` - Amount to mint
+    /// * `ctx` - Execution context
+    pub fn mint_tokens(
+        &mut self,
+        to: &Address,
+        subnet_id: &str,
+        amount: u64,
+        _ctx: &ExecutionContext,
+    ) -> RuntimeResult<ExecutionOutput> {
+        if amount == 0 {
+            return Ok(ExecutionOutput {
+                success: true,
+                message: Some("No tokens to mint (amount=0)".to_string()),
+                state_changes: vec![],
+                created_objects: vec![],
+                deleted_objects: vec![],
+                query_result: None,
+            });
+        }
+        
+        // Use deterministic coin ID with subnet_id as namespace
+        let coin_id = deterministic_coin_id(to, subnet_id);
+        
+        // Check if coin already exists
+        let existing = self.state.get_object(&coin_id)?;
+        
+        let (state_change, created) = if let Some(mut existing_coin) = existing {
+            // Add to existing balance - use BCS format
+            let old_state = existing_coin.to_coin_state_bytes();
+            existing_coin.data.balance.deposit(setu_types::Balance::new(amount))
+                .map_err(|e| RuntimeError::InvalidTransaction(e))?;
+            existing_coin.increment_version();
+            let new_state = existing_coin.to_coin_state_bytes();
+            
+            self.state.set_object(coin_id, existing_coin)?;
+            
+            (StateChange {
+                change_type: StateChangeType::Update,
+                object_id: coin_id,
+                old_state: Some(old_state),
+                new_state: Some(new_state),
+            }, false)
+        } else {
+            // Create new coin - use BCS format
+            let coin = create_typed_coin(to.clone(), amount, subnet_id);
+            let new_state = coin.to_coin_state_bytes();
+            
+            // Store with deterministic ID (not the random ID from create_typed_coin)
+            self.state.set_object(coin_id, coin)?;
+            
+            (StateChange {
+                change_type: StateChangeType::Create,
+                object_id: coin_id,
+                old_state: None,
+                new_state: Some(new_state),
+            }, true)
+        };
+        
+        info!(
+            to = %to,
+            subnet_id = %subnet_id,
+            amount = amount,
+            created = created,
+            "Tokens minted"
+        );
+        
+        Ok(ExecutionOutput {
+            success: true,
+            message: Some(format!("Minted {} tokens to {} in subnet {}", amount, to, subnet_id)),
+            state_changes: vec![state_change],
+            created_objects: if created { vec![coin_id] } else { vec![] },
+            deleted_objects: vec![],
+            query_result: None,
+        })
+    }
+    
+    /// Get or create a coin for an address in specific subnet
+    /// 
+    /// Uses deterministic coin ID generation for consistency with storage layer.
+    /// Returns (coin_id, was_created).
+    /// 
+    /// # Arguments
+    /// * `owner` - Owner address
+    /// * `subnet_id` - Subnet ID (determines token type)
+    /// * `ctx` - Execution context
+    pub fn get_or_create_coin(
+        &mut self,
+        owner: &Address,
+        subnet_id: &str,
+        _ctx: &ExecutionContext,
+    ) -> RuntimeResult<(ObjectId, bool)> {
+        // Use deterministic coin ID with subnet_id
+        let coin_id = deterministic_coin_id(owner, subnet_id);
+        
+        // Check if coin already exists
+        if self.state.get_object(&coin_id).is_ok() {
+            return Ok((coin_id, false));
+        }
+        
+        // Create new coin with 0 balance using deterministic ID
+        let coin = create_typed_coin(owner.clone(), 0, subnet_id);
+        // Note: create_typed_coin generates random ID, but we use deterministic ID for storage
+        self.state.set_object(coin_id, coin)?;
+        
+        info!(
+            owner = %owner,
+            subnet_id = %subnet_id,
+            coin_id = %coin_id,
+            "Created empty coin for recipient with deterministic ID"
+        );
+        
+        Ok((coin_id, true))
     }
 }
 

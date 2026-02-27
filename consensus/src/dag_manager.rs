@@ -15,7 +15,7 @@ use crate::dag::{Dag, DagError};
 use crate::recent_cache::{FinalizedEventMeta, RecentEventCache, CacheStatsSnapshot};
 use setu_storage::EventStoreBackend;
 use setu_types::{Anchor, AnchorId, Event, EventId};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, warn};
@@ -153,6 +153,14 @@ pub struct DagManager {
     /// Configuration
     config: DagManagerConfig,
     
+    /// Minimum depth for new events (depth floor)
+    /// Updated when anchors are finalized to ensure new events land above
+    /// the GC watermark (anchor_depth). Without this, events referencing
+    /// old parents (e.g., genesis at depth=0) get a depth below anchor_depth,
+    /// causing the depth inversion bug where get_events_in_range(from > to)
+    /// returns 0 events and no further CFs can ever be created.
+    min_depth: AtomicU64,
+    
     /// Whether warmup is in progress
     warming_up: AtomicBool,
     
@@ -176,6 +184,7 @@ impl DagManager {
             recent_cache,
             event_store,
             config,
+            min_depth: AtomicU64::new(0),
             warming_up: AtomicBool::new(false),
             pending_queue: Mutex::new(Vec::new()),
         }
@@ -294,11 +303,54 @@ impl DagManager {
         }
         
         // Phase 2: Calculate new_event_depth and check depth_diff
+        // For genesis events (no parents, first in DAG), depth = 0.
+        // For events with explicit parents, depth = max_parent_depth + 1.
+        // For events without parents but DAG is non-empty (edge case / safety net),
+        // use current max_depth + 1 to ensure they're above the anchor_depth.
         let new_event_depth = if parent_results.is_empty() {
-            0 // Genesis event
+            let dag = self.dag.read().await;
+            let current_max = dag.max_depth();
+            let is_empty = dag.is_empty();
+            let depth = if is_empty && current_max == 0 {
+                0 // Genesis event - DAG is empty, start at depth 0
+            } else {
+                // Safety net: event without parents in a non-empty DAG.
+                // This shouldn't happen in normal operation now that
+                // modification_tracker is wired in GSM, but we keep it
+                // as a fallback to avoid depth=0 collisions with genesis.
+                current_max + 1
+            };
+            tracing::debug!(
+                event_id = %event.id,
+                parent_count = parent_results.len(),
+                dag_is_empty = is_empty,
+                dag_max_depth = current_max,
+                calculated_depth = depth,
+                "resolve_parents: event without explicit parents"
+            );
+            depth
         } else {
             max_parent_depth + 1
         };
+        
+        // Apply depth floor to ensure events land above the GC watermark.
+        // After a CF finalizes, anchor_depth advances (e.g., from 0 to 2).
+        // Events referencing old parents (e.g., genesis at depth=0) would get
+        // calculated depth=1, which is below anchor_depth=2. This causes
+        // get_events_in_range(from=2, to=1) to return 0 events forever.
+        // The depth floor raises such events to at least anchor_depth.
+        let raw_depth = new_event_depth;
+        let floor = self.min_depth.load(Ordering::Acquire);
+        let new_event_depth = new_event_depth.max(floor);
+        if floor > 0 && new_event_depth > raw_depth {
+            debug!(
+                event_id = %event.id,
+                raw_depth = raw_depth,
+                floor = floor,
+                final_depth = new_event_depth,
+                "resolve_parents: depth floor raised event depth"
+            );
+        }
         
         // Check depth_diff for Cache/Store parents
         for (parent_id, info) in &parent_results {
@@ -411,6 +463,31 @@ impl DagManager {
     }
     
     // =========================================================================
+    // Depth Floor Management
+    // =========================================================================
+    
+    /// Update the minimum depth (depth floor) for new events
+    /// 
+    /// Called after anchor finalization to ensure new events land above
+    /// the GC watermark (anchor_depth). Uses atomic fetch_max to ensure
+    /// the floor only ever increases (monotonic).
+    pub fn update_min_depth(&self, depth: u64) {
+        let prev = self.min_depth.fetch_max(depth, Ordering::Release);
+        if depth > prev {
+            debug!(
+                prev_min_depth = prev,
+                new_min_depth = depth,
+                "Updated min_depth (depth floor)"
+            );
+        }
+    }
+    
+    /// Get the current minimum depth floor
+    pub fn min_depth(&self) -> u64 {
+        self.min_depth.load(Ordering::Acquire)
+    }
+    
+    // =========================================================================
     // Finalization and GC
     // =========================================================================
     
@@ -426,6 +503,10 @@ impl DagManager {
     /// 5. Remove from DAG (only events without active children)
     pub async fn on_anchor_finalized(&self, anchor: &Anchor) -> Result<GcStats, DagManagerError> {
         let event_ids: Vec<EventId> = anchor.event_ids.clone();
+        
+        // Update depth floor: new events must land at or above anchor.depth + 1
+        // to be reachable by future CFs (which start from anchor_depth).
+        self.update_min_depth(anchor.depth + 1);
         
         // Step 0: Update event status to Finalized (GC prerequisite!)
         // has_active_children() depends on status == Finalized

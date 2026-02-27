@@ -28,7 +28,6 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::binary::BinaryMerkleTree;
 use crate::error::{MerkleError, MerkleResult};
@@ -85,15 +84,14 @@ impl SubnetStateEntry {
 
     /// Compute the leaf hash for this entry.
     ///
-    /// Leaf hash = SHA256(AGGREGATION_LEAF_PREFIX || subnet_id || state_root)
+    /// Leaf hash = BLAKE3(AGGREGATION_LEAF_PREFIX || subnet_id || state_root)
     pub fn leaf_hash(&self) -> HashValue {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(AGGREGATION_LEAF_PREFIX);
         hasher.update(&self.subnet_id);
         hasher.update(self.state_root.as_bytes());
-        let result = hasher.finalize();
         let mut bytes = [0u8; HASH_LENGTH];
-        bytes.copy_from_slice(&result);
+        bytes.copy_from_slice(hasher.finalize().as_bytes());
         HashValue::new(bytes)
     }
 
@@ -150,16 +148,15 @@ impl SubnetAggregationProof {
     }
 }
 
-/// Hash two children to create an internal node.
+/// Hash two children to create an internal node (using BLAKE3).
 fn hash_internal(left: &HashValue, right: &HashValue) -> HashValue {
     use crate::hash::prefix;
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(prefix::INTERNAL);
     hasher.update(left.as_bytes());
     hasher.update(right.as_bytes());
-    let result = hasher.finalize();
     let mut bytes = [0u8; HASH_LENGTH];
-    bytes.copy_from_slice(&result);
+    bytes.copy_from_slice(hasher.finalize().as_bytes());
     HashValue::new(bytes)
 }
 

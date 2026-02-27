@@ -11,6 +11,8 @@ use setu_rpc::{
     HeartbeatRequest, HeartbeatResponse, RegisterSolverRequest, RegisterSolverResponse,
     RegisterValidatorRequest, RegisterValidatorResponse, RegistrationHandler,
     SubmitTransferRequest, SubmitTransferResponse,
+    // Batch transfer imports
+    SubmitTransfersBatchRequest, SubmitTransfersBatchResponse,
     // User RPC imports
     UserRpcHandler, RegisterUserRequest, RegisterUserResponse,
     GetAccountRequest, GetAccountResponse, GetBalanceRequest, 
@@ -48,6 +50,9 @@ pub trait ValidatorService: Send + Sync {
     
     /// Submit transfer
     fn submit_transfer(&self, request: SubmitTransferRequest) -> impl std::future::Future<Output = SubmitTransferResponse> + Send;
+    
+    /// Submit batch of transfers (optimized: 2 locks instead of 5-6N)
+    fn submit_transfers_batch(&self, request: SubmitTransfersBatchRequest) -> impl std::future::Future<Output = SubmitTransfersBatchResponse> + Send;
     
     /// Get transfer status
     fn get_transfer_status(&self, transfer_id: &str) -> GetTransferStatusResponse;
@@ -130,6 +135,31 @@ pub async fn http_submit_transfer<S: ValidatorService>(
     Json(request): Json<SubmitTransferRequest>,
 ) -> Json<SubmitTransferResponse> {
     Json(service.submit_transfer(request).await)
+}
+
+/// Submit a batch of transfers
+///
+/// This endpoint is optimized for high-throughput scenarios.
+/// It reduces lock acquisitions from 5-6N (N transfers) to just 2.
+///
+/// ## Request
+/// ```json
+/// {
+///   "transfers": [
+///     { "sender": "alice", "receiver": "bob", "amount": 100 },
+///     { "sender": "alice", "receiver": "charlie", "amount": 50 }
+///   ]
+/// }
+/// ```
+///
+/// ## Limits
+/// - Maximum batch size: 200 transfers
+/// - Warning threshold: 100 transfers
+pub async fn http_submit_transfers_batch<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<SubmitTransfersBatchRequest>,
+) -> Json<SubmitTransfersBatchResponse> {
+    Json(service.submit_transfers_batch(request).await)
 }
 
 /// Get transfer status
