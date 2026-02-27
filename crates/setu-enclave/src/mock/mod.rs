@@ -176,7 +176,10 @@ impl MockEnclave {
                     )))?;
                 
                 // Convert CoinState → Object<CoinData> for runtime
-                let owner = Address::from(coin_state.owner.as_str());
+                // CoinState.owner is stored in hex format ("0x..."), so use from_hex
+                // to avoid double-hashing. Address::from() would hash the hex string again.
+                let owner = Address::from_hex(&coin_state.owner)
+                    .unwrap_or_else(|_| Address::from(coin_state.owner.as_str()));
                 let coin_data = CoinData {
                     coin_type: CoinType::new(&coin_state.coin_type),
                     balance: Balance::new(coin_state.balance),
