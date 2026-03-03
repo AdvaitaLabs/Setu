@@ -59,4 +59,74 @@ mod tests {
         };
         assert_eq!(calculate_transfer_power_drain(&config), 10);
     }
+
+    // -- Task power drain --
+
+    fn make_metrics(gas_used: u64) -> EventMetrics {
+        EventMetrics {
+            solver_id: "solver-1".to_string(),
+            compute_time_us: 0,
+            gas_used,
+            write_count: 0,
+            read_count: 0,
+            value_transferred: 0,
+            dag_depth: 0,
+            flux_burn: 0,
+            power_delta: 0,
+        }
+    }
+
+    #[test]
+    fn test_task_power_disabled_returns_zero() {
+        let config = PoCWConfig::default(); // enabled: false
+        let metrics = make_metrics(10_000);
+        assert_eq!(calculate_task_power_drain(&metrics, &config), 0);
+    }
+
+    #[test]
+    fn test_task_power_known_input() {
+        let config = PoCWConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        // solver_power_rate default = 0.001
+        // drain = 0.001 * 10_000 = 10.0 → 10
+        let metrics = make_metrics(10_000);
+        assert_eq!(calculate_task_power_drain(&metrics, &config), 10);
+    }
+
+    #[test]
+    fn test_task_power_minimum_one() {
+        let config = PoCWConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        // drain = 0.001 * 1 = 0.001 → rounds to 0 → clamped to 1
+        let metrics = make_metrics(1);
+        assert_eq!(calculate_task_power_drain(&metrics, &config), 1);
+    }
+
+    #[test]
+    fn test_task_power_zero_gas_still_minimum_one() {
+        let config = PoCWConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        // drain = 0.001 * 0 = 0.0 → rounds to 0 → clamped to 1
+        let metrics = make_metrics(0);
+        assert_eq!(calculate_task_power_drain(&metrics, &config), 1);
+    }
+
+    #[test]
+    fn test_task_power_rounding() {
+        let config = PoCWConfig {
+            enabled: true,
+            solver_power_rate: 0.003,
+            ..Default::default()
+        };
+        // drain = 0.003 * 1500 = 4.5 → rounds to 4 (banker's rounding)
+        // Actually f64::round() rounds 4.5 → 5 (round half away from zero)
+        let metrics = make_metrics(1500);
+        assert_eq!(calculate_task_power_drain(&metrics, &config), 5);
+    }
 }
