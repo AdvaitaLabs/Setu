@@ -1,18 +1,18 @@
-//! Flux minting (Stage 3) and emission adjustment (Stage 5).
+//! Flux minting and emission adjustment.
 //!
-//! Stage 3: FluxMinted = κ × ΔPower_total
-//! Stage 5: κ(k+1) = clamp(κ(k) × (1 + dampening × (target/real − 1)), κ_min, κ_max)
+//! Minting: FluxMinted = κ × ΔPower_total
+//! Adjustment: κ(k+1) = clamp(κ(k) × (1 + dampening × (target/real − 1)), κ_min, κ_max)
 
 use setu_types::pocw::{EmissionState, PoCWConfig};
 
-/// Stage 3: compute Flux minted this fold.
+/// Compute Flux minted this fold.
 ///
 /// FluxMinted = round(κ × total_power_consumed)
 pub fn compute_flux_minted(total_power_consumed: u64, kappa: f64) -> u64 {
     (kappa * total_power_consumed as f64).round() as u64
 }
 
-/// Stage 5: adjust κ based on observed vs target velocity.
+/// Adjust κ based on observed vs target velocity.
 ///
 /// Records `flux_minted` in the velocity history, then adjusts κ:
 ///   real_velocity = mean(velocity_history)
@@ -43,7 +43,7 @@ pub fn adjust_kappa(state: &mut EmissionState, flux_minted: u64, config: &PoCWCo
 mod tests {
     use super::*;
 
-    // -- Stage 3: Flux minting --
+    // -- Flux minting --
 
     #[test]
     fn test_minting_basic() {
@@ -70,7 +70,7 @@ mod tests {
         assert_eq!(compute_flux_minted(3, 0.7), 2);
     }
 
-    // -- Stage 5: Kappa adjustment --
+    // -- Kappa adjustment --
 
     fn default_emission_config() -> PoCWConfig {
         PoCWConfig {
