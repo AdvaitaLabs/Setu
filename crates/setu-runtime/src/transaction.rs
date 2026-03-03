@@ -2,7 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 use setu_types::{Address, ObjectId};
-use std::collections::BTreeMap;
 
 /// Transaction types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,8 +10,8 @@ pub enum TransactionType {
     Transfer(TransferTx),
     /// Query transaction (read-only)
     Query(QueryTx),
-    /// Program transaction (small deterministic instruction set)
-    Program(ProgramTx),
+    /// Move-style script transaction (typed stack VM)
+    MoveScript(MoveScriptTx),
 }
 
 /// Simplified transaction structure
@@ -60,93 +59,86 @@ pub enum QueryType {
     OwnedObjects,
 }
 
-/// Program transaction payload.
-///
-/// This enables simple deterministic programmability without integrating a full VM.
+/// Move-style script payload for programmable execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramTx {
-    /// Program bytecode (instruction sequence)
-    pub instructions: Vec<Instruction>,
-    /// Named input values available via `LoadInput`
-    pub inputs: BTreeMap<String, ProgramValue>,
-    /// Optional execution step limit override
-    pub max_steps: Option<u64>,
+pub struct MoveScriptTx {
+    /// Bytecode instruction stream
+    pub code: Vec<Bytecode>,
+    /// Local variable signature table (slot types)
+    pub locals_sig: Vec<SignatureToken>,
+    /// Parameter signature (first N locals are parameters)
+    pub params_sig: Vec<SignatureToken>,
+    /// Return signature (stack shape expected at `Ret`)
+    pub return_sig: Vec<SignatureToken>,
+    /// Runtime argument values
+    pub args: Vec<MoveValue>,
+    /// Generic type arguments (reserved for phase-2+ features)
+    pub type_args: Vec<TypeTag>,
+    /// Gas budget for script execution
+    pub max_gas: u64,
+    /// Declared input objects this script can access
+    pub input_objects: Vec<ObjectId>,
 }
 
-/// Value type used by the program runtime.
+/// Runtime value type for the Move-style interpreter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProgramValue {
+pub enum MoveValue {
     U64(u64),
     Bool(bool),
+    Address(Address),
+    Vector(Vec<MoveValue>),
 }
 
-/// Arithmetic and bitwise binary operations.
+/// Type signatures used by verifier/interpreter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignatureToken {
+    Bool,
+    U64,
+    Address,
+    Vector(Box<SignatureToken>),
+}
+
+/// Type tags for script generic arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TypeTag {
+    Bool,
+    U64,
+    Address,
+    Vector(Box<TypeTag>),
+}
+
+/// Move-style phase-1 bytecode set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum BinaryOp {
+pub enum Bytecode {
+    // Constants
+    LdU64(u64),
+    LdTrue,
+    LdFalse,
+    // Locals
+    CopyLoc(u8),
+    MoveLoc(u8),
+    StLoc(u8),
+    Pop,
+    // Arithmetic
     Add,
     Sub,
     Mul,
     Div,
     Mod,
-    BitAnd,
-    BitOr,
-    BitXor,
-}
-
-/// Comparison operations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CompareOp {
+    // Comparison
     Eq,
-    Ne,
+    Neq,
     Lt,
     Le,
     Gt,
     Ge,
-}
-
-/// Instruction set (10 opcodes total).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Instruction {
-    Nop,
-    Const {
-        dst: u8,
-        value: ProgramValue,
-    },
-    Mov {
-        dst: u8,
-        src: u8,
-    },
-    BinOp {
-        op: BinaryOp,
-        dst: u8,
-        lhs: u8,
-        rhs: u8,
-    },
-    Cmp {
-        op: CompareOp,
-        dst: u8,
-        lhs: u8,
-        rhs: u8,
-    },
-    LoadInput {
-        dst: u8,
-        key: String,
-    },
-    StoreOutput {
-        key: String,
-        src: u8,
-    },
-    Jump {
-        pc: u16,
-    },
-    JumpIf {
-        cond: u8,
-        pc: u16,
-    },
-    Halt {
-        success: bool,
-        message: Option<String>,
-    },
+    // Control flow
+    BrTrue(u16),
+    BrFalse(u16),
+    Branch(u16),
+    // Termination
+    Ret,
+    Abort { code: u64, message: Option<String> },
 }
 
 impl Transaction {
@@ -198,29 +190,20 @@ impl Transaction {
         }
     }
 
-    /// Create a new programmable transaction.
-    pub fn new_program(
-        sender: Address,
-        instructions: Vec<Instruction>,
-        inputs: BTreeMap<String, ProgramValue>,
-        max_steps: Option<u64>,
-    ) -> Self {
+    /// Create a new Move-style script transaction.
+    pub fn new_move_script(sender: Address, script: MoveScriptTx) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
 
-        let id = format!("prog_{:x}", timestamp);
+        let id = format!("move_{:x}", timestamp);
 
         Self {
             id,
             sender,
-            tx_type: TransactionType::Program(ProgramTx {
-                instructions,
-                inputs,
-                max_steps,
-            }),
-            input_objects: vec![],
+            input_objects: script.input_objects.clone(),
+            tx_type: TransactionType::MoveScript(script),
             timestamp,
         }
     }

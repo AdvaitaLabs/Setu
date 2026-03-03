@@ -18,6 +18,6 @@ pub use executor::{
 };
 pub use state::{InMemoryStateStore, StateStore};
 pub use transaction::{
-    BinaryOp, CompareOp, Instruction, ProgramTx, ProgramValue, QueryTx, Transaction,
-    TransactionType, TransferTx,
+    Bytecode, MoveScriptTx, MoveValue, QueryTx, SignatureToken, Transaction, TransactionType,
+    TransferTx, TypeTag,
 };

@@ -1,100 +1,176 @@
-# Setu Runtime VM (Short Spec)
+# Setu Runtime Move-Style VM
 
-This VM is a small deterministic instruction executor used by `ProgramTx` in `setu-runtime`.
+This document specifies the current programmable VM in `setu-runtime`.
 
-## Goals
+## Overview
 
-- Add programmable execution without full Move VM integration.
-- Keep behavior deterministic and easy to audit.
-- Support basic arithmetic plus control flow (branch/jump).
+Setu VM is a **Move-style typed stack VM with local slots**.
 
-## Transaction Entry
+- Stack-based evaluation (`LdU64`, `Add`, `BrTrue`, `Ret`, etc.)
+- Indexed locals (`CopyLoc`, `MoveLoc`, `StLoc`)
+- Pre-execution verifier (control-flow + type checks)
+- Deterministic interpreter with gas metering
 
-`ProgramTx` contains:
+This VM powers `TransactionType::MoveScript`.
 
-- `instructions: Vec<Instruction>`
-- `inputs: BTreeMap<String, ProgramValue>`
-- `max_steps: Option<u64>`
+## Transaction Format
 
-Execution is triggered via `TransactionType::Program`.
+Programmable execution uses `MoveScriptTx`:
 
-## Value Model
+- `code: Vec<Bytecode>`
+- `locals_sig: Vec<SignatureToken>`
+- `params_sig: Vec<SignatureToken>`
+- `return_sig: Vec<SignatureToken>`
+- `args: Vec<MoveValue>`
+- `type_args: Vec<TypeTag>` (reserved for generic extensions)
+- `max_gas: u64`
+- `input_objects: Vec<ObjectId>`
 
-`ProgramValue`:
+`Transaction::new_move_script(...)` copies `input_objects` into transaction-level dependencies.
+
+## Runtime Types
+
+`MoveValue`:
 
 - `U64(u64)`
 - `Bool(bool)`
+- `Address(Address)`
+- `Vector(Vec<MoveValue>)`
 
-Registers are fixed-size (`16`) and initialized to `U64(0)`.
+`SignatureToken`:
 
-## Instruction Set (10 opcodes)
+- `U64`
+- `Bool`
+- `Address`
+- `Vector(Box<SignatureToken>)`
 
-1. `Nop`
-2. `Const { dst, value }`
-3. `Mov { dst, src }`
-4. `BinOp { op, dst, lhs, rhs }`
-5. `Cmp { op, dst, lhs, rhs }`
-6. `LoadInput { dst, key }`
-7. `StoreOutput { key, src }`
-8. `Jump { pc }`
-9. `JumpIf { cond, pc }`
-10. `Halt { success, message }`
+`TypeTag` currently mirrors simple base/vector types and is reserved for future generic handling.
 
-`BinOp` supports checked arithmetic/bitwise ops:
-`Add`, `Sub`, `Mul`, `Div`, `Mod`, `BitAnd`, `BitOr`, `BitXor`.
+## Bytecode Set (Current)
 
-`Cmp` supports:
-`Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`.
+Constants:
 
-## Determinism and Safety
+- `LdU64(u64)`, `LdTrue`, `LdFalse`
 
-Before execution:
+Locals/stack:
 
-- Validate instruction count (`<= 4096`).
-- Validate jump targets are in range.
-- Validate register indices are valid.
-- Validate `max_steps` (`1..=100000`, default `10000`).
+- `CopyLoc(u8)`, `MoveLoc(u8)`, `StLoc(u8)`, `Pop`
 
-During execution:
+Arithmetic:
 
-- Enforce step limit.
-- Fail on overflow/div-by-zero/mod-by-zero.
-- Fail on missing input key.
-- Require explicit `Halt`; falling off program is an error.
+- `Add`, `Sub`, `Mul`, `Div`, `Mod`
 
-## Output
+Comparison:
 
-Current VM phase returns:
+- `Eq`, `Neq`, `Lt`, `Le`, `Gt`, `Ge`
 
-- `ExecutionOutput.success` from `Halt.success`
-- `ExecutionOutput.message` from `Halt.message` (or default message)
-- `ExecutionOutput.query_result` containing stored output key-values
-- No state writes yet (`state_changes` is empty in this phase)
+Control flow:
 
-## Minimal Example
+- `BrTrue(u16)`, `BrFalse(u16)`, `Branch(u16)`
 
-```rust
-use std::collections::BTreeMap;
-use setu_runtime::{Instruction, ProgramValue, BinaryOp, CompareOp, Transaction};
-use setu_types::Address;
+Termination:
 
-let tx = Transaction::new_program(
-    Address::from("alice"),
-    vec![
-        Instruction::Const { dst: 0, value: ProgramValue::U64(2) },
-        Instruction::Const { dst: 1, value: ProgramValue::U64(3) },
-        Instruction::BinOp { op: BinaryOp::Add, dst: 2, lhs: 0, rhs: 1 }, // r2 = 5
-        Instruction::Const { dst: 3, value: ProgramValue::U64(4) },
-        Instruction::Cmp { op: CompareOp::Gt, dst: 4, lhs: 2, rhs: 3 },    // r4 = true
-        Instruction::JumpIf { cond: 4, pc: 8 },
-        Instruction::Const { dst: 5, value: ProgramValue::U64(0) },
-        Instruction::Jump { pc: 9 },
-        Instruction::Const { dst: 5, value: ProgramValue::U64(1) },
-        Instruction::StoreOutput { key: "ok".to_string(), src: 5 },
-        Instruction::Halt { success: true, message: Some("done".to_string()) },
-    ],
-    BTreeMap::new(),
-    None,
-);
-```
+- `Ret`
+- `Abort { code: u64, message: Option<String> }`
 
+## Verification Pipeline
+
+Before execution, the VM verifies:
+
+1. Structural envelope:
+- non-empty code
+- code length bound
+- locals count bound
+- `params_sig.len() <= locals_sig.len()`
+- `args.len() == params_sig.len()`
+- `max_gas > 0`
+
+2. Argument type compatibility:
+- each `arg` matches `params_sig`
+
+3. Bytecode control-flow and type safety:
+- valid branch targets
+- stack underflow prevention via abstract interpretation
+- opcode operand type checks
+- join-point stack state consistency
+- return stack matches `return_sig`
+- at least one reachable terminal instruction (`Ret` or `Abort`)
+
+If verification fails, execution is rejected with `RuntimeError::InvalidTransaction`.
+
+## Execution Semantics
+
+Interpreter model:
+
+- `locals: Vec<Option<MoveValue>>`, initialized from `args`
+- `stack: Vec<MoveValue>`
+- `pc: usize`
+- per-op gas charging
+
+Current runtime bounds:
+
+- `MAX_CODE_LENGTH = 4096`
+- `MAX_LOCALS = 256`
+- `MAX_STACK_DEPTH = 1024`
+- `MAX_STEPS = 100000`
+
+Arithmetic is checked:
+
+- overflow/underflow -> error
+- division/mod by zero -> error
+
+Gas behavior:
+
+- fixed gas cost table by opcode
+- execution aborts with out-of-gas error when budget is insufficient
+
+Termination behavior:
+
+- `Ret`: success, stack must match `return_sig`, return values emitted in `query_result.returns`
+- `Abort`: non-success `ExecutionOutput` with `abort_code` in `query_result`
+
+## Output Contract
+
+For `MoveScript` execution:
+
+- `ExecutionOutput.success`: `true` on `Ret`, `false` on `Abort`
+- `ExecutionOutput.message`: execution/abort message
+- `ExecutionOutput.query_result`:
+  - `returns`: return values (on `Ret`)
+  - `gas_used`: consumed gas
+  - `abort_code`: on `Abort`
+- `state_changes`, `created_objects`, `deleted_objects`: empty in current phase
+
+Transfer/query paths are unchanged.
+
+## Example
+
+High-level shape of a script:
+
+1. load params from locals
+2. compute and compare
+3. branch
+4. push return value
+5. `Ret`
+
+Reference tests:
+
+- `test_move_script_branch_and_return`
+- `test_move_script_out_of_gas`
+
+in `crates/setu-runtime/src/executor.rs`.
+
+## Current Scope and Next Steps
+
+Implemented scope:
+
+- typed stack VM core
+- locals handling
+- verifier
+- gas metering
+
+Not yet implemented:
+
+- module/function call model (`Call`)
+- storage/resource bytecodes (`Exists`, `MoveFrom`, `MoveTo`)
+- struct/resource semantics (`Pack`, `Unpack`, abilities)

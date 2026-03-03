@@ -3,12 +3,12 @@
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::state::StateStore;
 use crate::transaction::{
-    BinaryOp, CompareOp, Instruction, ProgramTx, ProgramValue, QueryTx, QueryType, Transaction,
+    Bytecode, MoveScriptTx, MoveValue, QueryTx, QueryType, SignatureToken, Transaction,
     TransactionType, TransferTx,
 };
 use serde::{Deserialize, Serialize};
 use setu_types::{create_typed_coin, Address, CoinType, ObjectId};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, VecDeque};
 use tracing::{debug, info, warn};
 
 /// Execution context
@@ -92,7 +92,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
         let result = match &tx.tx_type {
             TransactionType::Transfer(transfer_tx) => self.execute_transfer(tx, transfer_tx, ctx),
             TransactionType::Query(query_tx) => self.execute_query(tx, query_tx, ctx),
-            TransactionType::Program(program_tx) => self.execute_program(tx, program_tx, ctx),
+            TransactionType::MoveScript(script_tx) => self.execute_move_script(tx, script_tx, ctx),
         };
 
         match &result {
@@ -323,265 +323,611 @@ impl<S: StateStore> RuntimeExecutor<S> {
         })
     }
 
-    /// Execute a programmable transaction using a compact deterministic instruction set.
-    fn execute_program(
+    /// Execute Move-style script (typed stack + locals).
+    fn execute_move_script(
         &mut self,
         _tx: &Transaction,
-        program_tx: &ProgramTx,
+        script_tx: &MoveScriptTx,
         _ctx: &ExecutionContext,
     ) -> RuntimeResult<ExecutionOutput> {
-        const REGISTER_COUNT: usize = 16;
-        const DEFAULT_MAX_STEPS: u64 = 10_000;
-        const HARD_MAX_STEPS: u64 = 100_000;
-        const MAX_PROGRAM_LENGTH: usize = 4_096;
+        const MAX_CODE_LENGTH: usize = 4_096;
+        const MAX_LOCALS: usize = 256;
+        const MAX_STACK_DEPTH: usize = 1_024;
+        const MAX_STEPS: usize = 100_000;
 
-        if program_tx.instructions.is_empty() {
-            return Err(RuntimeError::InvalidTransaction(
-                "Program has no instructions".to_string(),
-            ));
+        self.verify_move_script(script_tx, MAX_CODE_LENGTH, MAX_LOCALS)?;
+
+        let mut gas_remaining = script_tx.max_gas;
+        let mut steps = 0usize;
+        let mut pc = 0usize;
+        let mut stack: Vec<MoveValue> = Vec::new();
+        let mut locals: Vec<Option<MoveValue>> = vec![None; script_tx.locals_sig.len()];
+
+        for (i, arg) in script_tx.args.iter().enumerate() {
+            locals[i] = Some(arg.clone());
         }
 
-        if program_tx.instructions.len() > MAX_PROGRAM_LENGTH {
-            return Err(RuntimeError::InvalidTransaction(format!(
-                "Program too large: {} > {} instructions",
-                program_tx.instructions.len(),
-                MAX_PROGRAM_LENGTH
-            )));
-        }
-
-        let max_steps = program_tx.max_steps.unwrap_or(DEFAULT_MAX_STEPS);
-        if max_steps == 0 || max_steps > HARD_MAX_STEPS {
-            return Err(RuntimeError::InvalidTransaction(format!(
-                "Invalid max_steps: {} (allowed: 1..={})",
-                max_steps, HARD_MAX_STEPS
-            )));
-        }
-
-        self.validate_program(program_tx, REGISTER_COUNT)?;
-
-        let mut registers = vec![ProgramValue::U64(0); REGISTER_COUNT];
-        let mut outputs: BTreeMap<String, ProgramValue> = BTreeMap::new();
-        let mut pc: usize = 0;
-        let mut steps: u64 = 0;
-        let mut halt_result: Option<(bool, Option<String>)> = None;
-
-        while pc < program_tx.instructions.len() {
-            if steps >= max_steps {
+        loop {
+            if pc >= script_tx.code.len() {
                 return Err(RuntimeError::InvalidTransaction(format!(
-                    "Program step limit exceeded at pc={} (max_steps={})",
-                    pc, max_steps
+                    "Program counter out of range: {}",
+                    pc
+                )));
+            }
+
+            if steps >= MAX_STEPS {
+                return Err(RuntimeError::InvalidTransaction(format!(
+                    "Step limit exceeded at pc={}",
+                    pc
                 )));
             }
             steps += 1;
 
-            match &program_tx.instructions[pc] {
-                Instruction::Nop => {
+            let op = &script_tx.code[pc];
+            let gas_cost = Self::opcode_gas_cost(op);
+            if gas_remaining < gas_cost {
+                return Err(RuntimeError::InvalidTransaction(format!(
+                    "Out of gas at pc={} (required={}, remaining={})",
+                    pc, gas_cost, gas_remaining
+                )));
+            }
+            gas_remaining -= gas_cost;
+
+            match op {
+                Bytecode::LdU64(v) => {
+                    stack.push(MoveValue::U64(*v));
                     pc += 1;
                 }
-                Instruction::Const { dst, value } => {
-                    registers[*dst as usize] = value.clone();
+                Bytecode::LdTrue => {
+                    stack.push(MoveValue::Bool(true));
                     pc += 1;
                 }
-                Instruction::Mov { dst, src } => {
-                    registers[*dst as usize] = registers[*src as usize].clone();
+                Bytecode::LdFalse => {
+                    stack.push(MoveValue::Bool(false));
                     pc += 1;
                 }
-                Instruction::BinOp { op, dst, lhs, rhs } => {
-                    let left = Self::read_u64(&registers, *lhs, pc)?;
-                    let right = Self::read_u64(&registers, *rhs, pc)?;
-                    let result = Self::execute_binop(op, left, right, pc)?;
-                    registers[*dst as usize] = ProgramValue::U64(result);
-                    pc += 1;
-                }
-                Instruction::Cmp { op, dst, lhs, rhs } => {
-                    let left = Self::read_u64(&registers, *lhs, pc)?;
-                    let right = Self::read_u64(&registers, *rhs, pc)?;
-                    let result = Self::execute_cmp(op, left, right);
-                    registers[*dst as usize] = ProgramValue::Bool(result);
-                    pc += 1;
-                }
-                Instruction::LoadInput { dst, key } => {
-                    let value = program_tx.inputs.get(key).ok_or_else(|| {
+                Bytecode::CopyLoc(local_idx) => {
+                    let idx = *local_idx as usize;
+                    let val = locals[idx].clone().ok_or_else(|| {
                         RuntimeError::InvalidTransaction(format!(
-                            "Missing program input '{}' at pc={}",
-                            key, pc
+                            "CopyLoc on uninitialized local {} at pc={}",
+                            idx, pc
                         ))
                     })?;
-                    registers[*dst as usize] = value.clone();
+                    stack.push(val);
                     pc += 1;
                 }
-                Instruction::StoreOutput { key, src } => {
-                    outputs.insert(key.clone(), registers[*src as usize].clone());
+                Bytecode::MoveLoc(local_idx) => {
+                    let idx = *local_idx as usize;
+                    let val = locals[idx].take().ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!(
+                            "MoveLoc on uninitialized local {} at pc={}",
+                            idx, pc
+                        ))
+                    })?;
+                    stack.push(val);
                     pc += 1;
                 }
-                Instruction::Jump { pc: target } => {
-                    pc = *target as usize;
+                Bytecode::StLoc(local_idx) => {
+                    let idx = *local_idx as usize;
+                    let val = Self::pop_value(&mut stack, pc)?;
+                    let expected_ty = &script_tx.locals_sig[idx];
+                    Self::ensure_value_type(&val, expected_ty, pc)?;
+                    locals[idx] = Some(val);
+                    pc += 1;
                 }
-                Instruction::JumpIf { cond, pc: target } => {
-                    let condition = Self::read_bool(&registers, *cond, pc)?;
-                    if condition {
+                Bytecode::Pop => {
+                    let _ = Self::pop_value(&mut stack, pc)?;
+                    pc += 1;
+                }
+                Bytecode::Add => {
+                    let rhs = Self::pop_u64(&mut stack, pc)?;
+                    let lhs = Self::pop_u64(&mut stack, pc)?;
+                    let result = lhs.checked_add(rhs).ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!(
+                            "Arithmetic overflow at pc={}",
+                            pc
+                        ))
+                    })?;
+                    stack.push(MoveValue::U64(result));
+                    pc += 1;
+                }
+                Bytecode::Sub => {
+                    let rhs = Self::pop_u64(&mut stack, pc)?;
+                    let lhs = Self::pop_u64(&mut stack, pc)?;
+                    let result = lhs.checked_sub(rhs).ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!(
+                            "Arithmetic underflow at pc={}",
+                            pc
+                        ))
+                    })?;
+                    stack.push(MoveValue::U64(result));
+                    pc += 1;
+                }
+                Bytecode::Mul => {
+                    let rhs = Self::pop_u64(&mut stack, pc)?;
+                    let lhs = Self::pop_u64(&mut stack, pc)?;
+                    let result = lhs.checked_mul(rhs).ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!(
+                            "Arithmetic overflow at pc={}",
+                            pc
+                        ))
+                    })?;
+                    stack.push(MoveValue::U64(result));
+                    pc += 1;
+                }
+                Bytecode::Div => {
+                    let rhs = Self::pop_u64(&mut stack, pc)?;
+                    if rhs == 0 {
+                        return Err(RuntimeError::InvalidTransaction(format!(
+                            "Division by zero at pc={}",
+                            pc
+                        )));
+                    }
+                    let lhs = Self::pop_u64(&mut stack, pc)?;
+                    stack.push(MoveValue::U64(lhs / rhs));
+                    pc += 1;
+                }
+                Bytecode::Mod => {
+                    let rhs = Self::pop_u64(&mut stack, pc)?;
+                    if rhs == 0 {
+                        return Err(RuntimeError::InvalidTransaction(format!(
+                            "Modulo by zero at pc={}",
+                            pc
+                        )));
+                    }
+                    let lhs = Self::pop_u64(&mut stack, pc)?;
+                    stack.push(MoveValue::U64(lhs % rhs));
+                    pc += 1;
+                }
+                Bytecode::Eq => {
+                    let rhs = Self::pop_value(&mut stack, pc)?;
+                    let lhs = Self::pop_value(&mut stack, pc)?;
+                    stack.push(MoveValue::Bool(lhs == rhs));
+                    pc += 1;
+                }
+                Bytecode::Neq => {
+                    let rhs = Self::pop_value(&mut stack, pc)?;
+                    let lhs = Self::pop_value(&mut stack, pc)?;
+                    stack.push(MoveValue::Bool(lhs != rhs));
+                    pc += 1;
+                }
+                Bytecode::Lt => {
+                    let rhs = Self::pop_u64(&mut stack, pc)?;
+                    let lhs = Self::pop_u64(&mut stack, pc)?;
+                    stack.push(MoveValue::Bool(lhs < rhs));
+                    pc += 1;
+                }
+                Bytecode::Le => {
+                    let rhs = Self::pop_u64(&mut stack, pc)?;
+                    let lhs = Self::pop_u64(&mut stack, pc)?;
+                    stack.push(MoveValue::Bool(lhs <= rhs));
+                    pc += 1;
+                }
+                Bytecode::Gt => {
+                    let rhs = Self::pop_u64(&mut stack, pc)?;
+                    let lhs = Self::pop_u64(&mut stack, pc)?;
+                    stack.push(MoveValue::Bool(lhs > rhs));
+                    pc += 1;
+                }
+                Bytecode::Ge => {
+                    let rhs = Self::pop_u64(&mut stack, pc)?;
+                    let lhs = Self::pop_u64(&mut stack, pc)?;
+                    stack.push(MoveValue::Bool(lhs >= rhs));
+                    pc += 1;
+                }
+                Bytecode::BrTrue(target) => {
+                    let cond = Self::pop_bool(&mut stack, pc)?;
+                    if cond {
                         pc = *target as usize;
                     } else {
                         pc += 1;
                     }
                 }
-                Instruction::Halt { success, message } => {
-                    halt_result = Some((*success, message.clone()));
-                    break;
+                Bytecode::BrFalse(target) => {
+                    let cond = Self::pop_bool(&mut stack, pc)?;
+                    if !cond {
+                        pc = *target as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+                Bytecode::Branch(target) => {
+                    pc = *target as usize;
+                }
+                Bytecode::Ret => {
+                    if stack.len() != script_tx.return_sig.len() {
+                        return Err(RuntimeError::InvalidTransaction(format!(
+                            "Return stack length mismatch at pc={}: expected {}, got {}",
+                            pc,
+                            script_tx.return_sig.len(),
+                            stack.len()
+                        )));
+                    }
+                    for (value, ty) in stack.iter().zip(script_tx.return_sig.iter()) {
+                        Self::ensure_value_type(value, ty, pc)?;
+                    }
+
+                    let return_values_json: Vec<serde_json::Value> =
+                        stack.into_iter().map(Self::move_value_to_json).collect();
+                    let query_result = serde_json::json!({
+                        "returns": return_values_json,
+                        "gas_used": script_tx.max_gas.saturating_sub(gas_remaining),
+                    });
+
+                    return Ok(ExecutionOutput {
+                        success: true,
+                        message: Some(format!("Move script executed in {} steps", steps)),
+                        state_changes: vec![],
+                        created_objects: vec![],
+                        deleted_objects: vec![],
+                        query_result: Some(query_result),
+                    });
+                }
+                Bytecode::Abort { code, message } => {
+                    return Ok(ExecutionOutput {
+                        success: false,
+                        message: Some(match message {
+                            Some(m) => format!("Abort({}): {}", code, m),
+                            None => format!("Abort({})", code),
+                        }),
+                        state_changes: vec![],
+                        created_objects: vec![],
+                        deleted_objects: vec![],
+                        query_result: Some(serde_json::json!({
+                            "abort_code": code,
+                            "gas_used": script_tx.max_gas.saturating_sub(gas_remaining),
+                        })),
+                    });
+                }
+            }
+
+            if stack.len() > MAX_STACK_DEPTH {
+                return Err(RuntimeError::InvalidTransaction(format!(
+                    "Stack depth exceeded limit {} at pc={}",
+                    MAX_STACK_DEPTH, pc
+                )));
+            }
+        }
+    }
+
+    fn verify_move_script(
+        &self,
+        script_tx: &MoveScriptTx,
+        max_code_len: usize,
+        max_locals: usize,
+    ) -> RuntimeResult<()> {
+        if script_tx.code.is_empty() {
+            return Err(RuntimeError::InvalidTransaction(
+                "Move script has empty code".to_string(),
+            ));
+        }
+        if script_tx.code.len() > max_code_len {
+            return Err(RuntimeError::InvalidTransaction(format!(
+                "Move script too large: {} > {} instructions",
+                script_tx.code.len(),
+                max_code_len
+            )));
+        }
+        if script_tx.locals_sig.len() > max_locals {
+            return Err(RuntimeError::InvalidTransaction(format!(
+                "Too many locals: {} > {}",
+                script_tx.locals_sig.len(),
+                max_locals
+            )));
+        }
+        if script_tx.params_sig.len() > script_tx.locals_sig.len() {
+            return Err(RuntimeError::InvalidTransaction(format!(
+                "params_sig longer than locals_sig: {} > {}",
+                script_tx.params_sig.len(),
+                script_tx.locals_sig.len()
+            )));
+        }
+        if script_tx.args.len() != script_tx.params_sig.len() {
+            return Err(RuntimeError::InvalidTransaction(format!(
+                "Argument length mismatch: expected {}, got {}",
+                script_tx.params_sig.len(),
+                script_tx.args.len()
+            )));
+        }
+        if script_tx.max_gas == 0 {
+            return Err(RuntimeError::InvalidTransaction(
+                "max_gas must be greater than zero".to_string(),
+            ));
+        }
+
+        for (arg, sig) in script_tx.args.iter().zip(script_tx.params_sig.iter()) {
+            Self::ensure_value_matches_sig(arg, sig)?;
+        }
+
+        self.verify_control_flow_and_types(script_tx)
+    }
+
+    fn verify_control_flow_and_types(&self, script_tx: &MoveScriptTx) -> RuntimeResult<()> {
+        let mut queue: VecDeque<(usize, Vec<SignatureToken>)> = VecDeque::new();
+        let mut seen: HashMap<usize, Vec<SignatureToken>> = HashMap::new();
+        let mut has_terminal = false;
+        queue.push_back((0, Vec::new()));
+
+        while let Some((pc, stack_state)) = queue.pop_front() {
+            if pc >= script_tx.code.len() {
+                return Err(RuntimeError::InvalidTransaction(format!(
+                    "Invalid pc {} during verification",
+                    pc
+                )));
+            }
+
+            if let Some(existing) = seen.get(&pc) {
+                if existing != &stack_state {
+                    return Err(RuntimeError::InvalidTransaction(format!(
+                        "Incompatible stack state at join point pc={}",
+                        pc
+                    )));
+                }
+                continue;
+            }
+            seen.insert(pc, stack_state.clone());
+
+            let mut stack = stack_state;
+            let op = &script_tx.code[pc];
+            let mut push_succ =
+                |next_pc: usize, next_stack: Vec<SignatureToken>| -> RuntimeResult<()> {
+                    if next_pc >= script_tx.code.len() {
+                        return Err(RuntimeError::InvalidTransaction(format!(
+                            "Control flow exits code range at pc={}",
+                            pc
+                        )));
+                    }
+                    queue.push_back((next_pc, next_stack));
+                    Ok(())
+                };
+
+            match op {
+                Bytecode::LdU64(_) => {
+                    stack.push(SignatureToken::U64);
+                    push_succ(pc + 1, stack)?;
+                }
+                Bytecode::LdTrue | Bytecode::LdFalse => {
+                    stack.push(SignatureToken::Bool);
+                    push_succ(pc + 1, stack)?;
+                }
+                Bytecode::CopyLoc(idx) | Bytecode::MoveLoc(idx) => {
+                    let local_idx = *idx as usize;
+                    let ty = script_tx.locals_sig.get(local_idx).ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!(
+                            "Local index out of bounds {} at pc={}",
+                            local_idx, pc
+                        ))
+                    })?;
+                    stack.push(ty.clone());
+                    push_succ(pc + 1, stack)?;
+                }
+                Bytecode::StLoc(idx) => {
+                    let local_idx = *idx as usize;
+                    let ty = script_tx.locals_sig.get(local_idx).ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!(
+                            "Local index out of bounds {} at pc={}",
+                            local_idx, pc
+                        ))
+                    })?;
+                    let top = stack.pop().ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!(
+                            "Stack underflow at StLoc pc={}",
+                            pc
+                        ))
+                    })?;
+                    if &top != ty {
+                        return Err(RuntimeError::InvalidTransaction(format!(
+                            "Type mismatch at StLoc pc={}",
+                            pc
+                        )));
+                    }
+                    push_succ(pc + 1, stack)?;
+                }
+                Bytecode::Pop => {
+                    let _ = stack.pop().ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!(
+                            "Stack underflow at Pop pc={}",
+                            pc
+                        ))
+                    })?;
+                    push_succ(pc + 1, stack)?;
+                }
+                Bytecode::Add | Bytecode::Sub | Bytecode::Mul | Bytecode::Div | Bytecode::Mod => {
+                    let rhs = stack.pop().ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!("Stack underflow at pc={}", pc))
+                    })?;
+                    let lhs = stack.pop().ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!("Stack underflow at pc={}", pc))
+                    })?;
+                    if rhs != SignatureToken::U64 || lhs != SignatureToken::U64 {
+                        return Err(RuntimeError::InvalidTransaction(format!(
+                            "Arithmetic expects U64 at pc={}",
+                            pc
+                        )));
+                    }
+                    stack.push(SignatureToken::U64);
+                    push_succ(pc + 1, stack)?;
+                }
+                Bytecode::Eq | Bytecode::Neq => {
+                    let rhs = stack.pop().ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!("Stack underflow at pc={}", pc))
+                    })?;
+                    let lhs = stack.pop().ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!("Stack underflow at pc={}", pc))
+                    })?;
+                    if rhs != lhs {
+                        return Err(RuntimeError::InvalidTransaction(format!(
+                            "Eq/Neq operand type mismatch at pc={}",
+                            pc
+                        )));
+                    }
+                    stack.push(SignatureToken::Bool);
+                    push_succ(pc + 1, stack)?;
+                }
+                Bytecode::Lt | Bytecode::Le | Bytecode::Gt | Bytecode::Ge => {
+                    let rhs = stack.pop().ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!("Stack underflow at pc={}", pc))
+                    })?;
+                    let lhs = stack.pop().ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!("Stack underflow at pc={}", pc))
+                    })?;
+                    if rhs != SignatureToken::U64 || lhs != SignatureToken::U64 {
+                        return Err(RuntimeError::InvalidTransaction(format!(
+                            "Comparison expects U64 at pc={}",
+                            pc
+                        )));
+                    }
+                    stack.push(SignatureToken::Bool);
+                    push_succ(pc + 1, stack)?;
+                }
+                Bytecode::BrTrue(target) | Bytecode::BrFalse(target) => {
+                    let cond = stack.pop().ok_or_else(|| {
+                        RuntimeError::InvalidTransaction(format!(
+                            "Stack underflow at branch pc={}",
+                            pc
+                        ))
+                    })?;
+                    if cond != SignatureToken::Bool {
+                        return Err(RuntimeError::InvalidTransaction(format!(
+                            "Branch condition must be Bool at pc={}",
+                            pc
+                        )));
+                    }
+                    let target_pc = *target as usize;
+                    if target_pc >= script_tx.code.len() {
+                        return Err(RuntimeError::InvalidTransaction(format!(
+                            "Branch target {} out of bounds at pc={}",
+                            target_pc, pc
+                        )));
+                    }
+                    push_succ(target_pc, stack.clone())?;
+                    push_succ(pc + 1, stack)?;
+                }
+                Bytecode::Branch(target) => {
+                    let target_pc = *target as usize;
+                    if target_pc >= script_tx.code.len() {
+                        return Err(RuntimeError::InvalidTransaction(format!(
+                            "Branch target {} out of bounds at pc={}",
+                            target_pc, pc
+                        )));
+                    }
+                    push_succ(target_pc, stack)?;
+                }
+                Bytecode::Ret => {
+                    if stack != script_tx.return_sig {
+                        return Err(RuntimeError::InvalidTransaction(format!(
+                            "Return signature mismatch at pc={}",
+                            pc
+                        )));
+                    }
+                    has_terminal = true;
+                }
+                Bytecode::Abort { .. } => {
+                    has_terminal = true;
                 }
             }
         }
 
-        let (success, message) = halt_result.ok_or_else(|| {
-            RuntimeError::InvalidTransaction(
-                "Program terminated without Halt instruction".to_string(),
-            )
-        })?;
-
-        let mut query_map = serde_json::Map::new();
-        for (k, v) in outputs {
-            query_map.insert(k, Self::program_value_to_json(v));
+        if !has_terminal {
+            return Err(RuntimeError::InvalidTransaction(
+                "Script has no reachable terminal instruction (Ret/Abort)".to_string(),
+            ));
         }
 
-        let query_result = serde_json::Value::Object(query_map);
-        Ok(ExecutionOutput {
-            success,
-            message: message.or_else(|| Some(format!("Program executed in {} steps", steps))),
-            state_changes: vec![],
-            created_objects: vec![],
-            deleted_objects: vec![],
-            query_result: Some(query_result),
+        Ok(())
+    }
+
+    fn opcode_gas_cost(op: &Bytecode) -> u64 {
+        match op {
+            Bytecode::LdU64(_) | Bytecode::LdTrue | Bytecode::LdFalse => 1,
+            Bytecode::CopyLoc(_) | Bytecode::MoveLoc(_) | Bytecode::StLoc(_) | Bytecode::Pop => 1,
+            Bytecode::Add | Bytecode::Sub | Bytecode::Mul => 2,
+            Bytecode::Div | Bytecode::Mod => 3,
+            Bytecode::Eq
+            | Bytecode::Neq
+            | Bytecode::Lt
+            | Bytecode::Le
+            | Bytecode::Gt
+            | Bytecode::Ge => 1,
+            Bytecode::BrTrue(_) | Bytecode::BrFalse(_) | Bytecode::Branch(_) => 1,
+            Bytecode::Ret => 1,
+            Bytecode::Abort { .. } => 1,
+        }
+    }
+
+    fn pop_value(stack: &mut Vec<MoveValue>, pc: usize) -> RuntimeResult<MoveValue> {
+        stack.pop().ok_or_else(|| {
+            RuntimeError::InvalidTransaction(format!("Stack underflow at pc={}", pc))
         })
     }
 
-    fn validate_program(&self, program_tx: &ProgramTx, register_count: usize) -> RuntimeResult<()> {
-        let program_len = program_tx.instructions.len();
-        for (pc, instr) in program_tx.instructions.iter().enumerate() {
-            match instr {
-                Instruction::Nop => {}
-                Instruction::Const { dst, .. } => {
-                    Self::validate_register(*dst, register_count, pc)?;
-                }
-                Instruction::Mov { dst, src } => {
-                    Self::validate_register(*dst, register_count, pc)?;
-                    Self::validate_register(*src, register_count, pc)?;
-                }
-                Instruction::BinOp { dst, lhs, rhs, .. } => {
-                    Self::validate_register(*dst, register_count, pc)?;
-                    Self::validate_register(*lhs, register_count, pc)?;
-                    Self::validate_register(*rhs, register_count, pc)?;
-                }
-                Instruction::Cmp { dst, lhs, rhs, .. } => {
-                    Self::validate_register(*dst, register_count, pc)?;
-                    Self::validate_register(*lhs, register_count, pc)?;
-                    Self::validate_register(*rhs, register_count, pc)?;
-                }
-                Instruction::LoadInput { dst, .. } => {
-                    Self::validate_register(*dst, register_count, pc)?;
-                }
-                Instruction::StoreOutput { src, .. } => {
-                    Self::validate_register(*src, register_count, pc)?;
-                }
-                Instruction::Jump { pc: target } => {
-                    Self::validate_jump(*target, program_len, pc)?;
-                }
-                Instruction::JumpIf { cond, pc: target } => {
-                    Self::validate_register(*cond, register_count, pc)?;
-                    Self::validate_jump(*target, program_len, pc)?;
-                }
-                Instruction::Halt { .. } => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_register(reg: u8, register_count: usize, pc: usize) -> RuntimeResult<()> {
-        if reg as usize >= register_count {
-            return Err(RuntimeError::InvalidTransaction(format!(
-                "Invalid register r{} at pc={} (max register index: {})",
-                reg,
-                pc,
-                register_count.saturating_sub(1)
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_jump(target: u16, program_len: usize, pc: usize) -> RuntimeResult<()> {
-        if target as usize >= program_len {
-            return Err(RuntimeError::InvalidTransaction(format!(
-                "Invalid jump target {} at pc={} (program length: {})",
-                target, pc, program_len
-            )));
-        }
-        Ok(())
-    }
-
-    fn read_u64(registers: &[ProgramValue], reg: u8, pc: usize) -> RuntimeResult<u64> {
-        match &registers[reg as usize] {
-            ProgramValue::U64(v) => Ok(*v),
-            ProgramValue::Bool(_) => Err(RuntimeError::InvalidTransaction(format!(
-                "Type error at pc={}: expected u64 in r{}, found bool",
-                pc, reg
+    fn pop_u64(stack: &mut Vec<MoveValue>, pc: usize) -> RuntimeResult<u64> {
+        match Self::pop_value(stack, pc)? {
+            MoveValue::U64(v) => Ok(v),
+            other => Err(RuntimeError::InvalidTransaction(format!(
+                "Type error at pc={}: expected U64, found {:?}",
+                pc, other
             ))),
         }
     }
 
-    fn read_bool(registers: &[ProgramValue], reg: u8, _pc: usize) -> RuntimeResult<bool> {
-        match &registers[reg as usize] {
-            ProgramValue::Bool(v) => Ok(*v),
-            ProgramValue::U64(v) => Ok(*v != 0),
+    fn pop_bool(stack: &mut Vec<MoveValue>, pc: usize) -> RuntimeResult<bool> {
+        match Self::pop_value(stack, pc)? {
+            MoveValue::Bool(v) => Ok(v),
+            other => Err(RuntimeError::InvalidTransaction(format!(
+                "Type error at pc={}: expected Bool, found {:?}",
+                pc, other
+            ))),
         }
     }
 
-    fn execute_binop(op: &BinaryOp, lhs: u64, rhs: u64, pc: usize) -> RuntimeResult<u64> {
-        let result = match op {
-            BinaryOp::Add => lhs.checked_add(rhs),
-            BinaryOp::Sub => lhs.checked_sub(rhs),
-            BinaryOp::Mul => lhs.checked_mul(rhs),
-            BinaryOp::Div => {
-                if rhs == 0 {
-                    return Err(RuntimeError::InvalidTransaction(format!(
-                        "Division by zero at pc={}",
-                        pc
-                    )));
-                }
-                Some(lhs / rhs)
-            }
-            BinaryOp::Mod => {
-                if rhs == 0 {
-                    return Err(RuntimeError::InvalidTransaction(format!(
-                        "Modulo by zero at pc={}",
-                        pc
-                    )));
-                }
-                Some(lhs % rhs)
-            }
-            BinaryOp::BitAnd => Some(lhs & rhs),
-            BinaryOp::BitOr => Some(lhs | rhs),
-            BinaryOp::BitXor => Some(lhs ^ rhs),
-        };
-
-        result.ok_or_else(|| {
-            RuntimeError::InvalidTransaction(format!("Arithmetic overflow at pc={} ({:?})", pc, op))
-        })
-    }
-
-    fn execute_cmp(op: &CompareOp, lhs: u64, rhs: u64) -> bool {
-        match op {
-            CompareOp::Eq => lhs == rhs,
-            CompareOp::Ne => lhs != rhs,
-            CompareOp::Lt => lhs < rhs,
-            CompareOp::Le => lhs <= rhs,
-            CompareOp::Gt => lhs > rhs,
-            CompareOp::Ge => lhs >= rhs,
+    fn ensure_value_type(
+        value: &MoveValue,
+        expected: &SignatureToken,
+        pc: usize,
+    ) -> RuntimeResult<()> {
+        if Self::value_matches_sig(value, expected) {
+            Ok(())
+        } else {
+            Err(RuntimeError::InvalidTransaction(format!(
+                "Type mismatch at pc={}: value {:?} does not match {:?}",
+                pc, value, expected
+            )))
         }
     }
 
-    fn program_value_to_json(value: ProgramValue) -> serde_json::Value {
+    fn ensure_value_matches_sig(value: &MoveValue, expected: &SignatureToken) -> RuntimeResult<()> {
+        if Self::value_matches_sig(value, expected) {
+            Ok(())
+        } else {
+            Err(RuntimeError::InvalidTransaction(format!(
+                "Argument type mismatch: value {:?} does not match {:?}",
+                value, expected
+            )))
+        }
+    }
+
+    fn value_matches_sig(value: &MoveValue, expected: &SignatureToken) -> bool {
+        match (value, expected) {
+            (MoveValue::Bool(_), SignatureToken::Bool) => true,
+            (MoveValue::U64(_), SignatureToken::U64) => true,
+            (MoveValue::Address(_), SignatureToken::Address) => true,
+            (MoveValue::Vector(values), SignatureToken::Vector(inner)) => {
+                values.iter().all(|v| Self::value_matches_sig(v, inner))
+            }
+            _ => false,
+        }
+    }
+
+    fn move_value_to_json(value: MoveValue) -> serde_json::Value {
         match value {
-            ProgramValue::U64(v) => serde_json::json!(v),
-            ProgramValue::Bool(v) => serde_json::json!(v),
+            MoveValue::U64(v) => serde_json::json!(v),
+            MoveValue::Bool(v) => serde_json::json!(v),
+            MoveValue::Address(addr) => serde_json::json!(addr.to_string()),
+            MoveValue::Vector(vals) => {
+                serde_json::Value::Array(vals.into_iter().map(Self::move_value_to_json).collect())
+            }
         }
     }
 
@@ -728,7 +1074,6 @@ impl<S: StateStore> RuntimeExecutor<S> {
 mod tests {
     use super::*;
     use crate::state::InMemoryStateStore;
-    use std::collections::BTreeMap;
 
     #[test]
     fn test_full_transfer() {
@@ -802,57 +1147,34 @@ mod tests {
     }
 
     #[test]
-    fn test_program_branch_and_jump() {
+    fn test_move_script_branch_and_return() {
         let store = InMemoryStateStore::new();
         let mut executor = RuntimeExecutor::new(store);
         let sender = Address::from("alice");
 
-        let instructions = vec![
-            Instruction::Const {
-                dst: 0,
-                value: ProgramValue::U64(10),
-            },
-            Instruction::Const {
-                dst: 1,
-                value: ProgramValue::U64(3),
-            },
-            Instruction::BinOp {
-                op: BinaryOp::Add,
-                dst: 2,
-                lhs: 0,
-                rhs: 1,
-            },
-            Instruction::Const {
-                dst: 3,
-                value: ProgramValue::U64(12),
-            },
-            Instruction::Cmp {
-                op: CompareOp::Gt,
-                dst: 4,
-                lhs: 2,
-                rhs: 3,
-            },
-            Instruction::JumpIf { cond: 4, pc: 8 },
-            Instruction::Const {
-                dst: 5,
-                value: ProgramValue::U64(0),
-            },
-            Instruction::Jump { pc: 9 },
-            Instruction::Const {
-                dst: 5,
-                value: ProgramValue::U64(1),
-            },
-            Instruction::StoreOutput {
-                key: "flag".to_string(),
-                src: 5,
-            },
-            Instruction::Halt {
-                success: true,
-                message: None,
-            },
-        ];
+        let script = MoveScriptTx {
+            code: vec![
+                Bytecode::CopyLoc(0),
+                Bytecode::CopyLoc(1),
+                Bytecode::Add,
+                Bytecode::LdU64(12),
+                Bytecode::Gt,
+                Bytecode::BrFalse(8),
+                Bytecode::LdU64(1),
+                Bytecode::Ret,
+                Bytecode::LdU64(0),
+                Bytecode::Ret,
+            ],
+            locals_sig: vec![SignatureToken::U64, SignatureToken::U64],
+            params_sig: vec![SignatureToken::U64, SignatureToken::U64],
+            return_sig: vec![SignatureToken::U64],
+            args: vec![MoveValue::U64(10), MoveValue::U64(3)],
+            type_args: vec![],
+            max_gas: 200,
+            input_objects: vec![],
+        };
 
-        let tx = Transaction::new_program(sender, instructions, BTreeMap::new(), None);
+        let tx = Transaction::new_move_script(sender, script);
         let ctx = ExecutionContext {
             executor_id: "solver1".to_string(),
             timestamp: 1000,
@@ -862,17 +1184,32 @@ mod tests {
         let output = executor.execute_transaction(&tx, &ctx).unwrap();
         assert!(output.success);
         let result = output.query_result.unwrap();
-        assert_eq!(result["flag"], serde_json::json!(1));
+        assert_eq!(result["returns"][0], serde_json::json!(1));
     }
 
     #[test]
-    fn test_program_step_limit() {
+    fn test_move_script_out_of_gas() {
         let store = InMemoryStateStore::new();
         let mut executor = RuntimeExecutor::new(store);
         let sender = Address::from("alice");
 
-        let instructions = vec![Instruction::Jump { pc: 0 }];
-        let tx = Transaction::new_program(sender, instructions, BTreeMap::new(), Some(5));
+        let script = MoveScriptTx {
+            code: vec![
+                Bytecode::LdTrue,
+                Bytecode::BrFalse(3),
+                Bytecode::Branch(0),
+                Bytecode::Ret,
+            ],
+            locals_sig: vec![],
+            params_sig: vec![],
+            return_sig: vec![],
+            args: vec![],
+            type_args: vec![],
+            max_gas: 8,
+            input_objects: vec![],
+        };
+
+        let tx = Transaction::new_move_script(sender, script);
         let ctx = ExecutionContext {
             executor_id: "solver1".to_string(),
             timestamp: 1000,
@@ -881,7 +1218,7 @@ mod tests {
 
         let err = executor.execute_transaction(&tx, &ctx).unwrap_err();
         assert!(
-            err.to_string().contains("step limit exceeded"),
+            err.to_string().contains("Out of gas"),
             "unexpected error: {}",
             err
         );
