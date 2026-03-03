@@ -50,6 +50,11 @@ pub fn process_fold(config: &PoCWConfig, events: &[Event]) -> Option<FoldEconomi
             solver_rewards.push(SolverReward {
                 solver_id: solver_id.clone(),
                 transfer_count: *count,
+                task_count: 0,
+                distance_score: 0.0,
+                necessity_score: 0.0,
+                contribution_score: 0.0,
+                weight: 0.0,
                 flux_reward: reward,
             });
         }
@@ -60,7 +65,10 @@ pub fn process_fold(config: &PoCWConfig, events: &[Event]) -> Option<FoldEconomi
         event_count: events.len(),
         total_flux_burned,
         total_power_consumed,
+        flux_minted: 0,
         total_solver_rewards,
+        kappa_before: 1.0,
+        kappa_after: 1.0,
         solver_rewards,
     })
 }

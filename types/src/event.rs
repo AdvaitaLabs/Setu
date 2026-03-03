@@ -262,6 +262,10 @@ pub struct Event {
     /// Solver that executed this event (creator is the validator, not the solver)
     #[serde(default)]
     pub executed_by: Option<String>,
+
+    /// Per-event economic metrics (computed by validator after TEE execution)
+    #[serde(default)]
+    pub event_metrics: Option<crate::pocw::EventMetrics>,
 }
 
 impl Event {
@@ -299,6 +303,7 @@ impl Event {
             execution_result: None,
             timestamp,
             executed_by: None,
+            event_metrics: None,
         }
     }
 

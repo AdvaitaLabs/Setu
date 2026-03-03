@@ -758,10 +758,13 @@ mod tests {
             event_count: 5,
             total_flux_burned: 105_000,
             total_power_consumed: 5,
+            flux_minted: 0,
             total_solver_rewards: 5,
+            kappa_before: 1.0,
+            kappa_after: 1.0,
             solver_rewards: vec![
-                SolverReward { solver_id: "solver-a".into(), transfer_count: 3, flux_reward: 3 },
-                SolverReward { solver_id: "solver-b".into(), transfer_count: 2, flux_reward: 2 },
+                SolverReward { solver_id: "solver-a".into(), transfer_count: 3, task_count: 0, distance_score: 0.0, necessity_score: 0.0, contribution_score: 0.0, weight: 0.0, flux_reward: 3 },
+                SolverReward { solver_id: "solver-b".into(), transfer_count: 2, task_count: 0, distance_score: 0.0, necessity_score: 0.0, contribution_score: 0.0, weight: 0.0, flux_reward: 2 },
             ],
         };
 
@@ -778,14 +781,17 @@ mod tests {
             assert_eq!(u64::from_le_bytes(val_b.try_into().unwrap()), 2);
         }
 
-        // Apply a second fold — rewards accumulate
+        // Apply a second fold -- rewards accumulate
         let economics2 = FoldEconomics {
             event_count: 2,
             total_flux_burned: 42_000,
             total_power_consumed: 2,
+            flux_minted: 0,
             total_solver_rewards: 2,
+            kappa_before: 1.0,
+            kappa_after: 1.0,
             solver_rewards: vec![
-                SolverReward { solver_id: "solver-a".into(), transfer_count: 2, flux_reward: 2 },
+                SolverReward { solver_id: "solver-a".into(), transfer_count: 2, task_count: 0, distance_score: 0.0, necessity_score: 0.0, contribution_score: 0.0, weight: 0.0, flux_reward: 2 },
             ],
         };
         manager.apply_reward_minting(&economics2);
