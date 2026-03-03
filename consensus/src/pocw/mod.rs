@@ -1,6 +1,7 @@
-//! PoCW economic calculations for FluxTransfer transactions
+//! PoCW economic calculations for FluxTransfer and TaskSubmit events.
 //!
-//! Provides flux burn and power drain computation, gated by PoCWConfig::enabled.
+//! Provides flux burn, power drain, and scoring computation,
+//! gated by PoCWConfig::enabled.
 
 pub mod flux_burn;
 pub mod power;
