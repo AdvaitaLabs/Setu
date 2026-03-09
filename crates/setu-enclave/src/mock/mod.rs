@@ -185,11 +185,10 @@ impl MockEnclave {
                     balance: Balance::new(coin_state.balance),
                 };
                 
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                
+                // Use deterministic timestamp (0) instead of SystemTime::now().
+                // created_at / updated_at are NOT included in CoinState (the consensus-
+                // critical BCS format), so they don't affect state hashes or conflict
+                // detection. Using 0 eliminates non-determinism in the TEE path.
                 let coin_object = Object {
                     metadata: setu_types::ObjectMetadata {
                         id: object_id,
@@ -198,8 +197,8 @@ impl MockEnclave {
                         object_type: setu_types::ObjectType::OwnedObject,
                         owner: Some(owner),
                         ownership: setu_types::Ownership::AddressOwner(owner),
-                        created_at: now,
-                        updated_at: now,
+                        created_at: 0,
+                        updated_at: 0,
                     },
                     data: coin_data,
                 };
@@ -343,7 +342,7 @@ impl MockEnclave {
             return self.execute_transfer_via_runtime(event, transfer, resolved_inputs, diff).await;
         }
         
-        // Infrastructure events (SubnetRegister, UserRegister) should NEVER reach TEE.
+        // Infrastructure / root events should NEVER reach TEE.
         // They are executed directly by Validator via InfraExecutor.
         // If we receive such events here, it indicates a routing bug.
         // See: types/src/event.rs - EventType::is_validator_executed()
@@ -355,6 +354,10 @@ impl MockEnclave {
             setu_types::event::EventPayload::UserRegister(_) => {
                 warn!(event_id = %event.id, "UserRegister event incorrectly routed to TEE - should use InfraExecutor");
                 return Err("UserRegister is a Validator-executed event, should not reach TEE".to_string());
+            }
+            setu_types::event::EventPayload::ContractPublish { .. } => {
+                warn!(event_id = %event.id, "ContractPublish event incorrectly routed to TEE - should use InfraExecutor");
+                return Err("ContractPublish is a Validator-executed event, should not reach TEE".to_string());
             }
             _ => {}
         }
@@ -385,7 +388,7 @@ impl MockEnclave {
             ).await;
         }
         
-        // Infrastructure events (SubnetRegister, UserRegister) should NEVER reach TEE.
+        // Infrastructure / root events should NEVER reach TEE.
         // They are executed directly by Validator via InfraExecutor.
         // If we receive such events here, it indicates a routing bug.
         match &event.payload {
@@ -396,6 +399,10 @@ impl MockEnclave {
             setu_types::event::EventPayload::UserRegister(_) => {
                 warn!(event_id = %event.id, "UserRegister event incorrectly routed to TEE - should use InfraExecutor");
                 return Err("UserRegister is a Validator-executed event, should not reach TEE".to_string());
+            }
+            setu_types::event::EventPayload::ContractPublish { .. } => {
+                warn!(event_id = %event.id, "ContractPublish event incorrectly routed to TEE - should use InfraExecutor");
+                return Err("ContractPublish is a Validator-executed event, should not reach TEE".to_string());
             }
             _ => {}
         }
