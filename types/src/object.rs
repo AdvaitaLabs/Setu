@@ -28,6 +28,11 @@ impl ObjectId {
         Self::from_bytes(&bytes)
     }
     
+    /// Random ObjectId — **TEST ONLY**.
+    ///
+    /// Uses system time + memory entropy. NOT deterministic.
+    /// MUST NOT be used in consensus-critical paths.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn random() -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(
@@ -414,12 +419,13 @@ impl<T: Serialize + Clone> Object<T> {
         self.metadata.digest = ObjectDigest::new(*hasher.finalize().as_bytes());
     }
 
+    /// Increment version and recompute digest.
+    ///
+    /// NOTE: `updated_at` is NOT updated here to avoid non-determinism.
+    /// Timestamps in Object metadata are for informational purposes only
+    /// and are NOT included in CoinState (the consensus-critical format).
     pub fn increment_version(&mut self) {
         self.metadata.version += 1;
-        self.metadata.updated_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
         self.compute_digest();
     }
 
@@ -432,17 +438,18 @@ impl<T: Serialize + Clone> Object<T> {
     }
 }
 
+/// Generate deterministic object ID from seed.
+///
+/// ID = BLAKE3("SETU_GEN_OID:" || seed)
+///
+/// CRITICAL: This function MUST be deterministic.
+/// The same seed MUST always produce the same ObjectId across all nodes.
+/// Callers are responsible for providing a unique seed
+/// (e.g., include tx_hash + counter to avoid collisions).
 pub fn generate_object_id(seed: &[u8]) -> ObjectId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"SETU_GEN_OID:");
     hasher.update(seed);
-    hasher.update(
-        &std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-            .to_le_bytes(),
-    );
     ObjectId::new(*hasher.finalize().as_bytes())
 }
 
