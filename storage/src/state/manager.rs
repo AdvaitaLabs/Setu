@@ -809,39 +809,80 @@ impl GlobalStateManager {
         change: &StateChange,
     ) -> ApplyResult {
         let object_id = Self::parse_state_change_key(&change.key);
-        let smt = self.get_subnet_mut(subnet_id);
         
         match &change.new_value {
             Some(value) => {
-                // Insert or update
-                let root = smt.upsert(object_id, value.clone());
+                // Insert or update — SMT operation first, then index updates
+                let root = {
+                    let smt = self.get_subnet_mut(subnet_id);
+                    *smt.upsert(object_id, value.clone()).as_bytes()
+                };
+                // smt borrow released here
                 
                 // Update coin_type_index and owner_coin_index if this is a CoinState
-                // Parse the BCS-serialized CoinState to extract owner and coin_type
-                if let Some(coin_state) = CoinState::from_bytes(value) {
-                    self.coin_type_index
-                        .entry(coin_state.owner.clone())
-                        .or_default()
-                        .insert(coin_state.coin_type.clone());
+                if let Some(new_cs) = CoinState::from_bytes(value) {
+                    // If there's an old value, check if owner changed → clean up old index
+                    if let Some(ref old_bytes) = change.old_value {
+                        if let Some(old_cs) = CoinState::from_bytes(old_bytes) {
+                            if old_cs.owner != new_cs.owner {
+                                // Owner changed (e.g., full transfer) → remove from old owner's index
+                                if let Some(set) = self.owner_coin_index.get_mut(&old_cs.owner) {
+                                    set.remove(&(*object_id.as_bytes(), old_cs.coin_type.clone()));
+                                    if set.is_empty() {
+                                        self.owner_coin_index.remove(&old_cs.owner);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     
-                    // Track owner → object_id mapping
-                    self.owner_coin_index
-                        .entry(coin_state.owner.clone())
+                    // Add/update new owner's index entries
+                    self.coin_type_index
+                        .entry(new_cs.owner.clone())
                         .or_default()
-                        .insert((*object_id.as_bytes(), coin_state.coin_type.clone()));
+                        .insert(new_cs.coin_type.clone());
+                    
+                    self.owner_coin_index
+                        .entry(new_cs.owner.clone())
+                        .or_default()
+                        .insert((*object_id.as_bytes(), new_cs.coin_type.clone()));
                 }
                 
                 ApplyResult::Updated {
                     object_id: *object_id.as_bytes(),
-                    new_root: *root.as_bytes(),
+                    new_root: root,
                 }
             }
             None => {
-                // Delete
-                let removed = smt.delete(&object_id);
+                // Delete — clean up indices first, then remove from SMT.
+                // Prefer old_value from the StateChange; if absent, read from SMT
+                // before deletion so we can still clean up indices.
+                let effective_old = change.old_value.clone().or_else(|| {
+                    let smt = self.get_subnet_mut(subnet_id);
+                    smt.get(&object_id).cloned()
+                });
+                
+                if let Some(ref old_bytes) = effective_old {
+                    if let Some(old_cs) = CoinState::from_bytes(old_bytes) {
+                        // Remove from owner_coin_index
+                        if let Some(set) = self.owner_coin_index.get_mut(&old_cs.owner) {
+                            set.remove(&(*object_id.as_bytes(), old_cs.coin_type.clone()));
+                            if set.is_empty() {
+                                self.owner_coin_index.remove(&old_cs.owner);
+                            }
+                        }
+                        // Note: coin_type_index not cleaned here because the owner may
+                        // still have other coins of the same type. Cleaned during rebuild.
+                    }
+                }
+                
+                let existed = {
+                    let smt = self.get_subnet_mut(subnet_id);
+                    smt.delete(&object_id).is_some()
+                };
                 ApplyResult::Deleted {
                     object_id: *object_id.as_bytes(),
-                    existed: removed.is_some(),
+                    existed,
                 }
             }
         }
@@ -1009,18 +1050,23 @@ impl GlobalStateManager {
                 key = %key,
                 "Invalid oid: format — hex decode failed or wrong length"
             );
+        } else if key.starts_with("user:") || key.starts_with("solver:") || key.starts_with("validator:") {
+            // Known non-object metadata key prefixes.
+            // These don't have a native 32-byte ObjectId, so we hash the key.
+            let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
+            return HashValue::from_slice(&hash).expect("32 bytes");
         } else {
-            // Non-oid: prefix is now an explicit error (no more silent SHA256 fallback)
+            // Unknown prefix — this is a bug in the calling code
             tracing::error!(
                 key = %key,
-                "Unknown key prefix — expected 'oid:' prefix. Legacy 'coin:' prefix is no longer supported."
+                "Unknown key prefix — expected 'oid:', 'user:', 'solver:', or 'validator:' prefix."
             );
         }
-        // Fallback: use BLAKE3 hash instead of SHA256 to produce a deterministic value
+        // Fallback: use BLAKE3 hash to produce a deterministic value
         // This path should never be hit in correct code after key format unification
         debug_assert!(
             false,
-            "parse_state_change_key: unexpected key format '{}'. All keys should use 'oid:' prefix.",
+            "parse_state_change_key: unexpected key format '{}'. All keys should use known prefixes.",
             key
         );
         let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
