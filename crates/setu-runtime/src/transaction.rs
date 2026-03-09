@@ -58,7 +58,10 @@ pub enum QueryType {
 }
 
 impl Transaction {
-    /// Create a new transfer transaction
+    /// Create a new transfer transaction (non-consensus path only).
+    ///
+    /// ⚠️ Uses `SystemTime::now()` — **NOT** safe for TEE/consensus paths.
+    /// For TEE/Enclave execution, use [`new_transfer_deterministic`] instead.
     pub fn new_transfer(
         sender: Address,
         coin_id: ObjectId,
@@ -82,6 +85,48 @@ impl Transaction {
             }),
             input_objects: vec![coin_id],
             timestamp,
+        }
+    }
+
+    /// Deterministic transfer constructor for TEE/consensus paths.
+    ///
+    /// Unlike [`new_transfer`] which uses `SystemTime::now()`, this constructor
+    /// derives `id` and `timestamp` from the execution context, ensuring all
+    /// validator nodes produce identical `Transaction` values for the same input.
+    ///
+    /// # Arguments
+    /// * `ctx_timestamp` — deterministic timestamp from `ExecutionContext.timestamp`
+    ///   (originally sourced from the Event, identical across all validators)
+    ///
+    /// # When to use
+    /// - `execute_transfer_with_coin` (Enclave entry point)
+    /// - `execute_simple_transfer` (auto-select path)
+    /// - `MergeThenTransfer` Step 2
+    /// - Any path where multiple validators must produce the same state
+    ///
+    /// # When NOT to use
+    /// - RPC/CLI convenience paths (non-consensus, `SystemTime` acceptable)
+    /// - Tests (use `new_transfer` for brevity)
+    pub fn new_transfer_deterministic(
+        sender: Address,
+        coin_id: ObjectId,
+        recipient: Address,
+        amount: Option<u64>,
+        ctx_timestamp: u64,
+    ) -> Self {
+        // Derive id from coin_id + timestamp — both deterministic across nodes
+        let id = format!("tx_{}_{:x}", &coin_id.to_string()[..8], ctx_timestamp);
+
+        Self {
+            id,
+            sender,
+            tx_type: TransactionType::Transfer(TransferTx {
+                coin_id,
+                recipient,
+                amount,
+            }),
+            input_objects: vec![coin_id],
+            timestamp: ctx_timestamp,
         }
     }
     
