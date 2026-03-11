@@ -156,6 +156,18 @@ pub struct SolverPowerState {
     pub event_count: u64,
 }
 
+impl SolverPowerState {
+    /// Create a new solver power state with the given budget
+    pub fn new(solver_id: String, initial_budget: u64) -> Self {
+        Self {
+            solver_id,
+            remaining_power: initial_budget,
+            total_consumed: 0,
+            event_count: 0,
+        }
+    }
+}
+
 // ========== Emission state ==========
 
 /// Tracks kappa and velocity history for Stage 5 emission adjustment.

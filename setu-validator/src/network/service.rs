@@ -143,7 +143,7 @@ impl ValidatorNetworkService {
         let dag_events = Arc::new(RwLock::new(Vec::new()));
 
         // Create TEE executor
-        let tee_executor = TeeExecutor::new(
+        let mut tee_executor = TeeExecutor::new(
             http_client.clone(),
             Arc::clone(&solver_info),
             Arc::clone(&transfer_status),
@@ -153,6 +153,9 @@ impl ValidatorNetworkService {
             validator_id.clone(),
             100, // Max concurrent TEE calls
         ).with_task_preparer(Arc::clone(&task_preparer));
+        if let Some(pocw) = config.pocw_config {
+            tee_executor = tee_executor.with_pocw_config(pocw);
+        }
 
         Self {
             validator_id,
@@ -208,7 +211,7 @@ impl ValidatorNetworkService {
         let dag_events = Arc::new(RwLock::new(Vec::new()));
 
         // Create TEE executor with consensus
-        let tee_executor = TeeExecutor::new(
+        let mut tee_executor = TeeExecutor::new(
             http_client.clone(),
             Arc::clone(&solver_info),
             Arc::clone(&transfer_status),
@@ -218,6 +221,9 @@ impl ValidatorNetworkService {
             validator_id.clone(),
             100, // Max concurrent TEE calls
         ).with_task_preparer(Arc::clone(&task_preparer));
+        if let Some(pocw) = config.pocw_config {
+            tee_executor = tee_executor.with_pocw_config(pocw);
+        }
 
         Self {
             validator_id,

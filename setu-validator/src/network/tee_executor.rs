@@ -17,9 +17,11 @@ use super::types::*;
 use super::solver_client::{ExecuteTaskRequest, ExecuteTaskResponse};
 use crate::ConsensusValidator;
 use crate::TaskPreparer;
+use consensus::pocw::{flux_burn, power};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use setu_types::event::Event;
+use setu_types::pocw::{EventMetrics, PoCWConfig};
 use setu_types::task::SolverTask;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -49,6 +51,8 @@ pub struct TeeExecutor {
     pending_count: Arc<AtomicU64>,
     /// Task preparer (for applying state changes after execution)
     task_preparer: Option<Arc<TaskPreparer>>,
+    /// PoCW configuration (for computing EventMetrics after TEE execution)
+    pocw_config: Option<PoCWConfig>,
 }
 
 impl TeeExecutor {
@@ -74,12 +78,19 @@ impl TeeExecutor {
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             pending_count: Arc::new(AtomicU64::new(0)),
             task_preparer: None,
+            pocw_config: None,
         }
     }
 
     /// Set the task preparer for applying state changes after TEE execution
     pub fn with_task_preparer(mut self, task_preparer: Arc<TaskPreparer>) -> Self {
         self.task_preparer = Some(task_preparer);
+        self
+    }
+
+    /// Set PoCW config for computing EventMetrics after TEE execution
+    pub fn with_pocw_config(mut self, config: PoCWConfig) -> Self {
+        self.pocw_config = Some(config);
         self
     }
 
@@ -106,6 +117,7 @@ impl TeeExecutor {
         let consensus = self.consensus.clone();
         let validator_id = self.validator_id.clone();
         let task_preparer = self.task_preparer.clone();
+        let pocw_config = self.pocw_config;
 
         tokio::spawn(async move {
             Self::execute_tee_task_internal(
@@ -122,6 +134,7 @@ impl TeeExecutor {
                 consensus,
                 validator_id,
                 task_preparer,
+                pocw_config,
             )
             .await;
         });
@@ -145,6 +158,7 @@ impl TeeExecutor {
         consensus: Option<Arc<ConsensusValidator>>,
         validator_id: String,
         task_preparer: Option<Arc<TaskPreparer>>,
+        pocw_config: Option<PoCWConfig>,
     ) {
         let task_id_hex = hex::encode(&task.task_id[..8]);
 
@@ -188,6 +202,10 @@ impl TeeExecutor {
         let mut event = task.event.clone();
         let event_id = event.id.clone();
 
+        // Capture metrics inputs before task is moved into request
+        let read_count = task.read_set.len();
+        let value_transferred = event.transfer.as_ref().map(|t| t.amount).unwrap_or(0);
+
         // 3. Create HTTP request
         let request = ExecuteTaskRequest {
             solver_task: task,
@@ -230,7 +248,48 @@ impl TeeExecutor {
                             event.executed_by = Some(solver_id.clone());
                             event.status = setu_types::event::EventStatus::Executed;
 
-                            // 5b. Apply state changes to global state immediately
+                            // 5b. Compute EventMetrics (PoCW Stages 1 & 2)
+                            if let Some(ref config) = pocw_config {
+                                if config.enabled {
+                                    let mut metrics = EventMetrics {
+                                        solver_id: solver_id.clone(),
+                                        compute_time_us: result_dto.execution_time_us,
+                                        gas_used: result_dto.gas_used,
+                                        write_count: result_dto.state_changes.len(),
+                                        read_count,
+                                        value_transferred,
+                                        dag_depth: 0, // Not in DAG yet; updated at fold time
+                                        flux_burn: 0,
+                                        power_delta: 0,
+                                    };
+
+                                    // Stage 1: Flux burn
+                                    metrics.flux_burn = if event.event_type == setu_types::event::EventType::Transfer {
+                                        flux_burn::calculate_transfer_burn(config)
+                                    } else {
+                                        flux_burn::calculate_task_burn(&metrics, config)
+                                    };
+
+                                    // Stage 2: Power drain
+                                    metrics.power_delta = if event.event_type == setu_types::event::EventType::Transfer {
+                                        power::calculate_transfer_power_drain(config)
+                                    } else {
+                                        power::calculate_task_power_drain(&metrics, config)
+                                    };
+
+                                    debug!(
+                                        event_id = %&event_id[..20.min(event_id.len())],
+                                        flux_burn = metrics.flux_burn,
+                                        power_delta = metrics.power_delta,
+                                        gas_used = metrics.gas_used,
+                                        "EventMetrics computed"
+                                    );
+
+                                    event.event_metrics = Some(metrics);
+                                }
+                            }
+
+                            // 5c. Apply state changes to global state immediately
                             if let Some(ref tp) = task_preparer {
                                 tp.apply_state_changes(&execution_result.state_changes);
                             }
