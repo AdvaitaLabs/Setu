@@ -765,7 +765,7 @@ impl ConsensusEngine {
             
             // Check if our vote caused finalization
             // (vote_for_cf adds vote but doesn't check finalization, so we check here)
-            let finalized = manager.check_finalization(&cf_id);
+            let finalized = manager.check_finalization(&cf_id, &dag);
             if finalized {
                 return self.handle_finalization(&mut manager).await;
             }
@@ -881,8 +881,9 @@ impl ConsensusEngine {
             );
         }
         
+        let dag = self.dag.read().await;
         let mut manager = self.consensus_manager.write().await;
-        let finalized = manager.receive_vote(vote);
+        let finalized = manager.receive_vote(vote, &dag);
 
         if finalized {
             self.handle_finalization(&mut manager).await
@@ -1348,9 +1349,10 @@ mod tests {
             let vote2 = Vote::new("v2".to_string(), cf.id.clone(), true);
             let vote3 = Vote::new("v3".to_string(), cf.id.clone(), true);
             
-            manager.receive_vote(vote1);
-            manager.receive_vote(vote2);
-            let finalized = manager.receive_vote(vote3);
+            let dag = crate::dag::Dag::new();
+            manager.receive_vote(vote1, &dag);
+            manager.receive_vote(vote2, &dag);
+            let finalized = manager.receive_vote(vote3, &dag);
             
             assert!(finalized, "CF should be finalized after quorum");
             
@@ -1418,20 +1420,21 @@ mod tests {
         
         let mut manager = engine.consensus_manager.write().await;
         manager.receive_cf(cf);
-        
+        let dag = crate::dag::Dag::new();
+
         // Vote 1: approve (should not finalize yet)
         let vote1 = Vote::new("v1".to_string(), cf_id.clone(), true);
-        let result1 = manager.receive_vote(vote1);
+        let result1 = manager.receive_vote(vote1, &dag);
         assert!(!result1, "Should not finalize with 1 approve vote");
-        
+
         // Vote 2: reject (1 reject, not enough)
         let vote2 = Vote::new("v2".to_string(), cf_id.clone(), false);
-        let result2 = manager.receive_vote(vote2);
+        let result2 = manager.receive_vote(vote2, &dag);
         assert!(!result2, "Should not reject with only 1 reject vote");
-        
+
         // Vote 3: reject (2 rejects = 1/3+1, should reject)
         let vote3 = Vote::new("v3".to_string(), cf_id.clone(), false);
-        let result3 = manager.receive_vote(vote3);
+        let result3 = manager.receive_vote(vote3, &dag);
         assert!(result3, "Should reject with 2 reject votes (1/3+1 threshold)");
         
         // Verify CF was removed from pending (can't directly access private field)
@@ -1476,10 +1479,11 @@ mod tests {
         {
             let mut manager = engine.consensus_manager.write().await;
             manager.receive_cf(cf);
-            
+
             // Verify CF is pending (test by attempting to receive vote)
+            let dag = crate::dag::Dag::new();
             let vote = Vote::new("v1".to_string(), cf_id.clone(), true);
-            manager.receive_vote(vote);
+            manager.receive_vote(vote, &dag);
         }
         
         // Wait for timeout
@@ -1535,9 +1539,10 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
         
         // Receive a vote - should trigger timeout check and remove CF
+        let dag = crate::dag::Dag::new();
         let vote = Vote::new("v1".to_string(), cf_id.clone(), true);
-        let result = manager.receive_vote(vote);
-        
+        let result = manager.receive_vote(vote, &dag);
+
         // The vote processing should detect timeout and remove CF
         assert!(result, "Should return true when CF is removed due to timeout");
     }
@@ -1589,10 +1594,11 @@ mod tests {
         manager.receive_cf(cf1);
         
         // Reject the CF with enough reject votes
+        let dag = crate::dag::Dag::new();
         let vote1 = Vote::new("v2".to_string(), cf1_id.clone(), false);
         let vote2 = Vote::new("v3".to_string(), cf1_id.clone(), false);
-        manager.receive_vote(vote1);
-        let rejected = manager.receive_vote(vote2);
+        manager.receive_vote(vote1, &dag);
+        let rejected = manager.receive_vote(vote2, &dag);
         
         assert!(rejected, "CF should be rejected with 2 reject votes");
         

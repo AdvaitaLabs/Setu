@@ -162,6 +162,10 @@ pub trait StateProvider: Send + Sync {
         let proof = self.get_merkle_proof(object_id)?;
         Some((data, proof))
     }
+
+    /// Apply a state change (object_id bytes + new serialized value) to the global state.
+    /// Default is no-op for providers that don't support writes.
+    fn apply_state_change(&self, _object_id: [u8; 32], _value: Vec<u8>) {}
 }
 
 // ============================================================================
@@ -317,6 +321,11 @@ impl StateProvider for MerkleStateProvider {
     fn get_last_modifying_event(&self, object_id: &ObjectId) -> Option<String> {
         let tracker = self.modification_tracker.read().unwrap();
         tracker.get(object_id.as_bytes()).cloned()
+    }
+
+    fn apply_state_change(&self, object_id: [u8; 32], value: Vec<u8>) {
+        let mut manager = self.state_manager.write().unwrap();
+        manager.upsert_object(self.default_subnet.clone(), object_id, value);
     }
 }
 

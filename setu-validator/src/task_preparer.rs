@@ -113,7 +113,23 @@ impl TaskPreparer {
         let state_provider = Arc::new(MerkleStateProvider::new(state_manager));
         Self::new(validator_id, state_provider)
     }
-    
+
+    /// Apply TEE execution state changes to the global Merkle state.
+    /// Called after successful TEE execution so balance queries reflect updates
+    /// without waiting for fold.
+    pub fn apply_state_changes(&self, state_changes: &[setu_types::event::StateChange]) {
+        for sc in state_changes {
+            if let Some(ref new_value) = sc.new_value {
+                // key format: "coin:{hex_object_id}" — parse the object_id
+                if let Some(hex_id) = sc.key.strip_prefix("coin:") {
+                    if let Ok(object_id) = setu_types::ObjectId::from_hex(hex_id) {
+                        self.state_provider.apply_state_change(*object_id.as_bytes(), new_value.clone());
+                    }
+                }
+            }
+        }
+    }
+
     /// Prepare a SolverTask from a Transfer request
     ///
     /// This is the main entry point for task preparation.

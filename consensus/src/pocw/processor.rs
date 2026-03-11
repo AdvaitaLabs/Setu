@@ -1,21 +1,33 @@
-//! Fold-level economic processor for FluxTransfer transactions.
+//! Fold-level economic processor.
 //!
-//! Takes a set of fold events and a PoCWConfig, produces a FoldEconomics summary
-//! with per-solver reward breakdown.
+//! Handles both FluxTransfer (flat fee) and TaskSubmit (formula-based) events.
+//! Orchestrates burn aggregation, power aggregation, flux minting, PoCW reward
+//! distribution, and kappa emission adjustment.
 
 use std::collections::HashMap;
 use setu_types::event::EventType;
-use setu_types::pocw::{PoCWConfig, FoldEconomics, SolverReward};
+use setu_types::pocw::{EmissionState, PoCWConfig, FoldEconomics, SolverReward};
 use setu_types::Event;
 
+use crate::dag::Dag;
+use super::emission::{compute_flux_minted, adjust_kappa};
 use super::flux_burn::calculate_transfer_burn;
 use super::power::calculate_transfer_power_drain;
+use super::scoring;
 
 /// Process a fold's events and produce an economic summary.
 ///
-/// Only FluxTransfer events with `executed_by` set are counted for solver rewards.
+/// Aggregates burn and power from both Transfer (flat) and TaskSubmit
+/// (per-event metrics) events. Mints flux, distributes via PoCW scoring,
+/// and adjusts kappa.
+///
 /// Returns `None` if PoCW is disabled.
-pub fn process_fold(config: &PoCWConfig, events: &[Event]) -> Option<FoldEconomics> {
+pub fn process_fold(
+    config: &PoCWConfig,
+    events: &[Event],
+    dag: &Dag,
+    emission: &mut EmissionState,
+) -> Option<FoldEconomics> {
     if !config.enabled {
         return None;
     }
@@ -24,51 +36,74 @@ pub fn process_fold(config: &PoCWConfig, events: &[Event]) -> Option<FoldEconomi
     let power_per_transfer = calculate_transfer_power_drain(config);
 
     let mut transfer_count: usize = 0;
+    let mut task_burn: u64 = 0;
+    let mut task_power: u64 = 0;
     let mut solver_transfers: HashMap<String, u64> = HashMap::new();
 
     for event in events {
-        if event.event_type != EventType::Transfer {
-            continue;
-        }
-        transfer_count += 1;
-
-        if let Some(solver_id) = &event.executed_by {
-            *solver_transfers.entry(solver_id.clone()).or_default() += 1;
+        match event.event_type {
+            EventType::Transfer => {
+                transfer_count += 1;
+                if let Some(solver_id) = &event.executed_by {
+                    *solver_transfers.entry(solver_id.clone()).or_default() += 1;
+                }
+            }
+            EventType::TaskSubmit => {
+                if let Some(ref metrics) = event.event_metrics {
+                    task_burn += metrics.flux_burn;
+                    task_power += metrics.power_delta;
+                }
+            }
+            _ => {}
         }
     }
 
-    let total_flux_burned = burn_per_transfer * transfer_count as u64;
-    let total_power_consumed = power_per_transfer * transfer_count as u64;
+    let total_flux_burned = burn_per_transfer * transfer_count as u64 + task_burn;
+    let total_power_consumed = power_per_transfer * transfer_count as u64 + task_power;
 
-    let mut solver_rewards = Vec::new();
-    let mut total_solver_rewards: u64 = 0;
+    // Minting: FluxMinted = κ × ΔPower_total
+    let kappa_before = emission.kappa;
+    let flux_minted = compute_flux_minted(total_power_consumed, kappa_before);
 
+    // PoCW reward distribution
+    let mut solver_rewards = scoring::compute_rewards(dag, events, flux_minted, config);
+
+    // Merge transfer rewards into solver records
     if config.solver_transfer_reward_enabled {
         for (solver_id, count) in &solver_transfers {
-            let reward = config.solver_transfer_reward * count;
-            total_solver_rewards += reward;
-            solver_rewards.push(SolverReward {
-                solver_id: solver_id.clone(),
-                transfer_count: *count,
-                task_count: 0,
-                distance_score: 0.0,
-                necessity_score: 0.0,
-                contribution_score: 0.0,
-                weight: 0.0,
-                flux_reward: reward,
-            });
+            let transfer_reward = config.solver_transfer_reward * count;
+            if let Some(existing) = solver_rewards.iter_mut().find(|r| r.solver_id == *solver_id) {
+                existing.transfer_count = *count;
+                existing.flux_reward += transfer_reward;
+            } else {
+                solver_rewards.push(SolverReward {
+                    solver_id: solver_id.clone(),
+                    transfer_count: *count,
+                    task_count: 0,
+                    distance_score: 0.0,
+                    necessity_score: 0.0,
+                    contribution_score: 0.0,
+                    weight: 0.0,
+                    flux_reward: transfer_reward,
+                });
+            }
         }
         solver_rewards.sort_by(|a, b| a.solver_id.cmp(&b.solver_id));
     }
+
+    let total_solver_rewards = solver_rewards.iter().map(|r| r.flux_reward).sum();
+
+    // Emission adjustment: κ(k+1) = f(κ(k), flux_minted)
+    let kappa_after = adjust_kappa(emission, flux_minted, config);
 
     Some(FoldEconomics {
         event_count: events.len(),
         total_flux_burned,
         total_power_consumed,
-        flux_minted: 0,
+        flux_minted,
         total_solver_rewards,
-        kappa_before: 1.0,
-        kappa_after: 1.0,
+        kappa_before,
+        kappa_after,
         solver_rewards,
     })
 }
@@ -106,17 +141,23 @@ mod tests {
         }
     }
 
+    fn call_process_fold(config: &PoCWConfig, events: &[Event]) -> Option<FoldEconomics> {
+        let dag = Dag::new();
+        let mut emission = EmissionState::new(config.kappa);
+        process_fold(config, events, &dag, &mut emission)
+    }
+
     #[test]
     fn test_disabled_returns_none() {
         let config = PoCWConfig::default(); // enabled: false
         let events = vec![make_transfer_event(Some("solver-1"))];
-        assert!(process_fold(&config, &events).is_none());
+        assert!(call_process_fold(&config, &events).is_none());
     }
 
     #[test]
     fn test_empty_fold() {
         let config = enabled_config();
-        let result = process_fold(&config, &[]).unwrap();
+        let result = call_process_fold(&config, &[]).unwrap();
         assert_eq!(result.event_count, 0);
         assert_eq!(result.total_flux_burned, 0);
         assert_eq!(result.total_power_consumed, 0);
@@ -133,15 +174,17 @@ mod tests {
             make_transfer_event(Some("solver-1")),
         ];
 
-        let result = process_fold(&config, &events).unwrap();
+        let result = call_process_fold(&config, &events).unwrap();
         assert_eq!(result.event_count, 3);
         assert_eq!(result.total_flux_burned, 21_000 * 3);
         assert_eq!(result.total_power_consumed, 1 * 3);
-        assert_eq!(result.total_solver_rewards, 1 * 3);
+        // flux_minted = κ(1.0) × 3 = 3
+        assert_eq!(result.flux_minted, 3);
         assert_eq!(result.solver_rewards.len(), 1);
         assert_eq!(result.solver_rewards[0].solver_id, "solver-1");
         assert_eq!(result.solver_rewards[0].transfer_count, 3);
-        assert_eq!(result.solver_rewards[0].flux_reward, 3);
+        // PoCW reward (3) + transfer reward (3*1) = 6
+        assert_eq!(result.solver_rewards[0].flux_reward, 3 + 3);
     }
 
     #[test]
@@ -155,18 +198,22 @@ mod tests {
             make_transfer_event(Some("solver-2")),
         ];
 
-        let result = process_fold(&config, &events).unwrap();
+        let result = call_process_fold(&config, &events).unwrap();
         assert_eq!(result.event_count, 5);
         assert_eq!(result.total_flux_burned, 21_000 * 5);
-        assert_eq!(result.total_solver_rewards, 5); // 2 + 3
+        // flux_minted = κ(1.0) × 5 = 5
+        assert_eq!(result.flux_minted, 5);
 
+        // PoCW rewards distributed by scoring (equal weight since
+        // events not in DAG → equal distance/necessity, zero contribution)
+        // Transfer rewards added on top: solver-1 gets 2, solver-2 gets 3
         // Sorted by solver_id
         assert_eq!(result.solver_rewards[0].solver_id, "solver-1");
         assert_eq!(result.solver_rewards[0].transfer_count, 2);
-        assert_eq!(result.solver_rewards[0].flux_reward, 2);
         assert_eq!(result.solver_rewards[1].solver_id, "solver-2");
         assert_eq!(result.solver_rewards[1].transfer_count, 3);
-        assert_eq!(result.solver_rewards[1].flux_reward, 3);
+        // Total = PoCW distributed (5) + transfer rewards (5) = 10
+        assert_eq!(result.total_solver_rewards, 10);
     }
 
     #[test]
@@ -178,24 +225,28 @@ mod tests {
         };
         let events = vec![make_transfer_event(Some("solver-1"))];
 
-        let result = process_fold(&config, &events).unwrap();
+        let result = call_process_fold(&config, &events).unwrap();
         assert_eq!(result.total_flux_burned, 21_000);
-        assert_eq!(result.total_solver_rewards, 0);
-        assert!(result.solver_rewards.is_empty());
+        // flux_minted = κ(1.0) × 1 = 1, distributed via PoCW scoring
+        assert_eq!(result.flux_minted, 1);
+        // PoCW reward only (no transfer reward since disabled)
+        assert_eq!(result.solver_rewards.len(), 1);
+        assert_eq!(result.solver_rewards[0].flux_reward, 1);
     }
 
     #[test]
-    fn test_non_transfer_events_ignored() {
+    fn test_non_transfer_events_ignored_for_burn() {
         let config = enabled_config();
         let events = vec![
             make_transfer_event(Some("solver-1")),
-            make_genesis_event(), // not a transfer
+            make_genesis_event(), // not a transfer — no burn or power
         ];
 
-        let result = process_fold(&config, &events).unwrap();
-        assert_eq!(result.event_count, 2); // total events in fold
+        let result = call_process_fold(&config, &events).unwrap();
+        assert_eq!(result.event_count, 2);
         assert_eq!(result.total_flux_burned, 21_000); // only 1 transfer burned
-        assert_eq!(result.total_solver_rewards, 1);
+        assert_eq!(result.total_power_consumed, 1);
+        assert_eq!(result.flux_minted, 1);
     }
 
     #[test]
@@ -206,12 +257,15 @@ mod tests {
             make_transfer_event(None), // no solver recorded
         ];
 
-        let result = process_fold(&config, &events).unwrap();
+        let result = call_process_fold(&config, &events).unwrap();
         // Both transfers still burn and drain
         assert_eq!(result.total_flux_burned, 21_000 * 2);
         assert_eq!(result.total_power_consumed, 2);
-        // Only the one with executed_by gets a reward
-        assert_eq!(result.total_solver_rewards, 1);
+        assert_eq!(result.flux_minted, 2);
+        // PoCW reward for solver-1 (only executed_by events get scoring)
+        // Transfer reward for solver-1: 1*1 = 1
+        // solver-1 gets PoCW(2) + transfer(1) = 3
         assert_eq!(result.solver_rewards.len(), 1);
+        assert_eq!(result.solver_rewards[0].flux_reward, 2 + 1);
     }
 }

@@ -152,7 +152,7 @@ impl ValidatorNetworkService {
             None, // No consensus
             validator_id.clone(),
             100, // Max concurrent TEE calls
-        );
+        ).with_task_preparer(Arc::clone(&task_preparer));
 
         Self {
             validator_id,
@@ -217,7 +217,7 @@ impl ValidatorNetworkService {
             Some(Arc::clone(&consensus_validator)),
             validator_id.clone(),
             100, // Max concurrent TEE calls
-        );
+        ).with_task_preparer(Arc::clone(&task_preparer));
 
         Self {
             validator_id,

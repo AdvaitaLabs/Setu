@@ -16,6 +16,7 @@
 use super::types::*;
 use super::solver_client::{ExecuteTaskRequest, ExecuteTaskResponse};
 use crate::ConsensusValidator;
+use crate::TaskPreparer;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use setu_types::event::Event;
@@ -46,6 +47,8 @@ pub struct TeeExecutor {
     semaphore: Arc<Semaphore>,
     /// Count of pending TEE tasks
     pending_count: Arc<AtomicU64>,
+    /// Task preparer (for applying state changes after execution)
+    task_preparer: Option<Arc<TaskPreparer>>,
 }
 
 impl TeeExecutor {
@@ -70,7 +73,14 @@ impl TeeExecutor {
             validator_id,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             pending_count: Arc::new(AtomicU64::new(0)),
+            task_preparer: None,
         }
+    }
+
+    /// Set the task preparer for applying state changes after TEE execution
+    pub fn with_task_preparer(mut self, task_preparer: Arc<TaskPreparer>) -> Self {
+        self.task_preparer = Some(task_preparer);
+        self
     }
 
     /// Spawn an async TEE task (non-blocking)
@@ -95,6 +105,7 @@ impl TeeExecutor {
         let dag_events = Arc::clone(&self.dag_events);
         let consensus = self.consensus.clone();
         let validator_id = self.validator_id.clone();
+        let task_preparer = self.task_preparer.clone();
 
         tokio::spawn(async move {
             Self::execute_tee_task_internal(
@@ -110,6 +121,7 @@ impl TeeExecutor {
                 dag_events,
                 consensus,
                 validator_id,
+                task_preparer,
             )
             .await;
         });
@@ -132,6 +144,7 @@ impl TeeExecutor {
         dag_events: Arc<RwLock<Vec<String>>>,
         consensus: Option<Arc<ConsensusValidator>>,
         validator_id: String,
+        task_preparer: Option<Arc<TaskPreparer>>,
     ) {
         let task_id_hex = hex::encode(&task.task_id[..8]);
 
@@ -213,9 +226,14 @@ impl TeeExecutor {
                                     .collect(),
                             };
 
-                            event.set_execution_result(execution_result);
+                            event.set_execution_result(execution_result.clone());
                             event.executed_by = Some(solver_id.clone());
                             event.status = setu_types::event::EventStatus::Executed;
+
+                            // 5b. Apply state changes to global state immediately
+                            if let Some(ref tp) = task_preparer {
+                                tp.apply_state_changes(&execution_result.state_changes);
+                            }
 
                             // 6. Submit to consensus (if enabled)
                             if let Some(ref consensus_validator) = consensus {

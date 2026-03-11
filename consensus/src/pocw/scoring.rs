@@ -123,7 +123,7 @@ pub fn compute_rewards(
                 } else {
                     0.0
                 };
-                let flux_reward = (weight * flux_minted as f64).round() as u64;
+                let flux_reward = (weight * flux_minted as f64).floor() as u64;
 
                 SolverReward {
                     solver_id: solver_id.clone(),
