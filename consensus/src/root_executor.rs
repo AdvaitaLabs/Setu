@@ -12,8 +12,9 @@
 
 use setu_merkle::sha256;
 use setu_types::{
-    Event, EventType, SubnetId, 
+    Event, EventType, SubnetId,
     ObjectStateValue, object_type, HashValue as TypesHash, ZERO_HASH,
+    pocw::PoCWConfig,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -77,12 +78,15 @@ impl RootExecutionResult {
 pub struct RootSubnetExecutor {
     /// Current state root
     current_state_root: TypesHash,
-    
+
     /// Pending updates (not yet committed)
     pending_updates: HashMap<[u8; 32], ObjectStateValue>,
-    
+
     /// Pending deletions
     pending_deletions: Vec<[u8; 32]>,
+
+    /// PoCW config for initializing solver power budgets
+    pocw_config: Option<PoCWConfig>,
 }
 
 impl RootSubnetExecutor {
@@ -92,12 +96,19 @@ impl RootSubnetExecutor {
             current_state_root: initial_state_root,
             pending_updates: HashMap::new(),
             pending_deletions: Vec::new(),
+            pocw_config: None,
         }
     }
-    
+
     /// Create with empty state
     pub fn empty() -> Self {
         Self::new(ZERO_HASH)
+    }
+
+    /// Set PoCW config for solver power budget initialization
+    pub fn with_pocw_config(mut self, config: PoCWConfig) -> Self {
+        self.pocw_config = Some(config);
+        self
     }
     
     /// Get the current state root
@@ -189,9 +200,11 @@ impl RootSubnetExecutor {
     }
     
     /// Execute solver registration
+    ///
+    /// Also initializes the solver's PoCW power budget if PoCW is enabled.
     fn execute_solver_register(&mut self, event: &Event) -> Result<RootExecutionResult, RootExecutorError> {
         let key = self.generate_solver_key(&event.creator);
-        
+
         let state = ObjectStateValue::new(
             self.address_to_bytes(&event.creator),
             1,
@@ -199,21 +212,51 @@ impl RootSubnetExecutor {
             *sha256(event.id.as_bytes()).as_bytes(),
             SubnetId::ROOT,
         );
-        
+
         self.pending_updates.insert(key, state.clone());
-        
+
+        // Initialize solver power budget if PoCW is enabled
+        if let Some(ref config) = self.pocw_config {
+            if config.enabled {
+                let power_key = self.generate_power_key(&event.creator);
+                let power_value = ObjectStateValue::new(
+                    self.address_to_bytes(&event.creator),
+                    1,
+                    object_type::SOLVER_INFO, // reuse type; power is a sub-object
+                    *sha256(format!("power:{}", event.id).as_bytes()).as_bytes(),
+                    SubnetId::ROOT,
+                );
+                self.pending_updates.insert(power_key, power_value);
+
+                tracing::info!(
+                    solver_id = %event.creator,
+                    initial_power = config.initial_power_budget,
+                    "Initialized solver power budget"
+                );
+            }
+        }
+
         let new_root = self.compute_pending_root();
         self.current_state_root = new_root;
-        
+
         let mut updated = HashMap::new();
         updated.insert(key, state);
-        
+
         Ok(RootExecutionResult {
             updated_objects: updated,
             deleted_objects: Vec::new(),
             new_state_root: new_root,
             event_id: event.id.clone(),
         })
+    }
+
+    /// Generate object key for a solver's power budget
+    fn generate_power_key(&self, solver_id: &str) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[0] = object_type::SOLVER_INFO;
+        let hash = sha256(format!("power:{}", solver_id).as_bytes());
+        key[1..].copy_from_slice(&hash.as_bytes()[..31]);
+        key
     }
     
     /// Execute solver unregistration
@@ -334,6 +377,7 @@ impl Default for RootSubnetExecutor {
         Self::empty()
     }
 }
+
 
 #[cfg(test)]
 mod tests {

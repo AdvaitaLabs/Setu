@@ -3,30 +3,34 @@
 //! Sits as a parallel path alongside existing consensus — does not modify
 //! anchor building, voting, or state application.
 
-use setu_types::pocw::{PoCWConfig, FoldEconomics};
+use setu_types::pocw::{EmissionState, PoCWConfig, FoldEconomics};
 use setu_types::Event;
 use tracing::info;
 
+use crate::dag::Dag;
 use super::processor;
 
 /// Observes fold commits and produces economic summaries.
 pub struct FoldObserver {
     config: PoCWConfig,
+    emission: EmissionState,
     /// History of fold economics for diagnostics
     history: Vec<FoldEconomics>,
 }
 
 impl FoldObserver {
     pub fn new(config: PoCWConfig) -> Self {
+        let kappa = config.kappa;
         Self {
             config,
+            emission: EmissionState::new(kappa),
             history: Vec::new(),
         }
     }
 
     /// Called after a fold is committed. Processes economics if enabled.
-    pub fn on_fold_committed(&mut self, events: &[Event]) -> Option<FoldEconomics> {
-        let result = processor::process_fold(&self.config, events)?;
+    pub fn on_fold_committed(&mut self, events: &[Event], dag: &Dag) -> Option<FoldEconomics> {
+        let result = processor::process_fold(&self.config, events, dag, &mut self.emission)?;
 
         info!(
             event_count = result.event_count,
@@ -69,8 +73,9 @@ mod tests {
     #[test]
     fn test_disabled_produces_none() {
         let mut observer = FoldObserver::new(PoCWConfig::default());
+        let dag = Dag::new();
         let events = vec![make_transfer("solver-1")];
-        assert!(observer.on_fold_committed(&events).is_none());
+        assert!(observer.on_fold_committed(&events, &dag).is_none());
         assert!(observer.history().is_empty());
     }
 
@@ -82,16 +87,18 @@ mod tests {
             ..Default::default()
         };
         let mut observer = FoldObserver::new(config);
+        let dag = Dag::new();
         let events = vec![
             make_transfer("solver-1"),
             make_transfer("solver-2"),
             make_transfer("solver-1"),
         ];
 
-        let result = observer.on_fold_committed(&events).unwrap();
+        let result = observer.on_fold_committed(&events, &dag).unwrap();
         assert_eq!(result.event_count, 3);
         assert_eq!(result.total_flux_burned, 21_000 * 3);
-        assert_eq!(result.total_solver_rewards, 3);
+        // flux_minted = κ(1.0) × 3 = 3, plus transfer rewards = 3
+        assert_eq!(result.flux_minted, 3);
         assert_eq!(result.solver_rewards.len(), 2);
         assert_eq!(observer.history().len(), 1);
     }
@@ -103,9 +110,10 @@ mod tests {
             ..Default::default()
         };
         let mut observer = FoldObserver::new(config);
+        let dag = Dag::new();
 
-        observer.on_fold_committed(&[make_transfer("s1")]);
-        observer.on_fold_committed(&[make_transfer("s2"), make_transfer("s2")]);
+        observer.on_fold_committed(&[make_transfer("s1")], &dag);
+        observer.on_fold_committed(&[make_transfer("s2"), make_transfer("s2")], &dag);
 
         assert_eq!(observer.history().len(), 2);
         assert_eq!(observer.history()[0].event_count, 1);

@@ -223,8 +223,9 @@ async fn main() -> anyhow::Result<()> {
         info!("✓ PoCW enabled (transfer_fee={})", fee);
     }
     
-    // Extract transfer fee before consensus_config is consumed
-    let transfer_fee = consensus_config.consensus.pocw
+    // Extract PoCW config before consensus_config is consumed
+    let pocw_config = consensus_config.consensus.pocw;
+    let transfer_fee = pocw_config
         .filter(|p| p.enabled)
         .map(|p| p.transfer_fee)
         .unwrap_or(0);
@@ -277,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
         http_listen_addr: config.http_addr,
         p2p_listen_addr: config.p2p_addr,
         transfer_fee,
+        pocw_config: pocw_config.filter(|p| p.enabled),
     };
     
     // Create network service with consensus enabled
@@ -343,6 +345,7 @@ async fn main() -> anyhow::Result<()> {
     info!("║    GET  /api/v1/validators         - List validators       ║");
     info!("║    GET  /api/v1/health             - Health check          ║");
     info!("║    POST /api/v1/transfer           - Submit transfer       ║");
+    info!("║    POST /api/v1/task               - Submit task           ║");
     info!("║    POST /api/v1/event              - Submit event (Solver) ║");
     info!("║    GET  /api/v1/events             - List events           ║");
     info!("╚════════════════════════════════════════════════════════════╝");

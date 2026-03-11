@@ -38,6 +38,7 @@ use setu_types::task::{
 };
 use setu_types::{Event, EventType, SubnetId, ObjectId};
 use setu_types::event::VLCSnapshot;
+use setu_types::registration::TaskSubmission;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -113,7 +114,23 @@ impl TaskPreparer {
         let state_provider = Arc::new(MerkleStateProvider::new(state_manager));
         Self::new(validator_id, state_provider)
     }
-    
+
+    /// Apply TEE execution state changes to the global Merkle state.
+    /// Called after successful TEE execution so balance queries reflect updates
+    /// without waiting for fold.
+    pub fn apply_state_changes(&self, state_changes: &[setu_types::event::StateChange]) {
+        for sc in state_changes {
+            if let Some(ref new_value) = sc.new_value {
+                // key format: "coin:{hex_object_id}" — parse the object_id
+                if let Some(hex_id) = sc.key.strip_prefix("coin:") {
+                    if let Ok(object_id) = setu_types::ObjectId::from_hex(hex_id) {
+                        self.state_provider.apply_state_change(*object_id.as_bytes(), new_value.clone());
+                    }
+                }
+            }
+        }
+    }
+
     /// Prepare a SolverTask from a Transfer request
     ///
     /// This is the main entry point for task preparation.
@@ -223,6 +240,59 @@ impl TaskPreparer {
         Ok(task)
     }
     
+    /// Prepare a SolverTask from a TaskSubmission
+    ///
+    /// Unlike transfers, task submissions don't require coin selection.
+    /// The task payload is passed through to the solver/TEE for execution.
+    pub fn prepare_task_submission(
+        &self,
+        task_submission: &TaskSubmission,
+        subnet_id: SubnetId,
+        parent_ids: Vec<String>,
+        vlc_snapshot: VLCSnapshot,
+    ) -> Result<SolverTask, TaskPrepareError> {
+        debug!(
+            task_id = %task_submission.task_id,
+            task_type = %task_submission.task_type,
+            submitter = %task_submission.submitter,
+            "Preparing SolverTask for task submission"
+        );
+
+        // Create TaskSubmit event
+        let event = Event::task_submit(
+            task_submission.clone(),
+            parent_ids,
+            vlc_snapshot,
+            self.validator_id.clone(),
+        );
+
+        // Get pre-state root
+        let pre_state_root = self.state_provider.get_state_root();
+
+        // Generate task_id
+        let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
+
+        // Build SolverTask with empty resolved_inputs (no coin selection needed)
+        let resolved_inputs = ResolvedInputs::new();
+
+        let task = SolverTask::new(
+            task_id,
+            event,
+            resolved_inputs,
+            pre_state_root,
+            subnet_id,
+        )
+        .with_gas_budget(GasBudget::default());
+
+        info!(
+            task_submission_id = %task_submission.task_id,
+            solver_task_id = %hex::encode(&task_id[..8]),
+            "SolverTask prepared for task submission"
+        );
+
+        Ok(task)
+    }
+
     /// Select the best coin for a transfer
     ///
     /// Strategy: Select the smallest coin that can cover the transfer amount
@@ -368,6 +438,7 @@ mod tests {
     use super::*;
     use setu_types::{Transfer, TransferType};
     use setu_types::task::OperationType;
+    use setu_types::registration::TaskSubmission;
     
     fn create_test_transfer() -> Transfer {
         Transfer::new("test-tx-1", "alice", "bob", 100)
@@ -463,5 +534,43 @@ mod tests {
             }
             _ => panic!("Expected InsufficientBalance error"),
         }
+    }
+
+    #[test]
+    fn test_prepare_task_submission() {
+        use setu_vlc::VectorClock;
+
+        let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+
+        let task_sub = TaskSubmission {
+            task_id: "task-001".to_string(),
+            task_type: "compute".to_string(),
+            submitter: "alice".to_string(),
+            payload: vec![1, 2, 3],
+        };
+
+        let vlc = VLCSnapshot {
+            vector_clock: VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1000,
+        };
+        let result = preparer.prepare_task_submission(
+            &task_sub,
+            SubnetId::ROOT,
+            vec![],
+            vlc,
+        );
+
+        assert!(result.is_ok());
+        let solver_task = result.unwrap();
+
+        // Event should be TaskSubmit type
+        assert_eq!(solver_task.event.event_type, EventType::TaskSubmit);
+
+        // Resolved inputs should be empty (no coin selection for tasks)
+        assert!(solver_task.resolved_inputs.input_objects.is_empty());
+
+        // Task ID should be deterministic and non-zero
+        assert!(!solver_task.task_id.iter().all(|&b| b == 0));
     }
 }

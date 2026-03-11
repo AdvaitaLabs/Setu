@@ -261,10 +261,10 @@ impl ConsensusManager {
     /// 
     /// Returns true if the CF is finalized after this vote.
     /// Duplicate votes from the same validator are ignored (idempotent).
-    pub fn receive_vote(&mut self, vote: Vote) -> bool {
+    pub fn receive_vote(&mut self, vote: Vote, dag: &Dag) -> bool {
         let cf_id = vote.cf_id.clone();
         let voter_id = vote.validator_id.clone();
-        
+
         if let Some(cf) = self.pending_cfs.get_mut(&cf_id) {
             // Skip if this validator already voted (idempotency)
             if cf.votes.contains_key(&voter_id) {
@@ -274,7 +274,7 @@ impl ConsensusManager {
         } else {
             return false;
         }
-        self.check_finalization(&cf_id)
+        self.check_finalization(&cf_id, dag)
     }
 
     /// Check if a CF has reached quorum (finalize), rejection threshold (reject), or timeout
@@ -283,7 +283,7 @@ impl ConsensusManager {
     /// Public because engine.receive_cf() needs to check after vote_for_cf().
     /// 
     /// Returns true if CF was finalized or rejected (removed from pending).
-    pub fn check_finalization(&mut self, cf_id: &str) -> bool {
+    pub fn check_finalization(&mut self, cf_id: &str, dag: &Dag) -> bool {
         let decision = {
             let cf = match self.pending_cfs.get(cf_id) {
                 Some(cf) => cf,
@@ -319,7 +319,7 @@ impl ConsensusManager {
                                 // PoCW: observe the committed fold and mint rewards
                                 if let Some(ref mut observer) = self.fold_observer {
                                     let fold_events = pending_build.all_events();
-                                    if let Some(economics) = observer.on_fold_committed(&fold_events) {
+                                    if let Some(economics) = observer.on_fold_committed(&fold_events, dag) {
                                         self.apply_reward_minting(&economics);
                                     }
                                 }
@@ -721,14 +721,18 @@ mod tests {
         // Create CF (deferred commit mode - state not modified yet)
         let cf = manager.try_create_cf(&dag, &vlc);
         assert!(cf.is_some());
-        let cf_id = cf.unwrap().id.clone();
-        
+        let cf = cf.unwrap();
+        let cf_id = cf.id.clone();
+
+        // Add CF to pending (required before voting)
+        manager.receive_cf(cf);
+
         // State not committed yet (prepare_build only)
         assert_eq!(manager.anchor_count(), 0);
-        
+
         // Vote to finalize (single validator, so immediate finalization)
         manager.vote_for_cf(&cf_id, true, None);
-        let finalized = manager.check_finalization(&cf_id);
+        let finalized = manager.check_finalization(&cf_id, &dag);
         assert!(finalized, "CF should be finalized with single validator");
         
         // Now state should be committed
@@ -758,10 +762,13 @@ mod tests {
             event_count: 5,
             total_flux_burned: 105_000,
             total_power_consumed: 5,
+            flux_minted: 0,
             total_solver_rewards: 5,
+            kappa_before: 1.0,
+            kappa_after: 1.0,
             solver_rewards: vec![
-                SolverReward { solver_id: "solver-a".into(), transfer_count: 3, flux_reward: 3 },
-                SolverReward { solver_id: "solver-b".into(), transfer_count: 2, flux_reward: 2 },
+                SolverReward { solver_id: "solver-a".into(), transfer_count: 3, task_count: 0, distance_score: 0.0, necessity_score: 0.0, contribution_score: 0.0, weight: 0.0, flux_reward: 3 },
+                SolverReward { solver_id: "solver-b".into(), transfer_count: 2, task_count: 0, distance_score: 0.0, necessity_score: 0.0, contribution_score: 0.0, weight: 0.0, flux_reward: 2 },
             ],
         };
 
@@ -778,14 +785,17 @@ mod tests {
             assert_eq!(u64::from_le_bytes(val_b.try_into().unwrap()), 2);
         }
 
-        // Apply a second fold — rewards accumulate
+        // Apply a second fold -- rewards accumulate
         let economics2 = FoldEconomics {
             event_count: 2,
             total_flux_burned: 42_000,
             total_power_consumed: 2,
+            flux_minted: 0,
             total_solver_rewards: 2,
+            kappa_before: 1.0,
+            kappa_after: 1.0,
             solver_rewards: vec![
-                SolverReward { solver_id: "solver-a".into(), transfer_count: 2, flux_reward: 2 },
+                SolverReward { solver_id: "solver-a".into(), transfer_count: 2, task_count: 0, distance_score: 0.0, necessity_score: 0.0, contribution_score: 0.0, weight: 0.0, flux_reward: 2 },
             ],
         };
         manager.apply_reward_minting(&economics2);

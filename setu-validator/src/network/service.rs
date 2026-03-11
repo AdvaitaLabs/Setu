@@ -143,7 +143,7 @@ impl ValidatorNetworkService {
         let dag_events = Arc::new(RwLock::new(Vec::new()));
 
         // Create TEE executor
-        let tee_executor = TeeExecutor::new(
+        let mut tee_executor = TeeExecutor::new(
             http_client.clone(),
             Arc::clone(&solver_info),
             Arc::clone(&transfer_status),
@@ -152,7 +152,10 @@ impl ValidatorNetworkService {
             None, // No consensus
             validator_id.clone(),
             100, // Max concurrent TEE calls
-        );
+        ).with_task_preparer(Arc::clone(&task_preparer));
+        if let Some(pocw) = config.pocw_config {
+            tee_executor = tee_executor.with_pocw_config(pocw);
+        }
 
         Self {
             validator_id,
@@ -208,7 +211,7 @@ impl ValidatorNetworkService {
         let dag_events = Arc::new(RwLock::new(Vec::new()));
 
         // Create TEE executor with consensus
-        let tee_executor = TeeExecutor::new(
+        let mut tee_executor = TeeExecutor::new(
             http_client.clone(),
             Arc::clone(&solver_info),
             Arc::clone(&transfer_status),
@@ -217,7 +220,10 @@ impl ValidatorNetworkService {
             Some(Arc::clone(&consensus_validator)),
             validator_id.clone(),
             100, // Max concurrent TEE calls
-        );
+        ).with_task_preparer(Arc::clone(&task_preparer));
+        if let Some(pocw) = config.pocw_config {
+            tee_executor = tee_executor.with_pocw_config(pocw);
+        }
 
         Self {
             validator_id,
@@ -357,6 +363,8 @@ impl ValidatorNetworkService {
             // Transfer endpoints
             .route("/api/v1/transfer", post(setu_api::http_submit_transfer::<ValidatorNetworkService>))
             .route("/api/v1/transfer/status", post(setu_api::http_get_transfer_status::<ValidatorNetworkService>))
+            // Task submission endpoint
+            .route("/api/v1/task", post(setu_api::http_submit_task::<ValidatorNetworkService>))
             // Event endpoints
             .route("/api/v1/event", post(setu_api::http_submit_event::<ValidatorNetworkService>))
             .route("/api/v1/events", get(setu_api::http_get_events::<ValidatorNetworkService>))
@@ -406,6 +414,137 @@ impl ValidatorNetworkService {
 
     pub fn get_transfer_status(&self, transfer_id: &str) -> GetTransferStatusResponse {
         TransferHandler::get_transfer_status(&self.transfer_status, transfer_id)
+    }
+
+    // ============================================
+    // Task Submission (TaskSubmit events)
+    // ============================================
+
+    pub async fn submit_task(&self, request: setu_rpc::SubmitTaskRequest) -> setu_rpc::SubmitTaskResponse {
+        let now = super::types::current_timestamp_secs();
+        let task_counter = self.transfer_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let task_id = format!("task-{}-{}", now, task_counter);
+
+        let mut steps = Vec::new();
+
+        info!(task_id = %task_id, submitter = %request.submitter, task_type = %request.task_type, "Processing task submission");
+
+        steps.push(setu_rpc::ProcessingStep {
+            step: "receive".to_string(),
+            status: "completed".to_string(),
+            details: Some(format!("Task {} received", task_id)),
+            timestamp: now,
+        });
+
+        // VLC assignment
+        let vlc_time = self.get_vlc_time();
+        let vlc_snapshot = {
+            let mut snapshot = setu_types::event::VLCSnapshot::for_node(self.validator_id.clone());
+            snapshot.logical_time = vlc_time;
+            snapshot.physical_time = super::types::current_timestamp_millis();
+            snapshot
+        };
+
+        steps.push(setu_rpc::ProcessingStep {
+            step: "vlc_assign".to_string(),
+            status: "completed".to_string(),
+            details: Some(format!("VLC time: {}", vlc_time)),
+            timestamp: now,
+        });
+
+        // Build TaskSubmission
+        let task_submission = setu_types::registration::TaskSubmission::new(
+            &task_id,
+            &request.task_type,
+            &request.submitter,
+        ).with_payload(request.payload);
+
+        // Prepare SolverTask
+        let subnet_id = setu_types::SubnetId::ROOT;
+        let solver_task = match self.task_preparer.prepare_task_submission(
+            &task_submission,
+            subnet_id,
+            vec![], // No explicit parents; DAG assigns based on tips
+            vlc_snapshot,
+        ) {
+            Ok(task) => {
+                steps.push(setu_rpc::ProcessingStep {
+                    step: "prepare_task".to_string(),
+                    status: "completed".to_string(),
+                    details: Some("SolverTask prepared".to_string()),
+                    timestamp: now,
+                });
+                task
+            }
+            Err(e) => {
+                let msg = format!("Task preparation failed: {}", e);
+                return setu_rpc::SubmitTaskResponse {
+                    success: false,
+                    message: msg,
+                    task_id: Some(task_id),
+                    solver_id: None,
+                    processing_steps: steps,
+                };
+            }
+        };
+
+        // Route to solver (reuse transfer routing)
+        let transfer_for_routing = setu_types::Transfer::new(
+            &task_id,
+            &request.submitter,
+            &request.submitter, // task doesn't have a "to" — use submitter
+            0,
+        )
+        .with_type(setu_types::TransferType::TaskSubmit)
+        .with_preferred_solver_opt(request.preferred_solver);
+
+        let solver_id = match self.router_manager.route_transfer(&transfer_for_routing) {
+            Ok(id) => {
+                steps.push(setu_rpc::ProcessingStep {
+                    step: "route".to_string(),
+                    status: "completed".to_string(),
+                    details: Some(format!("Routed to: {}", id)),
+                    timestamp: now,
+                });
+                id
+            }
+            Err(e) => {
+                let msg = format!("No solver available: {}", e);
+                return setu_rpc::SubmitTaskResponse {
+                    success: false,
+                    message: msg,
+                    task_id: Some(task_id),
+                    solver_id: None,
+                    processing_steps: steps,
+                };
+            }
+        };
+
+        // Store tracker
+        self.transfer_status.insert(
+            task_id.clone(),
+            TransferTracker {
+                transfer_id: task_id.clone(),
+                status: "pending_tee_execution".to_string(),
+                solver_id: Some(solver_id.clone()),
+                event_id: None,
+                processing_steps: steps.clone(),
+                created_at: now,
+            },
+        );
+
+        // Spawn TEE execution
+        self.tee_executor.spawn_tee_task(task_id.clone(), solver_id.clone(), solver_task);
+
+        info!(task_id = %task_id, solver_id = %solver_id, "Task submitted (TEE execution spawned)");
+
+        setu_rpc::SubmitTaskResponse {
+            success: true,
+            message: "Task submitted, awaiting TEE execution".to_string(),
+            task_id: Some(task_id),
+            solver_id: Some(solver_id),
+            processing_steps: steps,
+        }
     }
 
     // ============================================
@@ -643,6 +782,10 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
 
     async fn submit_transfer(&self, request: SubmitTransferRequest) -> SubmitTransferResponse {
         self.submit_transfer(request).await
+    }
+
+    async fn submit_task(&self, request: setu_rpc::SubmitTaskRequest) -> setu_rpc::SubmitTaskResponse {
+        self.submit_task(request).await
     }
 
     fn get_transfer_status(&self, transfer_id: &str) -> GetTransferStatusResponse {

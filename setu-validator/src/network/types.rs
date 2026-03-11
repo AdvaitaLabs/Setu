@@ -26,6 +26,8 @@ pub struct NetworkServiceConfig {
     /// Transaction fee applied to each FluxTransfer (from PoCWConfig, 0 if disabled).
     /// This fee is burned (destroyed) — it is not paid to any recipient.
     pub transfer_fee: u64,
+    /// PoCW configuration (passed to TeeExecutor for EventMetrics computation)
+    pub pocw_config: Option<setu_types::pocw::PoCWConfig>,
 }
 
 impl Default for NetworkServiceConfig {
@@ -34,6 +36,7 @@ impl Default for NetworkServiceConfig {
             http_listen_addr: "127.0.0.1:8080".parse().unwrap(),
             p2p_listen_addr: "127.0.0.1:9000".parse().unwrap(),
             transfer_fee: 0,
+            pocw_config: None,
         }
     }
 }

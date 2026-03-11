@@ -262,6 +262,37 @@ pub struct ProcessingStep {
     pub timestamp: u64,
 }
 
+/// Request to submit a task for solver execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitTaskRequest {
+    /// Task type (e.g., "compute", "inference", "custom")
+    pub task_type: String,
+    /// Submitter address
+    pub submitter: String,
+    /// Task payload (opaque bytes, interpreted by the solver)
+    #[serde(default)]
+    pub payload: Vec<u8>,
+    /// Optional preferred solver
+    pub preferred_solver: Option<String>,
+    /// Optional subnet ID
+    pub subnet_id: Option<String>,
+}
+
+/// Response to task submission
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitTaskResponse {
+    /// Whether submission was successful
+    pub success: bool,
+    /// Human-readable message
+    pub message: String,
+    /// Assigned task ID (transfer tracker ID)
+    pub task_id: Option<String>,
+    /// Assigned solver ID
+    pub solver_id: Option<String>,
+    /// Processing steps
+    pub processing_steps: Vec<ProcessingStep>,
+}
+
 /// Request to get transfer status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetTransferStatusRequest {
