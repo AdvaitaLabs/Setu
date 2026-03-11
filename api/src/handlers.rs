@@ -11,9 +11,10 @@ use setu_rpc::{
     HeartbeatRequest, HeartbeatResponse, RegisterSolverRequest, RegisterSolverResponse,
     RegisterValidatorRequest, RegisterValidatorResponse, RegistrationHandler,
     SubmitTransferRequest, SubmitTransferResponse,
+    SubmitTaskRequest, SubmitTaskResponse,
     // User RPC imports
     UserRpcHandler, RegisterUserRequest, RegisterUserResponse,
-    GetAccountRequest, GetAccountResponse, GetBalanceRequest, 
+    GetAccountRequest, GetAccountResponse, GetBalanceRequest,
     GetBalanceResponse as UserGetBalanceResponse,
     GetPowerRequest, GetPowerResponse, GetCreditRequest, GetCreditResponse,
     GetCredentialsRequest, GetCredentialsResponse, TransferRequest, TransferResponse,
@@ -48,10 +49,13 @@ pub trait ValidatorService: Send + Sync {
     
     /// Submit transfer
     fn submit_transfer(&self, request: SubmitTransferRequest) -> impl std::future::Future<Output = SubmitTransferResponse> + Send;
-    
+
+    /// Submit task for solver execution
+    fn submit_task(&self, request: SubmitTaskRequest) -> impl std::future::Future<Output = SubmitTaskResponse> + Send;
+
     /// Get transfer status
     fn get_transfer_status(&self, transfer_id: &str) -> GetTransferStatusResponse;
-    
+
     /// Submit event
     fn submit_event(&self, request: SubmitEventRequest) -> impl std::future::Future<Output = SubmitEventResponse> + Send;
     
@@ -130,6 +134,14 @@ pub async fn http_submit_transfer<S: ValidatorService>(
     Json(request): Json<SubmitTransferRequest>,
 ) -> Json<SubmitTransferResponse> {
     Json(service.submit_transfer(request).await)
+}
+
+/// Submit a task for solver execution
+pub async fn http_submit_task<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<SubmitTaskRequest>,
+) -> Json<SubmitTaskResponse> {
+    Json(service.submit_task(request).await)
 }
 
 /// Get transfer status
