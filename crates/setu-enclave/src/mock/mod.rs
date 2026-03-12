@@ -140,7 +140,7 @@ impl MockEnclave {
     /// 
     /// ## Format
     /// 
-    /// read_set entries use key format: "coin:{hex_object_id}"
+    /// read_set entries use key format: "oid:{hex_object_id}"
     /// value is BCS-serialized CoinState (raw storage format)
     /// 
     /// ## Security
@@ -157,8 +157,8 @@ impl MockEnclave {
         let mut loaded_count = 0;
         
         for entry in read_set {
-            // Parse object key: "coin:{hex_object_id}"
-            let hex_id = entry.key.strip_prefix("coin:");
+            // Parse object key: "oid:{hex_object_id}"
+            let hex_id = entry.key.strip_prefix("oid:");
             
             if let Some(hex_id) = hex_id {
                 // Parse ObjectId from hex string
@@ -242,15 +242,21 @@ impl MockEnclave {
         let mut processed = Vec::new();
         let mut failed = Vec::new();
         
-        // Process each event using shared self.runtime (legacy mode)
+        // Legacy mode: acquire write lock once for the entire execution.
+        // This eliminates the TOCTOU gap from the previous read-then-write pattern
+        // and unifies the code path with simulate_execution_isolated.
+        let mut runtime_guard = self.runtime.write().await;
+        
         for event in &input.events {
             // Check timeout
             if start.elapsed().as_millis() as u64 > self.config.max_execution_time_ms {
                 return Err(StfError::ExecutionTimeout);
             }
             
-            // Execute event using self.runtime (shared)
-            let result = self.execute_single_event(event, &input.resolved_inputs, &mut diff).await;
+            // Execute event using shared runtime (acquired write lock above)
+            let result = self.execute_single_event_with_runtime(
+                event, &input.resolved_inputs, &mut diff, &mut *runtime_guard,
+            ).await;
             
             match result {
                 Ok(()) => {
@@ -319,59 +325,16 @@ impl MockEnclave {
         Ok((diff, processed, failed))
     }
     
-    /// Execute a single event using setu-runtime
+    /// Execute a single event using the provided runtime
     /// 
-    /// This is the core STF (State Transition Function) execution.
-    /// For transfer events, uses resolved_inputs.primary_coin() to get the coin_id
-    /// that Validator has already selected.
-    /// For registration events, handles subnet/user registration with token logic.
-    /// For other events, records them in legacy state.
-    /// 
-    /// NOTE: This method uses self.runtime (shared). For concurrent execution,
-    /// use execute_single_event_with_runtime() instead.
-    async fn execute_single_event(
-        &self,
-        event: &setu_types::Event,
-        resolved_inputs: &ResolvedInputs,
-        diff: &mut StateDiff,
-    ) -> Result<(), String> {
-        debug!(event_id = %event.id, event_type = ?event.event_type, "Executing event via setu-runtime");
-        
-        // Check if this is a transfer event
-        if let Some(transfer) = &event.transfer {
-            return self.execute_transfer_via_runtime(event, transfer, resolved_inputs, diff).await;
-        }
-        
-        // Infrastructure / root events should NEVER reach TEE.
-        // They are executed directly by Validator via InfraExecutor.
-        // If we receive such events here, it indicates a routing bug.
-        // See: types/src/event.rs - EventType::is_validator_executed()
-        match &event.payload {
-            setu_types::event::EventPayload::SubnetRegister(_) => {
-                warn!(event_id = %event.id, "SubnetRegister event incorrectly routed to TEE - should use InfraExecutor");
-                return Err("SubnetRegister is a Validator-executed event, should not reach TEE".to_string());
-            }
-            setu_types::event::EventPayload::UserRegister(_) => {
-                warn!(event_id = %event.id, "UserRegister event incorrectly routed to TEE - should use InfraExecutor");
-                return Err("UserRegister is a Validator-executed event, should not reach TEE".to_string());
-            }
-            setu_types::event::EventPayload::ContractPublish { .. } => {
-                warn!(event_id = %event.id, "ContractPublish event incorrectly routed to TEE - should use InfraExecutor");
-                return Err("ContractPublish is a Validator-executed event, should not reach TEE".to_string());
-            }
-            _ => {}
-        }
-        
-        // For non-transfer events, record in legacy state
-        let mut legacy_state = self.legacy_state.write().await;
-        self.record_event_processed(&mut legacy_state, event, diff);
-        Ok(())
-    }
-    
-    /// Execute a single event with an isolated local runtime (solver-tee3 mode)
-    /// 
-    /// This variant takes a mutable reference to a LOCAL RuntimeExecutor,
-    /// ensuring complete isolation from concurrent tasks.
+    /// Core STF (State Transition Function) execution logic used by both
+    /// legacy (shared runtime via write lock) and solver-tee3 (isolated runtime) modes.
+    /// The caller provides the appropriate RuntimeExecutor reference.
+    ///
+    /// For transfer events, delegates to execute_transfer_with_local_runtime.
+    /// For merge/split/merge-then-transfer, executes directly via runtime.
+    /// Infrastructure events (SubnetRegister, etc.) are rejected — they must
+    /// be handled by Validator's InfraExecutor.
     async fn execute_single_event_with_runtime(
         &self,
         event: &setu_types::Event,
@@ -404,6 +367,132 @@ impl MockEnclave {
                 warn!(event_id = %event.id, "ContractPublish event incorrectly routed to TEE - should use InfraExecutor");
                 return Err("ContractPublish is a Validator-executed event, should not reach TEE".to_string());
             }
+            setu_types::event::EventPayload::CoinMerge { .. } => {
+                let ctx = ExecutionContext::new(
+                    self.config.solver_id.clone(),
+                    event.timestamp,
+                    false,
+                    Self::derive_tx_hash(&event.id),
+                );
+                if let setu_types::OperationType::MergeCoins { target_index, source_indices } = &resolved_inputs.operation {
+                    let target_coin_id = resolved_inputs.input_objects[*target_index].object_id.clone();
+                    let source_coin_ids: Vec<setu_types::object::ObjectId> = source_indices.iter()
+                        .map(|&i| resolved_inputs.input_objects[i].object_id.clone())
+                        .collect();
+                    let owner = local_runtime.state()
+                        .get_object(&target_coin_id)
+                        .map_err(|e| format!("Failed to read target coin: {}", e))?
+                        .ok_or_else(|| format!("Target coin {} not found", target_coin_id))?
+                        .metadata.owner.clone()
+                        .ok_or_else(|| "Target coin has no owner".to_string())?;
+                    let output = local_runtime.execute_merge_coins(
+                        &owner,
+                        target_coin_id,
+                        &source_coin_ids,
+                        &ctx,
+                    ).map_err(|e| format!("Runtime merge error: {}", e))?;
+                    if !output.success {
+                        return Err(output.message.unwrap_or_else(|| "Merge failed".to_string()));
+                    }
+                    diff.add_state_changes(&output.state_changes);
+                } else {
+                    return Err("CoinMerge payload but operation is not MergeCoins".to_string());
+                }
+                let mut legacy_state = self.legacy_state.write().await;
+                self.record_event_processed(&mut legacy_state, event, diff);
+                return Ok(());
+            }
+            setu_types::event::EventPayload::CoinSplit { .. } => {
+                let ctx = ExecutionContext::new(
+                    self.config.solver_id.clone(),
+                    event.timestamp,
+                    false,
+                    Self::derive_tx_hash(&event.id),
+                );
+                if let setu_types::OperationType::SplitCoin { source_index, amounts } = &resolved_inputs.operation {
+                    let source_coin_id = resolved_inputs.input_objects[*source_index].object_id.clone();
+                    let owner = local_runtime.state()
+                        .get_object(&source_coin_id)
+                        .map_err(|e| format!("Failed to read source coin: {}", e))?
+                        .ok_or_else(|| format!("Source coin {} not found", source_coin_id))?
+                        .metadata.owner.clone()
+                        .ok_or_else(|| "Source coin has no owner".to_string())?;
+                    let output = local_runtime.execute_split_coin(
+                        &owner,
+                        source_coin_id,
+                        amounts,
+                        &ctx,
+                    ).map_err(|e| format!("Runtime split error: {}", e))?;
+                    if !output.success {
+                        return Err(output.message.unwrap_or_else(|| "Split failed".to_string()));
+                    }
+                    diff.add_state_changes(&output.state_changes);
+                } else {
+                    return Err("CoinSplit payload but operation is not SplitCoin".to_string());
+                }
+                let mut legacy_state = self.legacy_state.write().await;
+                self.record_event_processed(&mut legacy_state, event, diff);
+                return Ok(());
+            }
+            setu_types::event::EventPayload::CoinMergeThenTransfer { .. } => {
+                let ctx = ExecutionContext::new(
+                    self.config.solver_id.clone(),
+                    event.timestamp,
+                    false,
+                    Self::derive_tx_hash(&event.id),
+                );
+                if let setu_types::OperationType::MergeThenTransfer {
+                    target_index, source_indices, recipient, amount
+                } = &resolved_inputs.operation {
+                    let target_coin_id = resolved_inputs.input_objects[*target_index].object_id.clone();
+                    let source_coin_ids: Vec<setu_types::object::ObjectId> = source_indices.iter()
+                        .map(|&i| resolved_inputs.input_objects[i].object_id.clone())
+                        .collect();
+                    let owner = local_runtime.state()
+                        .get_object(&target_coin_id)
+                        .map_err(|e| format!("Failed to read target coin: {}", e))?
+                        .ok_or_else(|| format!("Target coin {} not found", target_coin_id))?
+                        .metadata.owner.clone()
+                        .ok_or_else(|| "Target coin has no owner".to_string())?;
+
+                    // Step 1: Merge — accumulate sources into target (same local_runtime)
+                    let mut merge_output = local_runtime.execute_merge_coins(
+                        &owner,
+                        target_coin_id.clone(),
+                        &source_coin_ids,
+                        &ctx,
+                    ).map_err(|e| format!("Runtime merge error: {}", e))?;
+                    if !merge_output.success {
+                        return Err(merge_output.message.unwrap_or_else(|| "Merge failed".to_string()));
+                    }
+
+                    // Step 2: Transfer from merged coin to recipient
+                    // ⚠️ Uses the SAME local_runtime — Step 2 reads Step 1's writes.
+                    // If Step 2 fails, the entire function returns Err and local_runtime
+                    // is discarded — no partial writes are committed.
+                    let transfer_output = local_runtime.execute_transfer_with_coin(
+                        target_coin_id,
+                        &owner.to_string(),
+                        &recipient.to_string(),
+                        Some(*amount),
+                        &ctx,
+                    ).map_err(|e| format!("Runtime transfer error: {}", e))?;
+                    if !transfer_output.success {
+                        return Err(transfer_output.message.unwrap_or_else(|| "Transfer failed".to_string()));
+                    }
+
+                    // Step 3: Combine state_changes (order matters! merge before transfer)
+                    merge_output.state_changes.extend(transfer_output.state_changes);
+                    merge_output.created_objects.extend(transfer_output.created_objects);
+                    merge_output.deleted_objects.extend(transfer_output.deleted_objects);
+                    diff.add_state_changes(&merge_output.state_changes);
+                } else {
+                    return Err("CoinMergeThenTransfer payload but operation is not MergeThenTransfer".to_string());
+                }
+                let mut legacy_state = self.legacy_state.write().await;
+                self.record_event_processed(&mut legacy_state, event, diff);
+                return Ok(());
+            }
             _ => {}
         }
         
@@ -413,79 +502,14 @@ impl MockEnclave {
         Ok(())
     }
     
-    /// Execute a transfer event via setu-runtime (solver-tee3 architecture)
+    /// Execute a transfer event using the provided runtime
     /// 
     /// Uses resolved_inputs.primary_coin() to get the coin_id that Validator
-    /// has already selected. This follows the solver-tee3 design where 
+    /// has already selected. This follows the solver-tee3 design where
     /// Validator prepares everything - if coin_id is missing, it's an error.
-    /// 
-    /// NOTE: This uses self.runtime (shared). For concurrent execution,
-    /// use execute_transfer_with_local_runtime() instead.
-    async fn execute_transfer_via_runtime(
-        &self,
-        event: &setu_types::Event,
-        transfer: &setu_types::Transfer,
-        resolved_inputs: &ResolvedInputs,
-        diff: &mut StateDiff,
-    ) -> Result<(), String> {
-        let ctx = ExecutionContext {
-            executor_id: self.config.solver_id.clone(),
-            timestamp: event.timestamp,
-            in_tee: false, // Mock enclave
-        };
-        
-        // solver-tee3: resolved_inputs MUST have primary_coin
-        let resolved_coin = resolved_inputs.primary_coin()
-            .ok_or_else(|| "Missing resolved_inputs.primary_coin - TaskPreparer error".to_string())?;
-        
-        debug!(
-            event_id = %event.id,
-            coin_id = %resolved_coin.object_id,
-            from = %transfer.from,
-            to = %transfer.to,
-            amount = transfer.amount,
-            "Executing transfer with resolved coin_id (solver-tee3)"
-        );
-        
-        // Use the coin_id from resolved_inputs
-        let output = {
-            let mut runtime = self.runtime.write().await;
-            runtime.execute_transfer_with_coin(
-                resolved_coin.object_id.clone(),
-                &transfer.from,
-                &transfer.to,
-                Some(transfer.amount as u64),
-                &ctx,
-            ).map_err(|e| format!("Runtime error: {}", e))?
-        };
-        
-        if !output.success {
-            return Err(output.message.unwrap_or_else(|| "Transfer failed".to_string()));
-        }
-        
-        // Convert setu-runtime StateChanges to enclave StateDiff using helper method
-        diff.add_state_changes(&output.state_changes);
-        
-        // Record event as processed
-        let mut legacy_state = self.legacy_state.write().await;
-        self.record_event_processed(&mut legacy_state, event, diff);
-        
-        info!(
-            event_id = %event.id,
-            from = %transfer.from,
-            to = %transfer.to,
-            amount = transfer.amount,
-            state_changes = output.state_changes.len(),
-            "Transfer executed successfully via setu-runtime"
-        );
-        
-        Ok(())
-    }
-    
-    /// Execute a transfer event with an isolated local runtime (solver-tee3 mode)
-    /// 
-    /// This variant takes a mutable reference to a LOCAL RuntimeExecutor,
-    /// ensuring complete isolation from concurrent tasks.
+    ///
+    /// Used by both legacy (shared runtime via write lock) and solver-tee3
+    /// (isolated runtime) execution paths.
     async fn execute_transfer_with_local_runtime(
         &self,
         event: &setu_types::Event,
@@ -494,11 +518,12 @@ impl MockEnclave {
         diff: &mut StateDiff,
         local_runtime: &mut RuntimeExecutor<InMemoryStateStore>,
     ) -> Result<(), String> {
-        let ctx = ExecutionContext {
-            executor_id: self.config.solver_id.clone(),
-            timestamp: event.timestamp,
-            in_tee: false, // Mock enclave
-        };
+        let ctx = ExecutionContext::new(
+            self.config.solver_id.clone(),
+            event.timestamp,
+            false, // Mock enclave
+            Self::derive_tx_hash(&event.id),
+        );
         
         // solver-tee3: resolved_inputs MUST have primary_coin
         let resolved_coin = resolved_inputs.primary_coin()
@@ -518,7 +543,7 @@ impl MockEnclave {
             resolved_coin.object_id.clone(),
             &transfer.from,
             &transfer.to,
-            Some(transfer.amount as u64),
+            Some(transfer.amount),
             &ctx,
         ).map_err(|e| format!("Runtime error: {}", e))?;
         
@@ -549,6 +574,14 @@ impl MockEnclave {
     // These are infrastructure events that should NEVER reach TEE.
     // They are executed directly by Validator via InfraExecutor.
     // See: setu_validator::InfraExecutor
+    
+    /// Derive a deterministic tx_hash from an event ID.
+    fn derive_tx_hash(event_id: &str) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_TX_HASH:");
+        hasher.update(event_id.as_bytes());
+        *hasher.finalize().as_bytes()
+    }
     
     /// Record that an event was processed (for non-transfer events)
     fn record_event_processed(
