@@ -204,37 +204,6 @@ impl Coin {
         self.data.balance.value()
     }
     
-    /// Split a specified amount into a new Coin
-    /// 
-    /// # Parameters
-    /// - `amount`: Amount to split
-    /// - `new_owner`: Owner of the new Coin
-    /// 
-    /// # Returns
-    /// Returns the newly created Coin object
-    pub fn split(&mut self, amount: u64, new_owner: Address) -> Result<Coin, String> {
-        let withdrawn = self.data.balance.withdraw(amount)?;
-        let new_coin = Coin::new_with_type(new_owner, withdrawn.value(), self.data.coin_type.clone());
-        self.increment_version();
-        Ok(new_coin)
-    }
-    
-    /// Merge another Coin into the current Coin
-    /// 
-    /// # Parameters
-    /// - `other`: The Coin object to merge (must be same coin type)
-    pub fn merge(&mut self, other: Coin) -> Result<(), String> {
-        if self.data.coin_type != other.data.coin_type {
-            return Err(format!(
-                "Cannot merge different coin types: {} vs {}",
-                self.data.coin_type, other.data.coin_type
-            ));
-        }
-        self.data.balance.deposit(other.data.balance)?;
-        self.increment_version();
-        Ok(())
-    }
-    
     /// Transfer ownership of the Coin
     /// 
     /// # Parameters
@@ -332,6 +301,96 @@ pub fn deterministic_coin_id_from_str(owner: &str, subnet_id: &str) -> ObjectId 
     ObjectId::new(*hasher.finalize().as_bytes())
 }
 
+// ============================================================================
+// Multi-Coin Model: Genesis Multi-Coin IDs
+// ============================================================================
+
+/// Generate deterministic Coin ObjectId for genesis multi-coin initialization.
+///
+/// When `coins_per_account > 1` in genesis.json, each account receives multiple
+/// coins with unique IDs. Index 0 uses the legacy `deterministic_coin_id_from_str`
+/// for backwards compatibility; indices 1..N use this function.
+///
+/// # Returns
+/// Deterministic ObjectId = BLAKE3("SETU_GENESIS_MULTI:" || owner || ":" || subnet_id || ":" || index)
+///
+/// # Domain separation
+/// Uses "SETU_GENESIS_MULTI:" prefix to prevent collisions with:
+/// - "SETU_COIN_ID:" (single genesis coin)
+/// - "SETU_COIN_TX:" (transaction-derived coins)
+pub fn deterministic_genesis_coin_id(owner: &str, subnet_id: &str, index: u32) -> ObjectId {
+    debug_assert!(
+        owner.starts_with("0x") && owner.len() == 66,
+        "deterministic_genesis_coin_id: expected canonical hex address, got '{}'",
+        owner
+    );
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"SETU_GENESIS_MULTI:");
+    hasher.update(owner.as_bytes());
+    hasher.update(b":");
+    hasher.update(subnet_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(&index.to_le_bytes());
+    ObjectId::new(*hasher.finalize().as_bytes())
+}
+
+// ============================================================================
+// Multi-Coin Model: Transaction-derived Coin IDs
+// ============================================================================
+
+/// Generate deterministic Coin ObjectId from transaction context.
+///
+/// Used in multi-Coin model where each new coin gets a unique,
+/// deterministic ID derived from the creating transaction.
+///
+/// # Arguments
+/// * `tx_hash` - Hash of the creating transaction (32 bytes)
+/// * `output_index` - Index of this coin among all coins created in the tx
+///
+/// # Returns
+/// Deterministic ObjectId = BLAKE3("SETU_COIN_TX:" || tx_hash || ":" || output_index)
+///
+/// # Determinism guarantee
+/// Same (tx_hash, output_index) → same ObjectId on all nodes.
+///
+/// # Domain separation
+/// Uses "SETU_COIN_TX:" prefix (vs "SETU_COIN_ID:" for deterministic_coin_id)
+/// to prevent collisions between the two ID schemes.
+pub fn coin_id_from_tx(tx_hash: &[u8; 32], output_index: u32) -> ObjectId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"SETU_COIN_TX:");
+    hasher.update(tx_hash);
+    hasher.update(b":");
+    hasher.update(&output_index.to_le_bytes());
+    ObjectId::new(*hasher.finalize().as_bytes())
+}
+
+/// Create a Coin with an externally specified ObjectId and deterministic timestamp.
+///
+/// Unlike `create_typed_coin` which generates an ID from (owner, type, value),
+/// this function accepts a pre-computed ID (e.g., from `coin_id_from_tx`).
+/// The digest is computed based on the provided ID, ensuring consistency.
+///
+/// # Arguments
+/// * `id` - Pre-computed ObjectId (e.g., from `coin_id_from_tx`)
+/// * `owner` - Owner address
+/// * `value` - Initial balance
+/// * `coin_type` - Coin type string (e.g., "ROOT", subnet_id)
+/// * `timestamp` - Deterministic timestamp (from ExecutionContext)
+pub fn create_coin_with_id(
+    id: ObjectId,
+    owner: Address,
+    value: u64,
+    coin_type: impl Into<String>,
+    timestamp: u64,
+) -> Coin {
+    let data = CoinData {
+        coin_type: CoinType::new(coin_type),
+        balance: Balance::new(value),
+    };
+    Object::new_owned_at(id, owner, data, timestamp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,54 +437,6 @@ mod tests {
         
         assert_eq!(coin.value(), 1000);
         assert_eq!(coin.coin_type().as_str(), "USDC");
-    }
-    
-    #[test]
-    fn test_coin_split() {
-        let owner = Address::from_str_id("sbt_alice");
-        let mut coin = Coin::new(owner, 1000);
-        
-        let new_owner = Address::from_str_id("sbt_bob");
-        let new_coin = coin.split(300, new_owner).unwrap();
-        
-        assert_eq!(coin.value(), 700);
-        assert_eq!(new_coin.value(), 300);
-        assert_eq!(coin.metadata.version, 2);
-        assert_eq!(new_coin.metadata.version, 1);
-        assert_eq!(new_coin.metadata.owner.as_ref().unwrap(), &new_owner);
-        // Split should preserve coin type
-        assert_eq!(new_coin.coin_type(), coin.coin_type());
-    }
-    
-    #[test]
-    fn test_coin_split_insufficient() {
-        let owner = Address::from_str_id("sbt_alice");
-        let mut coin = Coin::new(owner, 100);
-        
-        let result = coin.split(200, Address::from_str_id("sbt_bob"));
-        assert!(result.is_err());
-    }
-    
-    #[test]
-    fn test_coin_merge() {
-        let owner = Address::from_str_id("sbt_alice");
-        let mut coin1 = Coin::new(owner, 1000);
-        let coin2 = Coin::new(owner, 500);
-        
-        coin1.merge(coin2).unwrap();
-        
-        assert_eq!(coin1.value(), 1500);
-        assert_eq!(coin1.metadata.version, 2);
-    }
-    
-    #[test]
-    fn test_coin_merge_different_types() {
-        let owner = Address::from_str_id("sbt_alice");
-        let mut coin1 = Coin::new(owner, 1000);
-        let coin2 = Coin::new_with_type(owner, 500, CoinType::new("USDC"));
-        
-        // Cannot merge different coin types
-        assert!(coin1.merge(coin2).is_err());
     }
     
     #[test]

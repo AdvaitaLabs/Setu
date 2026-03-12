@@ -35,10 +35,25 @@ pub struct GenesisAccount {
 
     /// Initial balance in the smallest unit
     pub balance: u64,
+
+    /// Number of coin objects to create for this account (default: 1)
+    ///
+    /// When > 1, the total balance is split evenly across N coin objects.
+    /// This pre-shards the account's coins at genesis, enabling higher
+    /// per-sender parallelism in the multi-coin object model.
+    ///
+    /// Example: balance=1000000000, coins_per_account=5
+    /// → 5 coins × 200000000 each (last coin absorbs rounding remainder)
+    #[serde(default = "default_coins_per_account")]
+    pub coins_per_account: u32,
 }
 
 fn default_subnet_id() -> String {
     "ROOT".to_string()
+}
+
+fn default_coins_per_account() -> u32 {
+    1
 }
 
 impl GenesisConfig {

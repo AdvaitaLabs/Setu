@@ -50,7 +50,7 @@ pub use node::*;
 pub use object::{Object, ObjectId, Address, ObjectDigest, ObjectType, ObjectMetadata, Ownership, generate_object_id};
 
 // Coin related
-pub use coin::{Coin, CoinType, CoinData, CoinState, Balance, create_coin, create_typed_coin, deterministic_coin_id, deterministic_coin_id_from_str};
+pub use coin::{Coin, CoinType, CoinData, CoinState, Balance, create_coin, create_typed_coin, deterministic_coin_id, deterministic_coin_id_from_str, deterministic_genesis_coin_id, coin_id_from_tx, create_coin_with_id};
 
 // Profile & Credential related
 pub use profile::{

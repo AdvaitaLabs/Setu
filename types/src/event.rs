@@ -80,6 +80,12 @@ pub enum EventType {
     ContractCall,
     /// Smart contract / module publish
     ContractPublish,
+    /// Coin merge event (merge multiple coins into one)
+    CoinMerge,
+    /// Coin split event (split one coin into multiple)
+    CoinSplit,
+    /// Atomic compound: merge coins then transfer (partial or full)
+    CoinMergeThenTransfer,
 }
 
 impl EventType {
@@ -104,6 +110,9 @@ impl EventType {
                 | EventType::Relationship
                 | EventType::ContractCall
                 | EventType::ContractPublish
+                | EventType::CoinMerge
+                | EventType::CoinSplit
+                | EventType::CoinMergeThenTransfer
         )
     }
     
@@ -151,6 +160,9 @@ impl EventType {
             EventType::Relationship => "Relationship",
             EventType::ContractCall => "ContractCall",
             EventType::ContractPublish => "ContractPublish",
+            EventType::CoinMerge => "CoinMerge",
+            EventType::CoinSplit => "CoinSplit",
+            EventType::CoinMergeThenTransfer => "CoinMergeThenTransfer",
         }
     }
 }
@@ -195,6 +207,31 @@ pub enum EventPayload {
     ContractPublish {
         /// Compiled module bytecode
         modules: Vec<Vec<u8>>,
+    },
+    /// Coin merge operation (merge sources into target)
+    CoinMerge {
+        /// Target coin (receives merged balance)
+        target_coin_id: String,
+        /// Source coins to merge (will be deleted)
+        source_coin_ids: Vec<String>,
+    },
+    /// Coin split operation (split source into multiple)
+    CoinSplit {
+        /// Source coin to split
+        source_coin_id: String,
+        /// Amounts for each new coin
+        amounts: Vec<u64>,
+    },
+    /// Atomic compound: merge coins then transfer to recipient
+    CoinMergeThenTransfer {
+        /// Target coin (receives merged balance, then sends)
+        target_coin_id: String,
+        /// Source coins to merge (will be deleted)
+        source_coin_ids: Vec<String>,
+        /// Recipient of the transfer
+        recipient: String,
+        /// Amount to transfer after merge
+        amount: u64,
     },
 }
 
@@ -612,6 +649,20 @@ impl Event {
             EventPayload::ContractPublish { .. } => {
                 // Publisher is sender, captured by event.sender
                 vec![]
+            }
+            EventPayload::CoinMerge { target_coin_id, source_coin_ids } => {
+                let mut resources = vec![format!("coin:{}", target_coin_id)];
+                resources.extend(source_coin_ids.iter().map(|id| format!("coin:{}", id)));
+                resources
+            }
+            EventPayload::CoinSplit { source_coin_id, .. } => {
+                vec![format!("coin:{}", source_coin_id)]
+            }
+            EventPayload::CoinMergeThenTransfer { target_coin_id, source_coin_ids, recipient, .. } => {
+                let mut resources = vec![format!("coin:{}", target_coin_id)];
+                resources.extend(source_coin_ids.iter().map(|id| format!("coin:{}", id)));
+                resources.push(format!("user:{}", recipient));
+                resources
             }
             EventPayload::None => vec![],
             EventPayload::Genesis(g) => {
