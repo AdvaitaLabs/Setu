@@ -98,6 +98,11 @@ pub struct BenchmarkConfig {
     /// create user_001, user_002, ... user_N test accounts.
     /// Each test account receives `init_account_balance` tokens.
     /// 
+    /// Seed accounts are pre-sharded at genesis with multiple coins
+    /// (default 5 per genesis.json `coins_per_account`), so up to
+    /// 3 seeds × 5 coins = 15 accounts can be initialized in parallel
+    /// per round. More seed coins → faster init.
+    /// 
     /// This enables high-concurrency testing without requiring Validator
     /// to pre-initialize all test accounts.
     #[arg(long, default_value = "0")]
@@ -109,13 +114,20 @@ pub struct BenchmarkConfig {
 
     /// Number of coin objects to create per account (for concurrency)
     /// 
-    /// Each account's balance is split into N coin objects during init.
-    /// More coins = higher per-account concurrency (each coin can be
-    /// reserved independently for parallel transfers).
+    /// Setu uses a multi-coin object model where each account can own
+    /// multiple coin objects of the same type. Each coin can be reserved
+    /// independently, enabling parallel transfers from the same sender.
+    /// 
+    /// During account initialization, the balance is split into N coin
+    /// objects. More coins = higher per-account concurrency.
     /// 
     /// Recommended: set to concurrency / init_accounts * 2 or higher.
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "5")]
     pub coins_per_account: u64,
+
+    /// Path to genesis.json file (used to read seed account addresses)
+    #[arg(long, default_value = "genesis.json")]
+    pub genesis_file: String,
 
     /// Use batch API instead of single transfer API
     #[arg(long, default_value = "false")]

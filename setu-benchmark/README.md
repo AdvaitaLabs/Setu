@@ -63,9 +63,10 @@ cargo run -p setu-benchmark -- \
 ```
 
 **Why account initialization matters:**
-- Setu uses 1:1 binding between (owner, subnet) and coin
-- Each account can only process one transfer at a time
-- Success rate ≈ min(num_accounts / concurrency, 1) * 100%
+- Setu uses a multi-coin object model where each account can own multiple coin objects
+- Each coin can only be reserved by one transfer at a time
+- More coins per account = higher per-sender concurrency
+- For best results, set `--coins-per-account` >= `concurrency / init_accounts`
 
 ### Batch Mode (New)
 
@@ -103,6 +104,7 @@ cargo run -p setu-benchmark -- \
 | `--warmup` | Number of warmup requests | `100` |
 | `--init-accounts` | Number of test accounts to initialize (0=skip) | `0` |
 | `--init-account-balance` | Balance for each initialized account | `100000` |
+| `--coins-per-account` | Coin objects per account (more = higher parallelism) | `3` |
 | `--use-test-accounts` | Use test accounts instead of random addresses | `false` |
 | `--use-batch` | Use batch API endpoint | `false` |
 | `--batch-size` | Number of transfers per batch | `50` |
@@ -115,6 +117,12 @@ cargo run -p setu-benchmark -- \
 
 ## Account Architecture
 
+### Multi-Coin Object Model
+
+Setu uses a multi-coin object model where each account can own multiple coin objects
+of the same type. Each coin can be reserved independently for parallel transfers.
+Partial transfers automatically create new coins for recipients via split.
+
 ### Seed Accounts (Validator-side)
 The validator initializes 3 seed accounts with high balance (1B tokens each):
 - `alice`
@@ -125,9 +133,10 @@ The validator initializes 3 seed accounts with high balance (1B tokens each):
 When `--init-accounts N` is specified:
 1. Benchmark creates `user_001` to `user_N` by transferring from seed accounts
 2. Each test account receives `--init-account-balance` tokens
-3. Transfers are distributed across seed accounts using round-robin
+3. The balance is split into `--coins-per-account` coin objects for concurrency
+4. Transfers are distributed across seed accounts using round-robin
 
-This design decouples the Validator from benchmark-specific requirements.
+This design leverages the multi-coin model to maximize per-sender parallelism.
 
 ## Batch API Benefits
 
