@@ -282,6 +282,35 @@ impl Clone for GlobalStateManager {
 }
 
 impl GlobalStateManager {
+    /// Create a full read snapshot (preserving all index data).
+    ///
+    /// Unlike `clone()`, this method preserves coin_type_index, owner_coin_index,
+    /// and modification_tracker, so the read snapshot can properly serve queries.
+    ///
+    /// ## Differences from clone()
+    ///
+    /// | Field | clone() | clone_for_read_snapshot() |
+    /// |-------|---------|--------------------------|
+    /// | subnet_states | ✅ preserved | ✅ preserved |
+    /// | store | ❌ set to None | ❌ set to None |
+    /// | coin_type_index | ❌ cleared | ✅ preserved |
+    /// | owner_coin_index | ❌ cleared | ✅ preserved |
+    /// | modification_tracker | ❌ cleared | ✅ preserved |
+    ///
+    /// ## Performance
+    /// - subnet_states: O(N_subnets), each SMT internal im::HashMap O(1) clone (currently N=1)
+    /// - Index clone: O(N_accounts), 200 accounts → ~100μs
+    pub fn clone_for_read_snapshot(&self) -> Self {
+        Self {
+            subnet_states: self.subnet_states.clone(),  // O(N_subnets), each SMT clone O(1) (im::HashMap structural sharing)
+            store: None,  // Read snapshot doesn't need storage backend
+            current_anchor: self.current_anchor,
+            coin_type_index: self.coin_type_index.clone(),
+            owner_coin_index: self.owner_coin_index.clone(),
+            modification_tracker: self.modification_tracker.clone(),
+        }
+    }
+
     /// Create a new global state manager
     pub fn new() -> Self {
         let mut subnet_states = HashMap::new();
@@ -946,16 +975,31 @@ impl GlobalStateManager {
                     continue;
                 }
                 
-                // Conflict detection: verify old_value matches current SMT state
+                // Conflict detection: verify old_value matches current SMT state.
                 // This prevents double-spend where two events read the same stale state.
                 // If any state_change has an old_value that doesn't match current state,
                 // the event's read_set was stale → skip entire event.
+                //
+                // R9 fix: pending_writes shadow map for same-key multi-write support.
+                // MergeThenTransfer produces two writes to the same key within one event
+                // (merge Update → transfer Update). Without pending_writes, the second
+                // write's old_value would be compared against the un-updated SMT value,
+                // causing a false conflict. pending_writes tracks in-flight writes so
+                // the second check sees the first write's new_value.
                 let smt = self.get_subnet_mut(subnet_id);
+                let mut pending_writes: HashMap<HashValue, Option<Vec<u8>>> = HashMap::new();
                 for change in &result.state_changes {
+                    let object_id = Self::parse_state_change_key(&change.key);
+
                     if let Some(ref expected_old) = change.old_value {
-                        let object_id = Self::parse_state_change_key(&change.key);
-                        let current_value = smt.get(&object_id).cloned();
-                        if current_value.as_ref() != Some(expected_old) {
+                        // Check pending_writes first (prior change within same event),
+                        // fall back to SMT for the ground-truth current value.
+                        let effective_current = if let Some(pending) = pending_writes.get(&object_id) {
+                            pending.clone()
+                        } else {
+                            smt.get(&object_id).cloned()
+                        };
+                        if effective_current.as_ref() != Some(expected_old) {
                             // Stale read detected: current state differs from what
                             // the Solver saw when it executed this event.
                             // This is the double-spend safety net.
@@ -967,7 +1011,28 @@ impl GlobalStateManager {
                             summary.conflicted_events.push(event.id.clone());
                             continue 'event_loop;
                         }
+                    } else {
+                        // R15: Create operation (old_value is None) — defense-in-depth.
+                        // If the key already exists in SMT or pending_writes, something
+                        // is wrong (duplicate coin ID or replayed creation).
+                        let exists_in_pending = pending_writes.get(&object_id)
+                            .map(|v| v.is_some())
+                            .unwrap_or(false);
+                        let exists_in_smt = smt.get(&object_id).is_some();
+                        if exists_in_pending || exists_in_smt {
+                            tracing::warn!(
+                                event_id = %event.id,
+                                key = %change.key,
+                                "Create conflict: key already exists (duplicate coin ID?), skipping event"
+                            );
+                            summary.conflicted_events.push(event.id.clone());
+                            continue 'event_loop;
+                        }
                     }
+
+                    // Record this write in pending_writes so subsequent changes
+                    // within the same event see the updated value.
+                    pending_writes.insert(object_id, change.new_value.clone());
                 }
                 
                 let changes_count = result.state_changes.len();

@@ -23,6 +23,7 @@
 //! ```
 
 use crate::state::manager::GlobalStateManager;
+use crate::state::shared::SharedStateManager;
 use setu_merkle::{HashValue, SparseMerkleProof};
 use setu_types::{ObjectId, SubnetId};
 use std::collections::HashMap;
@@ -138,8 +139,8 @@ pub trait StateProvider: Send + Sync {
 /// This implementation reads state from the actual Merkle trees,
 /// providing real proofs and state data.
 pub struct MerkleStateProvider {
-    /// Global state manager with all subnet SMTs
-    state_manager: Arc<RwLock<GlobalStateManager>>,
+    /// Shared state manager (read-write separated)
+    shared: Arc<SharedStateManager>,
 
     /// Default subnet to operate on (usually ROOT)
     default_subnet: SubnetId,
@@ -151,26 +152,26 @@ pub struct MerkleStateProvider {
 
 impl MerkleStateProvider {
     /// Create a new MerkleStateProvider
-    pub fn new(state_manager: Arc<RwLock<GlobalStateManager>>) -> Self {
+    pub fn new(shared: Arc<SharedStateManager>) -> Self {
         Self {
-            state_manager,
+            shared,
             default_subnet: SubnetId::ROOT,
             modification_tracker: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// Create with a specific default subnet
-    pub fn with_subnet(state_manager: Arc<RwLock<GlobalStateManager>>, subnet_id: SubnetId) -> Self {
+    pub fn with_subnet(shared: Arc<SharedStateManager>, subnet_id: SubnetId) -> Self {
         Self {
-            state_manager,
+            shared,
             default_subnet: subnet_id,
             modification_tracker: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Get the underlying state manager (for direct access if needed)
-    pub fn state_manager(&self) -> Arc<RwLock<GlobalStateManager>> {
-        Arc::clone(&self.state_manager)
+    /// Get the underlying shared state manager
+    pub fn shared_state_manager(&self) -> Arc<SharedStateManager> {
+        Arc::clone(&self.shared)
     }
 
     /// Record that an event modified objects
@@ -205,8 +206,10 @@ impl MerkleStateProvider {
     /// During normal operation, apply_state_change() handles index updates,
     /// but this method is useful for manual initialization (genesis, tests).
     pub fn register_coin_type(&self, address: &str, subnet_id: &str) {
-        let mut gsm = self.state_manager.write().unwrap();
+        let mut gsm = self.shared.lock_write();
         gsm.register_coin_type(address, subnet_id);
+        // Note: init-time writes don't need immediate publish_snapshot()
+        // Genesis publishes once at the end
     }
 
     /// Get all registered subnet_ids for an address
@@ -216,8 +219,8 @@ impl MerkleStateProvider {
     /// This method queries the GlobalStateManager's authoritative index,
     /// which is kept in sync by apply_state_change().
     pub fn get_coin_types_for_address(&self, address: &str) -> Vec<String> {
-        let gsm = self.state_manager.read().unwrap();
-        gsm.get_coin_types_for_address(address)
+        let snapshot = self.shared.load_snapshot();
+        snapshot.get_coin_types_for_address(address)
             .into_iter()
             .collect()
     }
@@ -234,17 +237,19 @@ impl MerkleStateProvider {
     /// # Returns
     /// Number of coin entries indexed
     pub fn rebuild_coin_type_index(&self) -> usize {
-        let mut gsm = self.state_manager.write().unwrap();
+        let mut gsm = self.shared.lock_write();
         let count = gsm.rebuild_coin_type_index();
         debug!(coin_count = count, "Rebuilt coin_type_index from Merkle Tree");
+        // Publish after rebuilding index so readers see the updated index
+        self.shared.publish_snapshot(&gsm);
         count
     }
 
     /// Get statistics about the index
     pub fn index_stats(&self) -> (usize, usize) {
         // Return GSM's index stats as the authoritative source
-        let gsm = self.state_manager.read().unwrap();
-        gsm.coin_type_index_stats()
+        let snapshot = self.shared.load_snapshot();
+        snapshot.coin_type_index_stats()
     }
 
     // ------------------------------------------------------------------------
@@ -294,9 +299,9 @@ impl MerkleStateProvider {
 
     /// Get object from a specific subnet SMT
     fn get_object_from_subnet(&self, object_id_bytes: &[u8; 32], subnet_id: &SubnetId) -> Option<Vec<u8>> {
-        let manager = self.state_manager.read().unwrap();
+        let snapshot = self.shared.load_snapshot();
         let hash = HashValue::from_slice(object_id_bytes).ok()?;
-        manager.get_subnet(subnet_id)?.get(&hash).cloned()
+        snapshot.get_subnet(subnet_id)?.get(&hash).cloned()
     }
 
     /// Get object from the default subnet (ROOT)
@@ -306,9 +311,9 @@ impl MerkleStateProvider {
 
     /// Get Merkle proof from a specific subnet SMT
     fn get_proof_from_subnet(&self, object_id_bytes: &[u8; 32], subnet_id: &SubnetId) -> Option<SparseMerkleProof> {
-        let manager = self.state_manager.read().unwrap();
+        let snapshot = self.shared.load_snapshot();
         let hash = HashValue::from_slice(object_id_bytes).ok()?;
-        manager.get_subnet(subnet_id).map(|smt| smt.prove(&hash))
+        snapshot.get_subnet(subnet_id).map(|smt| smt.prove(&hash))
     }
 
     /// Get Merkle proof from the default subnet (ROOT)
@@ -333,46 +338,58 @@ impl StateProvider for MerkleStateProvider {
         // Canonicalize address to lowercase hex format ("0x...").
         let addr_hex = resolve_owner_address(address);
         
+        // Single snapshot for the entire method — guarantees cross-read consistency
+        let snapshot = self.shared.load_snapshot();
+        
         // Use owner_coin_index to find all (object_id, coin_type) pairs for this owner.
-        // This works for both deterministic init coins AND runtime split coins.
-        let manager = self.state_manager.read().unwrap();
-        let coin_objects = manager.get_coin_objects_for_address(&addr_hex);
-        drop(manager);
+        let coin_objects = snapshot.get_coin_objects_for_address(&addr_hex);
         
         if coin_objects.is_empty() {
             // Fallback: try deterministic ROOT subnet coin id
             let coin_object_id = Self::coin_object_id(&addr_hex);
             let target_subnet = SubnetId::ROOT;
-            if let Some(data) = self.get_object_from_subnet(&coin_object_id, &target_subnet) {
-                if let Some(coin_state) = CoinState::from_bytes(&data) {
-                    return vec![CoinInfo {
-                        object_id: ObjectId::new(coin_object_id),
-                        owner: coin_state.owner,
-                        balance: coin_state.balance,
-                        version: coin_state.version,
-                        coin_type: coin_state.coin_type,
-                    }];
+            let hash = match HashValue::from_slice(&coin_object_id) {
+                Ok(h) => h,
+                Err(_) => return vec![],
+            };
+            if let Some(smt) = snapshot.get_subnet(&target_subnet) {
+                if let Some(data) = smt.get(&hash).cloned() {
+                    if let Some(coin_state) = CoinState::from_bytes(&data) {
+                        return vec![CoinInfo {
+                            object_id: ObjectId::new(coin_object_id),
+                            owner: coin_state.owner,
+                            balance: coin_state.balance,
+                            version: coin_state.version,
+                            coin_type: coin_state.coin_type,
+                        }];
+                    }
                 }
             }
             debug!(address = %address, addr_hex = %addr_hex, "No coins found for address");
             return vec![];
         }
 
-        // Look up each coin object from its subnet SMT
+        // Look up each coin object from its subnet SMT — using the same snapshot
         let mut coins = Vec::new();
         for (object_id_bytes, coin_type) in coin_objects {
             let target_subnet = Self::resolve_subnet_id(&coin_type);
-            if let Some(data) = self.get_object_from_subnet(&object_id_bytes, &target_subnet) {
-                if let Some(coin_state) = CoinState::from_bytes(&data) {
-                    // Only include if still owned by this address
-                    if coin_state.owner == addr_hex {
-                        coins.push(CoinInfo {
-                            object_id: ObjectId::new(object_id_bytes),
-                            owner: coin_state.owner,
-                            balance: coin_state.balance,
-                            version: coin_state.version,
-                            coin_type: coin_state.coin_type,
-                        });
+            let hash = match HashValue::from_slice(&object_id_bytes) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            if let Some(smt) = snapshot.get_subnet(&target_subnet) {
+                if let Some(data) = smt.get(&hash).cloned() {
+                    if let Some(coin_state) = CoinState::from_bytes(&data) {
+                        // Only include if still owned by this address
+                        if coin_state.owner == addr_hex {
+                            coins.push(CoinInfo {
+                                object_id: ObjectId::new(object_id_bytes),
+                                owner: coin_state.owner,
+                                balance: coin_state.balance,
+                                version: coin_state.version,
+                                coin_type: coin_state.coin_type,
+                            });
+                        }
                     }
                 }
             }
@@ -389,8 +406,8 @@ impl StateProvider for MerkleStateProvider {
     }
 
     fn get_state_root(&self) -> [u8; 32] {
-        let manager = self.state_manager.read().unwrap();
-        let (root, _) = manager.compute_global_root_bytes();
+        let snapshot = self.shared.load_snapshot();
+        let (root, _) = snapshot.compute_global_root_bytes();
         root
     }
 
@@ -403,8 +420,8 @@ impl StateProvider for MerkleStateProvider {
     fn get_last_modifying_event(&self, object_id: &ObjectId) -> Option<String> {
         // First check GSM's modification_tracker (populated by apply_committed_events)
         {
-            let gsm = self.state_manager.read().unwrap();
-            if let Some(event_id) = gsm.get_last_modifying_event(object_id.as_bytes()) {
+            let snapshot = self.shared.load_snapshot();
+            if let Some(event_id) = snapshot.get_last_modifying_event(object_id.as_bytes()) {
                 return Some(event_id.clone());
             }
         }
@@ -500,8 +517,8 @@ pub fn init_coin_with_provider(
     subnet_id: &str,
 ) -> ObjectId {
     let object_id = {
-        let state_manager = provider.state_manager();
-        let mut manager = state_manager.write().unwrap();
+        let shared = provider.shared_state_manager();
+        let mut manager = shared.lock_write();
         init_coin_with_type(&mut manager, owner, balance, subnet_id)
     };
     
@@ -509,41 +526,6 @@ pub fn init_coin_with_provider(
     provider.register_coin_type(owner, subnet_id);
     
     object_id
-}
-
-/// Get or create a coin for the given address and subnet
-/// 
-/// This is useful for transfer operations where the recipient may not have
-/// a coin object yet. Returns the existing coin or creates one with 0 balance.
-/// 
-/// # Arguments
-/// * `provider` - The MerkleStateProvider
-/// * `owner` - Owner address
-/// * `subnet_id` - Subnet ID (determines token type)
-/// 
-/// # Returns
-/// (ObjectId, is_new) - object ID and whether it was newly created
-pub fn get_or_create_coin(
-    provider: &MerkleStateProvider,
-    owner: &str,
-    subnet_id: &str,
-) -> (ObjectId, bool) {
-    // coin_object_id_with_type normalizes the address internally
-    let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(owner, subnet_id);
-    let object_id = ObjectId::new(object_id_bytes);
-    
-    // Resolve the correct subnet to query
-    // Coins are stored in their respective subnet's SMT (physical isolation)
-    let target_subnet = MerkleStateProvider::resolve_subnet_id(subnet_id);
-    
-    // Check if coin already exists in the correct subnet
-    if provider.get_object_from_subnet(&object_id_bytes, &target_subnet).is_some() {
-        return (object_id, false);
-    }
-    
-    // Create new coin with 0 balance
-    let new_object_id = init_coin_with_provider(provider, owner, 0, subnet_id);
-    (new_object_id, true)
 }
 
 /// Mint initial supply for a subnet token to the owner
@@ -565,6 +547,84 @@ pub fn mint_subnet_token(
     init_coin_with_provider(provider, subnet_owner, initial_supply, subnet_id)
 }
 
+/// Initialize multiple coins for the same owner in a single account.
+///
+/// Splits `total_balance` across `num_coins` coin objects for the given owner.
+/// This enables higher per-sender parallelism at genesis, since each coin can
+/// be reserved independently for concurrent transfers.
+///
+/// # ID generation
+/// - Index 0: uses `deterministic_coin_id` (legacy-compatible)
+/// - Index 1..N: uses `deterministic_genesis_coin_id` (multi-coin scheme)
+///
+/// # Arguments
+/// * `state_manager` - The GlobalStateManager to register coins in
+/// * `owner` - Owner name or hex address
+/// * `total_balance` - Total balance to split across coins
+/// * `num_coins` - Number of coin objects to create (must be >= 1)
+/// * `subnet_id` - Subnet ID (coin type)
+///
+/// # Returns
+/// Vector of created ObjectIds
+pub fn init_coins_split(
+    state_manager: &mut GlobalStateManager,
+    owner: &str,
+    total_balance: u64,
+    num_coins: u32,
+    subnet_id: &str,
+) -> Vec<ObjectId> {
+    let num_coins = num_coins.max(1) as u64;
+
+    if num_coins == 1 {
+        return vec![init_coin_with_type(state_manager, owner, total_balance, subnet_id)];
+    }
+
+    let owner_hex = resolve_owner_address(owner);
+    let balance_per_coin = total_balance / num_coins;
+    let remainder = total_balance - balance_per_coin * (num_coins - 1);
+
+    let target_subnet = if subnet_id == "ROOT" {
+        setu_types::subnet::SubnetId::ROOT
+    } else {
+        setu_types::subnet::SubnetId::from_hex(subnet_id).unwrap_or_else(|_| {
+            setu_types::subnet::SubnetId::from_str_id(subnet_id)
+        })
+    };
+
+    let mut ids = Vec::with_capacity(num_coins as usize);
+
+    for idx in 0..num_coins {
+        let coin_balance = if idx == num_coins - 1 {
+            remainder
+        } else {
+            balance_per_coin
+        };
+
+        let object_id_bytes = if idx == 0 {
+            // Index 0: legacy deterministic_coin_id for backwards compatibility
+            MerkleStateProvider::coin_object_id_with_type(&owner_hex, subnet_id)
+        } else {
+            // Index 1..N: genesis multi-coin ID
+            *setu_types::deterministic_genesis_coin_id(
+                &owner_hex, subnet_id, idx as u32,
+            ).as_bytes()
+        };
+
+        let coin_state = CoinState::new_with_type(
+            owner_hex.clone(),
+            coin_balance,
+            subnet_id.to_string(),
+        );
+
+        state_manager.upsert_object(target_subnet, object_id_bytes, coin_state.to_bytes());
+        state_manager.register_coin_object(&owner_hex, subnet_id, object_id_bytes);
+
+        ids.push(ObjectId::new(object_id_bytes));
+    }
+
+    ids
+}
+
 /// Get coin state from raw bytes
 pub fn get_coin_state(data: &[u8]) -> Option<CoinState> {
     CoinState::from_bytes(data)
@@ -573,6 +633,21 @@ pub fn get_coin_state(data: &[u8]) -> Option<CoinState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper: create SharedStateManager from a GSM (for tests)
+    fn make_shared(gsm: GlobalStateManager) -> Arc<SharedStateManager> {
+        Arc::new(SharedStateManager::new(gsm))
+    }
+
+    /// Helper: create SharedStateManager, init coins via closure, then publish
+    fn make_shared_with_init<F>(f: F) -> Arc<SharedStateManager>
+    where
+        F: FnOnce(&mut GlobalStateManager),
+    {
+        let mut gsm = GlobalStateManager::new();
+        f(&mut gsm);
+        Arc::new(SharedStateManager::new(gsm))
+    }
 
     #[test]
     fn test_coin_state_serialization() {
@@ -587,16 +662,12 @@ mod tests {
 
     #[test]
     fn test_merkle_state_provider() {
-        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
-
-        // Initialize a coin for ROOT subnet
-        {
-            let mut manager = state_manager.write().unwrap();
-            init_coin(&mut manager, "alice", 1000);  // Uses ROOT as default
-        }
+        let shared = make_shared_with_init(|gsm| {
+            init_coin(gsm, "alice", 1000);  // Uses ROOT as default
+        });
 
         // Create provider and query
-        let provider = MerkleStateProvider::new(Arc::clone(&state_manager));
+        let provider = MerkleStateProvider::new(Arc::clone(&shared));
 
         // Query by ROOT subnet (not SETU)
         let coins = provider.get_coins_for_address_by_type("alice", "ROOT");
@@ -617,8 +688,8 @@ mod tests {
 
     #[test]
     fn test_modification_tracking() {
-        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
-        let provider = MerkleStateProvider::new(state_manager);
+        let shared = make_shared(GlobalStateManager::new());
+        let provider = MerkleStateProvider::new(shared);
 
         let object_id = ObjectId::new([1u8; 32]);
 
@@ -637,22 +708,22 @@ mod tests {
 
     #[test]
     fn test_multi_coin_types() {
-        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
-
-        // Initialize coins for different subnets
-        // Note: coin_type now represents subnet_id (1:1 binding)
-        {
-            let mut manager = state_manager.write().unwrap();
-            init_coin_with_type(&mut manager, "alice", 1000, "ROOT");       // Root subnet
-            init_coin_with_type(&mut manager, "alice", 500, "defi-subnet"); // DeFi subnet
-            init_coin_with_type(&mut manager, "alice", 200, "nft-subnet");  // NFT subnet
-        }
+        let shared = make_shared_with_init(|gsm| {
+            init_coin_with_type(gsm, "alice", 1000, "ROOT");       // Root subnet
+            init_coin_with_type(gsm, "alice", 500, "defi-subnet"); // DeFi subnet
+            init_coin_with_type(gsm, "alice", 200, "nft-subnet");  // NFT subnet
+        });
 
         // Create provider and register subnets for this address
-        let provider = MerkleStateProvider::new(Arc::clone(&state_manager));
+        let provider = MerkleStateProvider::new(Arc::clone(&shared));
         provider.register_coin_type("alice", "ROOT");
         provider.register_coin_type("alice", "defi-subnet");
         provider.register_coin_type("alice", "nft-subnet");
+        // Publish after registrations so readers see updated index
+        {
+            let gsm = shared.lock_write();
+            shared.publish_snapshot(&gsm);
+        }
 
         // Query all coins for alice
         let coins = provider.get_coins_for_address("alice");
@@ -675,35 +746,18 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_create_coin() {
-        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
-        let provider = MerkleStateProvider::new(Arc::clone(&state_manager));
-
-        // First call should create a new coin
-        let (object_id, is_new) = get_or_create_coin(&provider, "bob", "MYTOKEN");
-        assert!(is_new);
-        
-        // Verify coin was created with 0 balance
-        let coins = provider.get_coins_for_address_by_type("bob", "MYTOKEN");
-        assert_eq!(coins.len(), 1);
-        assert_eq!(coins[0].balance, 0);
-        assert_eq!(coins[0].object_id, object_id);
-
-        // Second call should return existing coin
-        let (object_id2, is_new2) = get_or_create_coin(&provider, "bob", "MYTOKEN");
-        assert!(!is_new2);
-        assert_eq!(object_id, object_id2);
-    }
-
-    #[test]
     fn test_mint_subnet_token() {
-        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
-        let provider = MerkleStateProvider::new(Arc::clone(&state_manager));
+        let shared = make_shared(GlobalStateManager::new());
+        let provider = MerkleStateProvider::new(Arc::clone(&shared));
 
         // Mint initial supply to subnet owner
-        // Note: subnet_id is first param, then owner, then amount
         let subnet_id = "my-app-subnet";
         let obj_id = mint_subnet_token(&provider, subnet_id, "subnet_owner", 1_000_000);
+        // Publish after mint so readers see the new coin
+        {
+            let gsm = shared.lock_write();
+            shared.publish_snapshot(&gsm);
+        }
         
         // Query by subnet_id (not token_symbol)
         let coins = provider.get_coins_for_address_by_type("subnet_owner", subnet_id);
@@ -714,22 +768,16 @@ mod tests {
 
     #[test]
     fn test_rebuild_coin_type_index() {
-        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
-
-        // Initialize multiple coins for multiple users
-        // Using subnet_id as the coin namespace
-        // Note: init_coin_with_type now auto-registers to GSM index
-        {
-            let mut manager = state_manager.write().unwrap();
-            init_coin_with_type(&mut manager, "alice", 1000, "ROOT");
-            init_coin_with_type(&mut manager, "alice", 500, "defi-subnet");
-            init_coin_with_type(&mut manager, "bob", 800, "ROOT");
-            init_coin_with_type(&mut manager, "bob", 300, "gaming-subnet");
-            init_coin_with_type(&mut manager, "charlie", 100, "ROOT");
-        }
+        let shared = make_shared_with_init(|gsm| {
+            init_coin_with_type(gsm, "alice", 1000, "ROOT");
+            init_coin_with_type(gsm, "alice", 500, "defi-subnet");
+            init_coin_with_type(gsm, "bob", 800, "ROOT");
+            init_coin_with_type(gsm, "bob", 300, "gaming-subnet");
+            init_coin_with_type(gsm, "charlie", 100, "ROOT");
+        });
 
         // Create provider - coins are already indexed in GSM
-        let provider = MerkleStateProvider::new(Arc::clone(&state_manager));
+        let provider = MerkleStateProvider::new(Arc::clone(&shared));
 
         // Before rebuild: alice's coins ARE found (auto-registered by init_coin_with_type)
         let alice_coins_before = provider.get_coins_for_address("alice");
@@ -757,8 +805,8 @@ mod tests {
 
     #[test]
     fn test_rebuild_index_empty_tree() {
-        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
-        let provider = MerkleStateProvider::new(state_manager);
+        let shared = make_shared(GlobalStateManager::new());
+        let provider = MerkleStateProvider::new(shared);
 
         // Rebuild on empty tree should work without error
         let count = provider.rebuild_coin_type_index();
