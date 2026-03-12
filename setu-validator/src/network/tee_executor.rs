@@ -45,9 +45,10 @@ use tracing::{debug, error, info, warn};
 /// 
 /// Ensures the reservation is released even if the task panics.
 /// Uses `Option::take()` pattern to allow explicit release or auto-release on drop.
+/// Supports both single and multi-coin (NeedMerge) reservations.
 struct ReservationGuard {
     manager: Option<Arc<CoinReservationManager>>,
-    handle: Option<ReservationHandle>,
+    handles: Vec<ReservationHandle>,
     transfer_id: String,
 }
 
@@ -57,18 +58,29 @@ impl ReservationGuard {
         handle: Option<ReservationHandle>,
         transfer_id: String,
     ) -> Self {
-        Self { manager, handle, transfer_id }
+        let handles = handle.into_iter().collect();
+        Self { manager, handles, transfer_id }
     }
 
-    /// Explicitly release the reservation (called on normal completion)
+    fn new_batch(
+        manager: Option<Arc<CoinReservationManager>>,
+        handles: Vec<ReservationHandle>,
+        transfer_id: String,
+    ) -> Self {
+        Self { manager, handles, transfer_id }
+    }
+
+    /// Explicitly release all reservations (called on normal completion)
     fn release(&mut self) {
-        if let (Some(mgr), Some(handle)) = (self.manager.take(), self.handle.take()) {
-            mgr.release(&handle);
-            debug!(
-                transfer_id = %self.transfer_id,
-                coin_id = %hex::encode(handle.coin_id.as_bytes()),
-                "Released coin reservation after TEE task completion"
-            );
+        if let Some(mgr) = self.manager.take() {
+            for handle in self.handles.drain(..) {
+                debug!(
+                    transfer_id = %self.transfer_id,
+                    coin_id = %hex::encode(handle.coin_id.as_bytes()),
+                    "Released coin reservation after TEE task completion"
+                );
+                mgr.release(&handle);
+            }
         }
     }
 }
@@ -76,13 +88,15 @@ impl ReservationGuard {
 impl Drop for ReservationGuard {
     fn drop(&mut self) {
         // Auto-release on drop (panic safety)
-        if let (Some(mgr), Some(handle)) = (self.manager.take(), self.handle.take()) {
-            mgr.release(&handle);
-            warn!(
-                transfer_id = %self.transfer_id,
-                coin_id = %hex::encode(handle.coin_id.as_bytes()),
-                "Reservation released via Drop (possible panic or early return)"
-            );
+        if let Some(mgr) = self.manager.take() {
+            for handle in self.handles.drain(..) {
+                warn!(
+                    transfer_id = %self.transfer_id,
+                    coin_id = %hex::encode(handle.coin_id.as_bytes()),
+                    "Reservation released via Drop (possible panic or early return)"
+                );
+                mgr.release(&handle);
+            }
         }
     }
 }
@@ -171,12 +185,32 @@ impl TeeExecutor {
         task: SolverTask,
         reservation: Option<ReservationHandle>,
     ) -> Result<(Event, u64, usize), String> {
+        self.execute_solver_inline_batch(
+            transfer_id,
+            solver_id,
+            task,
+            reservation.into_iter().collect(),
+        )
+        .await
+    }
+
+    /// Execute a solver task inline with batch reservation support.
+    ///
+    /// Same as `execute_solver_inline` but accepts multiple reservation handles
+    /// for NeedMerge (multi-coin) scenarios.
+    pub async fn execute_solver_inline_batch(
+        &self,
+        transfer_id: &str,
+        solver_id: &str,
+        task: SolverTask,
+        reservations: Vec<ReservationHandle>,
+    ) -> Result<(Event, u64, usize), String> {
         let task_id_hex = hex::encode(&task.task_id[..8]);
 
         // RAII guard for panic-safe reservation release
-        let mut reservation_guard = ReservationGuard::new(
+        let mut reservation_guard = ReservationGuard::new_batch(
             self.coin_reservation_manager.clone(),
-            reservation,
+            reservations,
             transfer_id.to_string(),
         );
 

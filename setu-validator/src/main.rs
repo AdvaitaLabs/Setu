@@ -15,7 +15,7 @@ use setu_validator::{
 };
 use setu_storage::{
     SetuDB, RocksDBEventStore, RocksDBCFStore, RocksDBAnchorStore, RocksDBMerkleStore,
-    GlobalStateManager, EventStoreBackend, CFStoreBackend, AnchorStoreBackend, B4StoreExt,
+    GlobalStateManager, SharedStateManager, EventStoreBackend, CFStoreBackend, AnchorStoreBackend, B4StoreExt,
     MerkleStateProvider,
 };
 use setu_types::{
@@ -24,7 +24,7 @@ use setu_types::{
     CoinState, Address, VLCSnapshot,
 };
 use setu_keys::{load_keypair};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::net::SocketAddr;
 use tracing::{info, error, warn, Level};
 use tracing_subscriber;
@@ -165,10 +165,11 @@ async fn main() -> anyhow::Result<()> {
     // quorum = (1 * 2) / 3 + 1 = 1, so single validator can finalize
     let mut consensus = ConsensusConfig::default();
     consensus.validator_count = 1;
-    // Lower vlc_delta_threshold for testing - allows faster CF creation
-    // Default is 10, which requires 10 VLC ticks to create a CF
-    // For low-throughput scenarios (like account initialization), this causes delays
-    consensus.vlc_delta_threshold = 3;
+    // Higher vlc_delta_threshold reduces anchor commit frequency,
+    // minimizing GlobalStateManager write-lock contention under high TPS.
+    // Each anchor commit blocks ALL task preparation reads, so less frequent = higher throughput.
+    // 3→5287; 10→5658; 20→5472; 50→5227; 100→4801; 200→4411. Optimal = 10.
+    consensus.vlc_delta_threshold = 10;
     
     let consensus_config = ConsensusValidatorConfig {
         node_info,
@@ -179,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
     
     // Create SHARED GlobalStateManager (used by both TaskPreparer and ConsensusValidator)
     // This is the key fix: both components now share the same state!
-    let shared_state_manager: Arc<RwLock<GlobalStateManager>> = if let Some(ref db_path) = config.db_path {
+    let shared_state_manager: Arc<SharedStateManager> = if let Some(ref db_path) = config.db_path {
         // RocksDB persistence mode
         info!("Opening RocksDB at: {}", db_path);
         let db = match SetuDB::open_default(db_path) {
@@ -191,10 +192,10 @@ async fn main() -> anyhow::Result<()> {
         };
         
         let merkle_store: Arc<dyn B4StoreExt> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
-        Arc::new(RwLock::new(GlobalStateManager::with_store(merkle_store)))
+        Arc::new(SharedStateManager::new(GlobalStateManager::with_store(merkle_store)))
     } else {
         // Memory mode
-        Arc::new(RwLock::new(GlobalStateManager::new()))
+        Arc::new(SharedStateManager::new(GlobalStateManager::new()))
     };
     
     // Create task preparer with the SHARED state manager
@@ -203,6 +204,13 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&shared_state_manager),
     ));
     info!("✓ TaskPreparer initialized with shared state manager");
+
+    // Create batch task preparer sharing the same state (production path)
+    let batch_task_preparer = Arc::new(setu_validator::BatchTaskPreparer::new(
+        config.node_config.node_id.clone(),
+        Arc::new(setu_storage::MerkleStateProvider::new(Arc::clone(&shared_state_manager))),
+    ));
+    info!("✓ BatchTaskPreparer initialized with shared state manager");
     
     // Create ConsensusValidator with appropriate storage backend
     let consensus_validator = if let Some(ref db_path) = config.db_path {
@@ -266,34 +274,89 @@ async fn main() -> anyhow::Result<()> {
                 );
 
                 // Build state changes for each genesis account
+                // Supports multi-coin: when coins_per_account > 1, balance is split
+                // across N coin objects for higher per-sender parallelism.
                 let mut state_changes = Vec::new();
                 for account in &genesis_config.accounts {
                     // Validate that the address is a proper hex address
                     let owner_addr = Address::from_hex(&account.address)
                         .expect("genesis account must have valid hex address");
                     let owner_hex = owner_addr.to_string();
-                    let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(
-                        &owner_hex,
-                        &genesis_config.subnet_id,
-                    );
-                    let coin_state = CoinState::new_with_type(
-                        owner_hex.clone(),
-                        account.balance,
-                        genesis_config.subnet_id.clone(),
-                    );
-                    let key = format!("oid:{}", hex::encode(object_id_bytes));
-                    state_changes.push(StateChange {
-                        key,
-                        old_value: None,
-                        new_value: Some(coin_state.to_bytes()),
-                    });
-                    info!(
-                        name = ?account.name,
-                        owner = %owner_hex,
-                        balance = account.balance,
-                        object_id = %hex::encode(object_id_bytes),
-                        "Genesis account prepared"
-                    );
+                    let num_coins = account.coins_per_account.max(1) as u64;
+
+                    if num_coins == 1 {
+                        // Single coin (legacy path): use deterministic_coin_id
+                        let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(
+                            &owner_hex,
+                            &genesis_config.subnet_id,
+                        );
+                        let coin_state = CoinState::new_with_type(
+                            owner_hex.clone(),
+                            account.balance,
+                            genesis_config.subnet_id.clone(),
+                        );
+                        let key = format!("oid:{}", hex::encode(object_id_bytes));
+                        state_changes.push(StateChange {
+                            key,
+                            old_value: None,
+                            new_value: Some(coin_state.to_bytes()),
+                        });
+                        info!(
+                            name = ?account.name,
+                            owner = %owner_hex,
+                            balance = account.balance,
+                            object_id = %hex::encode(object_id_bytes),
+                            "Genesis account prepared (1 coin)"
+                        );
+                    } else {
+                        // Multi-coin: split balance across N coins
+                        let balance_per_coin = account.balance / num_coins;
+                        let remainder = account.balance - balance_per_coin * (num_coins - 1);
+
+                        for idx in 0..num_coins {
+                            let coin_balance = if idx == num_coins - 1 {
+                                remainder  // last coin absorbs rounding remainder
+                            } else {
+                                balance_per_coin
+                            };
+
+                            let object_id = if idx == 0 {
+                                // Index 0: use legacy deterministic_coin_id for compatibility
+                                setu_types::deterministic_coin_id_from_str(
+                                    &owner_hex,
+                                    &genesis_config.subnet_id,
+                                )
+                            } else {
+                                setu_types::deterministic_genesis_coin_id(
+                                    &owner_hex,
+                                    &genesis_config.subnet_id,
+                                    idx as u32,
+                                )
+                            };
+                            let object_id_bytes = *object_id.as_bytes();
+
+                            let coin_state = CoinState::new_with_type(
+                                owner_hex.clone(),
+                                coin_balance,
+                                genesis_config.subnet_id.clone(),
+                            );
+                            let key = format!("oid:{}", hex::encode(object_id_bytes));
+                            state_changes.push(StateChange {
+                                key,
+                                old_value: None,
+                                new_value: Some(coin_state.to_bytes()),
+                            });
+                        }
+                        info!(
+                            name = ?account.name,
+                            owner = %owner_hex,
+                            total_balance = account.balance,
+                            coins = num_coins,
+                            balance_per_coin = balance_per_coin,
+                            "Genesis account prepared ({} coins)",
+                            num_coins
+                        );
+                    }
                 }
 
                 // Build genesis event with pre-computed execution result
@@ -339,8 +402,7 @@ async fn main() -> anyhow::Result<()> {
                 // will re-apply these changes (upsert is idempotent).
                 {
                     let genesis_event_id = genesis_event.id.clone();
-                    let mut gsm = shared_state_manager.write()
-                        .expect("Failed to acquire write lock on GlobalStateManager");
+                    let mut gsm = shared_state_manager.lock_write();
                     for change in &state_changes {
                         gsm.apply_state_change(
                             setu_types::subnet::SubnetId::ROOT,
@@ -359,6 +421,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    shared_state_manager.publish_snapshot(&gsm);
                 }
                 info!(
                     "✓ Genesis state applied: {} seed accounts initialized",
@@ -382,6 +445,7 @@ async fn main() -> anyhow::Result<()> {
         config.node_config.node_id.clone(),
         router_manager.clone(),
         task_preparer.clone(),
+        batch_task_preparer.clone(),
         consensus_validator.clone(),
         network_config,
     ));

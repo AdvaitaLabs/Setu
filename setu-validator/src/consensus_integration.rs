@@ -27,13 +27,13 @@ use setu_types::{
     Anchor, ConsensusConfig, ConsensusFrame, Event, EventId, Vote,
     NodeInfo, ValidatorInfo, SetuResult, SetuError, SubnetId,
 };
+use setu_storage::SharedStateManager;
 use setu_storage::subnet_state::GlobalStateManager;
 use setu_storage::{EventStore, CFStore, AnchorStore, EventStoreBackend, AnchorStoreBackend, CFStoreBackend};
 use crate::network_adapter::MessageRouter;
 use crate::persistence::FinalizationPersister;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::RwLock as StdRwLock;
 use tokio::sync::{mpsc, RwLock, Mutex, broadcast};
 use tracing::{debug, info, warn};
 
@@ -134,7 +134,7 @@ impl ConsensusValidator {
             config.consensus.clone(),
             config.node_info.id.clone(),
             validator_set.clone(),
-            Arc::new(StdRwLock::new(GlobalStateManager::default())),  // Use default state manager
+            Arc::new(SharedStateManager::new(GlobalStateManager::default())),  // Use default state manager
             Arc::clone(&event_store),        // Share the same EventStore!
         ));
         
@@ -164,7 +164,7 @@ impl ConsensusValidator {
     /// storage design works correctly (Layer3 fallback to EventStore).
     pub fn with_shared_state_manager(
         config: ConsensusValidatorConfig,
-        state_manager: Arc<StdRwLock<GlobalStateManager>>,
+        state_manager: Arc<SharedStateManager>,
     ) -> Self {
         let (msg_tx, msg_rx) = mpsc::channel(config.message_buffer_size);
         let (finalization_tx, _) = broadcast::channel(100);
@@ -222,7 +222,7 @@ impl ConsensusValidator {
     /// ```
     pub fn with_event_store_backend(
         config: ConsensusValidatorConfig,
-        state_manager: Arc<StdRwLock<GlobalStateManager>>,
+        state_manager: Arc<SharedStateManager>,
         event_store: Arc<dyn EventStoreBackend>,
     ) -> Self {
         let (msg_tx, msg_rx) = mpsc::channel(config.message_buffer_size);
@@ -280,7 +280,7 @@ impl ConsensusValidator {
     /// let cf_store: Arc<dyn CFStoreBackend> = Arc::new(RocksDBCFStore::from_shared(db.clone()));
     /// let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(RocksDBAnchorStore::from_shared(db.clone()));
     /// let merkle_store: Arc<dyn MerkleStore> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
-    /// let state_manager = Arc::new(StdRwLock::new(GlobalStateManager::with_store(merkle_store)));
+    /// let state_manager = Arc::new(SharedStateManager::new(GlobalStateManager::with_store(merkle_store)));
     /// 
     /// let validator = ConsensusValidator::with_all_backends(
     ///     config,
@@ -292,7 +292,7 @@ impl ConsensusValidator {
     /// ```
     pub fn with_all_backends(
         config: ConsensusValidatorConfig,
-        state_manager: Arc<StdRwLock<GlobalStateManager>>,
+        state_manager: Arc<SharedStateManager>,
         event_store: Arc<dyn EventStoreBackend>,
         cf_store: Arc<dyn CFStoreBackend>,
         anchor_store: Arc<dyn AnchorStoreBackend>,

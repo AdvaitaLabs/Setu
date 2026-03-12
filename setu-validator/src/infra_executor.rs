@@ -26,14 +26,14 @@
 //! logic as TEE to maintain consistency.
 
 use setu_runtime::{RuntimeExecutor, ExecutionContext, ExecutionOutput, InMemoryStateStore};
-use setu_storage::{GlobalStateManager, MerkleStateProvider};
+use setu_storage::{SharedStateManager, MerkleStateProvider};
 use setu_types::{
     Address, SubnetId,
     registration::{SubnetRegistration, UserRegistration},
     event::{Event, EventPayload, ExecutionResult, StateChange as EventStateChange},
 };
 use setu_vlc::VLCSnapshot;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tracing::{info, warn, error};
 
 /// Infrastructure event executor for Validator
@@ -68,11 +68,20 @@ impl InfraExecutor {
             .map_err(|e| e.to_string())?
             .as_millis() as u64;
 
-        let ctx = ExecutionContext {
-            executor_id: self.validator_id.clone(),
-            timestamp,
-            in_tee: false,
+        // Derive tx_hash from registration for deterministic ID generation
+        let tx_hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"SETU_TX_HASH:VALIDATOR:SUBNET:");
+            hasher.update(registration.subnet_id.as_bytes());
+            hasher.update(&timestamp.to_le_bytes());
+            *hasher.finalize().as_bytes()
         };
+        let ctx = ExecutionContext::new(
+            self.validator_id.clone(),
+            timestamp,
+            false,
+            tx_hash,
+        );
 
         // Create a temporary InMemoryStateStore for execution
         // In production, this would integrate with the actual state
@@ -142,11 +151,20 @@ impl InfraExecutor {
             .map_err(|e| e.to_string())?
             .as_millis() as u64;
 
-        let ctx = ExecutionContext {
-            executor_id: self.validator_id.clone(),
-            timestamp,
-            in_tee: false,
+        // Derive tx_hash from registration for deterministic ID generation
+        let tx_hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"SETU_TX_HASH:VALIDATOR:USER:");
+            hasher.update(registration.address.as_bytes());
+            hasher.update(&timestamp.to_le_bytes());
+            *hasher.finalize().as_bytes()
         };
+        let ctx = ExecutionContext::new(
+            self.validator_id.clone(),
+            timestamp,
+            false,
+            tx_hash,
+        );
 
         let temp_store = InMemoryStateStore::new();
         let mut runtime = RuntimeExecutor::new(temp_store);
@@ -203,9 +221,8 @@ impl InfraExecutor {
     /// AND coin index updates (coin_type_index, owner_coin_index).
     fn apply_state_changes(&self, output: &ExecutionOutput) -> Result<(), String> {
         // Get write access to the state manager
-        let state_manager = self.state_provider.state_manager();
-        let mut manager = state_manager.write()
-            .map_err(|e| format!("Failed to acquire state manager lock: {}", e))?;
+        let shared = self.state_provider.shared_state_manager();
+        let mut manager = shared.lock_write();
 
         for sc in &output.state_changes {
             // Convert to event-layer StateChange with canonical "oid:{hex}" key format
@@ -213,6 +230,9 @@ impl InfraExecutor {
             let event_sc = sc.to_event_state_change();
             manager.apply_state_change(SubnetId::ROOT, &event_sc);
         }
+        
+        // Publish snapshot so read path sees the infra changes immediately
+        shared.publish_snapshot(&manager);
 
         Ok(())
     }
@@ -225,8 +245,8 @@ mod tests {
 
     #[test]
     fn test_subnet_register() {
-        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
-        let provider = Arc::new(MerkleStateProvider::new(state_manager));
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(shared));
         let executor = InfraExecutor::new("validator-1".to_string(), provider);
 
         let registration = SubnetRegistration::new("subnet-test", "Test Subnet", "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf", "TEST")
@@ -248,8 +268,8 @@ mod tests {
 
     #[test]
     fn test_user_register() {
-        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
-        let provider = Arc::new(MerkleStateProvider::new(state_manager));
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(shared));
         let executor = InfraExecutor::new("validator-1".to_string(), provider);
 
         let registration = UserRegistration::from_metamask(

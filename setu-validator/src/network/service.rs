@@ -125,6 +125,7 @@ impl ValidatorNetworkService {
         validator_id: String,
         router_manager: Arc<RouterManager>,
         task_preparer: Arc<TaskPreparer>,
+        batch_task_preparer: Arc<BatchTaskPreparer>,
         config: NetworkServiceConfig,
     ) -> Self {
         let start_time = current_timestamp_secs();
@@ -165,9 +166,7 @@ impl ValidatorNetworkService {
 
         // Create BatchTaskPreparer from TaskPreparer's state
         // Note: In production, both should share the same MerkleStateProvider
-        let batch_task_preparer = Arc::new(
-            BatchTaskPreparer::new_for_testing(validator_id.clone())
-        );
+        let batch_task_preparer = batch_task_preparer;
 
         Self {
             validator_id,
@@ -199,6 +198,7 @@ impl ValidatorNetworkService {
         validator_id: String,
         router_manager: Arc<RouterManager>,
         task_preparer: Arc<TaskPreparer>,
+        batch_task_preparer: Arc<BatchTaskPreparer>,
         consensus_validator: Arc<ConsensusValidator>,
         config: NetworkServiceConfig,
     ) -> Self {
@@ -239,11 +239,8 @@ impl ValidatorNetworkService {
             100, // Max concurrent TEE calls
         ).with_coin_reservation_manager(Arc::clone(&coin_reservation_manager));
 
-        // Create BatchTaskPreparer from TaskPreparer's state
-        // Note: In production, both should share the same MerkleStateProvider
-        let batch_task_preparer = Arc::new(
-            BatchTaskPreparer::new_for_testing(validator_id.clone())
-        );
+        // Use the passed-in batch_task_preparer (shares state with TaskPreparer)
+        let batch_task_preparer = batch_task_preparer;
 
         Self {
             validator_id,
@@ -760,12 +757,14 @@ mod tests {
     fn create_test_service() -> Arc<ValidatorNetworkService> {
         let router_manager = Arc::new(RouterManager::new());
         let task_preparer = Arc::new(TaskPreparer::new_for_testing("test-validator".to_string()));
+        let batch_task_preparer = Arc::new(BatchTaskPreparer::new_for_testing("test-validator".to_string()));
         let config = NetworkServiceConfig::default();
 
         Arc::new(ValidatorNetworkService::new(
             "test-validator".to_string(),
             router_manager,
             task_preparer,
+            batch_task_preparer,
             config,
         ))
     }
