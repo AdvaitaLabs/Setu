@@ -1,5 +1,6 @@
 //! Transaction types for simple runtime
 
+use crate::sui_vm::SuiVmArg;
 use serde::{Deserialize, Serialize};
 use setu_types::{Address, ObjectId};
 
@@ -10,6 +11,8 @@ pub enum TransactionType {
     Transfer(TransferTx),
     /// Query transaction (read-only)
     Query(QueryTx),
+    /// Program transaction (Sui disassembly subset execution)
+    Program(ProgramTx),
 }
 
 /// Simplified transaction structure
@@ -47,6 +50,19 @@ pub struct QueryTx {
     pub params: serde_json::Value,
 }
 
+/// Program transaction (direct Sui subset VM execution)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramTx {
+    /// Sui `.mvb` disassembly text containing the target function.
+    pub disassembly: String,
+    /// Entry function name to execute.
+    pub function_name: String,
+    /// Arguments supplied to the entry function.
+    pub args: Vec<SuiVmArg>,
+    /// Optional gas budget (reserved for future accounting).
+    pub gas_budget: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QueryType {
     /// Query balance
@@ -72,9 +88,9 @@ impl Transaction {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
+
         let id = format!("tx_{:x}", timestamp);
-        
+
         Self {
             id,
             sender,
@@ -129,16 +145,16 @@ impl Transaction {
             timestamp: ctx_timestamp,
         }
     }
-    
+
     /// Create a new balance query transaction
     pub fn new_balance_query(address: Address) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
+
         let id = format!("query_{:x}", timestamp);
-        
+
         Self {
             id,
             sender: address.clone(),
@@ -148,6 +164,58 @@ impl Transaction {
             }),
             input_objects: vec![],
             timestamp,
+        }
+    }
+
+    /// Create a new Sui program transaction
+    pub fn new_program(
+        sender: Address,
+        disassembly: String,
+        function_name: impl Into<String>,
+        args: Vec<SuiVmArg>,
+    ) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let id = format!("prog_{:x}", timestamp);
+
+        Self {
+            id,
+            sender,
+            tx_type: TransactionType::Program(ProgramTx {
+                disassembly,
+                function_name: function_name.into(),
+                args,
+                gas_budget: None,
+            }),
+            input_objects: vec![],
+            timestamp,
+        }
+    }
+
+    /// Create a deterministic Sui program transaction
+    pub fn new_program_deterministic(
+        sender: Address,
+        disassembly: String,
+        function_name: impl Into<String>,
+        args: Vec<SuiVmArg>,
+        ctx_timestamp: u64,
+    ) -> Self {
+        let id = format!("prog_{:x}", ctx_timestamp);
+
+        Self {
+            id,
+            sender,
+            tx_type: TransactionType::Program(ProgramTx {
+                disassembly,
+                function_name: function_name.into(),
+                args,
+                gas_budget: None,
+            }),
+            input_objects: vec![],
+            timestamp: ctx_timestamp,
         }
     }
 }
