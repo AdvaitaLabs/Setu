@@ -1,5 +1,6 @@
 //! Transaction types for simple runtime
 
+use crate::program_vm::Program;
 use serde::{Deserialize, Serialize};
 use setu_types::{Address, ObjectId};
 
@@ -10,6 +11,8 @@ pub enum TransactionType {
     Transfer(TransferTx),
     /// Query transaction (read-only)
     Query(QueryTx),
+    /// Program transaction (VM execution)
+    Program(ProgramTx),
 }
 
 /// Simplified transaction structure
@@ -47,6 +50,15 @@ pub struct QueryTx {
     pub params: serde_json::Value,
 }
 
+/// Program transaction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramTx {
+    /// Program bytecode/instructions
+    pub program: Program,
+    /// Optional gas budget (reserved for future accounting)
+    pub gas_budget: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QueryType {
     /// Query balance
@@ -72,9 +84,9 @@ impl Transaction {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
+
         let id = format!("tx_{:x}", timestamp);
-        
+
         Self {
             id,
             sender,
@@ -129,16 +141,16 @@ impl Transaction {
             timestamp: ctx_timestamp,
         }
     }
-    
+
     /// Create a new balance query transaction
     pub fn new_balance_query(address: Address) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
+
         let id = format!("query_{:x}", timestamp);
-        
+
         Self {
             id,
             sender: address.clone(),
@@ -148,6 +160,47 @@ impl Transaction {
             }),
             input_objects: vec![],
             timestamp,
+        }
+    }
+
+    /// Create a new VM program transaction
+    pub fn new_program(sender: Address, program: Program) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let id = format!("prog_{:x}", timestamp);
+
+        Self {
+            id,
+            sender,
+            tx_type: TransactionType::Program(ProgramTx {
+                program,
+                gas_budget: None,
+            }),
+            input_objects: vec![],
+            timestamp,
+        }
+    }
+
+    /// Create a deterministic VM program transaction
+    pub fn new_program_deterministic(
+        sender: Address,
+        program: Program,
+        ctx_timestamp: u64,
+    ) -> Self {
+        let id = format!("prog_{:x}", ctx_timestamp);
+
+        Self {
+            id,
+            sender,
+            tx_type: TransactionType::Program(ProgramTx {
+                program,
+                gas_budget: None,
+            }),
+            input_objects: vec![],
+            timestamp: ctx_timestamp,
         }
     }
 }
