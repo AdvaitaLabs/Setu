@@ -1021,11 +1021,21 @@ impl GlobalStateManager {
                             .unwrap_or(false);
                         let exists_in_smt = smt.get(&object_id).is_some();
                         if exists_in_pending || exists_in_smt {
-                            tracing::warn!(
-                                event_id = %event.id,
-                                key = %change.key,
-                                "Create conflict: key already exists (duplicate coin ID?), skipping event"
-                            );
+                            if event.is_genesis() {
+                                // Genesis state was pre-applied to GSM at startup for
+                                // immediate availability (before CF forms). The duplicate
+                                // here is expected and harmless — just skip silently.
+                                tracing::debug!(
+                                    event_id = %event.id,
+                                    "Genesis event already applied at startup, skipping (expected)"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    event_id = %event.id,
+                                    key = %change.key,
+                                    "Create conflict: key already exists (duplicate coin ID?), skipping event"
+                                );
+                            }
                             summary.conflicted_events.push(event.id.clone());
                             continue 'event_loop;
                         }
