@@ -61,6 +61,72 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+
+    /// Generate, recover, inspect, and export keys
+    #[command(name = "gen-key")]
+    GenKey {
+        #[command(subcommand)]
+        action: GenKeyAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum GenKeyAction {
+    /// Generate a new keypair (random mnemonic)
+    Generate {
+        /// Signature scheme: ed25519, secp256k1, secp256r1
+        #[arg(long, short, default_value = "ed25519")]
+        scheme: String,
+
+        /// Mnemonic word count: 12, 15, 18, 21, 24
+        #[arg(long, short, default_value_t = 12)]
+        words: u8,
+
+        /// Output key file path (base64-encoded keypair)
+        #[arg(long, short)]
+        output: Option<String>,
+
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Recover keypair from a BIP-39 mnemonic
+    Recover {
+        /// BIP-39 mnemonic phrase
+        #[arg(long, short)]
+        mnemonic: String,
+
+        /// Signature scheme
+        #[arg(long, short, default_value = "ed25519")]
+        scheme: String,
+
+        /// Output key file path
+        #[arg(long, short)]
+        output: Option<String>,
+
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect an existing key file (public info only)
+    Inspect {
+        /// Key file path
+        #[arg(long, short = 'f')]
+        file: String,
+    },
+
+    /// Export key material from a key file
+    Export {
+        /// Key file path
+        #[arg(long, short = 'f')]
+        file: String,
+
+        /// Format: base64, hex, public
+        #[arg(long, default_value = "base64")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -361,6 +427,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Config { action } => {
             commands::config::handle(action).await?;
+        }
+        Commands::GenKey { action } => {
+            commands::gen_key::handle(action).await?;
         }
     }
     

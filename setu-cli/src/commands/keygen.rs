@@ -4,12 +4,9 @@ use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
 use setu_keys::{
     SignatureScheme, SetuKeyPair,
-    derive_address_from_secp256k1,
-    address_to_hex,
     generate_new_key,
     key_derive::derive_key_pair_from_mnemonic,
 };
-use k256::elliptic_curve::sec1::ToEncodedPoint;
 use std::fs;
 use std::path::Path;
 use colored::Colorize;
@@ -21,9 +18,9 @@ pub struct KeypairData {
     pub node_id: String,
     /// Node type (validator or solver)
     pub node_type: String,
-    /// Setu account address (0x + 64 hex chars, 32 bytes from Keccak256)
+    /// Setu account address (0x + 64 hex chars, 32 bytes from Blake2b-256)
     pub account_address: String,
-    /// Public key (hex encoded, 65 bytes uncompressed for secp256k1)
+    /// Public key (hex encoded, 32 bytes for ed25519)
     pub public_key: String,
     /// Private key (hex encoded, 32 bytes) - SENSITIVE!
     pub private_key: String,
@@ -37,47 +34,36 @@ pub struct KeypairData {
 }
 
 /// Generate a new keypair for validator or solver
+///
+/// Uses ed25519 scheme — compatible with Vote signing/verification which
+/// requires 32-byte ed25519 public keys.
 pub fn generate_keypair(
     node_type: &str,
     node_id: Option<String>,
     metadata: serde_json::Value,
 ) -> Result<KeypairData> {
-    println!("{} Generating {} keypair...", "🔑".cyan(), node_type);
+    println!("{} Generating {} keypair (ed25519)...", "🔑".cyan(), node_type);
     
-    // Generate secp256k1 keypair with mnemonic
-    let (address, keypair, scheme, mnemonic) = generate_new_key(
-        SignatureScheme::Secp256k1,
+    // Generate ed25519 keypair with mnemonic
+    let (address, keypair, _scheme, mnemonic) = generate_new_key(
+        SignatureScheme::ED25519,
         None,
         None,
     ).context("Failed to generate keypair")?;
     
-    // Get public key bytes (uncompressed, 65 bytes)
-    let public_key = keypair.public();
+    // ed25519 public key is 32 bytes
+    let public_key_bytes = keypair.public().as_bytes();
     
-    // For secp256k1, we need to get the uncompressed format (65 bytes)
-    let public_key_bytes = match &public_key {
-        setu_keys::PublicKey::Secp256k1(vk) => {
-            // Get uncompressed point (65 bytes: 0x04 || x || y)
-            use k256::elliptic_curve::sec1::ToEncodedPoint;
-            let point = vk.to_encoded_point(false); // false = uncompressed
-            point.as_bytes().to_vec()
-        }
-        _ => public_key.as_bytes(),
-    };
-    
-    // Derive Setu address (32 bytes from Keccak256)
-    let address_bytes = derive_address_from_secp256k1(&public_key_bytes)
-        .context("Failed to derive address")?;
-    let account_address = address_to_hex(&address_bytes);
+    // Use standard SetuAddress (Blake2b-256) returned by generate_new_key
+    let account_address = address.to_hex();
     
     // Generate node_id if not provided
     let node_id = node_id.unwrap_or_else(|| {
         format!("{}-{}", node_type, &account_address[2..10])
     });
     
-    // Get private key bytes
+    // Get private key bytes (skip scheme flag byte)
     let private_key_hex = keypair.encode_base64();
-    // Extract just the private key part (remove scheme flag)
     let private_key_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &private_key_hex
@@ -124,40 +110,27 @@ pub fn recover_from_mnemonic(
     node_id: Option<String>,
     metadata: serde_json::Value,
 ) -> Result<KeypairData> {
-    println!("{} Recovering {} keypair from mnemonic...", "🔄".cyan(), node_type);
+    println!("{} Recovering {} keypair from mnemonic (ed25519)...", "🔄".cyan(), node_type);
     
-    // Derive keypair from mnemonic
+    // Derive ed25519 keypair from mnemonic
     let (address, keypair) = derive_key_pair_from_mnemonic(
         mnemonic,
-        &SignatureScheme::Secp256k1,
+        &SignatureScheme::ED25519,
         None,
     ).context("Failed to derive keypair from mnemonic")?;
     
-    // Get public key bytes
-    let public_key = keypair.public();
+    // ed25519 public key is 32 bytes
+    let public_key_bytes = keypair.public().as_bytes();
     
-    // For secp256k1, we need to get the uncompressed format (65 bytes)
-    let public_key_bytes = match &public_key {
-        setu_keys::PublicKey::Secp256k1(vk) => {
-            // Get uncompressed point (65 bytes: 0x04 || x || y)
-            use k256::elliptic_curve::sec1::ToEncodedPoint;
-            let point = vk.to_encoded_point(false); // false = uncompressed
-            point.as_bytes().to_vec()
-        }
-        _ => public_key.as_bytes(),
-    };
-    
-    // Derive Setu address (32 bytes from Keccak256)
-    let address_bytes = derive_address_from_secp256k1(&public_key_bytes)
-        .context("Failed to derive address")?;
-    let account_address = address_to_hex(&address_bytes);
+    // Use standard SetuAddress (Blake2b-256)
+    let account_address = address.to_hex();
     
     // Generate node_id if not provided
     let node_id = node_id.unwrap_or_else(|| {
         format!("{}-{}", node_type, &account_address[2..10])
     });
     
-    // Get private key bytes
+    // Get private key bytes (skip scheme flag byte)
     let private_key_hex = keypair.encode_base64();
     let private_key_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
