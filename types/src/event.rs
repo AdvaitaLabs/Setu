@@ -528,6 +528,19 @@ impl Event {
         computed == self.id
     }
 
+    /// Recompute and update the event ID based on current fields.
+    ///
+    /// Must be called after modifying `creator`, `timestamp`, or `vlc_snapshot`
+    /// to keep the ID consistent. Used for deterministic genesis events.
+    pub fn recompute_id(&mut self) {
+        self.id = Self::compute_id(
+            &self.parent_ids,
+            &self.vlc_snapshot,
+            &self.creator,
+            self.timestamp,
+        );
+    }
+
     /// Legacy method for backward compatibility
     pub fn with_transfer(mut self, transfer: Transfer) -> Self {
         self.transfer = Some(transfer.clone());
