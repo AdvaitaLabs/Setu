@@ -127,11 +127,21 @@ impl AnemoNetworkService {
     }
 
     /// Connect to a peer
+    ///
+    /// Supports both IP addresses (e.g., "127.0.0.1") and DNS hostnames
+    /// (e.g., "validator-1" in Docker). Uses tokio::net::lookup_host for
+    /// async DNS resolution.
     pub async fn connect_to_peer(&self, node_info: NodeInfo) -> Result<PeerId> {
         let addr = format!("{}:{}", node_info.address, node_info.port);
-        let socket_addr: std::net::SocketAddr = addr
-            .parse()
-            .map_err(|e| AnemoError::InvalidConfig(format!("Invalid address: {}", e)))?;
+        let socket_addr = tokio::net::lookup_host(&addr)
+            .await
+            .map_err(|e| AnemoError::ConnectionFailed(
+                format!("Failed to resolve address {}: {}", addr, e),
+            ))?
+            .next()
+            .ok_or_else(|| AnemoError::ConnectionFailed(
+                format!("No addresses resolved for {}", addr),
+            ))?;
         let peer_id = self.transport.connect(socket_addr).await?;
         
         // Add to peer manager

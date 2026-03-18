@@ -37,17 +37,17 @@ pub struct QuicConfig {
     /// Maximum concurrent unidirectional streams
     pub max_concurrent_uni_streams: u64,
 
-    /// Stream receive window size
-    pub stream_receive_window: u64,
+    /// Stream receive window size (None = use anemo default 1.25MB)
+    pub stream_receive_window: Option<u64>,
 
-    /// Connection receive window size
-    pub receive_window: u64,
+    /// Connection receive window size (None = use anemo default, unlimited)
+    pub receive_window: Option<u64>,
 
-    /// Send window size
-    pub send_window: u64,
+    /// Send window size (None = use anemo default 10MB)
+    pub send_window: Option<u64>,
 
-    /// Max idle timeout in milliseconds
-    pub max_idle_timeout_ms: u64,
+    /// Max idle timeout in milliseconds (None = use anemo default 10s)
+    pub max_idle_timeout_ms: Option<u64>,
 
     /// Keep-alive interval in milliseconds
     pub keep_alive_interval_ms: Option<u64>,
@@ -115,10 +115,10 @@ impl Default for QuicConfig {
         Self {
             max_concurrent_bidi_streams: 100,
             max_concurrent_uni_streams: 100,
-            stream_receive_window: 1_250_000,      // 1.25MB
-            receive_window: 0,                      // Unlimited
-            send_window: 10_000_000,                // 10MB
-            max_idle_timeout_ms: 30_000,            // 30 seconds
+            stream_receive_window: Some(1_250_000), // 1.25MB
+            receive_window: None,                   // None = anemo default (unlimited)
+            send_window: Some(10_000_000),          // 10MB
+            max_idle_timeout_ms: Some(30_000),      // 30 seconds
             keep_alive_interval_ms: Some(5_000),    // 5 seconds
             // Use smaller buffer sizes for better compatibility
             socket_send_buffer_size: Some(2 << 20), // 2MB (was 20MB)
@@ -160,10 +160,10 @@ impl AnemoConfig {
         let mut quic_config = anemo::QuicConfig::default();
         quic_config.max_concurrent_bidi_streams = Some(self.quic.max_concurrent_bidi_streams);
         quic_config.max_concurrent_uni_streams = Some(self.quic.max_concurrent_uni_streams);
-        quic_config.stream_receive_window = Some(self.quic.stream_receive_window);
-        quic_config.receive_window = Some(self.quic.receive_window);
-        quic_config.send_window = Some(self.quic.send_window);
-        quic_config.max_idle_timeout_ms = Some(self.quic.max_idle_timeout_ms);
+        quic_config.stream_receive_window = self.quic.stream_receive_window;
+        quic_config.receive_window = self.quic.receive_window;
+        quic_config.send_window = self.quic.send_window;
+        quic_config.max_idle_timeout_ms = self.quic.max_idle_timeout_ms;
         quic_config.keep_alive_interval_ms = self.quic.keep_alive_interval_ms;
         quic_config.socket_send_buffer_size = self.quic.socket_send_buffer_size;
         quic_config.socket_receive_buffer_size = self.quic.socket_receive_buffer_size;
@@ -179,6 +179,7 @@ impl AnemoConfig {
             Some(self.connection_limits.peer_event_broadcast_channel_capacity);
 
         // Timeouts
+        config.connect_timeout_ms = Some(self.timeouts.connection_timeout_ms); // R3 fix: was missing
         config.connectivity_check_interval_ms = Some(self.timeouts.connectivity_check_interval_ms);
         config.connection_backoff_ms = Some(self.timeouts.connection_backoff_ms);
         config.max_connection_backoff_ms = Some(self.timeouts.max_connection_backoff_ms);
