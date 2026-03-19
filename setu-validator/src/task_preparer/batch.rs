@@ -538,7 +538,11 @@ impl BatchTaskPreparer {
         }
 
         let mut sorted_coins = coins.to_vec();
-        sorted_coins.sort_by_key(|c| c.balance);
+        // Sort by balance (ascending), then by ObjectId for determinism (R12)
+        sorted_coins.sort_by(|a, b| {
+            a.balance.cmp(&b.balance)
+                .then_with(|| a.object_id.cmp(&b.object_id))
+        });
 
         // Return smallest coin (already filtered for sufficient balance by caller)
         Ok(sorted_coins.remove(0))

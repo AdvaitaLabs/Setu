@@ -52,5 +52,6 @@ pub use error::{TransportError, TransportResult};
 #[cfg(feature = "http")]
 pub use http::types::{
     ExecuteTaskRequest, ExecuteTaskResponse,
+    ExecuteBatchRequest, ExecuteBatchResponse,
     TeeExecutionResultDto, StateChangeDto, AttestationDto,
 };

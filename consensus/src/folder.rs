@@ -4,9 +4,10 @@ use setu_types::{
 use crate::anchor_builder::{AnchorBuilder, AnchorBuildResult, AnchorBuildError, PendingAnchorBuild};
 use crate::dag::Dag;
 use crate::vlc::VLC;
+use setu_storage::SharedStateManager;
 use setu_storage::subnet_state::GlobalStateManager;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// Decision outcome for a ConsensusFrame
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +110,14 @@ pub struct ConsensusManager {
     pending_cfs: HashMap<String, ConsensusFrame>,
     /// Pending anchor builds awaiting finalization (cf_id -> PendingAnchorBuild)
     pending_builds: HashMap<String, PendingAnchorBuild>,
+    /// Events collected for each pending CF (cf_id -> events).
+    /// Stored on CF arrival so they can be applied at finalization time,
+    /// avoiding out-of-order pre-apply issues on Followers.
+    pending_cf_events: HashMap<String, Vec<setu_types::Event>>,
+    /// Votes received before their CF proposal arrived.
+    /// In P2P networks, votes can arrive before proposals due to network ordering.
+    /// These are replayed when the CF is received via `receive_cf`.
+    buffered_votes: HashMap<String, Vec<Vote>>,
     /// Finalized ConsensusFrames
     finalized_cfs: Vec<ConsensusFrame>,
     /// Set of anchor IDs that have been persisted to storage
@@ -129,6 +138,8 @@ impl ConsensusManager {
             legacy_folder: DagFolder::new(config),
             pending_cfs: HashMap::new(),
             pending_builds: HashMap::new(),
+            pending_cf_events: HashMap::new(),
+            buffered_votes: HashMap::new(),
             finalized_cfs: Vec::new(),
             persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
@@ -140,7 +151,7 @@ impl ConsensusManager {
     pub fn with_shared_state_manager(
         config: ConsensusConfig, 
         validator_id: String,
-        state_manager: Arc<RwLock<GlobalStateManager>>,
+        state_manager: Arc<SharedStateManager>,
     ) -> Self {
         Self {
             config: config.clone(),
@@ -148,6 +159,8 @@ impl ConsensusManager {
             legacy_folder: DagFolder::new(config),
             pending_cfs: HashMap::new(),
             pending_builds: HashMap::new(),
+            pending_cf_events: HashMap::new(),
+            buffered_votes: HashMap::new(),
             finalized_cfs: Vec::new(),
             persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
@@ -212,8 +225,20 @@ impl ConsensusManager {
     }
 
     pub fn receive_cf(&mut self, cf: ConsensusFrame) {
-        if !self.pending_cfs.contains_key(&cf.id) {
-            self.pending_cfs.insert(cf.id.clone(), cf);
+        let cf_id = cf.id.clone();
+        if !self.pending_cfs.contains_key(&cf_id) {
+            self.pending_cfs.insert(cf_id.clone(), cf);
+            
+            // Replay any votes that arrived before this CF proposal.
+            if let Some(buffered) = self.buffered_votes.remove(&cf_id) {
+                if let Some(cf) = self.pending_cfs.get_mut(&cf_id) {
+                    for vote in buffered {
+                        if !cf.votes.contains_key(&vote.validator_id) {
+                            cf.add_vote(vote);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -272,6 +297,9 @@ impl ConsensusManager {
             }
             cf.add_vote(vote);
         } else {
+            // CF not yet received — buffer the vote for later replay.
+            // In P2P networks, votes can arrive before their CF proposal.
+            self.buffered_votes.entry(cf_id.clone()).or_default().push(vote);
             return false;
         }
         self.check_finalization(&cf_id)
@@ -314,6 +342,8 @@ impl ConsensusManager {
                     // Check if this is our CF (we have a pending_build for it)
                     if let Some(pending_build) = self.pending_builds.remove(cf_id) {
                         // Leader path: commit the pending build
+                        // Clean up stored events (Leader uses pending_build's events)
+                        self.pending_cf_events.remove(cf_id);
                         tracing::info!(cf_id = %cf_id, "Leader path: committing pending build");
                         match self.anchor_builder.commit_build(pending_build.clone()) {
                             Ok(state_summary) => {
@@ -347,10 +377,28 @@ impl ConsensusManager {
                             }
                         }
                     } else {
-                        // Follower path: we didn't create this CF
-                        tracing::info!(cf_id = %cf_id, "Follower path: no pending_build, syncing metadata only");
-                        // For now, just sync metadata. Full state sync requires events from DAG
-                        self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
+                        // Follower path: apply state at finalization time (deferred apply).
+                        // Events were stored in pending_cf_events when the CF arrived.
+                        // Applying here (not on arrival) guarantees correct ordering:
+                        // CFs finalize in Leader commit order, so the write GSM base
+                        // state always matches what the Leader computed against.
+                        let events = self.pending_cf_events.remove(cf_id).unwrap_or_default();
+                        tracing::info!(cf_id = %cf_id, event_count = events.len(), "Follower path: applying deferred state");
+                        match self.anchor_builder.apply_follower_finalized_cf(&events, &cf) {
+                            Ok(state_summary) => {
+                                tracing::info!(
+                                    cf_id = %cf_id,
+                                    total_events = state_summary.total_events,
+                                    total_changes = state_summary.total_changes,
+                                    "Follower path: state applied and committed"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(cf_id = %cf_id, error = %e,
+                                    "Follower deferred apply failed, syncing metadata only");
+                                self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
+                            }
+                        }
                     }
                     
                     self.finalized_cfs.push(cf);
@@ -364,8 +412,9 @@ impl ConsensusManager {
             Some(CFDecision::Reject) | Some(CFDecision::Timeout) => {
                 // Remove rejected/timeout CF from pending
                 if let Some(mut cf) = self.pending_cfs.remove(cf_id) {
-                    // Simply discard the pending_build if it exists (no rollback needed!)
+                    // Simply discard the pending_build and stored events (no rollback needed!)
                     self.pending_builds.remove(cf_id);
+                    self.pending_cf_events.remove(cf_id);
                     cf.reject();
                     return true;
                 }
@@ -443,6 +492,8 @@ impl ConsensusManager {
             if let Some(mut cf) = self.pending_cfs.remove(&id) {
                 // Simply discard the pending_build (no rollback needed in deferred commit mode!)
                 self.pending_builds.remove(&id);
+                self.pending_cf_events.remove(&id);
+                self.buffered_votes.remove(&id);
                 cf.reject();
             }
         }
@@ -469,7 +520,26 @@ impl ConsensusManager {
     pub fn should_fold(&self, vlc: &VLC) -> bool {
         self.anchor_builder.should_fold(vlc)
     }
-    
+
+    /// Dynamically update validator_count (affects quorum calculation).
+    ///
+    /// Called when validators are added/removed from the consensus set.
+    pub fn update_validator_count(&mut self, count: usize) {
+        let old_count = self.config.validator_count;
+        self.config.validator_count = count;
+        tracing::info!(
+            old_count = old_count,
+            new_count = count,
+            new_quorum = (count * 2) / 3 + 1,
+            "Validator count updated"
+        );
+    }
+
+    /// Get the current validator_count.
+    pub fn validator_count(&self) -> usize {
+        self.config.validator_count
+    }
+
     // =========================================================================
     // New methods for Merkle tree access
     // =========================================================================
@@ -485,7 +555,7 @@ impl ConsensusManager {
     }
     
     /// Get the shared GlobalStateManager
-    pub fn shared_state_manager(&self) -> Arc<RwLock<GlobalStateManager>> {
+    pub fn shared_state_manager(&self) -> Arc<SharedStateManager> {
         self.anchor_builder.shared_state_manager()
     }
     
@@ -529,15 +599,22 @@ impl ConsensusManager {
     // Follower State Synchronization
     // =========================================================================
     
-    /// Apply state changes from a received ConsensusFrame (follower path)
-    /// 
-    /// When a follower receives a CF from the leader, it needs to apply
-    /// the same state changes to maintain consistency. This method:
-    /// 1. Gets the events referenced in the CF's anchor
-    /// 2. Applies their state changes to the local SMT
-    /// 3. Verifies the resulting state root matches the anchor's merkle_roots
-    /// 
-    /// Returns true if state was applied and verified successfully.
+    /// Collect and store events from a received ConsensusFrame for later
+    /// application at finalization time (Follower path).
+    ///
+    /// Previously this method pre-applied events to the write GSM immediately
+    /// on CF arrival. This caused cascading failures when CFs arrived out of
+    /// order at Followers: the base state differed from the Leader's, root
+    /// verification failed, and the CF was rejected entirely.
+    ///
+    /// New approach (deferred apply):
+    /// 1. Collect events from the DAG
+    /// 2. Store them in `pending_cf_events` for use at finalization
+    /// 3. Do NOT mutate the write GSM
+    /// 4. State is applied at finalization time via `apply_follower_finalized_cf`,
+    ///    which guarantees correct ordering (CFs finalize in Leader order).
+    ///
+    /// Always returns true so the CF is received and voted on regardless.
     pub fn apply_cf_state_changes(&mut self, dag: &Dag, cf: &setu_types::ConsensusFrame) -> bool {
         // Get events from the anchor's event_ids
         let events: Vec<setu_types::Event> = cf.anchor.event_ids
@@ -545,31 +622,8 @@ impl ConsensusManager {
             .filter_map(|id| dag.get_event(id).cloned())
             .collect();
         
-        if events.is_empty() {
-            // No events to apply, but anchor might be empty - check merkle roots
-            return cf.anchor.merkle_roots.is_none() || 
-                   cf.anchor.merkle_roots.as_ref()
-                       .map(|r| r.global_state_root == self.get_global_root())
-                       .unwrap_or(true);
-        }
-        
-        // Apply state changes from these events
-        self.anchor_builder.with_state_manager_mut(|gsm| {
-            let _ = gsm.apply_committed_events(&events);
-        });
-        
-        // Verify the resulting global state root matches the anchor's
-        if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
-            let local_root = self.get_global_root();
-            if local_root != merkle_roots.global_state_root {
-                eprintln!(
-                    "State root mismatch! Local: {:?}, Anchor: {:?}",
-                    hex::encode(local_root),
-                    hex::encode(merkle_roots.global_state_root)
-                );
-                return false;
-            }
-        }
+        // Store events for deferred application at finalization time
+        self.pending_cf_events.insert(cf.id.clone(), events);
         
         true
     }

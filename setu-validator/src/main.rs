@@ -12,10 +12,17 @@ use setu_validator::{
     RouterManager, 
     ValidatorNetworkService, NetworkServiceConfig,
     ConsensusValidator, ConsensusValidatorConfig,
+    AnemoConsensusBroadcaster,
+    ConsensusEngineStore, SetuMessageHandler,
+    NetworkEvent,
+};
+use setu_network_anemo::{
+    AnemoNetworkService, NetworkConfig as AnemoNetworkConfig,
+    AnemoConfig, NetworkNodeInfo,
 };
 use setu_storage::{
     SetuDB, RocksDBEventStore, RocksDBCFStore, RocksDBAnchorStore, RocksDBMerkleStore,
-    GlobalStateManager, EventStoreBackend, CFStoreBackend, AnchorStoreBackend, B4StoreExt,
+    GlobalStateManager, SharedStateManager, EventStoreBackend, CFStoreBackend, AnchorStoreBackend, B4StoreExt,
     MerkleStateProvider,
 };
 use setu_types::{
@@ -24,8 +31,9 @@ use setu_types::{
     CoinState, Address, VLCSnapshot,
 };
 use setu_keys::{load_keypair};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tracing::{info, error, warn, Level};
 use tracing_subscriber;
 
@@ -36,13 +44,15 @@ struct ValidatorConfig {
     node_config: NodeConfig,
     /// HTTP API listen address
     http_addr: SocketAddr,
-    /// P2P listen address (for future use)
+    /// P2P listen address
     p2p_addr: SocketAddr,
     /// Key file path (optional)
     key_file: Option<String>,
     /// Database path for RocksDB persistence (optional)
     /// If not set, runs in pure memory mode
     db_path: Option<String>,
+    /// Seed peer list (PEER_VALIDATORS env, format: "host1:port1,host2:port2")
+    peer_validators: Vec<String>,
 }
 
 impl ValidatorConfig {
@@ -70,33 +80,24 @@ impl ValidatorConfig {
         // If set, enables RocksDB persistence for Events and Anchors
         let db_path = std::env::var("VALIDATOR_DB_PATH").ok();
         
+        // Seed peers for P2P connections
+        let peer_validators = std::env::var("PEER_VALIDATORS")
+            .ok()
+            .map(|s| s.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect())
+            .unwrap_or_default();
+        
         Self {
             node_config,
             http_addr: format!("{}:{}", listen_addr, http_port).parse().unwrap(),
             p2p_addr: format!("{}:{}", listen_addr, p2p_port).parse().unwrap(),
             key_file,
             db_path,
+            peer_validators,
         }
     }
-}
-
-/// Load keypair from file and extract registration info
-fn load_key_info(key_file: &str) -> anyhow::Result<(String, Vec<u8>, Vec<u8>)> {
-    info!("Loading keypair from: {}", key_file);
-    
-    let keypair = load_keypair(key_file)?;
-    let account_address = keypair.address().to_string();
-    let public_key = keypair.public().as_bytes();
-    
-    // Create registration message to sign
-    let message = format!("Register Validator: {}", account_address);
-    let signature = keypair.sign(message.as_bytes()).as_bytes();
-    
-    info!("Keypair loaded successfully");
-    info!("  Account Address: {}", account_address);
-    info!("  Public Key: {}", hex::encode(&public_key));
-    
-    Ok((account_address, public_key, signature))
 }
 
 #[tokio::main]
@@ -132,12 +133,14 @@ async fn main() -> anyhow::Result<()> {
         info!("  Set VALIDATOR_DB_PATH to enable persistence");
     }
 
-    // Load key info if key file is provided
-    let _key_info = if let Some(ref key_file) = config.key_file {
-        match load_key_info(key_file) {
-            Ok(info) => {
+    // Load keypair once for both logging and private key injection (R4 fix: single load)
+    let keypair = if let Some(ref key_file) = config.key_file {
+        match load_keypair(key_file) {
+            Ok(kp) => {
                 info!("✓ Validator keypair loaded successfully");
-                Some(info)
+                info!("  Account Address: {}", kp.address());
+                info!("  Public Key: {}", hex::encode(kp.public().as_bytes()));
+                Some(kp)
             }
             Err(e) => {
                 warn!("Failed to load key file: {}", e);
@@ -151,50 +154,77 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Load genesis config early to determine validator_count
+    let genesis_path = std::env::var("GENESIS_FILE")
+        .unwrap_or_else(|_| "genesis.json".to_string());
+    let genesis_result = GenesisConfig::load(&genesis_path);
+
+    // Determine genesis validator count for logging
+    let genesis_validator_count = match &genesis_result {
+        Ok(gc) if !gc.validators.is_empty() => gc.validators.len(),
+        _ => 1,
+    };
+
     // Create router manager (shared between NetworkService components)
     let router_manager = Arc::new(RouterManager::new());
     
     // Create ConsensusValidator for DAG + VLC + Consensus
-    let node_info = NodeInfo::new_validator(
+    // N3 fix: Use P2P address/port (not HTTP) so all validators in ValidatorSet
+    // share the same address semantics. HTTP addr is only used by the API server.
+    let mut node_info = NodeInfo::new_validator(
         config.node_config.node_id.clone(),
-        config.http_addr.ip().to_string(),
-        config.http_addr.port(),
+        config.p2p_addr.ip().to_string(),
+        config.p2p_addr.port(),
     );
+    // R5 fix: Inject local validator's public key into NodeInfo so that
+    // remote validators can verify our vote signatures.
+    if let Some(ref kp) = keypair {
+        node_info.public_key = kp.public().as_bytes().to_vec();
+    }
     
-    // Single node mode: set validator_count = 1 for quorum to work
-    // quorum = (1 * 2) / 3 + 1 = 1, so single validator can finalize
+    // Set validator_count: start with 1 (self only), registration loop will update
+    // Note: Don't pre-set to genesis count here because add_consensus_validator()
+    // updates validator_count = vs.count() which would go 3→2→3 causing confusion.
     let mut consensus = ConsensusConfig::default();
     consensus.validator_count = 1;
-    // Lower vlc_delta_threshold for testing - allows faster CF creation
-    // Default is 10, which requires 10 VLC ticks to create a CF
-    // For low-throughput scenarios (like account initialization), this causes delays
-    consensus.vlc_delta_threshold = 3;
+    // Higher vlc_delta_threshold reduces anchor commit frequency,
+    // minimizing GlobalStateManager write-lock contention under high TPS.
+    // Each anchor commit blocks ALL task preparation reads, so less frequent = higher throughput.
+    // 3→5287; 10→5658; 20→5472; 50→5227; 100→4801; 200→4411. Optimal = 10.
+    consensus.vlc_delta_threshold = 10;
     
     let consensus_config = ConsensusValidatorConfig {
         node_info,
         consensus,
-        is_leader: true, // Single node mode: always leader
+        is_leader: false, // RotatingProposer determines leader; no hardcoded leader
         ..Default::default()
     };
     
-    // Create SHARED GlobalStateManager (used by both TaskPreparer and ConsensusValidator)
-    // This is the key fix: both components now share the same state!
-    let shared_state_manager: Arc<RwLock<GlobalStateManager>> = if let Some(ref db_path) = config.db_path {
-        // RocksDB persistence mode
+    // R1 fix: Open RocksDB ONCE, share the single Arc<SetuDB> across all backends.
+    // Previously opened twice (for SharedStateManager and ConsensusValidator) causing
+    // LOCK file conflict crash in persistence mode.
+    let db: Option<Arc<SetuDB>> = if let Some(ref db_path) = config.db_path {
         info!("Opening RocksDB at: {}", db_path);
-        let db = match SetuDB::open_default(db_path) {
-            Ok(db) => Arc::new(db),
+        match SetuDB::open_default(db_path) {
+            Ok(db) => {
+                info!("✓ RocksDB opened successfully");
+                Some(Arc::new(db))
+            }
             Err(e) => {
                 error!("Failed to open RocksDB at {}: {}", db_path, e);
                 return Err(anyhow::anyhow!("Database open failed: {}", e));
             }
-        };
-        
-        let merkle_store: Arc<dyn B4StoreExt> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
-        Arc::new(RwLock::new(GlobalStateManager::with_store(merkle_store)))
+        }
     } else {
-        // Memory mode
-        Arc::new(RwLock::new(GlobalStateManager::new()))
+        None
+    };
+
+    // Create SHARED GlobalStateManager (used by both TaskPreparer and ConsensusValidator)
+    let shared_state_manager: Arc<SharedStateManager> = if let Some(ref db) = db {
+        let merkle_store: Arc<dyn B4StoreExt> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
+        Arc::new(SharedStateManager::new(GlobalStateManager::with_store(merkle_store)))
+    } else {
+        Arc::new(SharedStateManager::new(GlobalStateManager::new()))
     };
     
     // Create task preparer with the SHARED state manager
@@ -203,26 +233,23 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&shared_state_manager),
     ));
     info!("✓ TaskPreparer initialized with shared state manager");
+
+    // Create batch task preparer sharing the same state (production path)
+    let batch_task_preparer = Arc::new(setu_validator::BatchTaskPreparer::new(
+        config.node_config.node_id.clone(),
+        Arc::new(setu_storage::MerkleStateProvider::new(Arc::clone(&shared_state_manager))),
+    ));
+    info!("✓ BatchTaskPreparer initialized with shared state manager");
     
     // Create ConsensusValidator with appropriate storage backend
-    let consensus_validator = if let Some(ref db_path) = config.db_path {
-        // RocksDB persistence mode - open database and create all backends
-        let db = match SetuDB::open_default(db_path) {
-            Ok(db) => Arc::new(db),
-            Err(e) => {
-                error!("Failed to open RocksDB at {}: {}", db_path, e);
-                return Err(anyhow::anyhow!("Database open failed: {}", e));
-            }
-        };
-        
-        // Create all RocksDB-backed stores from shared database
+    let consensus_validator = if let Some(ref db) = db {
+        // RocksDB persistence mode - reuse the single DB handle
         let event_store: Arc<dyn EventStoreBackend> = Arc::new(RocksDBEventStore::from_shared(db.clone()));
         let cf_store: Arc<dyn CFStoreBackend> = Arc::new(RocksDBCFStore::from_shared(db.clone()));
         let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(RocksDBAnchorStore::from_shared(db.clone()));
         
         info!("✓ RocksDB backends initialized (Events, CF, Anchors, Merkle)");
         
-        // Use the SHARED state manager
         Arc::new(ConsensusValidator::with_all_backends(
             consensus_config,
             Arc::clone(&shared_state_manager),
@@ -238,8 +265,48 @@ async fn main() -> anyhow::Result<()> {
         ))
     };
     
-    info!("✓ ConsensusValidator initialized with shared state manager (single node mode)");
+    info!("✓ ConsensusValidator initialized (genesis_validators={})", genesis_validator_count);
     
+    // ========================================
+    // Register all genesis validators into consensus layer
+    // ========================================
+    // R2 fix: Use add_peer_validator() instead of engine().add_consensus_validator()
+    // to update BOTH ConsensusValidator.validator_set AND engine.validator_set atomically.
+    if let Ok(ref genesis_config) = genesis_result {
+        for gv in &genesis_config.validators {
+            if gv.id == config.node_config.node_id {
+                continue; // Skip self (already registered by constructor)
+            }
+            let mut peer_node_info = NodeInfo::new_validator(
+                gv.id.clone(),
+                gv.address.clone(),
+                gv.p2p_port,
+            );
+            // Inject public key from genesis if present
+            if let Some(ref pk_hex) = gv.public_key {
+                if let Ok(pk_bytes) = hex::decode(pk_hex) {
+                    peer_node_info.public_key = pk_bytes;
+                }
+            }
+            consensus_validator.add_peer_validator(peer_node_info).await;
+        }
+        let engine = consensus_validator.engine();
+        let vs = engine.validator_set_ref().read().await;
+        info!(
+            "✓ ValidatorSet initialized: {} validators, leader={:?}",
+            vs.count(),
+            vs.get_leader_id()
+        );
+        drop(vs);
+    }
+
+    // Inject private key for vote signing
+    if let Some(ref kp) = keypair {
+        let private_key_bytes = kp.secret_bytes().to_vec();
+        consensus_validator.engine().set_private_key(private_key_bytes).await;
+        info!("✓ Private key injected for vote signing");
+    }
+
     // Attempt to recover state from storage (if any)
     // This is safe to call even with empty storage (fresh start)
     if let Err(e) = consensus_validator.recover_from_storage().await {
@@ -249,13 +316,8 @@ async fn main() -> anyhow::Result<()> {
     // ========================================
     // Genesis Event: Initialize seed accounts
     // ========================================
-    // Load genesis.json and create a proper Genesis Event that flows through
-    // the DAG → CF → commit pipeline, replacing the old direct init_coin hack.
     {
-        let genesis_path = std::env::var("GENESIS_FILE")
-            .unwrap_or_else(|_| "genesis.json".to_string());
-
-        match GenesisConfig::load(&genesis_path) {
+        match &genesis_result {
             Ok(genesis_config) => {
                 info!(
                     chain_id = %genesis_config.chain_id,
@@ -266,42 +328,101 @@ async fn main() -> anyhow::Result<()> {
                 );
 
                 // Build state changes for each genesis account
+                // Supports multi-coin: when coins_per_account > 1, balance is split
+                // across N coin objects for higher per-sender parallelism.
                 let mut state_changes = Vec::new();
                 for account in &genesis_config.accounts {
                     // Validate that the address is a proper hex address
                     let owner_addr = Address::from_hex(&account.address)
                         .expect("genesis account must have valid hex address");
                     let owner_hex = owner_addr.to_string();
-                    let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(
-                        &owner_hex,
-                        &genesis_config.subnet_id,
-                    );
-                    let coin_state = CoinState::new_with_type(
-                        owner_hex.clone(),
-                        account.balance,
-                        genesis_config.subnet_id.clone(),
-                    );
-                    let key = format!("oid:{}", hex::encode(object_id_bytes));
-                    state_changes.push(StateChange {
-                        key,
-                        old_value: None,
-                        new_value: Some(coin_state.to_bytes()),
-                    });
-                    info!(
-                        name = ?account.name,
-                        owner = %owner_hex,
-                        balance = account.balance,
-                        object_id = %hex::encode(object_id_bytes),
-                        "Genesis account prepared"
-                    );
+                    let num_coins = account.coins_per_account.max(1) as u64;
+
+                    if num_coins == 1 {
+                        // Single coin (legacy path): use deterministic_coin_id
+                        let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(
+                            &owner_hex,
+                            &genesis_config.subnet_id,
+                        );
+                        let coin_state = CoinState::new_with_type(
+                            owner_hex.clone(),
+                            account.balance,
+                            genesis_config.subnet_id.clone(),
+                        );
+                        let key = format!("oid:{}", hex::encode(object_id_bytes));
+                        state_changes.push(StateChange {
+                            key,
+                            old_value: None,
+                            new_value: Some(coin_state.to_bytes()),
+                        });
+                        info!(
+                            name = ?account.name,
+                            owner = %owner_hex,
+                            balance = account.balance,
+                            object_id = %hex::encode(object_id_bytes),
+                            "Genesis account prepared (1 coin)"
+                        );
+                    } else {
+                        // Multi-coin: split balance across N coins
+                        let balance_per_coin = account.balance / num_coins;
+                        let remainder = account.balance - balance_per_coin * (num_coins - 1);
+
+                        for idx in 0..num_coins {
+                            let coin_balance = if idx == num_coins - 1 {
+                                remainder  // last coin absorbs rounding remainder
+                            } else {
+                                balance_per_coin
+                            };
+
+                            let object_id = if idx == 0 {
+                                // Index 0: use legacy deterministic_coin_id for compatibility
+                                setu_types::deterministic_coin_id_from_str(
+                                    &owner_hex,
+                                    &genesis_config.subnet_id,
+                                )
+                            } else {
+                                setu_types::deterministic_genesis_coin_id(
+                                    &owner_hex,
+                                    &genesis_config.subnet_id,
+                                    idx as u32,
+                                )
+                            };
+                            let object_id_bytes = *object_id.as_bytes();
+
+                            let coin_state = CoinState::new_with_type(
+                                owner_hex.clone(),
+                                coin_balance,
+                                genesis_config.subnet_id.clone(),
+                            );
+                            let key = format!("oid:{}", hex::encode(object_id_bytes));
+                            state_changes.push(StateChange {
+                                key,
+                                old_value: None,
+                                new_value: Some(coin_state.to_bytes()),
+                            });
+                        }
+                        info!(
+                            name = ?account.name,
+                            owner = %owner_hex,
+                            total_balance = account.balance,
+                            coins = num_coins,
+                            balance_per_coin = balance_per_coin,
+                            "Genesis account prepared ({} coins)",
+                            num_coins
+                        );
+                    }
                 }
 
                 // Build genesis event with pre-computed execution result
-                let vlc_snapshot = VLCSnapshot::default();
+                // Use deterministic fields so all validators produce the same ID
+                let mut vlc_snapshot = VLCSnapshot::default();
+                vlc_snapshot.physical_time = 0; // Eliminate SystemTime::now() non-determinism
                 let mut genesis_event = Event::genesis(
-                    config.node_config.node_id.clone(),
+                    "genesis".to_string(), // Fixed creator (not node_id) for cross-node consistency
                     vlc_snapshot,
                 );
+                genesis_event.timestamp = 0; // Fixed timestamp
+                genesis_event.recompute_id(); // Recompute ID with deterministic fields
                 genesis_event.payload = EventPayload::Genesis(genesis_config.clone());
                 genesis_event.set_execution_result(ExecutionResult {
                     success: true,
@@ -339,8 +460,7 @@ async fn main() -> anyhow::Result<()> {
                 // will re-apply these changes (upsert is idempotent).
                 {
                     let genesis_event_id = genesis_event.id.clone();
-                    let mut gsm = shared_state_manager.write()
-                        .expect("Failed to acquire write lock on GlobalStateManager");
+                    let mut gsm = shared_state_manager.lock_write();
                     for change in &state_changes {
                         gsm.apply_state_change(
                             setu_types::subnet::SubnetId::ROOT,
@@ -359,6 +479,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    shared_state_manager.publish_snapshot(&gsm);
                 }
                 info!(
                     "✓ Genesis state applied: {} seed accounts initialized",
@@ -371,6 +492,114 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     
+    // ========================================
+    // Phase 2: P2P Network Startup
+    // ========================================
+    
+    // 2.1 Create event channel for network → consensus flow
+    let (network_event_tx, network_event_rx) = tokio::sync::mpsc::channel::<NetworkEvent>(1000);
+    
+    // 2.2 Create MessageHandlerStore (three-layer query, direct storage)
+    let handler_store = Arc::new(ConsensusEngineStore::new(
+        consensus_validator.engine(),
+        consensus_validator.event_store(),
+    ));
+    
+    // 2.3 Create SetuMessageHandler
+    let setu_handler = Arc::new(SetuMessageHandler::new(
+        handler_store,
+        config.node_config.node_id.clone(),
+        network_event_tx,
+    ));
+    
+    // 2.4 Build Anemo network configuration
+    let anemo_config = AnemoNetworkConfig {
+        anemo: AnemoConfig {
+            listen_addr: config.p2p_addr.to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    
+    // 2.5 Build network-layer NodeInfo
+    let anemo_node_info = NetworkNodeInfo::new_validator(
+        config.node_config.node_id.clone(),
+        config.p2p_addr.ip().to_string(),
+        config.p2p_addr.port(),
+    );
+    
+    // 2.6 Start Anemo P2P network
+    let anemo_network = Arc::new(
+        AnemoNetworkService::with_handler(anemo_config, anemo_node_info, setu_handler)
+            .await
+            .expect("Failed to start Anemo P2P network")
+    );
+    info!(
+        listen_addr = %config.p2p_addr,
+        "✓ Anemo P2P network started"
+    );
+    
+    // 2.7 Create and inject broadcaster (P2P → consensus)
+    let broadcaster = Arc::new(AnemoConsensusBroadcaster::new(
+        Arc::clone(&anemo_network),
+        config.node_config.node_id.clone(),
+    ));
+    consensus_validator.set_broadcaster(broadcaster).await;
+    info!("✓ Consensus broadcaster connected");
+    
+    // 2.8 Start network event handler (network → consensus routing)
+    let _network_handler = consensus_validator.start_network_event_handler(network_event_rx);
+    info!("✓ Network event handler started");
+    
+    // ========================================
+    // Phase 2.4: Connect to Seed Peers
+    // ========================================
+    for peer_addr in &config.peer_validators {
+        let parts: Vec<&str> = peer_addr.split(':').collect();
+        if parts.len() != 2 {
+            warn!("Invalid peer address format: {} (expected host:port)", peer_addr);
+            continue;
+        }
+        let host = parts[0];
+        let port: u16 = match parts[1].parse() {
+            Ok(p) => p,
+            Err(_) => {
+                warn!("Invalid port in peer address: {}", peer_addr);
+                continue;
+            }
+        };
+        
+        // R9 fix: Look up genesis validator ID by address:port for consistent naming.
+        // Falls back to "peer-<addr>" if no genesis match found.
+        let peer_id_name = genesis_result.as_ref().ok()
+            .and_then(|gc| gc.validators.iter().find(|v| v.address == host && v.p2p_port == port))
+            .map(|v| v.id.clone())
+            .unwrap_or_else(|| format!("peer-{}", peer_addr));
+        let peer_info = NetworkNodeInfo::new_validator(
+            peer_id_name,
+            host.to_string(),
+            port,
+        );
+        
+        // Retry connection (peer may still be starting)
+        for retry in 0..5u32 {
+            match anemo_network.connect_to_peer(peer_info.clone()).await {
+                Ok(peer_id) => {
+                    info!(peer_id = %peer_id, addr = %peer_addr, "✓ Connected to peer");
+                    break;
+                }
+                Err(e) => {
+                    if retry < 4 {
+                        warn!(retry = retry + 1, addr = %peer_addr, error = %e, "Retrying peer connection");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    } else {
+                        error!(addr = %peer_addr, error = %e, "Failed to connect to peer after 5 retries");
+                    }
+                }
+            }
+        }
+    }
+
     // Create network service configuration
     let network_config = NetworkServiceConfig {
         http_listen_addr: config.http_addr,
@@ -382,6 +611,7 @@ async fn main() -> anyhow::Result<()> {
         config.node_config.node_id.clone(),
         router_manager.clone(),
         task_preparer.clone(),
+        batch_task_preparer.clone(),
         consensus_validator.clone(),
         network_config,
     ));
@@ -406,7 +636,12 @@ async fn main() -> anyhow::Result<()> {
     
     // Consensus - Real implementation
     info!("│ [CONSENSUS] Consensus module initialized                   │");
-    info!("│             - Mode: Single validator (leader)              │");
+    if genesis_validator_count > 1 {
+        info!("│             - Mode: Multi-validator ({} nodes)             │", genesis_validator_count);
+        info!("│             - P2P network: Anemo (QUIC)                   │");
+    } else {
+        info!("│             - Mode: Single validator (leader)              │");
+    }
     info!("│             - CF creation and finalization enabled         │");
     
     // AnchorBuilder
@@ -450,8 +685,20 @@ async fn main() -> anyhow::Result<()> {
             info!("HTTP server stopped");
         }
         _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl+C, shutting down...");
+            info!("Received Ctrl+C, initiating graceful shutdown...");
         }
+    }
+
+    // ── Graceful shutdown sequence ──
+    // Step 1: Stop batch collector (drain pending entries)
+    info!("Step 1: Stopping batch collector...");
+    network_service.shutdown_batch_collector().await;
+
+    // Step 2: Wait for pending post-execution tasks (consensus + storage)
+    info!("Step 2: Waiting for pending tasks...");
+    match network_service.wait_for_pending_tee_tasks(Duration::from_secs(10)).await {
+        Ok(()) => info!("All pending tasks completed"),
+        Err(e) => warn!("Shutdown timeout: {}", e),
     }
 
     info!("Validator shutdown complete");

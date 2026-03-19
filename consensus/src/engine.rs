@@ -17,12 +17,11 @@
 //! 7. After quorum votes, the ConsensusFrame is finalized
 //! 8. Next round begins with the finalized frame as anchor
 
-use setu_types::{ConsensusConfig, ConsensusFrame, Event, EventId, SetuResult, Vote};
+use setu_types::{ConsensusConfig, ConsensusFrame, Event, EventId, SetuResult, ValidatorInfo, Vote};
 use setu_vlc::VLCSnapshot;
-use setu_storage::{EventStore, EventStoreBackend, subnet_state::GlobalStateManager};
+use setu_storage::{EventStore, EventStoreBackend, SharedStateManager};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock as StdRwLock;
 use tokio::sync::{mpsc, RwLock, Mutex};
 use tracing::{debug, info, warn};
 
@@ -130,7 +129,7 @@ impl ConsensusEngine {
         config: ConsensusConfig,
         validator_id: String,
         validator_set: ValidatorSet,
-        state_manager: Arc<StdRwLock<GlobalStateManager>>,
+        state_manager: Arc<SharedStateManager>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1000);
         
@@ -211,7 +210,7 @@ impl ConsensusEngine {
         config: ConsensusConfig,
         validator_id: String,
         validator_set: ValidatorSet,
-        state_manager: Arc<StdRwLock<GlobalStateManager>>,
+        state_manager: Arc<SharedStateManager>,
         event_store: Arc<dyn EventStoreBackend>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1000);
@@ -280,6 +279,30 @@ impl ConsensusEngine {
     pub async fn get_broadcaster(&self) -> Option<Arc<dyn ConsensusBroadcaster>> {
         let b = self.broadcaster.read().await;
         b.as_ref().cloned()
+    }
+
+    /// Add a validator to the consensus set, updating both ValidatorSet and
+    /// ConsensusManager.validator_count atomically.
+    pub async fn add_consensus_validator(&self, info: setu_types::ValidatorInfo) {
+        let count = {
+            let mut vs = self.validator_set.write().await;
+            vs.add_validator(info.clone());
+            vs.count()
+        };
+        {
+            let mut cm = self.consensus_manager.write().await;
+            cm.update_validator_count(count);
+        }
+        info!(
+            validator_id = %info.node.id,
+            total_count = count,
+            "Validator added to consensus"
+        );
+    }
+
+    /// Get a reference to the ValidatorSet (for external queries).
+    pub fn validator_set_ref(&self) -> &Arc<RwLock<ValidatorSet>> {
+        &self.validator_set
     }
 
     /// Add an event to the DAG and try to create a CF if conditions are met
@@ -508,7 +531,8 @@ impl ConsensusEngine {
             let private_key = self.private_key.read().await;
             let key_ref = private_key.as_ref().map(|k| k.as_slice());
             
-            if let Some(_vote) = manager.vote_for_cf(&frame.id, true, key_ref) {
+            let self_vote = manager.vote_for_cf(&frame.id, true, key_ref);
+            if self_vote.is_some() {
                 debug!(cf_id = %frame.id, "Leader self-voted for CF");
                 
                 // Check if this vote causes finalization (single-node mode)
@@ -532,20 +556,47 @@ impl ConsensusEngine {
                 .send(ConsensusMessage::ProposeFrame(frame.clone()))
                 .await;
             
+            // Prepare CF for broadcast: embed leader's self-vote for atomic delivery.
+            // This guarantees followers receive CF + leader vote in a single message,
+            // eliminating the ordering dependency between separate CF and vote broadcasts.
+            // (verify_id() only checks anchor/proposer/created_at, not votes — safe to embed)
+            let mut broadcast_frame = frame.clone();
+            if let Some(ref v) = self_vote {
+                broadcast_frame.add_vote(v.clone());
+            }
+            
             // Broadcast to network via broadcaster (if configured)
             let broadcaster = self.broadcaster.read().await;
             if let Some(ref b) = *broadcaster {
-                match b.broadcast_cf(frame).await {
+                match b.broadcast_cf(&broadcast_frame).await {
                     Ok(result) => {
                         info!(
                             cf_id = %frame.id,
                             success = result.success_count,
                             total = result.total_peers,
-                            "CF broadcasted to peers"
+                            "CF broadcasted to peers (with leader vote embedded)"
                         );
                     }
                     Err(e) => {
                         warn!(cf_id = %frame.id, error = %e, "Failed to broadcast CF");
+                    }
+                }
+                
+                // Also broadcast vote separately as defense-in-depth backup.
+                // If CF arrived first, the embedded vote is already stored — this duplicate
+                // is detected by receive_vote()'s idempotency check and harmlessly ignored.
+                if let Some(ref vote) = self_vote {
+                    match b.broadcast_vote(vote).await {
+                        Ok(result) => {
+                            debug!(
+                                cf_id = %frame.id,
+                                success = result.success_count,
+                                "Leader self-vote broadcasted (backup)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(cf_id = %frame.id, error = %e, "Failed to broadcast leader self-vote");
+                        }
                     }
                 }
             } else {
@@ -753,14 +804,10 @@ impl ConsensusEngine {
             ));
         }
         
-        // Step 5-6: Apply state changes from the CF's events to maintain consistent state
-        // This also verifies the resulting state matches the anchor's state root
-        let state_verified = manager.apply_cf_state_changes(&dag, &cf);
-        if !state_verified {
-            return Err(setu_types::SetuError::InvalidData(
-                "State root mismatch after applying CF state changes".to_string()
-            ));
-        }
+        // Step 5-6: Collect events from CF for deferred state application at finalization.
+        // State is NOT applied here — it will be applied when the CF is finalized,
+        // guaranteeing correct ordering even if CFs arrive out of network order.
+        manager.apply_cf_state_changes(&dag, &cf);
         
         let cf_id = cf.id.clone();
         

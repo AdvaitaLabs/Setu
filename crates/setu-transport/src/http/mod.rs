@@ -9,6 +9,7 @@ pub mod middleware;
 
 pub use types::{
     ExecuteTaskRequest, ExecuteTaskResponse,
+    ExecuteBatchRequest, ExecuteBatchResponse,
     TeeExecutionResultDto, StateChangeDto, AttestationDto,
     HealthResponse, SolverInfoResponse, EnclaveInfoDto,
 };

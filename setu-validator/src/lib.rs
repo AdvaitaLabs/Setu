@@ -73,6 +73,7 @@ pub use broadcaster::{
 // Re-export network adapter types
 pub use network_adapter::{
     MessageRouter, NetworkEventHandler, SyncProtocol, SyncStore, InMemorySyncStore,
+    ConsensusEngineStore, SetuMessageHandler,
 };
 
 // Re-export protocol types (consensus-specific message definitions)

@@ -138,6 +138,39 @@ impl ResolvedInputs {
         }
     }
     
+    /// Create for split coin
+    pub fn split_coin(source: ResolvedObject, amounts: Vec<u64>) -> Self {
+        Self {
+            operation: OperationType::SplitCoin {
+                source_index: 0,
+                amounts,
+            },
+            input_objects: vec![source],
+        }
+    }
+    
+    /// Create for atomic merge-then-transfer
+    pub fn merge_then_transfer(
+        target: ResolvedObject,
+        sources: Vec<ResolvedObject>,
+        recipient: crate::object::Address,
+        amount: u64,
+    ) -> Self {
+        let source_indices: Vec<usize> = (1..=sources.len()).collect();
+        let mut objects = vec![target];
+        objects.extend(sources);
+        
+        Self {
+            operation: OperationType::MergeThenTransfer {
+                target_index: 0,
+                source_indices,
+                recipient,
+                amount,
+            },
+            input_objects: objects,
+        }
+    }
+    
     /// Get primary coin object (for Transfer)
     pub fn primary_coin(&self) -> Option<&ResolvedObject> {
         match &self.operation {
@@ -150,6 +183,9 @@ impl ResolvedInputs {
             }
             OperationType::SplitCoin { source_index, .. } => {
                 self.input_objects.get(*source_index)
+            }
+            OperationType::MergeThenTransfer { target_index, .. } => {
+                self.input_objects.get(*target_index)
             }
         }
     }
@@ -175,7 +211,7 @@ pub enum OperationType {
         amount: u64,
     },
     
-    /// Merge multiple coins into one (future)
+    /// Merge multiple coins into one
     MergeCoins {
         /// Index of target coin in input_objects
         target_index: usize,
@@ -183,12 +219,24 @@ pub enum OperationType {
         source_indices: Vec<usize>,
     },
     
-    /// Split one coin into multiple (future)
+    /// Split one coin into multiple
     SplitCoin {
         /// Index of source coin in input_objects
         source_index: usize,
         /// Amounts for new coins
         amounts: Vec<u64>,
+    },
+    
+    /// Atomic merge-then-transfer: merge sources into target, then partial transfer
+    MergeThenTransfer {
+        /// Index of target coin in input_objects
+        target_index: usize,
+        /// Indices of source coins to merge
+        source_indices: Vec<usize>,
+        /// Recipient address
+        recipient: crate::object::Address,
+        /// Amount to transfer after merge
+        amount: u64,
     },
 }
 

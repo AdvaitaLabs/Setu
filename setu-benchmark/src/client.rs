@@ -9,6 +9,46 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
+/// Convert a human-readable account name (e.g., "alice", "user_001") into
+/// the canonical `0x`-prefixed hex address that the Validator expects.
+///
+/// This replicates the logic of `Address::from_str_id` in `setu-types`:
+///   blake3::hash(name.as_bytes()) → 32-byte digest → "0x" + hex
+///
+/// If the input is already a valid hex address (64 hex chars with optional "0x" prefix),
+/// it is returned as-is (normalized with "0x" prefix).
+pub fn name_to_hex_address(name: &str) -> String {
+    let stripped = name.strip_prefix("0x").unwrap_or(name);
+    if stripped.len() == 64 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Already a hex address – normalize with 0x prefix
+        return format!("0x{}", stripped);
+    }
+    let hash = blake3::hash(name.as_bytes());
+    format!("0x{}", hex::encode(hash.as_bytes()))
+}
+
+/// Load seed account addresses from genesis.json.
+///
+/// Returns a Vec of `(name_or_label, hex_address)` pairs.
+/// The addresses in genesis.json are the authoritative source —
+/// they may be derived from real keypairs and do NOT necessarily match
+/// `blake3::hash(name)`.
+pub fn load_seed_addresses_from_genesis(genesis_path: &str) -> Result<Vec<String>> {
+    use setu_types::GenesisConfig;
+    let config = GenesisConfig::load(genesis_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load genesis file '{}': {}", genesis_path, e))?;
+    
+    let addresses: Vec<String> = config.accounts.iter()
+        .map(|a| a.address.clone())
+        .collect();
+    
+    if addresses.is_empty() {
+        anyhow::bail!("No accounts found in genesis file '{}'", genesis_path);
+    }
+    
+    Ok(addresses)
+}
+
 /// Transfer request for benchmark
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchTransferRequest {
@@ -257,15 +297,16 @@ pub fn generate_transfer(
     receiver_prefix: &str,
     amount: u64,
     seq: u64,
+    subnet_id: Option<String>,
 ) -> BenchTransferRequest {
     BenchTransferRequest {
-        from: format!("{}_{}", sender_prefix, seq % 1000),
-        to: format!("{}_{}", receiver_prefix, (seq + 500) % 1000),
+        from: name_to_hex_address(&format!("{}_{}", sender_prefix, seq % 1000)),
+        to: name_to_hex_address(&format!("{}_{}", receiver_prefix, (seq + 500) % 1000)),
         amount,
         transfer_type: "flux".to_string(),
         preferred_solver: None,
         shard_id: None,
-        subnet_id: None,
+        subnet_id,
         // Use unique resource key per request to ensure even distribution
         // across solvers via consistent hash routing
         resources: vec![format!("bench_resource_{}", seq)],
@@ -281,15 +322,19 @@ pub fn generate_transfer(
 /// If `num_test_accounts` is specified, uses that many user accounts.
 /// Otherwise, falls back to using only the 3 seed accounts.
 /// 
-/// ## IMPORTANT: Setu's 1:1 Coin Binding
+/// ## Multi-Coin Object Model
 /// 
-/// Setu uses 1:1 binding between (owner, subnet) and coin.
-/// Each account has exactly ONE coin, so concurrent requests from the same
-/// sender will cause reservation conflicts.
+/// Setu uses a multi-coin object model where each account can own multiple
+/// coin objects of the same type. Each coin can be reserved independently
+/// for parallel transfers. The number of coins per account determines
+/// the per-sender concurrency limit.
 /// 
-/// Success rate formula: min(num_accounts / concurrency, 1) * 100%
-/// - 100 accounts, 100 concurrent → ~100% success
-/// - 3 accounts, 100 concurrent → ~3% success
+/// With `--coins-per-account N`, each account has N coin objects.
+/// Effective per-sender parallelism = min(coins_per_account, concurrent_transfers_from_sender)
+/// 
+/// For best results:
+/// - Set coins_per_account >= concurrency / init_accounts
+/// - More accounts + more coins = higher aggregate concurrency
 /// 
 /// ## NOTE on Solver Distribution
 /// 
@@ -298,28 +343,27 @@ pub fn generate_transfer(
 /// Without this, all requests from the same 'from' address would route
 /// to the same solver, causing severe load imbalance in multi-solver tests.
 #[allow(dead_code)]
-pub fn generate_transfer_with_test_accounts(amount: u64, seq: u64) -> BenchTransferRequest {
-    generate_transfer_with_n_accounts(amount, seq, None)
+pub fn generate_transfer_with_test_accounts(amount: u64, seq: u64, seed_addresses: &[String]) -> BenchTransferRequest {
+    generate_transfer_with_n_accounts(amount, seq, None, seed_addresses, None)
 }
 
 /// Generate a transfer using a specified number of test accounts
 /// 
-/// - If `num_accounts` is None or 0, uses only seed accounts (alice, bob, charlie)
+/// - If `num_accounts` is None or 0, uses only seed accounts from genesis
 /// - Otherwise, uses user_001 to user_N (must be initialized via --init-accounts first)
-pub fn generate_transfer_with_n_accounts(amount: u64, seq: u64, num_accounts: Option<u64>) -> BenchTransferRequest {
+///
+/// `seed_addresses` are the authoritative hex addresses loaded from genesis.json.
+pub fn generate_transfer_with_n_accounts(amount: u64, seq: u64, num_accounts: Option<u64>, seed_addresses: &[String], subnet_id: Option<String>) -> BenchTransferRequest {
     // Build account list based on configuration
+    // All names are converted to canonical hex addresses for production Validator compatibility.
     let accounts: Vec<String> = match num_accounts {
         Some(n) if n > 0 => {
-            // Use initialized user accounts (user_001 to user_N)
-            (1..=n).map(|i| format!("user_{:03}", i)).collect()
+            // Use initialized user accounts (user_001 to user_N) → hex
+            (1..=n).map(|i| name_to_hex_address(&format!("user_{:03}", i))).collect()
         }
         _ => {
-            // Fall back to seed accounts only
-            vec![
-                "alice".to_string(),
-                "bob".to_string(),
-                "charlie".to_string(),
-            ]
+            // Fall back to seed accounts from genesis
+            seed_addresses.to_vec()
         }
     };
     
@@ -343,7 +387,7 @@ pub fn generate_transfer_with_n_accounts(amount: u64, seq: u64, num_accounts: Op
         transfer_type: "flux".to_string(),
         preferred_solver: None,
         shard_id: None,
-        subnet_id: None,
+        subnet_id,
         // Use unique resource key per request to ensure even distribution
         // across solvers via consistent hash routing
         resources: vec![format!("bench_resource_{}", seq)],
@@ -364,7 +408,8 @@ impl BenchClient {
     /// Returns Some(balance) if the account exists, None otherwise.
     /// This can be used to check if a transfer has been applied to state.
     pub async fn get_balance(&self, account: &str) -> Option<u64> {
-        let url = format!("{}/api/v1/state/balance/{}", self.base_url, account);
+        let hex_account = name_to_hex_address(account);
+        let url = format!("{}/api/v1/state/balance/{}", self.base_url, hex_account);
         
         match self.client.get(&url).send().await {
             Ok(response) if response.status().is_success() => {

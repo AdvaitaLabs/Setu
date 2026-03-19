@@ -206,11 +206,14 @@ async fn test_dependency_derivation_with_history() {
     }
     
     // Create MerkleStateProvider with initial accounts
-    use setu_storage::{GlobalStateManager, state_provider::init_coin};
-    use std::sync::RwLock;
-    let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
-    init_coin(&mut state_manager.write().unwrap(), "alice", 10_000_000);
-    init_coin(&mut state_manager.write().unwrap(), "bob", 5_000_000);
+    use setu_storage::{GlobalStateManager, SharedStateManager, state_provider::init_coin};
+    let state_manager = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+    {
+        let mut gsm = state_manager.lock_write();
+        init_coin(&mut gsm, "alice", 10_000_000);
+        init_coin(&mut gsm, "bob", 5_000_000);
+        state_manager.publish_snapshot(&gsm);
+    }
     let inner = MerkleStateProvider::new(state_manager);
     
     // Get alice's coins

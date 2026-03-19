@@ -3,15 +3,19 @@
 //! Implements RegistrationHandler trait for Validator RPC.
 
 use super::service::ValidatorNetworkService;
-use super::types::{current_timestamp_millis, current_timestamp_secs, ValidatorInfo};
+use super::types::{current_timestamp_millis, current_timestamp_secs, ValidatorInfo, SubnetInfo};
 use setu_rpc::{
     GetNodeStatusRequest, GetNodeStatusResponse, GetSolverListRequest, GetSolverListResponse,
     GetValidatorListRequest, GetValidatorListResponse, HeartbeatRequest, HeartbeatResponse,
+    GetSubnetListRequest, GetSubnetListResponse,
     NodeType, RegisterSolverRequest, RegisterSolverResponse, RegisterValidatorRequest,
-    RegisterValidatorResponse, RegistrationHandler, SolverListItem, UnregisterRequest,
+    RegisterValidatorResponse, RegisterSubnetRequest, RegisterSubnetResponse,
+    RegistrationHandler, SolverListItem, UnregisterRequest,
     UnregisterResponse,
 };
 use setu_types::{Event, SolverRegistration, ValidatorRegistration};
+use setu_types::registration::{SubnetRegistration, SubnetResourceLimits, TokenConfig};
+use setu_types::subnet::SubnetType;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -166,6 +170,20 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         };
         self.service.add_validator(validator_info);
 
+        // Linkage: also update consensus layer (ValidatorSet + validator_count)
+        if let Some(cv) = self.service.consensus_validator() {
+            let peer_node_info = setu_types::NodeInfo::new_validator(
+                request.validator_id.clone(),
+                request.address.clone(),
+                request.port,
+            );
+            cv.add_peer_validator(peer_node_info).await;
+            info!(
+                "Consensus layer updated: validator {} added",
+                request.validator_id
+            );
+        }
+
         // Add event to DAG (async to support consensus submission)
         self.service.add_event_to_dag(event).await;
 
@@ -178,6 +196,189 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         RegisterValidatorResponse {
             success: true,
             message: "Validator registered successfully".to_string(),
+        }
+    }
+
+    async fn register_subnet(&self, request: RegisterSubnetRequest) -> RegisterSubnetResponse {
+        info!(
+            subnet_id = %request.subnet_id,
+            name = %request.name,
+            owner = %request.owner,
+            token_symbol = %request.token_symbol,
+            "Processing subnet registration"
+        );
+
+        // Check if already registered
+        if self.service.get_subnet_info(&request.subnet_id).is_some() {
+            warn!(subnet_id = %request.subnet_id, "Subnet already registered");
+            return RegisterSubnetResponse {
+                success: false,
+                message: format!("Subnet '{}' is already registered", request.subnet_id),
+                subnet_id: Some(request.subnet_id),
+                event_id: None,
+            };
+        }
+
+        // Validate owner address (must be 0x + 64 hex chars = 66 total)
+        if !request.owner.starts_with("0x")
+            || request.owner.len() != 66
+            || !request.owner[2..].chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return RegisterSubnetResponse {
+                success: false,
+                message: "Invalid owner address format (expected 0x + 64 hex chars)".to_string(),
+                subnet_id: None,
+                event_id: None,
+            };
+        }
+
+        // Validate token_symbol: 1-10 uppercase alphanumeric characters
+        if request.token_symbol.is_empty()
+            || request.token_symbol.len() > 10
+            || !request.token_symbol.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        {
+            return RegisterSubnetResponse {
+                success: false,
+                message: "Invalid token_symbol (must be 1-10 uppercase alphanumeric characters)".to_string(),
+                subnet_id: None,
+                event_id: None,
+            };
+        }
+
+        // Parse subnet type
+        let subnet_type = match request.subnet_type.as_deref() {
+            None => SubnetType::App,
+            Some(t) => match t.to_ascii_lowercase().as_str() {
+                "app" | "application" => SubnetType::App,
+                "organization" | "org" => SubnetType::Organization,
+                "personal" => SubnetType::Personal,
+                other => {
+                    return RegisterSubnetResponse {
+                        success: false,
+                        message: format!("Unknown subnet type '{}' (valid: app, organization, personal)", other),
+                        subnet_id: None,
+                        event_id: None,
+                    };
+                }
+            },
+        };
+
+        // Build resource limits
+        let resource_limits = if request.max_tps.is_some() || request.max_storage_bytes.is_some() {
+            let mut limits = SubnetResourceLimits::new();
+            if let Some(tps) = request.max_tps {
+                limits = limits.with_tps(tps);
+            }
+            if let Some(storage) = request.max_storage_bytes {
+                limits = limits.with_storage(storage);
+            }
+            Some(limits)
+        } else {
+            None
+        };
+
+        // Build token config
+        let token_config = TokenConfig {
+            decimals: request.token_decimals.unwrap_or(8),
+            max_supply: request.token_max_supply,
+            mintable: request.token_mintable.unwrap_or(false),
+            burnable: request.token_burnable.unwrap_or(true),
+        };
+
+        // Build SubnetRegistration
+        let mut registration = SubnetRegistration::new(
+            request.subnet_id.clone(),
+            request.name.clone(),
+            request.owner.clone(),
+            request.token_symbol.clone(),
+        )
+        .with_type(subnet_type)
+        .with_token_config(token_config);
+
+        if let Some(desc) = &request.description {
+            registration = registration.with_description(desc.clone());
+        }
+        if let Some(parent) = &request.parent_subnet_id {
+            registration = registration.with_parent(parent.clone());
+        }
+        if let Some(max_users) = request.max_users {
+            registration = registration.with_max_users(max_users);
+        }
+        if let Some(limits) = resource_limits {
+            registration = registration.with_limits(limits);
+        }
+        if let Some(supply) = request.initial_token_supply {
+            registration = registration.with_initial_supply(supply);
+        }
+        if let Some(airdrop) = request.user_airdrop_amount {
+            registration = registration.with_user_airdrop(airdrop);
+        }
+        if !request.assigned_solvers.is_empty() {
+            registration = registration.with_solvers(request.assigned_solvers.clone());
+        }
+
+        // Create VLC snapshot
+        let vlc_time = self.service.get_vlc_time();
+        let mut vlc = setu_vlc::VectorClock::new();
+        vlc.increment(self.service.validator_id());
+        let vlc_snapshot = setu_vlc::VLCSnapshot {
+            vector_clock: vlc,
+            logical_time: vlc_time,
+            physical_time: current_timestamp_millis(),
+        };
+
+        // Create subnet registration event
+        let mut event = Event::subnet_register(
+            registration.clone(),
+            vec![],
+            vlc_snapshot,
+            self.service.validator_id().to_string(),
+        );
+
+        event.set_execution_result(setu_types::event::ExecutionResult {
+            success: true,
+            message: Some("Subnet registration executed".to_string()),
+            state_changes: vec![setu_types::event::StateChange {
+                key: format!("subnet:{}", request.subnet_id),
+                old_value: None,
+                new_value: Some(
+                    serde_json::json!({
+                        "name": request.name,
+                        "owner": request.owner,
+                        "token_symbol": request.token_symbol,
+                        "subnet_type": format!("{:?}", registration.subnet_type),
+                    }).to_string().into_bytes(),
+                ),
+            }],
+        });
+
+        let event_id = event.id.clone();
+
+        // Track subnet locally
+        self.service.add_subnet(SubnetInfo {
+            subnet_id: request.subnet_id.clone(),
+            name: request.name.clone(),
+            owner: request.owner.clone(),
+            subnet_type: format!("{:?}", registration.subnet_type),
+            token_symbol: request.token_symbol.clone(),
+            status: "active".to_string(),
+            registered_at: event.timestamp / 1000,
+        });
+
+        // Add event to DAG
+        self.service.add_event_to_dag(event).await;
+
+        info!(
+            subnet_id = %request.subnet_id,
+            event_id = %&event_id[..20.min(event_id.len())],
+            "Subnet registered successfully"
+        );
+
+        RegisterSubnetResponse {
+            success: true,
+            message: "Subnet registered successfully".to_string(),
+            subnet_id: Some(request.subnet_id),
+            event_id: Some(event_id),
         }
     }
 
@@ -263,6 +464,19 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         GetValidatorListResponse {
             validators: self.service.get_validator_list(),
         }
+    }
+
+    async fn get_subnet_list(&self, request: GetSubnetListRequest) -> GetSubnetListResponse {
+        let mut subnets = self.service.get_subnet_list();
+
+        if let Some(ref type_filter) = request.type_filter {
+            subnets.retain(|s| s.subnet_type.eq_ignore_ascii_case(type_filter));
+        }
+        if let Some(ref owner_filter) = request.owner_filter {
+            subnets.retain(|s| s.owner == *owner_filter);
+        }
+
+        GetSubnetListResponse { subnets }
     }
 
     async fn get_node_status(&self, request: GetNodeStatusRequest) -> GetNodeStatusResponse {

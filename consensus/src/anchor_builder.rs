@@ -23,9 +23,9 @@ use setu_types::{
     Anchor, AnchorMerkleRoots, ConsensusConfig, ConsensusFrame, Event, EventId, SubnetId,
     event::StateChange,
 };
-use setu_storage::{GlobalStateManager, StateApplySummary, StateApplyError};
+use setu_storage::{GlobalStateManager, SharedStateManager, StateApplySummary, StateApplyError};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 // ============================================================================
 // Types for Deferred Commit Mode
@@ -183,8 +183,8 @@ impl From<setu_merkle::MerkleError> for AnchorBuildError {
 /// Anchor Builder with integrated Merkle tree management
 pub struct AnchorBuilder {
     config: ConsensusConfig,
-    /// Global state manager (shared across components)
-    state_manager: Arc<RwLock<GlobalStateManager>>,
+    /// Shared state manager (read-write separated)
+    pub(crate) shared: Arc<SharedStateManager>,
     /// Last created anchor
     last_anchor: Option<Anchor>,
     /// Current anchor depth
@@ -206,7 +206,7 @@ impl AnchorBuilder {
     pub fn new(config: ConsensusConfig) -> Self {
         Self {
             config,
-            state_manager: Arc::new(RwLock::new(GlobalStateManager::new())),
+            shared: Arc::new(SharedStateManager::new(GlobalStateManager::new())),
             last_anchor: None,
             anchor_depth: 0,
             last_fold_vlc: 0,
@@ -218,10 +218,10 @@ impl AnchorBuilder {
     /// Create with a shared GlobalStateManager
     /// 
     /// This allows sharing state between components (e.g., TaskPreparer and ConsensusValidator)
-    pub fn with_shared_state_manager(config: ConsensusConfig, state_manager: Arc<RwLock<GlobalStateManager>>) -> Self {
+    pub fn with_shared_state_manager(config: ConsensusConfig, state_manager: Arc<SharedStateManager>) -> Self {
         Self {
             config,
-            state_manager,
+            shared: state_manager,
             last_anchor: None,
             anchor_depth: 0,
             last_fold_vlc: 0,
@@ -236,9 +236,9 @@ impl AnchorBuilder {
         delta >= self.config.vlc_delta_threshold
     }
     
-    /// Get the shared global state manager
-    pub fn shared_state_manager(&self) -> Arc<RwLock<GlobalStateManager>> {
-        Arc::clone(&self.state_manager)
+    /// Get the shared state manager
+    pub fn shared_state_manager(&self) -> Arc<SharedStateManager> {
+        Arc::clone(&self.shared)
     }
     
     /// Restore AnchorBuilder state from storage after restart
@@ -267,8 +267,7 @@ impl AnchorBuilder {
     where
         F: FnOnce(&mut GlobalStateManager) -> R,
     {
-        let mut guard = self.state_manager.write()
-            .expect("GlobalStateManager lock poisoned");
+        let mut guard = self.shared.lock_write();
         f(&mut guard)
     }
     
@@ -277,9 +276,8 @@ impl AnchorBuilder {
     where
         F: FnOnce(&GlobalStateManager) -> R,
     {
-        let guard = self.state_manager.read()
-            .expect("GlobalStateManager lock poisoned");
-        f(&guard)
+        let snapshot = self.shared.load_snapshot();
+        f(&snapshot)
     }
 
     // ========================================================================
@@ -389,16 +387,17 @@ impl AnchorBuilder {
         // Route events by subnet
         let routed = EventRouter::route_events(&events);
         
-        // Collect state changes without applying
+        // Collect state changes (for metadata in PendingAnchorBuild)
         let pending_state_changes = self.collect_state_changes(&events);
         
         // Compute events root (Binary Merkle Tree)
         let events_root_hash = compute_events_root(&events);
         let events_root = *events_root_hash.as_bytes();
         
-        // Compute pending state root using temporary clone
+        // Compute state root using same deterministic logic as Follower:
+        // VLC-sorted, conflict-detected, cloned from write GSM
         let (global_state_root, subnet_roots) = 
-            self.compute_pending_state_root(&pending_state_changes);
+            self.compute_state_root_from_events(&events);
         
         // Compute new anchor chain root (what it will be after commit)
         let anchor_chain_root = self.last_anchor_chain_root;
@@ -456,21 +455,17 @@ impl AnchorBuilder {
             });
         }
         
-        // Apply state changes to SMT
+        // Apply state changes to SMT and commit in a single write lock
         let events = pending.all_events();
-        let state_summary = {
-            let mut guard = self.state_manager.write()
-                .expect("GlobalStateManager lock poisoned");
-            guard.apply_committed_events(&events)
-        };
-        
-        // Commit state
         let anchor_id = self.anchor_depth + 1;
-        {
-            let mut guard = self.state_manager.write()
-                .expect("GlobalStateManager lock poisoned");
+        let state_summary = {
+            let mut guard = self.shared.lock_write();
+            let summary = guard.apply_committed_events(&events);
             guard.commit(anchor_id)?;
-        }
+            // Publish snapshot while still holding Mutex (atomic consistency)
+            self.shared.publish_snapshot(&guard);
+            summary
+        };
         
         // Update AnchorBuilder state
         self.last_anchor = Some(pending.anchor);
@@ -503,33 +498,35 @@ impl AnchorBuilder {
             });
         }
         
-        // 2. Verify state root (compute expected vs actual)
-        if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
-            let pending_changes = self.collect_state_changes(events);
-            let (expected_root, _) = self.compute_pending_state_root(&pending_changes);
-            
-            if expected_root != merkle_roots.global_state_root {
-                return Err(AnchorBuildError::RootMismatch {
-                    expected: expected_root,
-                    actual: merkle_roots.global_state_root,
-                });
-            }
-        }
-        
-        // 3. Apply state changes
-        let state_summary = {
-            let mut guard = self.state_manager.write()
-                .expect("GlobalStateManager lock poisoned");
-            guard.apply_committed_events(events)
-        };
-        
-        // 4. Commit and update metadata
+        // Hold write lock for the ENTIRE verify+commit to prevent race conditions.
+        // Without this, concurrent CF proposals can clone the same base state,
+        // and the second one's verification becomes stale after the first commits.
         let anchor_id = self.anchor_depth + 1;
-        {
-            let mut guard = self.state_manager.write()
-                .expect("GlobalStateManager lock poisoned");
+        let state_summary = {
+            let mut guard = self.shared.lock_write();
+            
+            // 2. Verify state root (compute expected vs actual)
+            if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
+                // Clone from write GSM under the lock
+                let mut temp_manager = (*guard).clone();
+                temp_manager.apply_committed_events(events);
+                let (expected_root, _) = temp_manager.compute_global_root_bytes();
+                
+                if expected_root != merkle_roots.global_state_root {
+                    // Write GSM NOT mutated — F1 safety preserved
+                    return Err(AnchorBuildError::RootMismatch {
+                        expected: expected_root,
+                        actual: merkle_roots.global_state_root,
+                    });
+                }
+            }
+            
+            // 3. Apply state changes and commit (same lock scope)
+            let summary = guard.apply_committed_events(events);
             guard.commit(anchor_id)?;
-        }
+            self.shared.publish_snapshot(&guard);
+            summary
+        };
         self.synchronize_finalized_anchor(&cf.anchor);
         
         Ok(state_summary)
@@ -556,26 +553,31 @@ impl AnchorBuilder {
         changes
     }
     
-    /// Compute state root after applying pending changes (using temporary clone)
-    fn compute_pending_state_root(
+    /// Compute state root by applying events using the same deterministic logic
+    /// as Follower verification (`apply_committed_events`).
+    ///
+    /// This ensures Leader and Follower always compute identical state roots:
+    /// - Same base state source (write GSM)
+    /// - Same event ordering (VLC sort inside `apply_committed_events`)
+    /// - Same conflict detection (old_value mismatch → skip event)
+    /// - Same genesis duplicate handling
+    ///
+    /// The write lock is held only for the duration of the clone, not during
+    /// the actual computation.
+    fn compute_state_root_from_events(
         &self,
-        pending_changes: &HashMap<SubnetId, Vec<StateChangeEntry>>,
+        events: &[Event],
     ) -> ([u8; 32], HashMap<SubnetId, [u8; 32]>) {
-        // Clone the state manager for temporary computation
+        // Clone from write GSM (same base state as Follower verification)
         let mut temp_manager = {
-            let guard = self.state_manager.read()
-                .expect("GlobalStateManager lock poisoned");
-            guard.clone()
+            let guard = self.shared.lock_write();
+            (*guard).clone()
         };
+        // Mutex released — computation is on a detached clone
         
-        // Apply pending changes to the clone
-        for (subnet_id, entries) in pending_changes {
-            for entry in entries {
-                for change in &entry.changes {
-                    temp_manager.apply_state_change(*subnet_id, change);
-                }
-            }
-        }
+        // Apply using identical logic to Follower:
+        // VLC-sorted, conflict-detected, genesis-aware
+        temp_manager.apply_committed_events(events);
         
         // Compute and return the root
         temp_manager.compute_global_root_bytes()
@@ -642,16 +644,14 @@ impl AnchorBuilder {
     
     /// Get a subnet's current state root
     pub fn get_subnet_root(&self, subnet_id: &SubnetId) -> Option<[u8; 32]> {
-        let guard = self.state_manager.read()
-            .expect("GlobalStateManager lock poisoned");
-        guard.get_subnet_root_bytes(subnet_id)
+        let snapshot = self.shared.load_snapshot();
+        snapshot.get_subnet_root_bytes(subnet_id)
     }
     
     /// Get the current global state root
     pub fn get_global_root(&self) -> [u8; 32] {
-        let guard = self.state_manager.read()
-            .expect("GlobalStateManager lock poisoned");
-        let (root, _) = guard.compute_global_root_bytes();
+        let snapshot = self.shared.load_snapshot();
+        let (root, _) = snapshot.compute_global_root_bytes();
         root
     }
     

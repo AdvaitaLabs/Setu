@@ -55,11 +55,15 @@ impl SolverHttpClient {
     pub async fn execute_task(&self, request: ExecuteTaskRequest) -> TransportResult<ExecuteTaskResponse> {
         let url = format!("{}/api/v1/execute-task", self.base_url);
 
-        debug!(url = %url, "Sending execute-task request");
+        debug!(url = %url, "Sending execute-task request (bincode)");
+
+        let body = bincode::serialize(&request)
+            .map_err(|e| TransportError::Internal(format!("bincode serialize error: {}", e)))?;
 
         let response = self.client
             .post(&url)
-            .json(&request)
+            .header("Content-Type", "application/octet-stream")
+            .body(body)
             .send()
             .await?;
 
@@ -73,10 +77,10 @@ impl SolverHttpClient {
             });
         }
 
-        let result: ExecuteTaskResponse = response
-            .json()
-            .await
+        let bytes = response.bytes().await
             .map_err(|e| TransportError::DeserializationError(e.to_string()))?;
+        let result: ExecuteTaskResponse = bincode::deserialize(&bytes)
+            .map_err(|e| TransportError::DeserializationError(format!("bincode deserialize error: {}", e)))?;
 
         Ok(result)
     }

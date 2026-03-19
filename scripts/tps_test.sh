@@ -40,7 +40,7 @@ WARMUP_REQUESTS=50        # 预热请求数
 USE_TEST_ACCOUNTS=true    # 使用测试账户
 INIT_ACCOUNTS=100         # 初始化测试账户数量 (0=不初始化，使用种子账户)
 INIT_ACCOUNT_BALANCE=100000  # 每个测试账户的初始余额
-COINS_PER_ACCOUNT=2       # 每个账户的 coin 对象数 (更多=更高单账户并发, 建议≥2)
+COINS_PER_ACCOUNT=5       # 每个账户的 coin 对象数 (多 Coin 模型, 更多=更高单账户并行度, 建议≥5)
 BENCHMARK_MODE="burst"    # 模式: burst, sustained, ramp
 SUSTAINED_DURATION=30     # sustained 模式持续时间(秒)
 SUSTAINED_TPS=100         # sustained 模式目标 TPS
@@ -95,7 +95,7 @@ Benchmark 配置:
   --no-test-accounts      不使用测试账户
   --init-accounts NUM     初始化测试账户数量 (默认: $INIT_ACCOUNTS, 0=使用种子账户)
   --init-balance NUM      每个测试账户初始余额 (默认: $INIT_ACCOUNT_BALANCE)
-  --coins-per-account N   每账户 coin 对象数 (默认: $COINS_PER_ACCOUNT, 更多=更高并发)
+  --coins-per-account N   每账户 coin 对象数 (默认: $COINS_PER_ACCOUNT, 多 Coin 模型, 更多=更高并发)
 
 Benchmark 模式:
   --burst                 突发模式 (默认)

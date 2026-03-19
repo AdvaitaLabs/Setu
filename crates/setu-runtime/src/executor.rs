@@ -11,16 +11,19 @@
 use serde::{Deserialize, Serialize};
 use tracing::{info, debug, warn};
 use setu_types::{
-    ObjectId, Address, CoinType, Balance, CoinData, Object,
-    deterministic_coin_id,
+    ObjectId, Address, CoinType, CoinData, Object,
+    coin_id_from_tx, create_coin_with_id,
 };
 // Note: Coin::to_coin_state_bytes() is used via trait method on Object<CoinData>
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::state::StateStore;
 use crate::transaction::{Transaction, TransactionType, TransferTx, QueryTx, QueryType};
 
-/// Execution context
-#[derive(Debug, Clone)]
+/// Execution context for a single transaction.
+///
+/// SAFETY: Do NOT clone this struct — the output_counter is per-transaction
+/// and cloning would cause duplicate ObjectId generation.
+#[derive(Debug)]  // 不 derive Clone!
 pub struct ExecutionContext {
     /// Executor (usually the solver)
     pub executor_id: String,
@@ -28,6 +31,50 @@ pub struct ExecutionContext {
     pub timestamp: u64,
     /// Whether executed in TEE (future implementation)
     pub in_tee: bool,
+    /// Transaction hash — used for deterministic ID generation
+    pub tx_hash: [u8; 32],
+    /// Output counter — tracks number of objects created in this tx.
+    /// Uses Cell for interior mutability (single-threaded execution context).
+    output_counter: std::cell::Cell<u32>,
+}
+
+impl ExecutionContext {
+    /// Create a new ExecutionContext.
+    ///
+    /// For STF/Enclave path: tx_hash derived from task_id (see design doc §3.3.2)
+    /// For genesis/validator path: tx_hash = BLAKE3("SETU_TX_HASH:GENESIS:" || event_id)
+    /// For tests: tx_hash = [0u8; 32] or deterministic test value
+    pub fn new(
+        executor_id: String,
+        timestamp: u64,
+        in_tee: bool,
+        tx_hash: [u8; 32],
+    ) -> Self {
+        Self {
+            executor_id,
+            timestamp,
+            in_tee,
+            tx_hash,
+            output_counter: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Get the next output index and increment counter.
+    ///
+    /// Panics if counter overflows u32 (> 4 billion coins per tx — impossible
+    /// in practice, but guarded defensively).
+    pub fn next_output_index(&self) -> u32 {
+        let idx = self.output_counter.get();
+        self.output_counter.set(
+            idx.checked_add(1).expect("output_counter overflow: > u32::MAX coins in one tx")
+        );
+        idx
+    }
+
+    /// Generate deterministic ObjectId for a new coin
+    pub fn new_coin_id(&self) -> ObjectId {
+        coin_id_from_tx(&self.tx_hash, self.next_output_index())
+    }
 }
 
 /// Execution output
@@ -147,7 +194,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
         &mut self,
         tx: &Transaction,
         transfer_tx: &TransferTx,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> RuntimeResult<ExecutionOutput> {
         let coin_id = transfer_tx.coin_id;
         let recipient = &transfer_tx.recipient;
@@ -157,8 +204,6 @@ impl<S: StateStore> RuntimeExecutor<S> {
             .ok_or(RuntimeError::ObjectNotFound(coin_id))?;
         
         // 1.5. 确保 Coin 是 Owned 对象（防御性检查）
-        // transfer_to() 对非 Owned 对象会静默跳过，导致生成无效 StateChange。
-        // 所有 Coin 都应该是 OwnedObject，如果不是则说明数据已损坏。
         if !coin.is_owned() {
             return Err(RuntimeError::InvalidTransaction(
                 format!("Coin {} is not an owned object — cannot transfer", coin_id)
@@ -186,138 +231,88 @@ impl<S: StateStore> RuntimeExecutor<S> {
         let mut created_objects = Vec::new();
         let deleted_objects = Vec::new();
         
-        // 3. 执行转账逻辑
-        match transfer_tx.amount {
-            // 完整转账：直接转移对象所有权
-            None => {
-                debug!(
-                    coin_id = %coin_id,
-                    from = %tx.sender,
-                    to = %recipient,
-                    amount = coin.data.balance.value(),
-                    "Full transfer"
-                );
-                
-                // transfer_to updates owner, ownership, version, and digest
-                coin.transfer_to(recipient.clone());
-                
-                // Use BCS serialization for storage compatibility
-                let new_state = coin.to_coin_state_bytes();
-                
-                // 保存更新后的对象
-                self.state.set_object(coin_id, coin)?;
-                
-                state_changes.push(StateChange {
-                    change_type: StateChangeType::Update,
-                    object_id: coin_id,
-                    old_state: Some(old_state),
-                    new_state: Some(new_state),
-                });
-            }
+        // 🔴 R13: 拒绝 amount == 0（防止创建 0 余额僵尸 Coin）
+        if let Some(0) = transfer_tx.amount {
+            return Err(RuntimeError::InvalidTransaction(
+                "Transfer amount must be > 0".into()
+            ));
+        }
+        
+        // 判断是否全额转账:
+        // - None: 显式全额
+        // - Some(amount) where amount == balance: 隐式全额（避免 0 余额僵尸 Coin）
+        let is_full_transfer = match transfer_tx.amount {
+            None => true,
+            Some(amount) => amount == coin.data.balance.value(),
+        };
+        
+        if is_full_transfer {
+            // 全额转账：直接转移所有权（不创建新 Coin，不留僵尸）
+            debug!(
+                coin_id = %coin_id,
+                from = %tx.sender,
+                to = %recipient,
+                amount = coin.data.balance.value(),
+                "Full transfer (ownership transfer)"
+            );
             
-            // 部分转账：使用 get-or-deposit 模式，确定性 coin ID
-            Some(amount) if amount < coin.data.balance.value() => {
-                let coin_type_str = coin.data.coin_type.as_str().to_string();
-                
-                debug!(
-                    coin_id = %coin_id,
-                    from = %tx.sender,
-                    to = %recipient,
-                    amount = amount,
-                    remaining = coin.data.balance.value() - amount,
-                    "Partial transfer (get-or-deposit)"
-                );
-                
-                // 从原 Coin 中提取金额
-                let transferred_balance = coin.data.balance.withdraw(amount)
-                    .map_err(|e| RuntimeError::InvalidTransaction(e))?;
-                
-                // 更新原 Coin: increment_version 同时更新 version 和 digest
-                // (之前用 `version += 1` 未更新 digest——虽然 CoinState 不含 digest,
-                //  但保持内存 Object 状态一致性，避免后续维护隐患)
-                coin.increment_version();
-                let new_state = coin.to_coin_state_bytes();
-                self.state.set_object(coin_id, coin)?;  // move, 不再 clone
-                
-                state_changes.push(StateChange {
-                    change_type: StateChangeType::Update,
-                    object_id: coin_id,
-                    old_state: Some(old_state),
-                    new_state: Some(new_state),
-                });
-                
-                // Use deterministic coin ID for recipient (1:1 model: one coin per address per subnet)
-                let recipient_coin_id = deterministic_coin_id(recipient, &coin_type_str);
-                
-                if let Some(mut existing_coin) = self.state.get_object(&recipient_coin_id)? {
-                    // Recipient already has a coin of this type → deposit into existing
-                    let old_recipient_state = existing_coin.to_coin_state_bytes();
-                    existing_coin.data.balance.deposit(transferred_balance)
-                        .map_err(|e| RuntimeError::InvalidTransaction(e))?;
-                    existing_coin.increment_version();
-                    let new_recipient_state = existing_coin.to_coin_state_bytes();
-                    
-                    self.state.set_object(recipient_coin_id, existing_coin)?;
-                    
-                    state_changes.push(StateChange {
-                        change_type: StateChangeType::Update,
-                        object_id: recipient_coin_id,
-                        old_state: Some(old_recipient_state),
-                        new_state: Some(new_recipient_state),
-                    });
-                } else {
-                    // Recipient doesn't have this coin type → create new coin with deterministic ID
-                    let data = CoinData {
-                        coin_type: CoinType::new(&coin_type_str),
-                        balance: Balance::new(amount),
-                    };
-                    let new_coin = Object::new_owned(recipient_coin_id, recipient.clone(), data);
-                    let new_coin_state = new_coin.to_coin_state_bytes();
-                    
-                    self.state.set_object(recipient_coin_id, new_coin)?;
-                    
-                    created_objects.push(recipient_coin_id);
-                    state_changes.push(StateChange {
-                        change_type: StateChangeType::Create,
-                        object_id: recipient_coin_id,
-                        old_state: None,
-                        new_state: Some(new_coin_state),
-                    });
-                }
-            }
+            coin.transfer_to(recipient.clone());
+            let new_state = coin.to_coin_state_bytes();
+            self.state.set_object(coin_id, coin)?;
             
-            // amount == full balance → treat as full transfer (avoid zombie 0-balance coin)
-            Some(amount) if amount == coin.data.balance.value() => {
-                debug!(
-                    coin_id = %coin_id,
-                    from = %tx.sender,
-                    to = %recipient,
-                    amount = amount,
-                    "Full transfer (amount == balance, ownership transfer)"
-                );
-                
-                coin.transfer_to(recipient.clone());
-                let new_state = coin.to_coin_state_bytes();
-                self.state.set_object(coin_id, coin)?;
-                
-                state_changes.push(StateChange {
-                    change_type: StateChangeType::Update,
-                    object_id: coin_id,
-                    old_state: Some(old_state),
-                    new_state: Some(new_state),
-                });
-            }
+            state_changes.push(StateChange {
+                change_type: StateChangeType::Update,
+                object_id: coin_id,
+                old_state: Some(old_state),
+                new_state: Some(new_state),
+            });
+        } else {
+            // 部分转账 (amount < balance): always-create-new pattern
+            let amount = transfer_tx.amount.unwrap(); // safe: is_full_transfer=false ⟹ Some
+            let coin_type_str = coin.data.coin_type.as_str().to_string();
             
-            // amount > balance → insufficient funds
-            Some(amount) => {
-                return Err(RuntimeError::InvalidTransaction(
-                    format!(
-                        "Insufficient balance: requested {}, available {}",
-                        amount,
-                        coin.data.balance.value()
-                    )
-                ));
-            }
+            debug!(
+                coin_id = %coin_id,
+                from = %tx.sender,
+                to = %recipient,
+                amount = amount,
+                remaining = coin.data.balance.value() - amount,
+                "Partial transfer (always-create-new)"
+            );
+            
+            // 1. 扣减 sender 的 Coin
+            let _ = coin.data.balance.withdraw(amount)
+                .map_err(|e| RuntimeError::InvalidTransaction(e))?;
+            coin.increment_version();
+            let new_state = coin.to_coin_state_bytes();
+            self.state.set_object(coin_id, coin)?;
+            
+            state_changes.push(StateChange {
+                change_type: StateChangeType::Update,
+                object_id: coin_id,
+                old_state: Some(old_state),
+                new_state: Some(new_state),
+            });
+            
+            // 2. 为 recipient 创建新 Coin（确定性 ID）
+            let new_coin_id = ctx.new_coin_id();
+            let new_coin = create_coin_with_id(
+                new_coin_id,
+                recipient.clone(),
+                amount,
+                &coin_type_str,
+                ctx.timestamp,
+            );
+            let new_coin_state = new_coin.to_coin_state_bytes();
+            self.state.set_object(new_coin_id, new_coin)?;
+            
+            created_objects.push(new_coin_id);
+            state_changes.push(StateChange {
+                change_type: StateChangeType::Create,
+                object_id: new_coin_id,
+                old_state: None,
+                new_state: Some(new_coin_state),
+            });
         }
         
         Ok(ExecutionOutput {
@@ -355,8 +350,11 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 
                 for obj_id in owned_objects {
                     if let Some(coin) = self.state.get_object(&obj_id)? {
-                        *total_balance.entry(coin.data.coin_type.clone()).or_insert(0) 
-                            += coin.data.balance.value();
+                        let entry = total_balance.entry(coin.data.coin_type.clone()).or_insert(0);
+                        *entry = entry.checked_add(coin.data.balance.value())
+                            .ok_or_else(|| RuntimeError::InvalidTransaction(
+                                "Balance overflow in query".to_string()
+                            ))?;
                     }
                 }
                 
@@ -458,31 +456,25 @@ impl<S: StateStore> RuntimeExecutor<S> {
         &mut self.state
     }
     
-    /// Execute a simple account-based transfer (convenience method)
-    /// 
-    /// This method accepts a simple `Transfer` request (from/to/amount) from users,
-    /// automatically finds suitable Coin objects from the sender, and executes the transfer.
-    /// 
-    /// This bridges the gap between user-facing account model and internal object model.
-    /// 
+    /// Execute a simple account-based transfer with auto-merge support.
+    ///
+    /// When a single Coin is insufficient, automatically merges all coins of
+    /// the same type, then executes the transfer. This is Setu's "auto-PTB".
+    ///
     /// # Arguments
     /// * `from` - Sender address (account)
-    /// * `to` - Recipient address (account)  
+    /// * `to` - Recipient address (account)
     /// * `amount` - Amount to transfer
     /// * `ctx` - Execution context
-    /// 
-    /// # Returns
-    /// * `ExecutionOutput` with state changes in object model format
+    /// * `coin_type` - Optional coin type filter (None = "ROOT")
     pub fn execute_simple_transfer(
         &mut self,
         from: &str,
         to: &str,
         amount: u64,
         ctx: &ExecutionContext,
+        coin_type: Option<&str>,
     ) -> RuntimeResult<ExecutionOutput> {
-        // ⚠️ Safety: execute_simple_transfer auto-selects coins, which is
-        // non-deterministic across validators. TEE/consensus paths MUST use
-        // execute_transfer_with_coin (coin pre-selected by TaskPreparer).
         if ctx.in_tee {
             return Err(RuntimeError::InvalidTransaction(
                 "execute_simple_transfer must not be called in TEE path — \
@@ -495,45 +487,25 @@ impl<S: StateStore> RuntimeExecutor<S> {
         let recipient = Address::from_hex(to)
             .map_err(|_| RuntimeError::InvalidAddress(to.to_string()))?;
         
-        info!(
-            from = %from,
-            to = %to,
-            amount = amount,
-            "Executing simple transfer"
-        );
+        info!(from = %from, to = %to, amount = amount, "Executing simple transfer");
         
-        // 1. Find sender's Coin objects
         let owned_objects = self.state.get_owned_objects(&sender)?;
+        let coin_type_filter = coin_type.unwrap_or("ROOT");
         
-        if owned_objects.is_empty() {
-            return Err(RuntimeError::InsufficientBalance {
-                address: sender.to_string(),
-                required: amount,
-                available: 0,
-            });
-        }
-        
-        // 2. Calculate total balance and find a suitable coin
-        let mut total_balance = 0u64;
-        let mut selected_coin_id: Option<ObjectId> = None;
-        let mut selected_coin_balance = 0u64;
-        
+        // Collect coins of the matching type
+        let mut coins: Vec<(ObjectId, Object<CoinData>)> = Vec::new();
         for obj_id in &owned_objects {
             if let Some(coin) = self.state.get_object(obj_id)? {
-                let balance = coin.data.balance.value();
-                total_balance += balance;
-                
-                // Select a coin that can cover the amount (prefer exact match or smallest sufficient)
-                if balance >= amount {
-                    if selected_coin_id.is_none() || balance < selected_coin_balance {
-                        selected_coin_id = Some(*obj_id);
-                        selected_coin_balance = balance;
-                    }
+                if coin.data.coin_type.as_str() == coin_type_filter {
+                    coins.push((*obj_id, coin));
                 }
             }
         }
         
-        // Check total balance
+        let total_balance: u64 = coins.iter()
+            .try_fold(0u64, |acc, (_, c)| acc.checked_add(c.data.balance.value()))
+            .ok_or(RuntimeError::InvalidTransaction("Total balance overflow".into()))?;
+        
         if total_balance < amount {
             return Err(RuntimeError::InsufficientBalance {
                 address: sender.to_string(),
@@ -542,35 +514,49 @@ impl<S: StateStore> RuntimeExecutor<S> {
             });
         }
         
-        // 3. If no single coin is sufficient, we need to merge (future: for now, error out)
-        let coin_id = selected_coin_id.ok_or_else(|| {
-            RuntimeError::InvalidTransaction(format!(
-                "No single coin with sufficient balance. Total: {}, Required: {}. Coin merging not yet implemented.",
-                total_balance, amount
-            ))
-        })?;
+        // Try to find a single coin that's sufficient (smallest sufficient)
+        coins.sort_by_key(|(_, c)| c.data.balance.value());
+        let single_sufficient = coins.iter()
+            .find(|(_, c)| c.data.balance.value() >= amount);
         
-        // 4. Create and execute the transfer transaction
-        // ⚠️ Use deterministic constructor — this is a TEE/consensus path.
-        let tx = Transaction::new_transfer_deterministic(
-            sender,
-            coin_id,
-            recipient,
-            Some(amount), // Always partial transfer for simple API
-            ctx.timestamp,
-        );
-        
-        self.execute_transaction(&tx, ctx)
+        if let Some((id, _)) = single_sufficient {
+            // Single coin is enough — direct transfer
+            let tx = Transaction::new_transfer_deterministic(
+                sender, *id, recipient, Some(amount), ctx.timestamp,
+            );
+            self.execute_transaction(&tx, ctx)
+        } else {
+            // Need to merge: merge all coins into the largest, then transfer
+            coins.sort_by(|(_, a), (_, b)| b.data.balance.value().cmp(&a.data.balance.value()));
+            let (target_id, _) = coins[0];
+            let source_ids: Vec<ObjectId> = coins[1..].iter().map(|(id, _)| *id).collect();
+            
+            let mut merge_output = self.execute_merge_coins(
+                &sender, target_id, &source_ids, ctx
+            )?;
+            
+            // Transfer from merged coin
+            let tx = Transaction::new_transfer_deterministic(
+                sender, target_id, recipient, Some(amount), ctx.timestamp,
+            );
+            let transfer_output = self.execute_transaction(&tx, ctx)?;
+            
+            // Combine outputs
+            merge_output.state_changes.extend(transfer_output.state_changes);
+            merge_output.created_objects.extend(transfer_output.created_objects);
+            merge_output.deleted_objects.extend(transfer_output.deleted_objects);
+            merge_output.message = Some(format!(
+                "Auto-merged {} coins, then transferred {} to {}",
+                source_ids.len() + 1, amount, recipient
+            ));
+            
+            Ok(merge_output)
+        }
     }
     
     // ========== Subnet & User Registration Handlers ==========
     
     /// Execute subnet registration - initializes subnet token if configured
-    /// 
-    /// This handles the SubnetRegister event and:
-    /// 1. Records subnet metadata
-    /// 2. Mints initial token supply to subnet owner (if token configured)
-    /// 3. Returns state changes for both subnet registration and token creation
     pub fn execute_subnet_register(
         &mut self,
         subnet_id: &str,
@@ -593,13 +579,10 @@ impl<S: StateStore> RuntimeExecutor<S> {
             "created_at": ctx.timestamp,
         });
         
-        // Generate deterministic ObjectId from subnet key (domain-separated)
         let subnet_object_id = ObjectId::new(
             setu_types::hash_utils::setu_hash_with_domain(b"SETU_SUBNET_META:", subnet_key.as_bytes())
         );
         
-        // Note: SubnetMetadata is NOT a Coin, so we keep JSON format for it
-        // Only Coin objects use BCS format
         state_changes.push(StateChange {
             change_type: StateChangeType::Create,
             object_id: subnet_object_id,
@@ -607,33 +590,12 @@ impl<S: StateStore> RuntimeExecutor<S> {
             new_state: Some(serde_json::to_vec(&subnet_data)?),
         });
         
-        // 2. Mint initial token supply to owner if configured
-        // Note: token_symbol is for display only, we use subnet_id as the coin namespace
+        // 2. Mint initial token supply via mint_tokens (unified path)
         if let Some(supply) = initial_supply {
             if supply > 0 {
-                // Use subnet_id as the coin namespace (1:1 binding)
-                // token_symbol is only for display purposes (stored in SubnetConfig)
-                let coin_id = deterministic_coin_id(owner, subnet_id);
-                
-                // Create token coin for subnet owner with deterministic ID
-                // (not via create_typed_coin, whose internal ID would differ from coin_id)
-                let data = CoinData {
-                    coin_type: CoinType::new(subnet_id),
-                    balance: Balance::new(supply),
-                };
-                let token_coin = Object::new_owned(coin_id, owner.clone(), data);
-                // Use BCS serialization for Coin storage
-                let coin_state = token_coin.to_coin_state_bytes();
-                
-                self.state.set_object(coin_id, token_coin)?;
-                
-                created_objects.push(coin_id);
-                state_changes.push(StateChange {
-                    change_type: StateChangeType::Create,
-                    object_id: coin_id,
-                    old_state: None,
-                    new_state: Some(coin_state),
-                });
+                let mint_output = self.mint_tokens(owner, subnet_id, supply, ctx)?;
+                state_changes.extend(mint_output.state_changes);
+                created_objects.extend(mint_output.created_objects);
                 
                 info!(
                     subnet_id = %subnet_id,
@@ -649,8 +611,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
             success: true,
             message: Some(format!(
                 "Subnet '{}' registered with owner {}{}",
-                name,
-                owner,
+                name, owner,
                 token_symbol.map_or(String::new(), |s| format!(", token: {}", s))
             )),
             state_changes,
@@ -661,18 +622,6 @@ impl<S: StateStore> RuntimeExecutor<S> {
     }
     
     /// Execute user registration (pure infrastructure primitive)
-    /// 
-    /// This is a basic infrastructure operation that only records user membership.
-    /// 
-    /// **Note**: Token airdrops are application-layer logic and should be handled
-    /// by Subnet applications (future: MoveVM smart contracts). The Setu core
-    /// only provides primitives like `mint_tokens()` and `transfer()` that
-    /// applications can compose.
-    /// 
-    /// # Arguments
-    /// * `user_address` - Address of the user to register
-    /// * `subnet_id` - Subnet the user is joining
-    /// * `ctx` - Execution context
     pub fn execute_user_register(
         &mut self,
         user_address: &Address,
@@ -681,7 +630,6 @@ impl<S: StateStore> RuntimeExecutor<S> {
     ) -> RuntimeResult<ExecutionOutput> {
         let mut state_changes = Vec::new();
         
-        // Record user membership (pure infrastructure operation)
         let membership_key = format!("user:{}:subnet:{}", user_address, subnet_id);
         let membership_data = serde_json::json!({
             "user": user_address.to_string(),
@@ -689,7 +637,6 @@ impl<S: StateStore> RuntimeExecutor<S> {
             "joined_at": ctx.timestamp,
         });
         
-        // Generate deterministic ObjectId from membership key (domain-separated)
         let membership_object_id = ObjectId::new(
             setu_types::hash_utils::setu_hash_with_domain(b"SETU_MEMBERSHIP:", membership_key.as_bytes())
         );
@@ -701,19 +648,11 @@ impl<S: StateStore> RuntimeExecutor<S> {
             new_state: Some(serde_json::to_vec(&membership_data)?),
         });
         
-        info!(
-            user = %user_address,
-            subnet_id = %subnet_id,
-            "User registered in subnet"
-        );
+        info!(user = %user_address, subnet_id = %subnet_id, "User registered in subnet");
         
         Ok(ExecutionOutput {
             success: true,
-            message: Some(format!(
-                "User {} registered in subnet '{}'",
-                user_address,
-                subnet_id,
-            )),
+            message: Some(format!("User {} registered in subnet '{}'", user_address, subnet_id)),
             state_changes,
             created_objects: vec![],
             deleted_objects: vec![],
@@ -721,22 +660,16 @@ impl<S: StateStore> RuntimeExecutor<S> {
         })
     }
     
-    /// Mint tokens to an address (pure infrastructure primitive)
-    /// 
-    /// This is a basic token minting operation. Applications can use this
-    /// to implement airdrops, rewards, or other token distribution logic.
-    /// 
-    /// # Arguments
-    /// * `to` - Address to mint tokens to
-    /// * `subnet_id` - Subnet ID (determines token type, 1:1 binding)
-    /// * `amount` - Amount to mint
-    /// * `ctx` - Execution context
+    /// Mint tokens — unified single path (R14 simplified)
+    ///
+    /// All mint operations use `ctx.new_coin_id()` (i.e., `coin_id_from_tx`)
+    /// to create new Coins. No more get-or-deposit pattern.
     pub fn mint_tokens(
         &mut self,
         to: &Address,
         subnet_id: &str,
         amount: u64,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> RuntimeResult<ExecutionOutput> {
         if amount == 0 {
             return Ok(ExecutionOutput {
@@ -749,104 +682,282 @@ impl<S: StateStore> RuntimeExecutor<S> {
             });
         }
         
-        // Use deterministic coin ID with subnet_id as namespace
-        let coin_id = deterministic_coin_id(to, subnet_id);
+        let coin_id = ctx.new_coin_id();
+        let coin = create_coin_with_id(coin_id, to.clone(), amount, subnet_id, ctx.timestamp);
+        let new_state = coin.to_coin_state_bytes();
+        self.state.set_object(coin_id, coin)?;
         
-        // Check if coin already exists
-        let existing = self.state.get_object(&coin_id)?;
-        
-        let (state_change, created) = if let Some(mut existing_coin) = existing {
-            // Add to existing balance - use BCS format
-            let old_state = existing_coin.to_coin_state_bytes();
-            existing_coin.data.balance.deposit(setu_types::Balance::new(amount))
-                .map_err(|e| RuntimeError::InvalidTransaction(e))?;
-            existing_coin.increment_version();
-            let new_state = existing_coin.to_coin_state_bytes();
-            
-            self.state.set_object(coin_id, existing_coin)?;
-            
-            (StateChange {
-                change_type: StateChangeType::Update,
-                object_id: coin_id,
-                old_state: Some(old_state),
-                new_state: Some(new_state),
-            }, false)
-        } else {
-            // Create new coin with deterministic ID - use BCS format
-            let data = CoinData {
-                coin_type: CoinType::new(subnet_id),
-                balance: Balance::new(amount),
-            };
-            let coin = Object::new_owned(coin_id, to.clone(), data);
-            let new_state = coin.to_coin_state_bytes();
-            
-            self.state.set_object(coin_id, coin)?;
-            
-            (StateChange {
-                change_type: StateChangeType::Create,
-                object_id: coin_id,
-                old_state: None,
-                new_state: Some(new_state),
-            }, true)
-        };
-        
-        info!(
-            to = %to,
-            subnet_id = %subnet_id,
-            amount = amount,
-            created = created,
-            "Tokens minted"
-        );
+        info!(to = %to, subnet_id = %subnet_id, amount = amount, "Tokens minted");
         
         Ok(ExecutionOutput {
             success: true,
             message: Some(format!("Minted {} tokens to {} in subnet {}", amount, to, subnet_id)),
-            state_changes: vec![state_change],
-            created_objects: if created { vec![coin_id] } else { vec![] },
+            state_changes: vec![StateChange {
+                change_type: StateChangeType::Create,
+                object_id: coin_id,
+                old_state: None,
+                new_state: Some(new_state),
+            }],
+            created_objects: vec![coin_id],
             deleted_objects: vec![],
             query_result: None,
         })
     }
     
-    /// Get or create a coin for an address in specific subnet
-    /// 
-    /// Uses deterministic coin ID generation for consistency with storage layer.
-    /// Returns (coin_id, was_created).
-    /// 
-    /// # Arguments
-    /// * `owner` - Owner address
-    /// * `subnet_id` - Subnet ID (determines token type)
-    /// * `ctx` - Execution context
-    pub fn get_or_create_coin(
+    // ========== Multi-Coin Operations ==========
+    
+    /// Maximum number of source coins in a single merge operation.
+    const MAX_MERGE_SOURCES: usize = 50;
+    
+    /// Merge multiple coins into a target coin.
+    ///
+    /// All source coins must belong to the same owner and have the same coin_type
+    /// as the target. After merge, target balance += sum(source balances), sources deleted.
+    pub fn execute_merge_coins(
         &mut self,
         owner: &Address,
-        subnet_id: &str,
+        target_coin_id: ObjectId,
+        source_coin_ids: &[ObjectId],
         _ctx: &ExecutionContext,
-    ) -> RuntimeResult<(ObjectId, bool)> {
-        // Use deterministic coin ID with subnet_id
-        let coin_id = deterministic_coin_id(owner, subnet_id);
-        
-        // Check if coin already exists
-        if self.state.get_object(&coin_id)?.is_some() {
-            return Ok((coin_id, false));
+    ) -> RuntimeResult<ExecutionOutput> {
+        // Parameter validation
+        if source_coin_ids.is_empty() {
+            return Err(RuntimeError::InvalidTransaction(
+                "Must provide at least one source coin to merge".into()
+            ));
+        }
+        if source_coin_ids.len() > Self::MAX_MERGE_SOURCES {
+            return Err(RuntimeError::InvalidTransaction(
+                format!("Too many source coins: {} (max {})",
+                    source_coin_ids.len(), Self::MAX_MERGE_SOURCES)
+            ));
+        }
+        // R11: target must not appear in sources
+        if source_coin_ids.contains(&target_coin_id) {
+            return Err(RuntimeError::InvalidTransaction(
+                format!("Target coin {} cannot also be a source", target_coin_id)
+            ));
+        }
+        // R11: no duplicate sources
+        {
+            let mut seen = std::collections::HashSet::with_capacity(source_coin_ids.len());
+            for id in source_coin_ids {
+                if !seen.insert(id) {
+                    return Err(RuntimeError::InvalidTransaction(
+                        format!("Duplicate source coin: {}", id)
+                    ));
+                }
+            }
         }
         
-        // Create new coin with 0 balance using deterministic ID
-        let data = CoinData {
-            coin_type: CoinType::new(subnet_id),
-            balance: Balance::new(0),
-        };
-        let coin = Object::new_owned(coin_id, owner.clone(), data);
-        self.state.set_object(coin_id, coin)?;
+        let mut state_changes = Vec::new();
+        let mut deleted_objects = Vec::new();
         
-        info!(
-            owner = %owner,
-            subnet_id = %subnet_id,
-            coin_id = %coin_id,
-            "Created empty coin for recipient with deterministic ID"
-        );
+        // 1. Read target coin
+        let mut target = self.state.get_object(&target_coin_id)?
+            .ok_or(RuntimeError::ObjectNotFound(target_coin_id))?;
         
-        Ok((coin_id, true))
+        let target_owner = target.metadata.owner.as_ref()
+            .ok_or(RuntimeError::InvalidOwnership {
+                object_id: target_coin_id,
+                address: owner.to_string(),
+            })?;
+        if target_owner != owner {
+            return Err(RuntimeError::InvalidOwnership {
+                object_id: target_coin_id,
+                address: owner.to_string(),
+            });
+        }
+        
+        let target_old_state = target.to_coin_state_bytes();
+        let target_coin_type = target.data.coin_type.clone();
+        
+        // 2. Merge source coins one by one
+        for &source_id in source_coin_ids {
+            let source = self.state.get_object(&source_id)?
+                .ok_or(RuntimeError::ObjectNotFound(source_id))?;
+            
+            let source_owner = source.metadata.owner.as_ref()
+                .ok_or(RuntimeError::InvalidOwnership {
+                    object_id: source_id,
+                    address: owner.to_string(),
+                })?;
+            if source_owner != owner {
+                return Err(RuntimeError::InvalidTransaction(
+                    format!("Source coin {} not owned by {}", source_id, owner)
+                ));
+            }
+            
+            if source.data.coin_type != target_coin_type {
+                return Err(RuntimeError::InvalidTransaction(
+                    format!("Coin type mismatch: target={}, source={}",
+                        target_coin_type, source.data.coin_type)
+                ));
+            }
+            
+            let source_old_state = source.to_coin_state_bytes();
+            target.data.balance.deposit(source.data.balance)
+                .map_err(|e| RuntimeError::InvalidTransaction(e))?;
+            
+            self.state.delete_object(&source_id)?;
+            deleted_objects.push(source_id);
+            state_changes.push(StateChange {
+                change_type: StateChangeType::Delete,
+                object_id: source_id,
+                old_state: Some(source_old_state),
+                new_state: None,
+            });
+        }
+        
+        // 3. Update target coin
+        target.increment_version();
+        let target_new_state = target.to_coin_state_bytes();
+        self.state.set_object(target_coin_id, target)?;
+        
+        state_changes.insert(0, StateChange {
+            change_type: StateChangeType::Update,
+            object_id: target_coin_id,
+            old_state: Some(target_old_state),
+            new_state: Some(target_new_state),
+        });
+        
+        Ok(ExecutionOutput {
+            success: true,
+            message: Some(format!("Merged {} coins", source_coin_ids.len())),
+            state_changes,
+            created_objects: vec![],
+            deleted_objects,
+            query_result: None,
+        })
+    }
+    
+    /// Maximum number of split outputs in a single split operation.
+    const MAX_SPLIT_OUTPUTS: usize = 50;
+    
+    /// Split a coin into multiple new coins.
+    ///
+    /// If total_split == balance (exact split), the source coin is deleted.
+    /// Otherwise, the source coin's balance is reduced.
+    pub fn execute_split_coin(
+        &mut self,
+        owner: &Address,
+        source_coin_id: ObjectId,
+        amounts: &[u64],
+        ctx: &ExecutionContext,
+    ) -> RuntimeResult<ExecutionOutput> {
+        if amounts.is_empty() {
+            return Err(RuntimeError::InvalidTransaction(
+                "Split amounts cannot be empty".into()
+            ));
+        }
+        if amounts.iter().any(|&a| a == 0) {
+            return Err(RuntimeError::InvalidTransaction(
+                "Split amount must be > 0 (zero-balance coins are not allowed)".into()
+            ));
+        }
+        if amounts.len() > Self::MAX_SPLIT_OUTPUTS {
+            return Err(RuntimeError::InvalidTransaction(
+                format!("Too many split outputs: {} (max {})",
+                    amounts.len(), Self::MAX_SPLIT_OUTPUTS)
+            ));
+        }
+        
+        let mut state_changes = Vec::new();
+        let mut created_objects = Vec::new();
+        let mut deleted_objects = Vec::new();
+        
+        // 1. Read and validate source coin
+        let mut source = self.state.get_object(&source_coin_id)?
+            .ok_or(RuntimeError::ObjectNotFound(source_coin_id))?;
+        
+        let source_owner = source.metadata.owner.as_ref()
+            .ok_or(RuntimeError::InvalidOwnership {
+                object_id: source_coin_id,
+                address: owner.to_string(),
+            })?;
+        if source_owner != owner {
+            return Err(RuntimeError::InvalidOwnership {
+                object_id: source_coin_id,
+                address: owner.to_string(),
+            });
+        }
+        
+        let source_old_state = source.to_coin_state_bytes();
+        let total_split: u64 = amounts.iter()
+            .try_fold(0u64, |acc, &a| acc.checked_add(a))
+            .ok_or(RuntimeError::InvalidTransaction("Split amounts overflow u64".into()))?;
+        
+        if source.data.balance.value() < total_split {
+            return Err(RuntimeError::InsufficientBalance {
+                address: owner.to_string(),
+                required: total_split,
+                available: source.data.balance.value(),
+            });
+        }
+        
+        let is_exact_split = source.data.balance.value() == total_split;
+        
+        // 2. Create new coins
+        for &amount in amounts {
+            let new_coin_id = ctx.new_coin_id();
+            let new_coin = create_coin_with_id(
+                new_coin_id,
+                owner.clone(),
+                amount,
+                source.data.coin_type.as_str(),
+                ctx.timestamp,
+            );
+            let new_coin_state = new_coin.to_coin_state_bytes();
+            
+            self.state.set_object(new_coin_id, new_coin)?;
+            created_objects.push(new_coin_id);
+            
+            state_changes.push(StateChange {
+                change_type: StateChangeType::Create,
+                object_id: new_coin_id,
+                old_state: None,
+                new_state: Some(new_coin_state),
+            });
+            
+            let _ = source.data.balance.withdraw(amount)
+                .map_err(|e| RuntimeError::InvalidTransaction(e))?;
+        }
+        
+        // 3. Handle source coin
+        if is_exact_split {
+            // Exact split: delete source coin (prevent 0-balance zombie)
+            self.state.delete_object(&source_coin_id)?;
+            deleted_objects.push(source_coin_id);
+            state_changes.insert(0, StateChange {
+                change_type: StateChangeType::Delete,
+                object_id: source_coin_id,
+                old_state: Some(source_old_state),
+                new_state: None,
+            });
+        } else {
+            // Partial split: update source coin
+            source.increment_version();
+            let source_new_state = source.to_coin_state_bytes();
+            self.state.set_object(source_coin_id, source)?;
+            state_changes.insert(0, StateChange {
+                change_type: StateChangeType::Update,
+                object_id: source_coin_id,
+                old_state: Some(source_old_state),
+                new_state: Some(source_new_state),
+            });
+        }
+        
+        Ok(ExecutionOutput {
+            success: true,
+            message: Some(format!("Split into {} coins{}",
+                amounts.len(),
+                if is_exact_split { " (source deleted)" } else { "" }
+            )),
+            state_changes,
+            created_objects,
+            deleted_objects,
+            query_result: None,
+        })
     }
 }
 
@@ -857,36 +968,31 @@ mod tests {
     use super::*;
     use crate::state::InMemoryStateStore;
     
+    /// Helper: create test ExecutionContext with deterministic tx_hash
+    fn test_ctx(seed: &str) -> ExecutionContext {
+        let tx_hash = *blake3::hash(format!("test-tx:{}", seed).as_bytes()).as_bytes();
+        ExecutionContext::new("test-solver".to_string(), 1000, false, tx_hash)
+    }
+    
     #[test]
     fn test_full_transfer() {
         let mut store = InMemoryStateStore::new();
         let sender = Address::from_str_id("alice");
         let recipient = Address::from_str_id("bob");
         
-        // 创建初始 Coin
         let coin = setu_types::create_coin(sender.clone(), 1000);
         let coin_id = *coin.id();
         store.set_object(coin_id, coin).unwrap();
         
-        // 创建执行器
         let mut executor = RuntimeExecutor::new(store);
-        
-        // 创建转账交易
         let tx = Transaction::new_transfer(sender.clone(), coin_id, recipient.clone(), None);
+        let ctx = test_ctx("full-transfer");
         
-        let ctx = ExecutionContext {
-            executor_id: "solver1".to_string(),
-            timestamp: 1000,
-            in_tee: false,
-        };
-        
-        // 执行转账
         let output = executor.execute_transaction(&tx, &ctx).unwrap();
         
         assert!(output.success);
         assert_eq!(output.state_changes.len(), 1);
         
-        // 验证所有权变更
         let coin = executor.state().get_object(&coin_id).unwrap().unwrap();
         assert_eq!(coin.metadata.owner.unwrap(), recipient);
     }
@@ -902,90 +1008,27 @@ mod tests {
         store.set_object(coin_id, coin).unwrap();
         
         let mut executor = RuntimeExecutor::new(store);
-        
-        // 转账 300
-        let tx = Transaction::new_transfer(
-            sender.clone(),
-            coin_id,
-            recipient.clone(),
-            Some(300),
-        );
-        
-        let ctx = ExecutionContext {
-            executor_id: "solver1".to_string(),
-            timestamp: 1000,
-            in_tee: false,
-        };
+        let tx = Transaction::new_transfer(sender.clone(), coin_id, recipient.clone(), Some(300));
+        let ctx = test_ctx("partial-transfer");
         
         let output = executor.execute_transaction(&tx, &ctx).unwrap();
         
         assert!(output.success);
-        // get-or-deposit: new coin created for recipient
+        // always-create-new: new coin created for recipient
         assert_eq!(output.created_objects.len(), 1);
+        // 2 state changes: sender Update + recipient Create
+        assert_eq!(output.state_changes.len(), 2);
+        assert_eq!(output.state_changes[1].change_type, StateChangeType::Create);
         
-        // 验证原 Coin 余额减少
+        // Verify sender balance reduced
         let original_coin = executor.state().get_object(&coin_id).unwrap().unwrap();
         assert_eq!(original_coin.data.balance.value(), 700);
         
-        // 验证 recipient coin 使用确定性 ID
-        let expected_coin_id = deterministic_coin_id(&recipient, "ROOT");
-        assert_eq!(output.created_objects[0], expected_coin_id);
-        let new_coin = executor.state().get_object(&expected_coin_id).unwrap().unwrap();
+        // Verify recipient coin created with tx-derived ID
+        let new_coin_id = output.created_objects[0];
+        let new_coin = executor.state().get_object(&new_coin_id).unwrap().unwrap();
         assert_eq!(new_coin.data.balance.value(), 300);
         assert_eq!(new_coin.metadata.owner.unwrap(), recipient);
-    }
-    
-    #[test]
-    fn test_partial_transfer_deposit_into_existing() {
-        let mut store = InMemoryStateStore::new();
-        let sender = Address::from_str_id("alice");
-        let recipient = Address::from_str_id("bob");
-        
-        // Alice has 1000
-        let alice_coin = setu_types::create_coin(sender.clone(), 1000);
-        let alice_coin_id = *alice_coin.id();
-        store.set_object(alice_coin_id, alice_coin).unwrap();
-        
-        // Bob already has 500 (with deterministic ID)
-        let bob_coin_id = deterministic_coin_id(&recipient, "ROOT");
-        let bob_data = CoinData {
-            coin_type: CoinType::native(),
-            balance: Balance::new(500),
-        };
-        let bob_coin = Object::new_owned(bob_coin_id, recipient.clone(), bob_data);
-        store.set_object(bob_coin_id, bob_coin).unwrap();
-        
-        let mut executor = RuntimeExecutor::new(store);
-        
-        // Transfer 300 from Alice to Bob
-        let tx = Transaction::new_transfer(
-            sender.clone(),
-            alice_coin_id,
-            recipient.clone(),
-            Some(300),
-        );
-        
-        let ctx = ExecutionContext {
-            executor_id: "solver1".to_string(),
-            timestamp: 1000,
-            in_tee: false,
-        };
-        
-        let output = executor.execute_transaction(&tx, &ctx).unwrap();
-        
-        assert!(output.success);
-        // No new coin created — deposited into existing
-        assert_eq!(output.created_objects.len(), 0);
-        // 2 state changes: sender Update + recipient Update
-        assert_eq!(output.state_changes.len(), 2);
-        assert_eq!(output.state_changes[1].change_type, StateChangeType::Update);
-        
-        // Verify balances
-        let alice_coin = executor.state().get_object(&alice_coin_id).unwrap().unwrap();
-        assert_eq!(alice_coin.data.balance.value(), 700);
-        
-        let bob_coin = executor.state().get_object(&bob_coin_id).unwrap().unwrap();
-        assert_eq!(bob_coin.data.balance.value(), 800); // 500 + 300
     }
     
     /// Balance conservation: sum of all balances must be unchanged after any transfer.
@@ -999,14 +1042,13 @@ mod tests {
         let coin_id = *coin.id();
         store.set_object(coin_id, coin).unwrap();
         
-        let before_total: u64 = 1000; // only alice has balance
+        let before_total: u64 = 1000;
         
         let mut executor = RuntimeExecutor::new(store);
         let tx = Transaction::new_transfer(sender.clone(), coin_id, recipient.clone(), None);
-        let ctx = ExecutionContext { executor_id: "s".into(), timestamp: 1, in_tee: false };
+        let ctx = test_ctx("conservation-full");
         executor.execute_transaction(&tx, &ctx).unwrap();
         
-        // After full transfer: sender coin now owned by recipient, balance unchanged
         let coin = executor.state().get_object(&coin_id).unwrap().unwrap();
         let after_total = coin.data.balance.value();
         assert_eq!(before_total, after_total, "Balance conservation violated in full transfer");
@@ -1026,43 +1068,19 @@ mod tests {
         
         let mut executor = RuntimeExecutor::new(store);
         let tx = Transaction::new_transfer(sender.clone(), coin_id, recipient.clone(), Some(300));
-        let ctx = ExecutionContext { executor_id: "s".into(), timestamp: 1, in_tee: false };
+        let ctx = test_ctx("conservation-partial");
         executor.execute_transaction(&tx, &ctx).unwrap();
         
-        // Sum: sender remaining + recipient new coin
+        // Sum: sender remaining + recipient new coin (tx-derived ID)
         let sender_coin = executor.state().get_object(&coin_id).unwrap().unwrap();
-        let recipient_coin_id = deterministic_coin_id(&recipient, "ROOT");
-        let recipient_coin = executor.state().get_object(&recipient_coin_id).unwrap().unwrap();
-        let after_total = sender_coin.data.balance.value() + recipient_coin.data.balance.value();
+        // Find recipient coin from get_owned_objects
+        let recipient_objs = executor.state().get_owned_objects(&recipient).unwrap();
+        let recipient_balance: u64 = recipient_objs.iter()
+            .filter_map(|id| executor.state().get_object(id).ok().flatten())
+            .map(|c| c.data.balance.value())
+            .sum();
+        let after_total = sender_coin.data.balance.value() + recipient_balance;
         assert_eq!(before_total, after_total, "Balance conservation violated in partial transfer");
-    }
-    
-    #[test]
-    fn test_balance_conservation_deposit_into_existing() {
-        let mut store = InMemoryStateStore::new();
-        let sender = Address::from_str_id("alice");
-        let recipient = Address::from_str_id("bob");
-        
-        let alice_coin = setu_types::create_coin(sender.clone(), 1000);
-        let alice_coin_id = *alice_coin.id();
-        store.set_object(alice_coin_id, alice_coin).unwrap();
-        
-        let bob_coin_id = deterministic_coin_id(&recipient, "ROOT");
-        let bob_data = CoinData { coin_type: CoinType::native(), balance: Balance::new(500) };
-        let bob_coin = Object::new_owned(bob_coin_id, recipient.clone(), bob_data);
-        store.set_object(bob_coin_id, bob_coin).unwrap();
-        
-        let before_total: u64 = 1000 + 500;
-        
-        let mut executor = RuntimeExecutor::new(store);
-        let tx = Transaction::new_transfer(sender.clone(), alice_coin_id, recipient.clone(), Some(300));
-        let ctx = ExecutionContext { executor_id: "s".into(), timestamp: 1, in_tee: false };
-        executor.execute_transaction(&tx, &ctx).unwrap();
-        
-        let alice = executor.state().get_object(&alice_coin_id).unwrap().unwrap();
-        let bob = executor.state().get_object(&bob_coin_id).unwrap().unwrap();
-        let after_total = alice.data.balance.value() + bob.data.balance.value();
-        assert_eq!(before_total, after_total, "Balance conservation violated in deposit-into-existing");
     }
     
     #[test]
@@ -1078,15 +1096,13 @@ mod tests {
         let before_total: u64 = 1000;
         
         let mut executor = RuntimeExecutor::new(store);
-        // amount == balance → treated as full transfer
         let tx = Transaction::new_transfer(sender.clone(), coin_id, recipient.clone(), Some(1000));
-        let ctx = ExecutionContext { executor_id: "s".into(), timestamp: 1, in_tee: false };
+        let ctx = test_ctx("conservation-exact");
         executor.execute_transaction(&tx, &ctx).unwrap();
         
         let coin = executor.state().get_object(&coin_id).unwrap().unwrap();
         let after_total = coin.data.balance.value();
         assert_eq!(before_total, after_total, "Balance conservation violated in amount==balance transfer");
-        // Verify ownership transferred
         assert_eq!(coin.metadata.owner.unwrap(), recipient);
     }
     
@@ -1102,9 +1118,184 @@ mod tests {
         
         let mut executor = RuntimeExecutor::new(store);
         let tx = Transaction::new_transfer(sender.clone(), coin_id, recipient.clone(), Some(2000));
-        let ctx = ExecutionContext { executor_id: "s".into(), timestamp: 1, in_tee: false };
+        let ctx = test_ctx("insufficient");
         
         let result = executor.execute_transaction(&tx, &ctx);
         assert!(result.is_err(), "Should reject transfer exceeding balance");
+    }
+    
+    #[test]
+    fn test_transfer_amount_zero_rejected() {
+        let mut store = InMemoryStateStore::new();
+        let sender = Address::from_str_id("alice");
+        let recipient = Address::from_str_id("bob");
+        
+        let coin = setu_types::create_coin(sender.clone(), 1000);
+        let coin_id = *coin.id();
+        store.set_object(coin_id, coin).unwrap();
+        
+        let mut executor = RuntimeExecutor::new(store);
+        let tx = Transaction::new_transfer(sender.clone(), coin_id, recipient.clone(), Some(0));
+        let ctx = test_ctx("zero-amount");
+        
+        let result = executor.execute_transaction(&tx, &ctx);
+        assert!(result.is_err(), "Should reject transfer with amount == 0");
+    }
+    
+    #[test]
+    fn test_merge_coins() {
+        let mut store = InMemoryStateStore::new();
+        let owner = Address::from_str_id("alice");
+        
+        // Create 3 coins
+        let coin1 = setu_types::create_coin(owner.clone(), 500);
+        let id1 = *coin1.id();
+        store.set_object(id1, coin1).unwrap();
+        
+        let coin2 = setu_types::create_coin(owner.clone(), 300);
+        let id2 = *coin2.id();
+        store.set_object(id2, coin2).unwrap();
+        
+        let coin3 = setu_types::create_coin(owner.clone(), 200);
+        let id3 = *coin3.id();
+        store.set_object(id3, coin3).unwrap();
+        
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = test_ctx("merge");
+        
+        let output = executor.execute_merge_coins(&owner, id1, &[id2, id3], &ctx).unwrap();
+        
+        assert!(output.success);
+        assert_eq!(output.deleted_objects.len(), 2);
+        
+        // Target coin has accumulated balance
+        let merged = executor.state().get_object(&id1).unwrap().unwrap();
+        assert_eq!(merged.data.balance.value(), 1000); // 500 + 300 + 200
+        
+        // Source coins deleted
+        assert!(executor.state().get_object(&id2).unwrap().is_none());
+        assert!(executor.state().get_object(&id3).unwrap().is_none());
+    }
+    
+    #[test]
+    fn test_merge_target_in_sources_rejected() {
+        let mut store = InMemoryStateStore::new();
+        let owner = Address::from_str_id("alice");
+        
+        let coin = setu_types::create_coin(owner.clone(), 500);
+        let id = *coin.id();
+        store.set_object(id, coin).unwrap();
+        
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = test_ctx("merge-self");
+        
+        let result = executor.execute_merge_coins(&owner, id, &[id], &ctx);
+        assert!(result.is_err(), "Target cannot be in sources");
+    }
+    
+    #[test]
+    fn test_split_coin() {
+        let mut store = InMemoryStateStore::new();
+        let owner = Address::from_str_id("alice");
+        
+        let coin = setu_types::create_coin(owner.clone(), 1000);
+        let coin_id = *coin.id();
+        store.set_object(coin_id, coin).unwrap();
+        
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = test_ctx("split");
+        
+        let output = executor.execute_split_coin(&owner, coin_id, &[200, 300], &ctx).unwrap();
+        
+        assert!(output.success);
+        assert_eq!(output.created_objects.len(), 2);
+        
+        // Source coin has reduced balance
+        let source = executor.state().get_object(&coin_id).unwrap().unwrap();
+        assert_eq!(source.data.balance.value(), 500); // 1000 - 200 - 300
+        
+        // New coins created with correct balances
+        let new1 = executor.state().get_object(&output.created_objects[0]).unwrap().unwrap();
+        assert_eq!(new1.data.balance.value(), 200);
+        let new2 = executor.state().get_object(&output.created_objects[1]).unwrap().unwrap();
+        assert_eq!(new2.data.balance.value(), 300);
+        
+        // Balance conservation
+        let total = source.data.balance.value() + new1.data.balance.value() + new2.data.balance.value();
+        assert_eq!(total, 1000);
+    }
+    
+    #[test]
+    fn test_split_exact_deletes_source() {
+        let mut store = InMemoryStateStore::new();
+        let owner = Address::from_str_id("alice");
+        
+        let coin = setu_types::create_coin(owner.clone(), 1000);
+        let coin_id = *coin.id();
+        store.set_object(coin_id, coin).unwrap();
+        
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = test_ctx("exact-split");
+        
+        let output = executor.execute_split_coin(&owner, coin_id, &[600, 400], &ctx).unwrap();
+        
+        assert!(output.success);
+        assert_eq!(output.deleted_objects.len(), 1);
+        assert_eq!(output.deleted_objects[0], coin_id);
+        
+        // Source coin deleted
+        assert!(executor.state().get_object(&coin_id).unwrap().is_none());
+        
+        // New coins balance conservation
+        let new1 = executor.state().get_object(&output.created_objects[0]).unwrap().unwrap();
+        let new2 = executor.state().get_object(&output.created_objects[1]).unwrap().unwrap();
+        assert_eq!(new1.data.balance.value() + new2.data.balance.value(), 1000);
+    }
+    
+    #[test]
+    fn test_split_zero_amount_rejected() {
+        let mut store = InMemoryStateStore::new();
+        let owner = Address::from_str_id("alice");
+        
+        let coin = setu_types::create_coin(owner.clone(), 1000);
+        let coin_id = *coin.id();
+        store.set_object(coin_id, coin).unwrap();
+        
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = test_ctx("split-zero");
+        
+        let result = executor.execute_split_coin(&owner, coin_id, &[0, 500], &ctx);
+        assert!(result.is_err(), "Should reject split with zero amount");
+    }
+    
+    #[test]
+    fn test_mint_tokens_creates_new_coin() {
+        let mut store = InMemoryStateStore::new();
+        let owner = Address::from_str_id("alice");
+        
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = test_ctx("mint");
+        
+        let output = executor.mint_tokens(&owner, "ROOT", 1000, &ctx).unwrap();
+        
+        assert!(output.success);
+        assert_eq!(output.created_objects.len(), 1);
+        
+        let minted = executor.state().get_object(&output.created_objects[0]).unwrap().unwrap();
+        assert_eq!(minted.data.balance.value(), 1000);
+        assert_eq!(minted.metadata.owner.unwrap(), owner);
+    }
+    
+    #[test]
+    fn test_coin_id_deterministic_from_tx() {
+        // Same tx_hash + output_index → same coin_id
+        let tx_hash = *blake3::hash(b"test-tx").as_bytes();
+        let id1 = coin_id_from_tx(&tx_hash, 0);
+        let id2 = coin_id_from_tx(&tx_hash, 0);
+        assert_eq!(id1, id2);
+        
+        // Different output_index → different coin_id
+        let id3 = coin_id_from_tx(&tx_hash, 1);
+        assert_ne!(id1, id3);
     }
 }

@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use setu_transport::http::{
     ExecuteTaskRequest, ExecuteTaskResponse,
+    ExecuteBatchRequest, ExecuteBatchResponse,
     TeeExecutionResultDto, StateChangeDto, AttestationDto,
     SolverHttpHandler, HealthResponse, SolverInfoResponse, EnclaveInfoDto,
 };
@@ -92,6 +93,74 @@ impl SolverHttpHandler for SolverHandler {
                     execution_time_us,
                 )
             }
+        }
+    }
+
+    async fn execute_task_batch(&self, request: ExecuteBatchRequest) -> ExecuteBatchResponse {
+        let total_start = Instant::now();
+        let batch_id = request.batch_id.clone();
+        let total = request.tasks.len();
+
+        info!(
+            batch_id = %batch_id,
+            batch_size = total,
+            "Processing batch task execution (parallel)"
+        );
+
+        // Phase 2: Parallel execution — each task builds an isolated local_runtime,
+        // no shared mutable state between tasks during STF execution.
+        let handles: Vec<_> = request.tasks.into_iter().enumerate().map(|(idx, task_req)| {
+            let executor = Arc::clone(&self.tee_executor);
+            tokio::spawn(async move {
+                let start = Instant::now();
+                let task_id_hex = hex::encode(&task_req.solver_task.task_id[..8]);
+                let result = executor.execute_solver_task(task_req.solver_task).await;
+                (idx, task_id_hex, start, result)
+            })
+        }).collect();
+
+        let mut indexed_results: Vec<(usize, ExecuteTaskResponse)> = Vec::with_capacity(total);
+        for handle in handles {
+            match handle.await {
+                Ok((idx, task_id_hex, start, Ok(result))) => {
+                    let execution_time_us = start.elapsed().as_micros() as u64;
+                    let result_dto = convert_to_dto(&result);
+                    indexed_results.push((idx, ExecuteTaskResponse::success(
+                        result_dto,
+                        format!("Task {}: {} events processed", task_id_hex, result.events_processed),
+                        execution_time_us,
+                    )));
+                }
+                Ok((idx, task_id_hex, start, Err(e))) => {
+                    let execution_time_us = start.elapsed().as_micros() as u64;
+                    error!(task_id = %task_id_hex, error = %e, "Batch task failed");
+                    indexed_results.push((idx, ExecuteTaskResponse::error(
+                        format!("TEE execution failed: {}", e),
+                        execution_time_us,
+                    )));
+                }
+                Err(join_err) => {
+                    error!(error = %join_err, "Batch task panicked");
+                    indexed_results.push((indexed_results.len(), ExecuteTaskResponse::error(
+                        format!("Task panicked: {}", join_err),
+                        0,
+                    )));
+                }
+            }
+        }
+
+        // Restore original order (index-aligned with Validator's BatchEntry vec)
+        indexed_results.sort_by_key(|(idx, _)| *idx);
+        let results: Vec<ExecuteTaskResponse> = indexed_results.into_iter().map(|(_, r)| r).collect();
+        let success_count = results.iter().filter(|r| r.success).count();
+
+        ExecuteBatchResponse {
+            all_success: success_count == total,
+            success_count,
+            failure_count: total - success_count,
+            results,
+            batch_id,
+            total_execution_time_us: total_start.elapsed().as_micros() as u64,
         }
     }
 

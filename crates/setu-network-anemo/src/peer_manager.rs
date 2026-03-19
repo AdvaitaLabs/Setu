@@ -105,16 +105,25 @@ impl AnemoPeerManager {
     }
 
     /// Add a peer with node information
+    ///
+    /// Uses entry API to preserve existing `connected` state — the background
+    /// PeerEvent handler may have already set `connected: true` before this
+    /// call. A bare `insert()` would overwrite that to `false`, causing the
+    /// peer to be excluded from `get_connected_peers()` and breaking broadcast.
     pub async fn add_peer(&self, node_info: NodeInfo, peer_id: PeerId) -> Result<()> {
         debug!("Adding peer {} with node info", peer_id);
 
-        let peer_info = PeerInfo {
-            node_info,
-            peer_id,
-            connected: false,
-        };
-
-        self.peers.insert(peer_id, peer_info);
+        self.peers
+            .entry(peer_id)
+            .and_modify(|info| {
+                // Update node_info metadata but preserve connected state
+                info.node_info = node_info.clone();
+            })
+            .or_insert_with(|| PeerInfo {
+                node_info,
+                peer_id,
+                connected: false,
+            });
         Ok(())
     }
 

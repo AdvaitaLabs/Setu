@@ -409,6 +409,14 @@ impl SetuKeyPair {
         self.scheme
     }
 
+    /// Get the raw private key bytes (read-only reference).
+    ///
+    /// The caller must not persist this reference or copy it to non-secure memory.
+    /// The `SetuKeyPair` will zeroize the bytes on drop.
+    pub fn secret_bytes(&self) -> &[u8] {
+        &self.secret_bytes
+    }
+
     /// Get the public key.
     pub fn public(&self) -> PublicKey {
         match self.scheme {

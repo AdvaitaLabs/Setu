@@ -68,6 +68,11 @@ impl SolverInfo {
     pub fn execute_task_url(&self) -> String {
         format!("{}/api/v1/execute-task", self.http_url())
     }
+
+    /// Get batch execute-task endpoint URL
+    pub fn execute_batch_url(&self) -> String {
+        format!("{}/api/v1/execute-task-batch", self.http_url())
+    }
 }
 
 /// Helper to get current timestamp in seconds
@@ -88,4 +93,16 @@ pub fn current_timestamp_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+/// Registered subnet information
+#[derive(Debug, Clone)]
+pub struct SubnetInfo {
+    pub subnet_id: String,
+    pub name: String,
+    pub owner: String,
+    pub subnet_type: String,
+    pub token_symbol: String,
+    pub status: String,
+    pub registered_at: u64,
 }

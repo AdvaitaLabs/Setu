@@ -13,8 +13,8 @@ use setu_types::{Transfer, TransferType, SubnetId};
 use setu_types::event::{Event, EventType, VLCSnapshot};
 use setu_solver::{TeeExecutor, TeeExecutionResult, SolverTask};
 use setu_validator::{TaskPreparer, MerkleStateProvider};
-use setu_storage::{GlobalStateManager, init_coin, StateProvider};
-use std::sync::{Arc, RwLock};
+use setu_storage::{GlobalStateManager, SharedStateManager, init_coin, StateProvider};
+use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -67,7 +67,7 @@ struct SingleNodeTestHarness {
     /// Validator components
     validator_id: String,
     task_preparer: Arc<TaskPreparer>,
-    state_manager: Arc<RwLock<GlobalStateManager>>,
+    state_manager: Arc<SharedStateManager>,
     
     /// Solver components
     solver_id: String,
@@ -86,12 +86,13 @@ struct SingleNodeTestHarness {
 impl SingleNodeTestHarness {
     fn new() -> Self {
         // Initialize state manager with test accounts
-        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
+        let state_manager = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
         {
-            let mut manager = state_manager.write().unwrap();
+            let mut manager = state_manager.lock_write();
             init_coin(&mut manager, "alice", 10_000_000);
             init_coin(&mut manager, "bob", 5_000_000);
             init_coin(&mut manager, "charlie", 1_000_000);
+            state_manager.publish_snapshot(&manager);
         }
         
         // Create state provider
@@ -274,7 +275,6 @@ impl SingleNodeTestHarness {
     
     /// Get balance for an address (for verification)
     fn get_balance(&self, address: &str) -> u64 {
-        let _manager = self.state_manager.read().unwrap();
         let state_provider = MerkleStateProvider::new(self.state_manager.clone());
         let coins = state_provider.get_coins_for_address(address);
         coins.iter().map(|c| c.balance).sum()

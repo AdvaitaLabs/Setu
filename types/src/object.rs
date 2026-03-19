@@ -3,7 +3,7 @@ use std::fmt;
 use std::str::FromStr;
 
 /// 32-byte object identifier
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 pub struct ObjectId([u8; 32]);
 
 impl ObjectId {
@@ -310,6 +310,19 @@ impl<T: Serialize + Clone> Object<T> {
             .unwrap()
             .as_millis() as u64;
 
+        Self::new_owned_at(id, owner, data, now)
+    }
+
+    /// Create a new owned object with a deterministic timestamp.
+    ///
+    /// Unlike `new_owned` which uses `SystemTime::now()`, this accepts an explicit
+    /// timestamp. Use this in consensus-critical paths (TEE, executor) where all
+    /// nodes must produce identical objects.
+    ///
+    /// `created_at` / `updated_at` are NOT included in CoinState BCS serialization
+    /// and do NOT participate in `compute_digest()`, so they don't affect consensus.
+    /// However, using deterministic timestamps avoids confusing debug output across nodes.
+    pub fn new_owned_at(id: ObjectId, owner: Address, data: T, timestamp: u64) -> Self {
         let mut obj = Self {
             metadata: ObjectMetadata {
                 id,
@@ -318,8 +331,8 @@ impl<T: Serialize + Clone> Object<T> {
                 object_type: ObjectType::OwnedObject,
                 owner: Some(owner),
                 ownership: Ownership::AddressOwner(owner),
-                created_at: now,
-                updated_at: now,
+                created_at: timestamp,
+                updated_at: timestamp,
             },
             data,
         };

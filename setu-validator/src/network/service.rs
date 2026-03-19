@@ -75,6 +75,9 @@ pub struct ValidatorNetworkService {
     /// Registered validators
     validators: Arc<RwLock<HashMap<String, ValidatorInfo>>>,
 
+    /// Registered subnets
+    registered_subnets: Arc<DashMap<String, SubnetInfo>>,
+
     /// Registered solver information (for sync HTTP calls)
     /// Uses DashMap for lock-free concurrent access
     solver_info: Arc<DashMap<String, SolverInfo>>,
@@ -125,6 +128,7 @@ impl ValidatorNetworkService {
         validator_id: String,
         router_manager: Arc<RouterManager>,
         task_preparer: Arc<TaskPreparer>,
+        batch_task_preparer: Arc<BatchTaskPreparer>,
         config: NetworkServiceConfig,
     ) -> Self {
         let start_time = current_timestamp_secs();
@@ -139,6 +143,9 @@ impl ValidatorNetworkService {
         // Create HTTP client for sync Solver calls
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .pool_max_idle_per_host(200)
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");
 
@@ -160,14 +167,12 @@ impl ValidatorNetworkService {
             Arc::clone(&dag_events),
             None, // No consensus
             validator_id.clone(),
-            100, // Max concurrent TEE calls
+            200, // Max concurrent TEE calls
         ).with_coin_reservation_manager(Arc::clone(&coin_reservation_manager));
 
         // Create BatchTaskPreparer from TaskPreparer's state
         // Note: In production, both should share the same MerkleStateProvider
-        let batch_task_preparer = Arc::new(
-            BatchTaskPreparer::new_for_testing(validator_id.clone())
-        );
+        let batch_task_preparer = batch_task_preparer;
 
         Self {
             validator_id,
@@ -176,6 +181,7 @@ impl ValidatorNetworkService {
             batch_task_preparer,
             consensus_validator: None,
             validators: Arc::new(RwLock::new(HashMap::new())),
+            registered_subnets: Arc::new(DashMap::new()),
             solver_info,
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
             http_client,
@@ -199,6 +205,7 @@ impl ValidatorNetworkService {
         validator_id: String,
         router_manager: Arc<RouterManager>,
         task_preparer: Arc<TaskPreparer>,
+        batch_task_preparer: Arc<BatchTaskPreparer>,
         consensus_validator: Arc<ConsensusValidator>,
         config: NetworkServiceConfig,
     ) -> Self {
@@ -215,6 +222,9 @@ impl ValidatorNetworkService {
         // Create HTTP client for sync Solver calls
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .pool_max_idle_per_host(200)
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");
 
@@ -236,14 +246,11 @@ impl ValidatorNetworkService {
             Arc::clone(&dag_events),
             Some(Arc::clone(&consensus_validator)),
             validator_id.clone(),
-            100, // Max concurrent TEE calls
+            200, // Max concurrent TEE calls
         ).with_coin_reservation_manager(Arc::clone(&coin_reservation_manager));
 
-        // Create BatchTaskPreparer from TaskPreparer's state
-        // Note: In production, both should share the same MerkleStateProvider
-        let batch_task_preparer = Arc::new(
-            BatchTaskPreparer::new_for_testing(validator_id.clone())
-        );
+        // Use the passed-in batch_task_preparer (shares state with TaskPreparer)
+        let batch_task_preparer = batch_task_preparer;
 
         Self {
             validator_id,
@@ -252,6 +259,7 @@ impl ValidatorNetworkService {
             batch_task_preparer,
             consensus_validator: Some(consensus_validator),
             validators: Arc::new(RwLock::new(HashMap::new())),
+            registered_subnets: Arc::new(DashMap::new()),
             solver_info,
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
             http_client,
@@ -334,6 +342,11 @@ impl ValidatorNetworkService {
         self.tee_executor.wait_for_pending_tasks(timeout).await
     }
 
+    /// Gracefully shutdown the batch collector (if enabled)
+    pub async fn shutdown_batch_collector(&self) {
+        self.tee_executor.shutdown_batch_collector().await;
+    }
+
     /// Start background cleanup task for expired coin reservations
     /// 
     /// This spawns a background task that periodically cleans up expired reservations
@@ -392,9 +405,11 @@ impl ValidatorNetworkService {
             // Registration endpoints
             .route("/api/v1/register/solver", post(setu_api::http_register_solver::<ValidatorNetworkService>))
             .route("/api/v1/register/validator", post(setu_api::http_register_validator::<ValidatorNetworkService>))
+            .route("/api/v1/register/subnet", post(setu_api::http_register_subnet::<ValidatorNetworkService>))
             // Query endpoints
             .route("/api/v1/solvers", get(setu_api::http_get_solvers::<ValidatorNetworkService>))
             .route("/api/v1/validators", get(setu_api::http_get_validators::<ValidatorNetworkService>))
+            .route("/api/v1/subnets", get(setu_api::http_get_subnets::<ValidatorNetworkService>))
             .route("/api/v1/health", get(setu_api::http_health::<ValidatorNetworkService>))
             // State query endpoints (Scheme B)
             .route("/api/v1/state/balance/:account", get(setu_api::http_get_balance::<ValidatorNetworkService>))
@@ -588,6 +603,35 @@ impl ValidatorNetworkService {
     }
 
     // ============================================
+    // Subnet Management
+    // ============================================
+
+    pub fn add_subnet(&self, info: SubnetInfo) {
+        self.registered_subnets.insert(info.subnet_id.clone(), info);
+    }
+
+    pub fn get_subnet_info(&self, subnet_id: &str) -> Option<SubnetInfo> {
+        self.registered_subnets.get(subnet_id).map(|v| v.clone())
+    }
+
+    pub fn get_subnet_list(&self) -> Vec<setu_rpc::SubnetListItem> {
+        self.registered_subnets
+            .iter()
+            .map(|entry| {
+                let s = entry.value();
+                setu_rpc::SubnetListItem {
+                    subnet_id: s.subnet_id.clone(),
+                    name: s.name.clone(),
+                    owner: s.owner.clone(),
+                    subnet_type: s.subnet_type.clone(),
+                    token_symbol: s.token_symbol.clone(),
+                    status: s.status.clone(),
+                }
+            })
+            .collect()
+    }
+
+    // ============================================
     // Solver Management
     // ============================================
 
@@ -675,6 +719,20 @@ impl ValidatorNetworkService {
             EventPayload::ValidatorUnregister(unreg) => {
                 self.validators.write().remove(&unreg.node_id);
             }
+            EventPayload::SubnetRegister(reg) => {
+                self.registered_subnets.insert(
+                    reg.subnet_id.clone(),
+                    SubnetInfo {
+                        subnet_id: reg.subnet_id.clone(),
+                        name: reg.name.clone(),
+                        owner: reg.owner.clone(),
+                        subnet_type: format!("{:?}", reg.subnet_type),
+                        token_symbol: reg.token_symbol.clone().unwrap_or_default(),
+                        status: "active".to_string(),
+                        registered_at: event.timestamp / 1000,
+                    },
+                );
+            }
             _ => {}
         }
     }
@@ -760,12 +818,14 @@ mod tests {
     fn create_test_service() -> Arc<ValidatorNetworkService> {
         let router_manager = Arc::new(RouterManager::new());
         let task_preparer = Arc::new(TaskPreparer::new_for_testing("test-validator".to_string()));
+        let batch_task_preparer = Arc::new(BatchTaskPreparer::new_for_testing("test-validator".to_string()));
         let config = NetworkServiceConfig::default();
 
         Arc::new(ValidatorNetworkService::new(
             "test-validator".to_string(),
             router_manager,
             task_preparer,
+            batch_task_preparer,
             config,
         ))
     }

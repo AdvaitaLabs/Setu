@@ -137,21 +137,22 @@ impl TransferHandler {
             _ => setu_types::SubnetId::ROOT,
         };
 
-        let (solver_task, reservation_handle) = match task_preparer.prepare_transfer_task_with_reservation(
+        let (solver_task, reservation_handles) = match task_preparer.prepare_transfer_task_with_reservation(
             &transfer, subnet_id, coin_reservation_manager
         ) {
-            Ok((task, handle)) => {
+            Ok((task, handles)) => {
                 steps.push(ProcessingStep {
                     step: "prepare_task".to_string(),
                     status: "completed".to_string(),
                     details: Some(format!(
-                        "SolverTask prepared with reservation: {} inputs, {} read_set",
+                        "SolverTask prepared with reservation: {} inputs, {} read_set, {} coins reserved",
                         task.resolved_inputs.input_objects.len(),
-                        task.read_set.len()
+                        task.read_set.len(),
+                        handles.len()
                     )),
                     timestamp: now,
                 });
-                (task, handle)
+                (task, handles)
             }
             Err(e) => {
                 return Self::fail_transfer(
@@ -177,7 +178,7 @@ impl TransferHandler {
             }
             Err(e) => {
                 // Release reservation on routing failure
-                coin_reservation_manager.release(&reservation_handle);
+                coin_reservation_manager.release_batch(&reservation_handles);
                 return Self::fail_transfer(
                     transfer_id,
                     &format!("No solver available: {}", e),
@@ -221,8 +222,8 @@ impl TransferHandler {
         // - Natural backpressure (HTTP connection blocks until Solver responds)
         // - No retry storm (coin released before HTTP response)
         if let Some(ref sid) = solver_id {
-            match tee_executor.execute_solver_inline(
-                &transfer_id, sid, solver_task, Some(reservation_handle),
+            match tee_executor.execute_solver_inline_batch(
+                &transfer_id, sid, solver_task, reservation_handles,
             ).await {
                 Ok((event, execution_time_us, events_processed)) => {
                     // Fire-and-forget: consensus + storage (no coin held)

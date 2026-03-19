@@ -47,10 +47,12 @@
 //! let handle = validator.start_network_event_handler(event_rx);
 //! ```
 
+mod consensus_store;
 mod router;
 mod setu_handler;
 mod sync_protocol;
 
+pub use consensus_store::ConsensusEngineStore;
 pub use router::{MessageRouter, NetworkEventHandler};
 pub use setu_handler::{SetuMessageHandler, MessageHandlerStore, SETU_ROUTE};
 pub use sync_protocol::{SyncProtocol, SyncStore, InMemorySyncStore};

@@ -143,24 +143,11 @@ where
                     );
                 }
                 
-                // TODO: Optimize storage strategy
-                // Current behavior: Store unconfirmed events for State Sync
-                // Future improvement: Only store confirmed events (after CF finalization)
-                // Keeping current behavior for backward compatibility with State Sync protocol
-                //
-                // Note: This may store events that fail consensus validation.
-                // State Sync should filter based on finalized anchors.
-                let serialized = SerializedEvent {
-                    seq: 0, // Will be assigned by store
-                    id: event.id.clone(),
-                    data: bincode::serialize(&event).unwrap_or_default(),
-                };
-                
-                if let Err(e) = self.store.store_events(vec![serialized]).await {
-                    warn!("Failed to store broadcast event: {}", e);
-                } else {
-                    debug!("Stored unconfirmed event for state sync");
-                }
+                // Event enters DAG via event_tx → MessageRouter → receive_event_from_network().
+                // Persistence happens later when CF is finalized (persist_finalized_anchor).
+                // No need to pre-write to EventStore here — that would cause:
+                //   1. Write amplification (event stored twice)
+                //   2. Unverified data in EventStore (bypasses router's verify_id check)
                 
                 Ok(None) // EventBroadcast doesn't require a response
             }

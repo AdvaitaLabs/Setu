@@ -5,11 +5,13 @@
 
 use crate::types::*;
 use axum::{extract::State, Json};
+use serde::Deserialize;
 use setu_rpc::{
     GetSolverListRequest, GetSolverListResponse, GetTransferStatusRequest,
     GetTransferStatusResponse, GetValidatorListRequest, GetValidatorListResponse,
     HeartbeatRequest, HeartbeatResponse, RegisterSolverRequest, RegisterSolverResponse,
     RegisterValidatorRequest, RegisterValidatorResponse, RegistrationHandler,
+    RegisterSubnetRequest, RegisterSubnetResponse, GetSubnetListRequest, GetSubnetListResponse,
     SubmitTransferRequest, SubmitTransferResponse,
     // Batch transfer imports
     SubmitTransfersBatchRequest, SubmitTransfersBatchResponse,
@@ -92,6 +94,15 @@ pub async fn http_register_validator<S: ValidatorService>(
     Json(handler.register_validator(request).await)
 }
 
+/// Register a subnet
+pub async fn http_register_subnet<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<RegisterSubnetRequest>,
+) -> Json<RegisterSubnetResponse> {
+    let handler = service.registration_handler();
+    Json(handler.register_subnet(request).await)
+}
+
 // ============================================
 // Query Handlers
 // ============================================
@@ -120,6 +131,29 @@ pub async fn http_get_validators<S: ValidatorService>(
         handler
             .get_validator_list(GetValidatorListRequest {
                 status_filter: None,
+            })
+            .await,
+    )
+}
+
+/// Query parameters for subnet list filtering
+#[derive(Debug, Deserialize, Default)]
+pub struct SubnetListQuery {
+    pub subnet_type: Option<String>,
+    pub owner: Option<String>,
+}
+
+/// Get list of registered subnets
+pub async fn http_get_subnets<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    axum::extract::Query(params): axum::extract::Query<SubnetListQuery>,
+) -> Json<GetSubnetListResponse> {
+    let handler = service.registration_handler();
+    Json(
+        handler
+            .get_subnet_list(GetSubnetListRequest {
+                type_filter: params.subnet_type,
+                owner_filter: params.owner,
             })
             .await,
     )

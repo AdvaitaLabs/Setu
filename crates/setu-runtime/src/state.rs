@@ -32,6 +32,8 @@ pub struct InMemoryStateStore {
     objects: HashMap<ObjectId, Object<CoinData>>,
     /// Ownership index: Address -> Vec<ObjectId>
     ownership_index: HashMap<Address, Vec<ObjectId>>,
+    /// Reverse index: ObjectId -> Address (for O(1) old-owner lookup)
+    object_owner: HashMap<ObjectId, Address>,
 }
 
 impl InMemoryStateStore {
@@ -40,14 +42,17 @@ impl InMemoryStateStore {
         Self {
             objects: HashMap::new(),
             ownership_index: HashMap::new(),
+            object_owner: HashMap::new(),
         }
     }
     
-    /// Update ownership index
+    /// Update ownership index (O(1) amortized via reverse index)
     fn update_ownership_index(&mut self, object_id: ObjectId, new_owner: &Address) {
-        // Remove from the old owner's index
-        for objects in self.ownership_index.values_mut() {
-            objects.retain(|id| id != &object_id);
+        // Remove from the old owner's index using reverse lookup (O(1))
+        if let Some(old_owner) = self.object_owner.remove(&object_id) {
+            if let Some(objects) = self.ownership_index.get_mut(&old_owner) {
+                objects.retain(|id| id != &object_id);
+            }
         }
         
         // Add to the new owner's index
@@ -55,12 +60,17 @@ impl InMemoryStateStore {
             .entry(new_owner.clone())
             .or_insert_with(Vec::new)
             .push(object_id);
+        
+        // Update reverse index
+        self.object_owner.insert(object_id, new_owner.clone());
     }
     
-    /// Remove object from ownership index
+    /// Remove object from ownership index (O(1) via reverse index)
     fn remove_from_ownership_index(&mut self, object_id: &ObjectId) {
-        for objects in self.ownership_index.values_mut() {
-            objects.retain(|id| id != object_id);
+        if let Some(old_owner) = self.object_owner.remove(object_id) {
+            if let Some(objects) = self.ownership_index.get_mut(&old_owner) {
+                objects.retain(|id| id != object_id);
+            }
         }
     }
     
@@ -70,8 +80,7 @@ impl InMemoryStateStore {
             .unwrap_or_default()
             .iter()
             .filter_map(|id| self.get_object(id).ok().flatten())
-            .map(|obj| obj.data.balance.value())
-            .sum()
+            .fold(0u64, |acc, obj| acc.saturating_add(obj.data.balance.value()))
     }
 }
 

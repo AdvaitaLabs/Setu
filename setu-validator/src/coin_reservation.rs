@@ -238,6 +238,49 @@ impl CoinReservationManager {
     pub fn ttl(&self) -> Duration {
         self.ttl
     }
+
+    /// Try to atomically reserve multiple coins (all-or-nothing).
+    ///
+    /// On success returns handles for every coin. On failure (any coin already
+    /// reserved) all previously-acquired reservations in this batch are rolled
+    /// back and `None` is returned.
+    ///
+    /// ## Thread Safety
+    ///
+    /// Each individual `try_reserve` is atomic (DashMap entry API), and rollback
+    /// uses `release` which is also shard-level. A tiny race window exists where
+    /// a competing caller could see an intermediate state, but that is benign:
+    /// the competing caller would simply fail its own `try_reserve` for the same
+    /// coin and retry later.
+    pub fn try_reserve_batch(
+        &self,
+        coins: &[(&ObjectId, u64)],
+        transfer_id: &str,
+    ) -> Option<Vec<ReservationHandle>> {
+        let mut handles = Vec::with_capacity(coins.len());
+
+        for &(coin_id, amount) in coins {
+            match self.try_reserve(coin_id, amount, transfer_id) {
+                Some(handle) => handles.push(handle),
+                None => {
+                    // Rollback all previously acquired reservations
+                    for h in &handles {
+                        self.release(h);
+                    }
+                    return None;
+                }
+            }
+        }
+
+        Some(handles)
+    }
+
+    /// Release all handles in a batch.
+    pub fn release_batch(&self, handles: &[ReservationHandle]) {
+        for h in handles {
+            self.release(h);
+        }
+    }
 }
 
 impl Default for CoinReservationManager {
@@ -366,5 +409,55 @@ mod tests {
 
         // Original reservation should still exist
         assert_eq!(mgr.reservation_count(), 1);
+    }
+
+    // ── try_reserve_batch tests ──
+
+    #[test]
+    fn test_batch_reserve_success() {
+        let mgr = CoinReservationManager::default();
+        let coins: Vec<(ObjectId, u64)> = (0..3)
+            .map(|i| (test_coin_id(i), 100))
+            .collect();
+
+        let refs: Vec<(&ObjectId, u64)> = coins.iter().map(|(id, a)| (id, *a)).collect();
+        let handles = mgr.try_reserve_batch(&refs, "tx-batch-1").unwrap();
+
+        assert_eq!(handles.len(), 3);
+        assert_eq!(mgr.reservation_count(), 3);
+
+        mgr.release_batch(&handles);
+        assert_eq!(mgr.reservation_count(), 0);
+    }
+
+    #[test]
+    fn test_batch_reserve_rollback_on_conflict() {
+        let mgr = CoinReservationManager::default();
+        let coin_a = test_coin_id(10);
+        let coin_b = test_coin_id(11);
+        let coin_c = test_coin_id(12);
+
+        // Pre-reserve coin_b by another transfer
+        let _h_other = mgr.try_reserve(&coin_b, 50, "tx-other").unwrap();
+        assert_eq!(mgr.reservation_count(), 1);
+
+        // Batch tries to reserve [a, b, c] — should fail on b → rollback a
+        let batch: Vec<(&ObjectId, u64)> = vec![(&coin_a, 100), (&coin_b, 100), (&coin_c, 100)];
+        let result = mgr.try_reserve_batch(&batch, "tx-batch-2");
+        assert!(result.is_none(), "batch should fail because coin_b is taken");
+
+        // Only the pre-existing reservation for coin_b should remain
+        assert_eq!(mgr.reservation_count(), 1);
+
+        // coin_a should be free again (rolled back)
+        assert!(mgr.try_reserve(&coin_a, 100, "tx-after").is_some());
+    }
+
+    #[test]
+    fn test_batch_reserve_empty() {
+        let mgr = CoinReservationManager::default();
+        let handles = mgr.try_reserve_batch(&[], "tx-empty").unwrap();
+        assert!(handles.is_empty());
+        assert_eq!(mgr.reservation_count(), 0);
     }
 }

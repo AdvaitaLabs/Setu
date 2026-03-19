@@ -50,11 +50,7 @@ async fn main() -> anyhow::Result<()> {
         Some(300), // 部分转账
     );
     
-    let ctx = ExecutionContext {
-        executor_id: "solver1".to_string(),
-        timestamp: 1000,
-        in_tee: false,
-    };
+    let ctx = ExecutionContext::new("solver1".to_string(), 1000, false, [0u8; 32]);
     
     let output1 = executor.execute_transaction(&tx1, &ctx)?;
     println!("✅ 交易成功: {}", output1.message.unwrap());
@@ -81,11 +77,7 @@ async fn main() -> anyhow::Result<()> {
         None, // 完整转账
     );
     
-    let ctx2 = ExecutionContext {
-        executor_id: "solver2".to_string(),
-        timestamp: 2000,
-        in_tee: false,
-    };
+    let ctx2 = ExecutionContext::new("solver2".to_string(), 2000, false, [1u8; 32]);
     
     let output2 = executor.execute_transaction(&tx2, &ctx2)?;
     println!("✅ 交易成功: {}", output2.message.unwrap());
@@ -101,11 +93,7 @@ async fn main() -> anyhow::Result<()> {
     println!("=== 测试 3: 查询余额 ===");
     
     let query_tx = Transaction::new_balance_query(alice.clone());
-    let ctx3 = ExecutionContext {
-        executor_id: "solver3".to_string(),
-        timestamp: 3000,
-        in_tee: false,
-    };
+    let ctx3 = ExecutionContext::new("solver3".to_string(), 3000, false, [2u8; 32]);
     
     let output3 = executor.execute_transaction(&query_tx, &ctx3)?;
     println!("✅ 查询成功");

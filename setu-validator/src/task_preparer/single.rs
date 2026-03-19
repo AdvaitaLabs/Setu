@@ -90,7 +90,7 @@ impl TaskPreparer {
     /// - Only needs to run once at startup
     pub fn new_with_state_manager(
         validator_id: String,
-        state_manager: Arc<std::sync::RwLock<setu_storage::GlobalStateManager>>,
+        state_manager: Arc<setu_storage::SharedStateManager>,
     ) -> Self {
         use setu_storage::MerkleStateProvider;
         
@@ -145,14 +145,37 @@ impl TaskPreparer {
             &transfer.from,
             &subnet_id_str,
         );
-        let selected_coin = self.select_coin_for_transfer(&sender_coins, amount)?;
-        
-        debug!(
-            object_id = ?selected_coin.object_id,
-            coin_balance = selected_coin.balance,
-            subnet_id = %selected_coin.coin_type,
-            "Selected coin for transfer"
-        );
+        let selection = self.select_coins_for_transfer(&sender_coins, amount)?;
+
+        // Auto-escalate: NeedMerge → MergeThenTransfer
+        match selection {
+            super::CoinSelectionResult::NeedMerge { target, sources } => {
+                let recipient = setu_types::object::Address::normalize(&transfer.to);
+                debug!(
+                    transfer_id = %transfer.id,
+                    target = %hex::encode(&target.object_id),
+                    source_count = sources.len(),
+                    "Auto-escalating to MergeThenTransfer"
+                );
+                return self.prepare_merge_then_transfer_task(
+                    &target, &sources, recipient, amount, subnet_id,
+                );
+            }
+            super::CoinSelectionResult::SingleCoin(ref selected_coin) => {
+                debug!(
+                    object_id = ?selected_coin.object_id,
+                    coin_balance = selected_coin.balance,
+                    subnet_id = %selected_coin.coin_type,
+                    "Selected single coin for transfer"
+                );
+            }
+        }
+
+        // SingleCoin path
+        let selected_coin = match selection {
+            super::CoinSelectionResult::SingleCoin(c) => c,
+            _ => unreachable!(), // NeedMerge returned above
+        };
         
         // Step 2: Build ResolvedObject and ResolvedInputs
         let resolved_coin = ResolvedObject {
@@ -238,7 +261,7 @@ impl TaskPreparer {
         transfer: &setu_types::Transfer,
         subnet_id: SubnetId,
         reservation_mgr: &crate::coin_reservation::CoinReservationManager,
-    ) -> Result<(SolverTask, crate::coin_reservation::ReservationHandle), TaskPrepareError> {
+    ) -> Result<(SolverTask, Vec<crate::coin_reservation::ReservationHandle>), TaskPrepareError> {
         let amount = transfer.amount;
         
         // Use subnet_id as the coin namespace (1:1 binding)
@@ -268,117 +291,380 @@ impl TaskPreparer {
                 format!("sender {} has no coins in subnet {}", transfer.from, subnet_id_str)
             ));
         }
-        
-        // Step 2: Filter eligible coins and sort by balance (ascending)
-        let mut eligible_coins: Vec<_> = sender_coins
+
+        // Step 2: Select coin(s) — may be single or NeedMerge
+        let selection = self.select_coins_for_transfer(&sender_coins, amount)?;
+
+        match selection {
+            super::CoinSelectionResult::SingleCoin(_) => {
+                // --- Single coin path: try to reserve ANY eligible coin ---
+                // Collect all eligible coins (balance >= amount), sorted by balance ascending
+                let mut eligible: Vec<_> = sender_coins.iter()
+                    .filter(|c| c.balance >= amount)
+                    .cloned()
+                    .collect();
+                eligible.sort_by(|a, b| a.balance.cmp(&b.balance)
+                    .then_with(|| a.object_id.cmp(&b.object_id)));
+
+                // Try each eligible coin until one reservation succeeds
+                let (selected_coin, handle) = {
+                    let mut reserved = None;
+                    for coin in &eligible {
+                        if let Some(h) = reservation_mgr
+                            .try_reserve(&coin.object_id, amount, &transfer.id)
+                        {
+                            reserved = Some((coin.clone(), h));
+                            break;
+                        }
+                        // This coin is already reserved, try the next one
+                    }
+                    reserved.ok_or_else(|| TaskPrepareError::AllCoinsReserved {
+                        sender: transfer.from.clone(),
+                        coin_count: eligible.len(),
+                    })?
+                };
+
+                debug!(
+                    object_id = ?selected_coin.object_id,
+                    coin_balance = selected_coin.balance,
+                    eligible_coins = eligible.len(),
+                    "Selected and reserved single coin for transfer"
+                );
+
+                let resolved_coin = setu_types::task::ResolvedObject {
+                    object_id: selected_coin.object_id,
+                    object_type: "Coin".to_string(),
+                    expected_version: selected_coin.version,
+                };
+                let resolved_inputs = setu_types::task::ResolvedInputs::transfer(resolved_coin.clone(), amount);
+
+                let input_objects: Vec<&setu_types::ObjectId> = vec![&selected_coin.object_id];
+                let parent_ids = self.derive_dependencies(&input_objects);
+
+                let coin_data = self.state_provider.get_object(&selected_coin.object_id)
+                    .ok_or(TaskPrepareError::ObjectNotFound(hex::encode(&selected_coin.object_id)))?;
+                let merkle_proof = self.state_provider.get_merkle_proof(&selected_coin.object_id);
+                let read_set = vec![
+                    setu_types::task::ReadSetEntry::new(
+                        format!("oid:{}", hex::encode(&selected_coin.object_id)),
+                        coin_data,
+                    ).with_proof(
+                        merkle_proof
+                            .map(|p| bcs::to_bytes(&p).unwrap_or_default())
+                            .unwrap_or_default()
+                    ),
+                ];
+
+                let event = self.create_event_from_transfer(transfer, parent_ids)?;
+                let pre_state_root = self.state_provider.get_state_root();
+                let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
+
+                let task = SolverTask::new(task_id, event, resolved_inputs, pre_state_root, subnet_id)
+                    .with_read_set(read_set)
+                    .with_gas_budget(setu_types::task::GasBudget::default());
+
+                info!(
+                    transfer_id = %transfer.id,
+                    task_id = %hex::encode(&task_id[..8]),
+                    reservation_id = %handle.reservation_id,
+                    "SolverTask prepared with single-coin reservation"
+                );
+
+                Ok((task, vec![handle]))
+            }
+
+            super::CoinSelectionResult::NeedMerge { target, sources } => {
+                // --- Multi-coin path: batch reserve all coins, then MergeThenTransfer ---
+                let mut batch_items: Vec<(&setu_types::ObjectId, u64)> = Vec::with_capacity(1 + sources.len());
+                batch_items.push((&target.object_id, target.balance));
+                for s in &sources {
+                    batch_items.push((&s.object_id, s.balance));
+                }
+
+                let handles = reservation_mgr
+                    .try_reserve_batch(&batch_items, &transfer.id)
+                    .ok_or_else(|| TaskPrepareError::AllCoinsReserved {
+                        sender: transfer.from.clone(),
+                        coin_count: 1 + sources.len(),
+                    })?;
+
+                debug!(
+                    transfer_id = %transfer.id,
+                    target = %hex::encode(&target.object_id),
+                    source_count = sources.len(),
+                    "Batch-reserved coins for MergeThenTransfer"
+                );
+
+                let recipient = setu_types::object::Address::normalize(&transfer.to);
+                match self.prepare_merge_then_transfer_task(&target, &sources, recipient, amount, subnet_id) {
+                    Ok(task) => Ok((task, handles)),
+                    Err(e) => {
+                        // Rollback reservations on task preparation failure
+                        reservation_mgr.release_batch(&handles);
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Prepare a SolverTask for merging multiple coins into one.
+    ///
+    /// The target coin accumulates balances from all source coins.
+    /// Source coins are deleted after merge.
+    pub fn prepare_merge_task(
+        &self,
+        target_coin: &CoinInfo,
+        source_coins: &[CoinInfo],
+        subnet_id: SubnetId,
+    ) -> Result<SolverTask, TaskPrepareError> {
+        if source_coins.is_empty() {
+            return Err(TaskPrepareError::InvalidInput(
+                "Must provide at least one source coin to merge".into(),
+            ));
+        }
+
+        let target_resolved = ResolvedObject {
+            object_id: target_coin.object_id,
+            object_type: "Coin".to_string(),
+            expected_version: target_coin.version,
+        };
+        let source_resolved: Vec<ResolvedObject> = source_coins
             .iter()
-            .filter(|c| c.balance >= amount)
-            .cloned()
+            .map(|c| ResolvedObject {
+                object_id: c.object_id,
+                object_type: "Coin".to_string(),
+                expected_version: c.version,
+            })
             .collect();
-        
-        if eligible_coins.is_empty() {
-            let total_balance: u64 = sender_coins.iter().map(|c| c.balance).sum();
+        let resolved_inputs = ResolvedInputs::merge_coins(target_resolved, source_resolved);
+
+        // Collect all coin ObjectIds for dependencies & read_set
+        let mut all_ids: Vec<ObjectId> = vec![target_coin.object_id];
+        all_ids.extend(source_coins.iter().map(|c| c.object_id));
+
+        let input_refs: Vec<&ObjectId> = all_ids.iter().collect();
+        let parent_ids = self.derive_dependencies(&input_refs);
+
+        let read_set = self.build_read_set(&all_ids)?;
+
+        let vlc_snapshot = self.generate_vlc_snapshot();
+        let mut event = Event::new(
+            EventType::CoinMerge,
+            parent_ids,
+            vlc_snapshot,
+            self.validator_id.clone(),
+        );
+        event.payload = setu_types::event::EventPayload::CoinMerge {
+            target_coin_id: hex::encode(&target_coin.object_id),
+            source_coin_ids: source_coins.iter().map(|c| hex::encode(&c.object_id)).collect(),
+        };
+
+        let pre_state_root = self.state_provider.get_state_root();
+        let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
+
+        let task = SolverTask::new(task_id, event, resolved_inputs, pre_state_root, subnet_id)
+            .with_read_set(read_set)
+            .with_gas_budget(GasBudget::default());
+
+        info!(
+            task_id = %hex::encode(&task_id[..8]),
+            target = %hex::encode(&target_coin.object_id),
+            source_count = source_coins.len(),
+            "Merge SolverTask prepared"
+        );
+        Ok(task)
+    }
+
+    /// Prepare a SolverTask for splitting one coin into multiple.
+    pub fn prepare_split_task(
+        &self,
+        source_coin: &CoinInfo,
+        amounts: Vec<u64>,
+        subnet_id: SubnetId,
+    ) -> Result<SolverTask, TaskPrepareError> {
+        if amounts.is_empty() {
+            return Err(TaskPrepareError::InvalidInput(
+                "Split amounts cannot be empty".into(),
+            ));
+        }
+        if amounts.iter().any(|&a| a == 0) {
+            return Err(TaskPrepareError::InvalidInput(
+                "Split amount must be > 0 (zero-balance coins are not allowed)".into(),
+            ));
+        }
+        let total: u64 = amounts.iter()
+            .try_fold(0u64, |acc, &a| acc.checked_add(a))
+            .ok_or_else(|| TaskPrepareError::InvalidInput(
+                "Split amounts overflow u64".into(),
+            ))?;
+        if total > source_coin.balance {
             return Err(TaskPrepareError::InsufficientBalance {
-                required: amount,
-                available: total_balance,
+                required: total,
+                available: source_coin.balance,
             });
         }
-        
-        eligible_coins.sort_by_key(|c| c.balance);
-        
-        // Step 3: Try to reserve each eligible coin until one succeeds
-        let mut selected_coin: Option<CoinInfo> = None;
-        let mut reservation_handle: Option<crate::coin_reservation::ReservationHandle> = None;
-        
-        for coin in &eligible_coins {
-            if let Some(handle) = reservation_mgr.try_reserve(
-                &coin.object_id,
-                amount,
-                &transfer.id,
-            ) {
-                selected_coin = Some(coin.clone());
-                reservation_handle = Some(handle);
-                break;
-            }
-            // Coin already reserved by another transfer, try next one
-            debug!(
-                object_id = %hex::encode(&coin.object_id),
-                "Coin already reserved, trying next"
+
+        let source_resolved = ResolvedObject {
+            object_id: source_coin.object_id,
+            object_type: "Coin".to_string(),
+            expected_version: source_coin.version,
+        };
+        let resolved_inputs = ResolvedInputs::split_coin(source_resolved, amounts.clone());
+
+        let input_refs: Vec<&ObjectId> = vec![&source_coin.object_id];
+        let parent_ids = self.derive_dependencies(&input_refs);
+
+        let read_set = self.build_read_set(&[source_coin.object_id])?;
+
+        let vlc_snapshot = self.generate_vlc_snapshot();
+        let mut event = Event::new(
+            EventType::CoinSplit,
+            parent_ids,
+            vlc_snapshot,
+            self.validator_id.clone(),
+        );
+        event.payload = setu_types::event::EventPayload::CoinSplit {
+            source_coin_id: hex::encode(&source_coin.object_id),
+            amounts,
+        };
+
+        let pre_state_root = self.state_provider.get_state_root();
+        let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
+
+        let task = SolverTask::new(task_id, event, resolved_inputs, pre_state_root, subnet_id)
+            .with_read_set(read_set)
+            .with_gas_budget(GasBudget::default());
+
+        info!(
+            task_id = %hex::encode(&task_id[..8]),
+            source = %hex::encode(&source_coin.object_id),
+            "Split SolverTask prepared"
+        );
+        Ok(task)
+    }
+
+    /// Prepare a SolverTask for atomic merge-then-transfer.
+    ///
+    /// Merges source coins into target, then transfers `amount` to `recipient`.
+    /// This is a compound operation executed atomically in TEE.
+    pub fn prepare_merge_then_transfer_task(
+        &self,
+        target_coin: &CoinInfo,
+        source_coins: &[CoinInfo],
+        recipient: setu_types::object::Address,
+        amount: u64,
+        subnet_id: SubnetId,
+    ) -> Result<SolverTask, TaskPrepareError> {
+        if source_coins.is_empty() {
+            return Err(TaskPrepareError::InvalidInput(
+                "Must provide at least one source coin to merge".into(),
+            ));
+        }
+
+        // Verify merged balance will be sufficient
+        let merged_balance: u64 = target_coin.balance
+            + source_coins.iter().map(|c| c.balance).sum::<u64>();
+        if merged_balance < amount {
+            return Err(TaskPrepareError::InsufficientBalance {
+                required: amount,
+                available: merged_balance,
+            });
+        }
+
+        let target_resolved = ResolvedObject {
+            object_id: target_coin.object_id,
+            object_type: "Coin".to_string(),
+            expected_version: target_coin.version,
+        };
+        let source_resolved: Vec<ResolvedObject> = source_coins
+            .iter()
+            .map(|c| ResolvedObject {
+                object_id: c.object_id,
+                object_type: "Coin".to_string(),
+                expected_version: c.version,
+            })
+            .collect();
+        let resolved_inputs = ResolvedInputs::merge_then_transfer(
+            target_resolved,
+            source_resolved,
+            recipient.clone(),
+            amount,
+        );
+
+        let mut all_ids: Vec<ObjectId> = vec![target_coin.object_id];
+        all_ids.extend(source_coins.iter().map(|c| c.object_id));
+
+        let input_refs: Vec<&ObjectId> = all_ids.iter().collect();
+        let parent_ids = self.derive_dependencies(&input_refs);
+
+        let read_set = self.build_read_set(&all_ids)?;
+
+        let vlc_snapshot = self.generate_vlc_snapshot();
+        let mut event = Event::new(
+            EventType::CoinMergeThenTransfer,
+            parent_ids,
+            vlc_snapshot,
+            self.validator_id.clone(),
+        );
+        event.payload = setu_types::event::EventPayload::CoinMergeThenTransfer {
+            target_coin_id: hex::encode(&target_coin.object_id),
+            source_coin_ids: source_coins.iter().map(|c| hex::encode(&c.object_id)).collect(),
+            recipient: recipient.to_string(),
+            amount,
+        };
+
+        let pre_state_root = self.state_provider.get_state_root();
+        let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
+
+        let task = SolverTask::new(task_id, event, resolved_inputs, pre_state_root, subnet_id)
+            .with_read_set(read_set)
+            .with_gas_budget(GasBudget::default());
+
+        info!(
+            task_id = %hex::encode(&task_id[..8]),
+            target = %hex::encode(&target_coin.object_id),
+            source_count = source_coins.len(),
+            amount = amount,
+            "MergeThenTransfer SolverTask prepared"
+        );
+        Ok(task)
+    }
+
+    /// Build read_set entries for a list of object IDs.
+    fn build_read_set(
+        &self,
+        object_ids: &[ObjectId],
+    ) -> Result<Vec<ReadSetEntry>, TaskPrepareError> {
+        let mut read_set = Vec::with_capacity(object_ids.len());
+        for oid in object_ids {
+            let coin_data = self.state_provider.get_object(oid)
+                .ok_or(TaskPrepareError::ObjectNotFound(hex::encode(oid)))?;
+            let merkle_proof = self.state_provider.get_merkle_proof(oid);
+            read_set.push(
+                ReadSetEntry::new(
+                    format!("oid:{}", hex::encode(oid)),
+                    coin_data,
+                ).with_proof(
+                    merkle_proof
+                        .map(|p| bcs::to_bytes(&p).unwrap_or_default())
+                        .unwrap_or_default()
+                ),
             );
         }
-        
-        let selected_coin = selected_coin.ok_or_else(|| {
-            TaskPrepareError::AllCoinsReserved {
-                sender: transfer.from.clone(),
-                coin_count: eligible_coins.len(),
-            }
-        })?;
-        
-        let reservation_handle = reservation_handle.expect("handle must exist if coin is selected");
-        
-        debug!(
-            object_id = ?selected_coin.object_id,
-            coin_balance = selected_coin.balance,
-            "Selected and reserved coin for transfer"
-        );
-        
-        // Step 4: Build ResolvedObject and ResolvedInputs (same as non-reservation path)
-        let resolved_coin = setu_types::task::ResolvedObject {
-            object_id: selected_coin.object_id,
-            object_type: "Coin".to_string(),
-            expected_version: selected_coin.version,
-        };
-        
-        let resolved_inputs = setu_types::task::ResolvedInputs::transfer(resolved_coin.clone(), amount);
-        
-        // Step 5: Derive event dependencies
-        let input_objects: Vec<&setu_types::ObjectId> = vec![&selected_coin.object_id];
-        let parent_ids = self.derive_dependencies(&input_objects);
-        
-        // Step 6: Build read_set with Merkle proof
-        let coin_data = self.state_provider.get_object(&selected_coin.object_id)
-            .ok_or(TaskPrepareError::ObjectNotFound(hex::encode(&selected_coin.object_id)))?;
-        
-        let merkle_proof = self.state_provider.get_merkle_proof(&selected_coin.object_id);
-        
-        let read_set = vec![
-            setu_types::task::ReadSetEntry::new(
-                format!("oid:{}", hex::encode(&selected_coin.object_id)),
-                coin_data,
-            ).with_proof(
-                merkle_proof
-                    .map(|p| bcs::to_bytes(&p).unwrap_or_default())
-                    .unwrap_or_default()
-            ),
-        ];
-        
-        // Step 7: Create Event
-        let event = self.create_event_from_transfer(transfer, parent_ids)?;
-        
-        // Step 8: Get pre-state root
-        let pre_state_root = self.state_provider.get_state_root();
-        
-        // Step 9: Generate task_id and create SolverTask
-        let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
-        
-        let task = SolverTask::new(
-            task_id,
-            event,
-            resolved_inputs,
-            pre_state_root,
-            subnet_id,
-        )
-        .with_read_set(read_set)
-        .with_gas_budget(setu_types::task::GasBudget::default());
-        
-        info!(
-            transfer_id = %transfer.id,
-            task_id = %hex::encode(&task_id[..8]),
-            reservation_id = %reservation_handle.reservation_id,
-            "SolverTask prepared with reservation"
-        );
-        
-        Ok((task, reservation_handle))
+        Ok(read_set)
+    }
+
+    /// Generate a VLC snapshot for non-transfer events.
+    fn generate_vlc_snapshot(&self) -> VLCSnapshot {
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let mut snapshot = VLCSnapshot::for_node(self.validator_id.clone());
+        snapshot.logical_time = now_nanos;
+        snapshot.physical_time = now_nanos / 1_000_000;
+        snapshot
     }
     
     /// Select the best coin for a transfer
@@ -389,30 +675,87 @@ impl TaskPreparer {
         coins: &[CoinInfo],
         amount: u64,
     ) -> Result<CoinInfo, TaskPrepareError> {
-        // Check if coins is empty first
+        match self.select_coins_for_transfer(coins, amount)? {
+            super::CoinSelectionResult::SingleCoin(coin) => Ok(coin),
+            super::CoinSelectionResult::NeedMerge { target, .. } => {
+                // Legacy callers get the largest coin; they don't support auto-merge
+                Ok(target)
+            }
+        }
+    }
+
+    /// Select coins for a transfer, potentially requiring merge.
+    ///
+    /// Returns `SingleCoin` when one coin covers the amount, or `NeedMerge`
+    /// when multiple coins must be merged first.
+    pub(crate) fn select_coins_for_transfer(
+        &self,
+        coins: &[CoinInfo],
+        amount: u64,
+    ) -> Result<super::CoinSelectionResult, TaskPrepareError> {
+        if amount == 0 {
+            return Err(TaskPrepareError::InvalidInput(
+                "Transfer amount must be > 0".into(),
+            ));
+        }
         if coins.is_empty() {
             return Err(TaskPrepareError::NoCoinsFound("sender has no coins".to_string()));
         }
-        
-        // Filter coins with sufficient balance
-        let mut eligible_coins: Vec<_> = coins
+
+        // Strategy 1: find a single coin that covers the amount (smallest sufficient)
+        let mut eligible: Vec<_> = coins
             .iter()
             .filter(|c| c.balance >= amount)
             .cloned()
             .collect();
-        
-        if eligible_coins.is_empty() {
-            let total_balance: u64 = coins.iter().map(|c| c.balance).sum();
+
+        // Sort ascending by balance, then ObjectId tie-break (R12)
+        eligible.sort_by(|a, b| {
+            a.balance.cmp(&b.balance)
+                .then_with(|| a.object_id.cmp(&b.object_id))
+        });
+
+        if let Some(coin) = eligible.into_iter().next() {
+            return Ok(super::CoinSelectionResult::SingleCoin(coin));
+        }
+
+        // Strategy 2: greedy merge (largest coins first until accumulated >= amount)
+        let mut sorted: Vec<_> = coins.to_vec();
+        // Sort descending by balance, then ascending ObjectId tie-break
+        sorted.sort_by(|a, b| {
+            b.balance.cmp(&a.balance)
+                .then_with(|| a.object_id.cmp(&b.object_id))
+        });
+
+        let mut selected = Vec::new();
+        let mut accumulated = 0u64;
+
+        for coin in sorted {
+            selected.push(coin.clone());
+            accumulated = accumulated.checked_add(coin.balance)
+                .unwrap_or(u64::MAX);
+            if accumulated >= amount {
+                break;
+            }
+            if selected.len() >= super::MAX_MERGE_SOURCES + 1 {
+                // +1 because first element becomes target, rest are sources
+                break;
+            }
+        }
+
+        if accumulated < amount {
             return Err(TaskPrepareError::InsufficientBalance {
                 required: amount,
-                available: total_balance,
+                available: accumulated,
             });
         }
-        
-        // Sort by balance (ascending) to select smallest sufficient coin
-        eligible_coins.sort_by_key(|c| c.balance);
-        
-        Ok(eligible_coins.remove(0))
+
+        // First coin (largest) is the merge target, rest are sources
+        let target = selected.remove(0);
+        Ok(super::CoinSelectionResult::NeedMerge {
+            target,
+            sources: selected,
+        })
     }
     
     /// Create Event from Transfer with derived parent IDs
@@ -506,6 +849,16 @@ mod tests {
             .with_type(TransferType::FluxTransfer)
             .with_power(10)
     }
+
+    fn make_coin(id_byte: u8, balance: u64) -> CoinInfo {
+        CoinInfo {
+            object_id: ObjectId::new([id_byte; 32]),
+            owner: "alice".to_string(),
+            balance,
+            version: 1,
+            coin_type: "ROOT".to_string(),
+        }
+    }
     
     #[test]
     fn test_prepare_transfer_task() {
@@ -536,29 +889,10 @@ mod tests {
     fn test_select_smallest_sufficient_coin() {
         let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
         
-        // coin_type now represents subnet_id (ROOT = root subnet)
         let coins = vec![
-            CoinInfo {
-                object_id: ObjectId::new([1u8; 32]),
-                owner: "alice".to_string(),
-                balance: 500,
-                version: 1,
-                coin_type: "ROOT".to_string(),
-            },
-            CoinInfo {
-                object_id: ObjectId::new([2u8; 32]),
-                owner: "alice".to_string(),
-                balance: 200,
-                version: 1,
-                coin_type: "ROOT".to_string(),
-            },
-            CoinInfo {
-                object_id: ObjectId::new([3u8; 32]),
-                owner: "alice".to_string(),
-                balance: 1000,
-                version: 1,
-                coin_type: "ROOT".to_string(),
-            },
+            make_coin(1, 500),
+            make_coin(2, 200),
+            make_coin(3, 1000),
         ];
         
         // For amount 150, should select coin with balance 200 (smallest sufficient)
@@ -576,15 +910,7 @@ mod tests {
     fn test_insufficient_balance() {
         let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
         
-        let coins = vec![
-            CoinInfo {
-                object_id: ObjectId::new([1u8; 32]),
-                owner: "alice".to_string(),
-                balance: 50,
-                version: 1,
-                coin_type: "ROOT".to_string(),  // subnet_id
-            },
-        ];
+        let coins = vec![make_coin(1, 50)];
         
         let result = preparer.select_coin_for_transfer(&coins, 100);
         assert!(result.is_err());
@@ -595,6 +921,113 @@ mod tests {
                 assert_eq!(available, 50);
             }
             _ => panic!("Expected InsufficientBalance error"),
+        }
+    }
+
+    // ── NeedMerge coin selection tests ──
+
+    #[test]
+    fn test_select_coins_single_coin_sufficient() {
+        let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+        let coins = vec![make_coin(1, 500), make_coin(2, 200)];
+
+        match preparer.select_coins_for_transfer(&coins, 150).unwrap() {
+            super::super::CoinSelectionResult::SingleCoin(c) => {
+                assert_eq!(c.balance, 200, "should pick smallest sufficient coin");
+            }
+            _ => panic!("Expected SingleCoin"),
+        }
+    }
+
+    #[test]
+    fn test_select_coins_need_merge_two_coins() {
+        let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+        // No single coin covers 250; need to merge 200+100=300 ≥ 250
+        let coins = vec![make_coin(1, 200), make_coin(2, 100), make_coin(3, 50)];
+
+        match preparer.select_coins_for_transfer(&coins, 250).unwrap() {
+            super::super::CoinSelectionResult::NeedMerge { target, sources } => {
+                assert_eq!(target.balance, 200, "target should be largest coin");
+                assert_eq!(sources.len(), 1, "only need one source");
+                assert_eq!(sources[0].balance, 100);
+            }
+            _ => panic!("Expected NeedMerge"),
+        }
+    }
+
+    #[test]
+    fn test_select_coins_need_merge_all_coins() {
+        let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+        let coins = vec![make_coin(1, 30), make_coin(2, 40), make_coin(3, 50)];
+
+        match preparer.select_coins_for_transfer(&coins, 100).unwrap() {
+            super::super::CoinSelectionResult::NeedMerge { target, sources } => {
+                assert_eq!(target.balance, 50, "target should be largest coin");
+                assert_eq!(sources.len(), 2, "need all remaining sources");
+                let total: u64 = target.balance + sources.iter().map(|s| s.balance).sum::<u64>();
+                assert!(total >= 100, "total should cover amount");
+            }
+            _ => panic!("Expected NeedMerge"),
+        }
+    }
+
+    #[test]
+    fn test_select_coins_insufficient_even_merged() {
+        let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+        let coins = vec![make_coin(1, 30), make_coin(2, 40)];
+
+        match preparer.select_coins_for_transfer(&coins, 200) {
+            Err(TaskPrepareError::InsufficientBalance { required, available }) => {
+                assert_eq!(required, 200);
+                assert_eq!(available, 70);
+            }
+            other => panic!("Expected InsufficientBalance, got: {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn test_select_coins_empty() {
+        let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+        let coins: Vec<CoinInfo> = vec![];
+
+        assert!(preparer.select_coins_for_transfer(&coins, 100).is_err());
+    }
+
+    #[test]
+    fn test_select_coins_deterministic_tie_break() {
+        let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+        // Two coins with same balance → ObjectId tie-break
+        let coins = vec![make_coin(2, 100), make_coin(1, 100)];
+
+        match preparer.select_coins_for_transfer(&coins, 100).unwrap() {
+            super::super::CoinSelectionResult::SingleCoin(c) => {
+                // Ascending ObjectId tie-break → coin with id_byte=1 should win
+                assert_eq!(c.object_id, ObjectId::new([1u8; 32]));
+            }
+            _ => panic!("Expected SingleCoin"),
+        }
+    }
+
+    #[test]
+    fn test_need_merge_greedy_stops_early() {
+        let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+        // Need 150: greedy picks 80+60=140 < 150, so adds 50 → 190 ≥ 150
+        let coins = vec![
+            make_coin(1, 80),
+            make_coin(2, 60),
+            make_coin(3, 50),
+            make_coin(4, 10),
+        ];
+
+        match preparer.select_coins_for_transfer(&coins, 150).unwrap() {
+            super::super::CoinSelectionResult::NeedMerge { target, sources } => {
+                assert_eq!(target.balance, 80);
+                assert_eq!(sources.len(), 2); // 60+50
+                assert_eq!(sources[0].balance, 60);
+                assert_eq!(sources[1].balance, 50);
+                // coin 4 (10) not included because accumulated already >= 150
+            }
+            _ => panic!("Expected NeedMerge"),
         }
     }
 }

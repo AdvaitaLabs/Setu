@@ -18,3 +18,10 @@ Cargo.lock
 # Logs
 *.log
 logs/
+docs/guide
+.setu-data/
+profile_bottleneck.sh
+tests/
+*.py
+.VSCodeCounter/
+docs/

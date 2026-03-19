@@ -23,6 +23,9 @@ pub trait RegistrationHandler: Send + Sync {
     /// Handle validator registration
     async fn register_validator(&self, request: RegisterValidatorRequest) -> RegisterValidatorResponse;
     
+    /// Handle subnet registration
+    async fn register_subnet(&self, request: RegisterSubnetRequest) -> RegisterSubnetResponse;
+    
     /// Handle unregister request
     async fn unregister(&self, request: UnregisterRequest) -> UnregisterResponse;
     
@@ -34,6 +37,9 @@ pub trait RegistrationHandler: Send + Sync {
     
     /// Get validator list
     async fn get_validator_list(&self, request: GetValidatorListRequest) -> GetValidatorListResponse;
+    
+    /// Get subnet list
+    async fn get_subnet_list(&self, request: GetSubnetListRequest) -> GetSubnetListResponse;
     
     /// Get node status
     async fn get_node_status(&self, request: GetNodeStatusRequest) -> GetNodeStatusResponse;
@@ -68,6 +74,10 @@ impl<H: RegistrationHandler> RegistrationServer<H> {
                 info!(validator_id = %req.validator_id, "Handling validator registration");
                 RpcResponse::RegisterValidator(self.handler.register_validator(req).await)
             }
+            RpcRequest::RegisterSubnet(req) => {
+                info!(subnet_id = %req.subnet_id, "Handling subnet registration");
+                RpcResponse::RegisterSubnet(self.handler.register_subnet(req).await)
+            }
             RpcRequest::Unregister(req) => {
                 info!(node_id = %req.node_id, "Handling unregister request");
                 RpcResponse::Unregister(self.handler.unregister(req).await)
@@ -83,6 +93,10 @@ impl<H: RegistrationHandler> RegistrationServer<H> {
             RpcRequest::GetValidatorList(req) => {
                 debug!("Handling get validator list");
                 RpcResponse::GetValidatorList(self.handler.get_validator_list(req).await)
+            }
+            RpcRequest::GetSubnetList(req) => {
+                debug!("Handling get subnet list");
+                RpcResponse::GetSubnetList(self.handler.get_subnet_list(req).await)
             }
             RpcRequest::GetNodeStatus(req) => {
                 debug!(node_id = %req.node_id, "Handling get node status");
@@ -254,6 +268,41 @@ impl RegistrationClient {
             _ => Err(RpcError::InvalidRequest("Unexpected response type".to_string())),
         }
     }
+    
+    /// Register a subnet
+    pub async fn register_subnet(&self, request: RegisterSubnetRequest) -> Result<RegisterSubnetResponse> {
+        info!(
+            subnet_id = %request.subnet_id,
+            name = %request.name,
+            owner = %request.owner,
+            token_symbol = %request.token_symbol,
+            "Registering subnet"
+        );
+        
+        let response = self.send_request(RpcRequest::RegisterSubnet(request)).await?;
+        
+        match response {
+            RpcResponse::RegisterSubnet(resp) => Ok(resp),
+            RpcResponse::Error(msg) => Err(RpcError::InvalidRequest(msg)),
+            _ => Err(RpcError::InvalidRequest("Unexpected response type".to_string())),
+        }
+    }
+    
+    /// Get subnet list
+    pub async fn get_subnet_list(&self, type_filter: Option<String>) -> Result<GetSubnetListResponse> {
+        let request = GetSubnetListRequest {
+            type_filter,
+            owner_filter: None,
+        };
+        
+        let response = self.send_request(RpcRequest::GetSubnetList(request)).await?;
+        
+        match response {
+            RpcResponse::GetSubnetList(resp) => Ok(resp),
+            RpcResponse::Error(msg) => Err(RpcError::InvalidRequest(msg)),
+            _ => Err(RpcError::InvalidRequest("Unexpected response type".to_string())),
+        }
+    }
 }
 
 // ============================================
@@ -349,6 +398,53 @@ impl HttpRegistrationClient {
     /// Get validator list via HTTP
     pub async fn get_validator_list(&self) -> Result<GetValidatorListResponse> {
         let url = format!("{}/api/v1/validators", self.base_url);
+        
+        let response = self.client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| RpcError::Network(e.to_string()))?;
+        
+        if !response.status().is_success() {
+            return Err(RpcError::Network(format!(
+                "HTTP error: {}",
+                response.status()
+            )));
+        }
+        
+        response
+            .json()
+            .await
+            .map_err(|e| RpcError::Serialization(e.to_string()))
+    }
+    
+    /// Register a subnet via HTTP
+    pub async fn register_subnet(&self, request: RegisterSubnetRequest) -> Result<RegisterSubnetResponse> {
+        let url = format!("{}/api/v1/register/subnet", self.base_url);
+        
+        let response = self.client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| RpcError::Network(e.to_string()))?;
+        
+        if !response.status().is_success() {
+            return Err(RpcError::Network(format!(
+                "HTTP error: {}",
+                response.status()
+            )));
+        }
+        
+        response
+            .json()
+            .await
+            .map_err(|e| RpcError::Serialization(e.to_string()))
+    }
+    
+    /// Get subnet list via HTTP
+    pub async fn get_subnet_list(&self) -> Result<GetSubnetListResponse> {
+        let url = format!("{}/api/v1/subnets", self.base_url);
         
         let response = self.client
             .get(&url)

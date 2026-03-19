@@ -270,18 +270,17 @@ impl MerkleStateProvider {
         let all_object_ids: Vec<&ObjectId> = coin_queries.iter().map(|q| &q.object_id).collect();
 
         // ══════════════════════════════════════════════════════════════════
-        // LOCK #1: state_manager - Get coins, objects, proofs, state_root
+        // SINGLE SNAPSHOT: state_manager - Get coins, objects, proofs, state_root
         //
         // Query each coin from its CORRECT subnet SMT (physical isolation)
+        // Solution C: single load_snapshot() replaces two separate read() locks
         // ══════════════════════════════════════════════════════════════════
         let mut builder = {
-            let state_manager_arc = self.state_manager();
-            let manager = state_manager_arc.read()
-                .expect("Failed to acquire read lock on GlobalStateManager for batch snapshot");
+            let snapshot = self.shared_state_manager().load_snapshot();
 
             // 1. Compute state_root ONCE (avoid N recomputations)
-            let (state_root, _subnet_roots) = manager.compute_global_root_bytes();
-            let snapshot_version = manager.current_anchor();
+            let (state_root, _subnet_roots) = snapshot.compute_global_root_bytes();
+            let snapshot_version = snapshot.current_anchor();
 
             let mut builder = BatchStateSnapshotBuilder::new(state_root, snapshot_version);
 
@@ -293,7 +292,7 @@ impl MerkleStateProvider {
                 };
 
                 // Query from the CORRECT subnet SMT (physical isolation)
-                if let Some(smt) = manager.get_subnet(&query.subnet_id) {
+                if let Some(smt) = snapshot.get_subnet(&query.subnet_id) {
                     if let Some(data) = smt.get(&hash).cloned() {
                         if let Some(coin_state) = CoinState::from_bytes(&data) {
                             let coin_info = CoinInfo {
@@ -321,37 +320,33 @@ impl MerkleStateProvider {
                 }
             }
 
-            builder
-        }; // Lock #1 released
-
-        // ══════════════════════════════════════════════════════════════════
-        // LOCK #2: modification_tracker - Get parent_ids for DAG causality
-        // ══════════════════════════════════════════════════════════════════
-        {
-            // Check GSM's modification_tracker first (populated by apply_committed_events)
-            let gsm_arc = self.state_manager();
-            let gsm = gsm_arc.read()
-                .expect("Failed to acquire read lock on GlobalStateManager for batch snapshot");
+            // ══════════════════════════════════════════════════════════════
+            // Same snapshot: modification_tracker - Get parent_ids for DAG causality
+            // (Previously a separate Lock #2, now uses the same snapshot)
+            // ══════════════════════════════════════════════════════════════
             for object_id in &all_object_ids {
-                if let Some(event_id) = gsm.get_last_modifying_event(object_id.as_bytes()) {
+                if let Some(event_id) = snapshot.get_last_modifying_event(object_id.as_bytes()) {
                     builder.add_last_modifying_event((*object_id).clone(), event_id.clone());
                 }
             }
-            drop(gsm);
 
-            // Fallback: check local modification_tracker for any remaining
+            builder
+        }; // snapshot Guard dropped
+
+        // Fallback: check local modification_tracker for any remaining
+        {
             let tracker_arc = self.modification_tracker();
             let tracker = tracker_arc.read()
                 .expect("Failed to acquire read lock on modification_tracker for batch snapshot");
             for object_id in all_object_ids {
-                // Only add if not already found in GSM
+                // Only add if not already found in GSM snapshot
                 if !builder.has_last_modifying_event(&object_id) {
                     if let Some(event_id) = tracker.get(object_id.as_bytes()) {
                         builder.add_last_modifying_event(object_id.clone(), event_id.clone());
                     }
                 }
             }
-        } // Lock #2 released
+        }
 
         // ══════════════════════════════════════════════════════════════════
         // ALL 2 LOCKS RELEASED - Build immutable snapshot
@@ -435,35 +430,37 @@ impl BatchStateSnapshot {
 mod tests {
     use super::*;
     use crate::state::manager::GlobalStateManager;
+    use crate::state::shared::SharedStateManager;
     use crate::state::provider::init_coin_with_type;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
-    fn setup_test_provider() -> (Arc<RwLock<GlobalStateManager>>, MerkleStateProvider) {
-        let state_manager = Arc::new(RwLock::new(GlobalStateManager::new()));
+    fn setup_test_provider() -> (Arc<SharedStateManager>, MerkleStateProvider) {
+        let mut gsm = GlobalStateManager::new();
+        init_coin_with_type(&mut gsm, "alice", 1000, "ROOT");
+        init_coin_with_type(&mut gsm, "alice", 500, "gaming-subnet");
+        init_coin_with_type(&mut gsm, "bob", 2000, "ROOT");
+        init_coin_with_type(&mut gsm, "charlie", 300, "ROOT");
 
-        // Initialize test coins
-        {
-            let mut manager = state_manager.write().unwrap();
-            init_coin_with_type(&mut manager, "alice", 1000, "ROOT");
-            init_coin_with_type(&mut manager, "alice", 500, "gaming-subnet");
-            init_coin_with_type(&mut manager, "bob", 2000, "ROOT");
-            init_coin_with_type(&mut manager, "charlie", 300, "ROOT");
-        }
-
-        let provider = MerkleStateProvider::new(Arc::clone(&state_manager));
+        let shared = Arc::new(SharedStateManager::new(gsm));
+        let provider = MerkleStateProvider::new(Arc::clone(&shared));
 
         // Register coin types for proper lookup
         provider.register_coin_type("alice", "ROOT");
         provider.register_coin_type("alice", "gaming-subnet");
         provider.register_coin_type("bob", "ROOT");
         provider.register_coin_type("charlie", "ROOT");
+        // Publish after registrations
+        {
+            let guard = shared.lock_write();
+            shared.publish_snapshot(&guard);
+        }
 
-        (state_manager, provider)
+        (shared, provider)
     }
 
     #[test]
     fn test_create_batch_snapshot_single_sender() {
-        let (_state_manager, provider) = setup_test_provider();
+        let (_shared, provider) = setup_test_provider();
 
         let pairs = vec![("alice", &SubnetId::ROOT)];
         let snapshot = provider.create_batch_snapshot(&pairs);
@@ -481,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_create_batch_snapshot_multiple_senders() {
-        let (_state_manager, provider) = setup_test_provider();
+        let (_shared, provider) = setup_test_provider();
 
         let pairs = vec![
             ("alice", &SubnetId::ROOT),
@@ -508,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_create_batch_snapshot_same_sender_multiple_subnets() {
-        let (_state_manager, provider) = setup_test_provider();
+        let (_shared, provider) = setup_test_provider();
 
         // Create a gaming subnet ID (using from_str_id for test)
         let gaming_subnet = SubnetId::from_str_id("gaming-subnet");
@@ -530,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_batch_snapshot_objects_and_proofs() {
-        let (_state_manager, provider) = setup_test_provider();
+        let (_shared, provider) = setup_test_provider();
 
         let pairs = vec![("alice", &SubnetId::ROOT)];
         let snapshot = provider.create_batch_snapshot(&pairs);
@@ -555,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_batch_snapshot_modification_tracking() {
-        let (state_manager, provider) = setup_test_provider();
+        let (_shared, provider) = setup_test_provider();
 
         // Record a modification
         let test_object_id = ObjectId::new([42u8; 32]);
@@ -563,7 +560,7 @@ mod tests {
 
         // Create snapshot (won't include the test object since it's not a coin)
         let pairs = vec![("alice", &SubnetId::ROOT)];
-        let snapshot = provider.create_batch_snapshot(&pairs);
+        let _snapshot = provider.create_batch_snapshot(&pairs);
 
         // The snapshot should have tracked alice's coin modifications if any exist
         // For genesis coins, there typically won't be prior modifications
@@ -571,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_batch_snapshot_stats() {
-        let (_state_manager, provider) = setup_test_provider();
+        let (_shared, provider) = setup_test_provider();
 
         let pairs = vec![
             ("alice", &SubnetId::ROOT),
@@ -588,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_batch_snapshot_empty_pairs() {
-        let (_state_manager, provider) = setup_test_provider();
+        let (_shared, provider) = setup_test_provider();
 
         let pairs: Vec<(&str, &SubnetId)> = vec![];
         let snapshot = provider.create_batch_snapshot(&pairs);
@@ -603,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_batch_snapshot_nonexistent_sender() {
-        let (_state_manager, provider) = setup_test_provider();
+        let (_shared, provider) = setup_test_provider();
 
         let pairs = vec![("nonexistent_user", &SubnetId::ROOT)];
         let snapshot = provider.create_batch_snapshot(&pairs);
@@ -615,15 +612,15 @@ mod tests {
 
     #[test]
     fn test_batch_snapshot_validation() {
-        let (state_manager, provider) = setup_test_provider();
+        let (shared, provider) = setup_test_provider();
 
         let pairs = vec![("alice", &SubnetId::ROOT)];
         let snapshot = provider.create_batch_snapshot(&pairs);
 
         // Get current anchor
         let current_anchor = {
-            let manager = state_manager.read().unwrap();
-            manager.current_anchor()
+            let guard = shared.load_snapshot();
+            guard.current_anchor()
         };
 
         // Snapshot should be valid

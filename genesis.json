@@ -5,17 +5,20 @@
     {
       "address": "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf",
       "name": "alice",
-      "balance": 1000000000
+      "balance": 1000000000,
+      "coins_per_account": 5
     },
     {
       "address": "0xeedf1a9c68b3f4a8b1a1032b2b5ad5c4795c026514f8317c7a215e218dccd6cf",
       "name": "bob",
-      "balance": 1000000000
+      "balance": 1000000000,
+      "coins_per_account": 5
     },
     {
       "address": "0x75bf18e34f9add02a2fe5a146813eb9362372eef6200f3b1dbc3f819671cba69",
       "name": "charlie",
-      "balance": 1000000000
+      "balance": 1000000000,
+      "coins_per_account": 5
     }
   ],
   "subnet_id": "ROOT"
