@@ -17,11 +17,13 @@ pub enum MessageType {
     RegisterValidator = 0x11,
     Unregister = 0x12,
     Heartbeat = 0x13,
+    RegisterSubnet = 0x14,
     
     // Query messages (0x2x)
     GetSolverList = 0x20,
     GetValidatorList = 0x21,
     GetNodeStatus = 0x22,
+    GetSubnetList = 0x23,
     
     // Transfer messages (0x3x)
     SubmitTransfer = 0x30,
@@ -350,6 +352,88 @@ pub struct GetTransferStatusResponse {
 // Common Types
 // ============================================
 
+// ============================================
+// Subnet Registration Request/Response Types
+// ============================================
+
+/// Request to register a new subnet
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterSubnetRequest {
+    /// Unique subnet identifier (e.g., "gaming-app")
+    pub subnet_id: String,
+    /// Human-readable name
+    pub name: String,
+    /// Description of the subnet's purpose
+    pub description: Option<String>,
+    /// Owner address (0x...)
+    pub owner: String,
+    /// Subnet type: "app", "organization", "personal"
+    pub subnet_type: Option<String>,
+    /// Parent subnet ID (None = root)
+    pub parent_subnet_id: Option<String>,
+    /// Maximum number of users (None = unlimited)
+    pub max_users: Option<u64>,
+    /// Maximum TPS for this subnet
+    pub max_tps: Option<u64>,
+    /// Maximum storage bytes
+    pub max_storage_bytes: Option<u64>,
+    /// Token symbol (required, e.g., "GAME")
+    pub token_symbol: String,
+    /// Initial token supply minted to owner
+    pub initial_token_supply: Option<u64>,
+    /// Token decimals (default: 8)
+    pub token_decimals: Option<u8>,
+    /// Max token supply cap (None = unlimited)
+    pub token_max_supply: Option<u64>,
+    /// Whether token is mintable after creation
+    pub token_mintable: Option<bool>,
+    /// Whether token is burnable
+    pub token_burnable: Option<bool>,
+    /// Airdrop amount for new users joining this subnet
+    pub user_airdrop_amount: Option<u64>,
+    /// Solver IDs to assign to this subnet
+    pub assigned_solvers: Vec<String>,
+}
+
+/// Response to subnet registration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterSubnetResponse {
+    /// Whether registration was successful
+    pub success: bool,
+    /// Human-readable message
+    pub message: String,
+    /// Assigned subnet ID
+    pub subnet_id: Option<String>,
+    /// Event ID for the registration event
+    pub event_id: Option<String>,
+}
+
+/// Request to list registered subnets
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSubnetListRequest {
+    /// Optional filter by subnet type
+    pub type_filter: Option<String>,
+    /// Optional filter by owner
+    pub owner_filter: Option<String>,
+}
+
+/// Subnet info in list response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubnetListItem {
+    pub subnet_id: String,
+    pub name: String,
+    pub owner: String,
+    pub subnet_type: String,
+    pub token_symbol: Option<String>,
+    pub status: String,
+}
+
+/// Response with subnet list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSubnetListResponse {
+    pub subnets: Vec<SubnetListItem>,
+}
+
 /// Node type enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeType {
@@ -375,10 +459,12 @@ impl std::fmt::Display for NodeType {
 pub enum RpcRequest {
     RegisterSolver(RegisterSolverRequest),
     RegisterValidator(RegisterValidatorRequest),
+    RegisterSubnet(RegisterSubnetRequest),
     Unregister(UnregisterRequest),
     Heartbeat(HeartbeatRequest),
     GetSolverList(GetSolverListRequest),
     GetValidatorList(GetValidatorListRequest),
+    GetSubnetList(GetSubnetListRequest),
     GetNodeStatus(GetNodeStatusRequest),
 }
 
@@ -387,10 +473,12 @@ pub enum RpcRequest {
 pub enum RpcResponse {
     RegisterSolver(RegisterSolverResponse),
     RegisterValidator(RegisterValidatorResponse),
+    RegisterSubnet(RegisterSubnetResponse),
     Unregister(UnregisterResponse),
     Heartbeat(HeartbeatResponse),
     GetSolverList(GetSolverListResponse),
     GetValidatorList(GetValidatorListResponse),
+    GetSubnetList(GetSubnetListResponse),
     GetNodeStatus(GetNodeStatusResponse),
     Error(String),
 }

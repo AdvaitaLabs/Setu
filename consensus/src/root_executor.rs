@@ -124,6 +124,7 @@ impl RootSubnetExecutor {
             EventType::ValidatorUnregister => self.execute_validator_unregister(event),
             EventType::SolverRegister => self.execute_solver_register(event),
             EventType::SolverUnregister => self.execute_solver_unregister(event),
+            EventType::SubnetRegister => self.execute_subnet_register(event),
             EventType::System => self.execute_system_event(event),
             _ => {
                 // For other event types, just acknowledge without state change
@@ -233,6 +234,34 @@ impl RootSubnetExecutor {
         })
     }
     
+    /// Execute subnet registration
+    fn execute_subnet_register(&mut self, event: &Event) -> Result<RootExecutionResult, RootExecutorError> {
+        let key = self.generate_subnet_key(&event.id);
+        
+        let state = ObjectStateValue::new(
+            self.address_to_bytes(&event.creator),
+            1,
+            object_type::SUBNET_CONFIG,
+            *blake3_hash(event.id.as_bytes()).as_bytes(),
+            SubnetId::ROOT,
+        );
+        
+        self.pending_updates.insert(key, state.clone());
+        
+        let new_root = self.compute_pending_root();
+        self.current_state_root = new_root;
+        
+        let mut updated = HashMap::new();
+        updated.insert(key, state);
+        
+        Ok(RootExecutionResult {
+            updated_objects: updated,
+            deleted_objects: Vec::new(),
+            new_state_root: new_root,
+            event_id: event.id.clone(),
+        })
+    }
+
     /// Execute system event (config updates, etc.)
     fn execute_system_event(&mut self, event: &Event) -> Result<RootExecutionResult, RootExecutorError> {
         let key = self.generate_config_key("global");
@@ -284,6 +313,15 @@ impl RootSubnetExecutor {
         let mut key = [0u8; 32];
         key[0] = object_type::GLOBAL_CONFIG;
         let hash = blake3_hash(config_name.as_bytes());
+        key[1..].copy_from_slice(&hash.as_bytes()[..31]);
+        key
+    }
+    
+    /// Generate object key for a subnet
+    fn generate_subnet_key(&self, subnet_id: &str) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[0] = object_type::SUBNET_CONFIG;
+        let hash = blake3_hash(subnet_id.as_bytes());
         key[1..].copy_from_slice(&hash.as_bytes()[..31]);
         key
     }

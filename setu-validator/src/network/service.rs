@@ -75,6 +75,9 @@ pub struct ValidatorNetworkService {
     /// Registered validators
     validators: Arc<RwLock<HashMap<String, ValidatorInfo>>>,
 
+    /// Registered subnets
+    registered_subnets: Arc<DashMap<String, SubnetInfo>>,
+
     /// Registered solver information (for sync HTTP calls)
     /// Uses DashMap for lock-free concurrent access
     solver_info: Arc<DashMap<String, SolverInfo>>,
@@ -178,6 +181,7 @@ impl ValidatorNetworkService {
             batch_task_preparer,
             consensus_validator: None,
             validators: Arc::new(RwLock::new(HashMap::new())),
+            registered_subnets: Arc::new(DashMap::new()),
             solver_info,
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
             http_client,
@@ -255,6 +259,7 @@ impl ValidatorNetworkService {
             batch_task_preparer,
             consensus_validator: Some(consensus_validator),
             validators: Arc::new(RwLock::new(HashMap::new())),
+            registered_subnets: Arc::new(DashMap::new()),
             solver_info,
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
             http_client,
@@ -400,9 +405,11 @@ impl ValidatorNetworkService {
             // Registration endpoints
             .route("/api/v1/register/solver", post(setu_api::http_register_solver::<ValidatorNetworkService>))
             .route("/api/v1/register/validator", post(setu_api::http_register_validator::<ValidatorNetworkService>))
+            .route("/api/v1/register/subnet", post(setu_api::http_register_subnet::<ValidatorNetworkService>))
             // Query endpoints
             .route("/api/v1/solvers", get(setu_api::http_get_solvers::<ValidatorNetworkService>))
             .route("/api/v1/validators", get(setu_api::http_get_validators::<ValidatorNetworkService>))
+            .route("/api/v1/subnets", get(setu_api::http_get_subnets::<ValidatorNetworkService>))
             .route("/api/v1/health", get(setu_api::http_health::<ValidatorNetworkService>))
             // State query endpoints (Scheme B)
             .route("/api/v1/state/balance/:account", get(setu_api::http_get_balance::<ValidatorNetworkService>))
@@ -596,6 +603,35 @@ impl ValidatorNetworkService {
     }
 
     // ============================================
+    // Subnet Management
+    // ============================================
+
+    pub fn add_subnet(&self, info: SubnetInfo) {
+        self.registered_subnets.insert(info.subnet_id.clone(), info);
+    }
+
+    pub fn get_subnet_info(&self, subnet_id: &str) -> Option<SubnetInfo> {
+        self.registered_subnets.get(subnet_id).map(|v| v.clone())
+    }
+
+    pub fn get_subnet_list(&self) -> Vec<setu_rpc::SubnetListItem> {
+        self.registered_subnets
+            .iter()
+            .map(|entry| {
+                let s = entry.value();
+                setu_rpc::SubnetListItem {
+                    subnet_id: s.subnet_id.clone(),
+                    name: s.name.clone(),
+                    owner: s.owner.clone(),
+                    subnet_type: s.subnet_type.clone(),
+                    token_symbol: s.token_symbol.clone(),
+                    status: s.status.clone(),
+                }
+            })
+            .collect()
+    }
+
+    // ============================================
     // Solver Management
     // ============================================
 
@@ -682,6 +718,20 @@ impl ValidatorNetworkService {
             EventPayload::SolverUnregister(unreg) => self.unregister_solver(&unreg.node_id),
             EventPayload::ValidatorUnregister(unreg) => {
                 self.validators.write().remove(&unreg.node_id);
+            }
+            EventPayload::SubnetRegister(reg) => {
+                self.registered_subnets.insert(
+                    reg.subnet_id.clone(),
+                    SubnetInfo {
+                        subnet_id: reg.subnet_id.clone(),
+                        name: reg.name.clone(),
+                        owner: reg.owner.clone(),
+                        subnet_type: format!("{:?}", reg.subnet_type),
+                        token_symbol: reg.token_symbol.clone(),
+                        status: "active".to_string(),
+                        registered_at: event.timestamp / 1000,
+                    },
+                );
             }
             _ => {}
         }

@@ -56,6 +56,12 @@ enum Commands {
         action: TransferAction,
     },
     
+    /// Subnet management
+    Subnet {
+        #[command(subcommand)]
+        action: SubnetAction,
+    },
+    
     /// Configuration management
     Config {
         #[command(subcommand)]
@@ -373,6 +379,91 @@ enum TransferAction {
 }
 
 #[derive(Subcommand)]
+pub enum SubnetAction {
+    /// Register a new subnet
+    Register {
+        /// Unique subnet identifier
+        #[arg(long)]
+        subnet_id: String,
+
+        /// Human-readable name
+        #[arg(long)]
+        name: String,
+
+        /// Owner address (0x...)
+        #[arg(long)]
+        owner: String,
+
+        /// Token symbol (required, e.g., "GAME")
+        #[arg(long)]
+        token_symbol: String,
+
+        /// Subnet description
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Subnet type: app, organization, personal
+        #[arg(long)]
+        subnet_type: Option<String>,
+
+        /// Parent subnet ID
+        #[arg(long)]
+        parent: Option<String>,
+
+        /// Maximum number of users
+        #[arg(long)]
+        max_users: Option<u64>,
+
+        /// Maximum TPS
+        #[arg(long)]
+        max_tps: Option<u64>,
+
+        /// Maximum storage bytes
+        #[arg(long)]
+        max_storage: Option<u64>,
+
+        /// Initial token supply minted to owner
+        #[arg(long)]
+        initial_supply: Option<u64>,
+
+        /// Token decimals (default: 8)
+        #[arg(long)]
+        token_decimals: Option<u8>,
+
+        /// Max token supply cap
+        #[arg(long)]
+        token_max_supply: Option<u64>,
+
+        /// Whether token is mintable after creation (default: false)
+        #[arg(long)]
+        token_mintable: Option<bool>,
+
+        /// Whether token is burnable (default: true)
+        #[arg(long)]
+        token_burnable: Option<bool>,
+
+        /// Airdrop amount for new users
+        #[arg(long)]
+        user_airdrop: Option<u64>,
+
+        /// Solver IDs to assign (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        solvers: Vec<String>,
+
+        /// Validator address
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        router: String,
+    },
+
+    /// List registered subnets
+    List {
+        /// Validator address
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        router: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigAction {
     /// Initialize configuration
     Init {
@@ -424,6 +515,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Transfer { action } => {
             commands::transfer::handle(action, &config).await?;
+        }
+        Commands::Subnet { action } => {
+            commands::subnet::handle(action, &config).await?;
         }
         Commands::Config { action } => {
             commands::config::handle(action).await?;

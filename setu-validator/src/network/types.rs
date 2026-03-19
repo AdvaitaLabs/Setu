@@ -94,3 +94,15 @@ pub fn current_timestamp_millis() -> u64 {
         .unwrap()
         .as_millis() as u64
 }
+
+/// Registered subnet information
+#[derive(Debug, Clone)]
+pub struct SubnetInfo {
+    pub subnet_id: String,
+    pub name: String,
+    pub owner: String,
+    pub subnet_type: String,
+    pub token_symbol: Option<String>,
+    pub status: String,
+    pub registered_at: u64,
+}
