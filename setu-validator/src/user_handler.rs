@@ -15,6 +15,7 @@ use setu_rpc::{
     CoinBalance, SubmitTransferRequest,
 };
 use setu_types::registration::UserRegistration;
+use setu_types::{ObjectId, hash_utils::setu_hash_with_domain};
 use setu_vlc::VLCSnapshot;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -81,21 +82,110 @@ impl UserRpcHandler for ValidatorUserHandler {
             }
         }
 
-        // ── Step 2: Signature format check (placeholder for Phase 2 real verification) ──
-        if let Some(ref signature) = request.signature {
-            if request.nostr_pubkey.is_some() {
-                if signature.len() != 64 {
+        // ── Step 2: Timestamp anti-replay ──────────────────────────
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let req_secs = request.timestamp / 1000; // request.timestamp is millis
+        if now_secs.abs_diff(req_secs) > 300 {
+            return Self::reg_err(
+                "Timestamp too old or too far in the future (5 min window)",
+                &request.address,
+            );
+        }
+
+        // ── Step 3: Signature verification ──────────────────────────
+        let skip_sig = std::env::var("SETU_SKIP_SIG_VERIFY").unwrap_or_default() == "1";
+
+        if !skip_sig {
+            let message = match &request.message {
+                Some(m) => m.clone(),
+                None => {
                     return Self::reg_err(
-                        "Invalid Nostr signature length (expected 64 bytes)",
+                        "Signed message is required for registration",
                         &request.address,
                     );
                 }
-            } else if signature.len() != 65 {
-                warn!(address = %request.address, "MetaMask signature length != 65, skipping check");
+            };
+
+            let signature = match &request.signature {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    return Self::reg_err(
+                        "Signature is required for registration",
+                        &request.address,
+                    );
+                }
+            };
+
+            let sig_result = if let Some(ref nostr_pubkey) = request.nostr_pubkey {
+                // Nostr: Schnorr BIP-340
+                setu_keys::verify::verify_nostr_schnorr(
+                    &request.address,
+                    nostr_pubkey,
+                    signature,
+                    message.as_bytes(),
+                )
+            } else if let Some(ref public_key_b64) = request.public_key {
+                // Setu native: Ed25519 / Secp256k1 / Secp256r1
+                // public_key is base64 (flag || pk_bytes), signature is raw bytes.
+                let pk_raw = setu_keys::PublicKey::decode_base64(public_key_b64)
+                    .and_then(|pk| {
+                        let mut v = vec![pk.scheme().flag()];
+                        v.extend(pk.as_bytes());
+                        Ok(v)
+                    });
+                match pk_raw {
+                    Ok(pk_bytes) => setu_keys::verify::verify_setu_native_raw(
+                        &request.address,
+                        &pk_bytes,
+                        signature,
+                        message.as_bytes(),
+                    ),
+                    Err(e) => Err(e),
+                }
+            } else {
+                // MetaMask: secp256k1 ECDSA with personal_sign recovery
+                setu_keys::verify::verify_metamask_personal_sign(
+                    &request.address,
+                    signature,
+                    &message,
+                )
+            };
+
+            if let Err(e) = sig_result {
+                warn!(address = %request.address, error = %e, "Signature verification failed");
+                return Self::reg_err(
+                    &format!("Signature verification failed: {}", e),
+                    &request.address,
+                );
             }
         }
 
-        // ── Step 3: Build VLC snapshot ──────────────────────────────
+        // ── Step 4: Duplicate registration detection ────────────────
+        let subnet_id = request.subnet_id.as_deref().unwrap_or("subnet-0");
+        let membership_key = format!("user:{}:subnet:{}", request.address, subnet_id);
+        let membership_object_id = ObjectId::new(
+            setu_hash_with_domain(b"SETU_MEMBERSHIP:", membership_key.as_bytes()),
+        );
+
+        if self
+            .network_service
+            .state_provider()
+            .get_object(&membership_object_id)
+            .is_some()
+        {
+            return Self::reg_err(
+                &format!(
+                    "User {} already registered in subnet '{}'",
+                    request.address, subnet_id
+                ),
+                &request.address,
+            );
+        }
+
+        // ── Step 5: Build VLC snapshot ──────────────────────────────
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -110,7 +200,7 @@ impl UserRpcHandler for ValidatorUserHandler {
             physical_time: now,
         };
 
-        // ── Step 4: Build UserRegistration ──────────────────────────
+        // ── Step 6: Build UserRegistration ──────────────────────────
         let registration = UserRegistration {
             address: request.address.clone(),
             nostr_pubkey: request.nostr_pubkey.clone(),
@@ -122,9 +212,10 @@ impl UserRpcHandler for ValidatorUserHandler {
             metadata: request.metadata.clone(),
             invited_by: None,
             invite_code: request.invite_code.clone(),
+            public_key: request.public_key.clone(),
         };
 
-        // ── Step 5: Delegate to InfraExecutor (路径 B) ──────────────
+        // ── Step 7: Delegate to InfraExecutor (路径 B) ──────────────
         // InfraExecutor:
         //   → RuntimeExecutor::execute_user_register()  (G11-compliant "oid:{hex}" state keys)
         //   → apply_state_changes() to MerkleStateProvider
@@ -143,7 +234,7 @@ impl UserRpcHandler for ValidatorUserHandler {
 
         let event_id = event.id.clone();
 
-        // ── Step 6: Add event to DAG ────────────────────────────────
+        // ── Step 8: Add event to DAG ────────────────────────────────
         self.network_service.add_event_to_dag(event).await;
 
         info!(

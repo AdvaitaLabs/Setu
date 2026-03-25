@@ -60,6 +60,11 @@ pub struct RegisterUserRequest {
     
     /// Invite code used for registration
     pub invite_code: Option<String>,
+
+    /// Setu-native users: Base64-encoded PublicKey (flag || pk_bytes).
+    /// MetaMask and Nostr users do not need this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 /// Response to user registration
@@ -418,6 +423,7 @@ mod tests {
             display_name: Some("Alice".to_string()),
             metadata: None,
             invite_code: Some("INVITE123".to_string()),
+            public_key: None,
         };
         
         let wrapped = UserRpcRequest::RegisterUser(metamask_request);
@@ -447,6 +453,7 @@ mod tests {
             display_name: Some("Bob".to_string()),
             metadata: None,
             invite_code: None,
+            public_key: None,
         };
         
         let wrapped = UserRpcRequest::RegisterUser(nostr_request);

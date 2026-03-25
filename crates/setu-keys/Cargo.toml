@@ -12,7 +12,7 @@ bip32 = "0.5"
 bip39 = { version = "2.0", features = ["rand"] }
 slip10_ed25519 = "0.1"
 ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
-k256 = { version = "0.13", features = ["ecdsa", "serde"] }
+k256 = { version = "0.13", features = ["ecdsa", "serde", "schnorr"] }
 p256 = { version = "0.13", features = ["ecdsa", "serde"] }
 rand = "0.8"
 serde = { workspace = true, features = ["derive"] }

@@ -19,6 +19,7 @@ pub mod key_identity;
 pub mod keypair_file;
 pub mod keystore;
 pub mod address_derive;
+pub mod verify;
 
 pub use crypto::{PublicKey, SetuAddress, SetuKeyPair, Signature, SignatureScheme};
 pub use error::KeyError;

@@ -327,34 +327,29 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             physical_time: current_timestamp_millis(),
         };
 
-        // Create subnet registration event
-        let mut event = Event::subnet_register(
-            registration.clone(),
-            vec![],
-            vlc_snapshot,
-            self.service.validator_id().to_string(),
-        );
-
-        event.set_execution_result(setu_types::event::ExecutionResult {
-            success: true,
-            message: Some("Subnet registration executed".to_string()),
-            state_changes: vec![setu_types::event::StateChange {
-                key: format!("subnet:{}", request.subnet_id),
-                old_value: None,
-                new_value: Some(
-                    serde_json::json!({
-                        "name": request.name,
-                        "owner": request.owner,
-                        "token_symbol": request.token_symbol,
-                        "subnet_type": format!("{:?}", registration.subnet_type),
-                    }).to_string().into_bytes(),
-                ),
-            }],
-        });
+        // Delegate to InfraExecutor (路径 B) — G11-compliant "oid:{hex}" state keys,
+        // and mint_tokens() is actually executed when initial_token_supply > 0.
+        let event = match self
+            .service
+            .infra_executor()
+            .execute_subnet_register(&registration, vlc_snapshot)
+        {
+            Ok(event) => event,
+            Err(e) => {
+                tracing::error!(subnet_id = %request.subnet_id, error = %e,
+                    "InfraExecutor subnet registration failed");
+                return RegisterSubnetResponse {
+                    success: false,
+                    message: format!("Subnet registration failed: {}", e),
+                    subnet_id: None,
+                    event_id: None,
+                };
+            }
+        };
 
         let event_id = event.id.clone();
 
-        // Track subnet locally
+        // Track subnet locally (in-memory DashMap — replayed from DAG on restart)
         self.service.add_subnet(SubnetInfo {
             subnet_id: request.subnet_id.clone(),
             name: request.name.clone(),
@@ -362,7 +357,10 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             subnet_type: format!("{:?}", registration.subnet_type),
             token_symbol: request.token_symbol.clone(),
             status: "active".to_string(),
-            registered_at: event.timestamp / 1000,
+            registered_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
         });
 
         // Add event to DAG
