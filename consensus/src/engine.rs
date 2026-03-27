@@ -311,10 +311,10 @@ impl ConsensusEngine {
     /// ensuring proper depth calculation and three-layer storage management.
     pub async fn add_event(&self, event: Event) -> SetuResult<EventId> {
         // Update local VLC by merging with the event's VLC
+        // merge() calls VLCSnapshot::receive() which already does merge + increment
         {
             let mut vlc = self.vlc.write().await;
             vlc.merge(&event.vlc_snapshot);
-            vlc.tick();
         }
 
         // Add event through DagManager with retry (handles TOCTOU race with GC)
@@ -375,10 +375,10 @@ impl ConsensusEngine {
     /// Unlike `add_event`, this does not broadcast the event again to avoid message loops.
     pub async fn receive_event_from_network(&self, event: Event) -> SetuResult<EventId> {
         // Update local VLC by merging with the event's VLC
+        // merge() calls VLCSnapshot::receive() which already does merge + increment
         {
             let mut vlc = self.vlc.write().await;
             vlc.merge(&event.vlc_snapshot);
-            vlc.tick();
         }
 
         // Add event through DagManager with retry (handles TOCTOU race with GC)
