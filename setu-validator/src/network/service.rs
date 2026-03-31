@@ -23,7 +23,7 @@ use super::types::*;
 use super::transfer_handler::TransferHandler;
 use super::tee_executor::TeeExecutor;
 use super::event_handler::EventHandler;
-use crate::{RouterManager, TaskPreparer, BatchTaskPreparer, ConsensusValidator};
+use crate::{RouterManager, TaskPreparer, BatchTaskPreparer, ConsensusValidator, InfraExecutor};
 use crate::coin_reservation::CoinReservationManager;
 use axum::{
     routing::{get, post},
@@ -290,6 +290,19 @@ impl ValidatorNetworkService {
         &self.router_manager
     }
 
+    /// Get the state provider (delegates to TaskPreparer)
+    pub fn state_provider(&self) -> &Arc<dyn setu_storage::StateProvider> {
+        self.task_preparer.state_provider()
+    }
+
+    /// Create an InfraExecutor using the shared MerkleStateProvider
+    pub fn infra_executor(&self) -> InfraExecutor {
+        InfraExecutor::new(
+            self.validator_id.clone(),
+            Arc::clone(self.batch_task_preparer.merkle_state_provider()),
+        )
+    }
+
     pub fn consensus_validator(&self) -> Option<&Arc<ConsensusValidator>> {
         self.consensus_validator.as_ref()
     }
@@ -431,6 +444,13 @@ impl ValidatorNetworkService {
             .route("/api/v1/user/credit", post(setu_api::http_get_credit::<ValidatorNetworkService>))
             .route("/api/v1/user/credentials", post(setu_api::http_get_credentials::<ValidatorNetworkService>))
             .route("/api/v1/user/transfer", post(setu_api::http_user_transfer::<ValidatorNetworkService>))
+            // Phase 3: Profile & Subnet Membership
+            .route("/api/v1/user/profile", post(setu_api::http_update_profile::<ValidatorNetworkService>))
+            .route("/api/v1/user/profile/:address", get(setu_api::http_get_profile::<ValidatorNetworkService>))
+            .route("/api/v1/user/subnet/join", post(setu_api::http_join_subnet::<ValidatorNetworkService>))
+            .route("/api/v1/user/subnet/leave", post(setu_api::http_leave_subnet::<ValidatorNetworkService>))
+            .route("/api/v1/user/subnet/check/:address/:subnet_id", get(setu_api::http_check_membership::<ValidatorNetworkService>))
+            .route("/api/v1/user/subnets/:address", get(setu_api::http_get_user_subnets::<ValidatorNetworkService>))
             .with_state(service);
 
         let listener = tokio::net::TcpListener::bind(self.config.http_listen_addr).await?;
@@ -695,6 +715,73 @@ impl ValidatorNetworkService {
         info!(solver_id = %node_id, "Solver unregistered");
     }
 
+    // ============================================
+    // DAG Replay Support
+    // ============================================
+
+    /// Apply a single event during DAG replay (synchronous, no async needed).
+    ///
+    /// Unlike `apply_event_side_effects()` which reads from `self.events` DashMap,
+    /// this method takes the event directly — because the events cache is not
+    /// populated during replay.
+    pub fn apply_replay_event(&self, event: &Event) -> crate::dag_replay::ReplayAction {
+        use crate::dag_replay::{ReplayAction, ReplayKind};
+
+        match &event.payload {
+            EventPayload::SubnetRegister(reg) => {
+                self.registered_subnets.insert(
+                    reg.subnet_id.clone(),
+                    SubnetInfo::from_registration(reg, event.timestamp),
+                );
+                ReplayAction::Applied(ReplayKind::SubnetRegister)
+            }
+            EventPayload::ValidatorRegister(reg) => {
+                self.validators.write().insert(
+                    reg.validator_id.clone(),
+                    ValidatorInfo::from_registration(reg, "online", event.timestamp),
+                );
+                ReplayAction::Applied(ReplayKind::ValidatorRegister)
+            }
+            EventPayload::ValidatorUnregister(unreg) => {
+                self.validators.write().remove(&unreg.node_id);
+                ReplayAction::Applied(ReplayKind::ValidatorUnregister)
+            }
+            EventPayload::SolverRegister(reg) => {
+                // During replay, record solver info but do NOT register in RouterManager.
+                // The solver must re-register through the live path to become routable.
+                // Otherwise we'd create a "phantom" solver that is selected for routing
+                // but cannot actually be reached.
+                self.solver_info.insert(
+                    reg.solver_id.clone(),
+                    SolverInfo::from_registration(reg, "replayed", event.timestamp),
+                );
+                ReplayAction::Applied(ReplayKind::SolverRegister)
+            }
+            EventPayload::SolverUnregister(unreg) => {
+                // During replay, only clean up solver_info — we didn't register
+                // in RouterManager during replay (see SolverRegister above).
+                self.solver_info.remove(&unreg.node_id);
+                ReplayAction::Applied(ReplayKind::SolverUnregister)
+            }
+            _ => ReplayAction::Skipped,
+        }
+    }
+
+    /// Get all registered subnets (used for testing/inspection).
+    pub fn get_all_subnets(&self) -> Vec<SubnetInfo> {
+        self.registered_subnets.iter().map(|r| r.value().clone()).collect()
+    }
+
+    /// Get all registered validators (used for testing/inspection).
+    pub fn get_all_validators(&self) -> Vec<ValidatorInfo> {
+        self.validators.read().values().cloned().collect()
+    }
+
+    /// Get all registered solvers (used for testing/inspection).
+    pub fn get_all_solvers(&self) -> Vec<SolverInfo> {
+        self.solver_info.iter().map(|r| r.value().clone()).collect()
+    }
+
     /// Apply event side effects (called from registration handler)
     pub async fn apply_event_side_effects(&self, event_id: &str) {
         let event = match self.events.get(event_id).map(|e| e.clone()) {
@@ -706,31 +793,31 @@ impl ValidatorNetworkService {
             EventPayload::ValidatorRegister(reg) => {
                 self.validators.write().insert(
                     reg.validator_id.clone(),
-                    ValidatorInfo {
-                        validator_id: reg.validator_id.clone(),
-                        address: reg.address.clone(),
-                        port: reg.port,
-                        status: "online".to_string(),
-                        registered_at: event.timestamp / 1000,
-                    },
+                    ValidatorInfo::from_registration(reg, "online", event.timestamp),
                 );
             }
             EventPayload::SolverUnregister(unreg) => self.unregister_solver(&unreg.node_id),
+            EventPayload::SolverRegister(reg) => {
+                let request = setu_rpc::RegisterSolverRequest {
+                    solver_id: reg.solver_id.clone(),
+                    address: reg.address.clone(),
+                    port: reg.port,
+                    account_address: reg.account_address.clone(),
+                    public_key: reg.public_key.clone(),
+                    signature: reg.signature.clone(),
+                    capacity: reg.capacity,
+                    shard_id: reg.shard_id.clone(),
+                    resources: reg.resources.clone(),
+                };
+                self.register_solver_internal(&request);
+            }
             EventPayload::ValidatorUnregister(unreg) => {
                 self.validators.write().remove(&unreg.node_id);
             }
             EventPayload::SubnetRegister(reg) => {
                 self.registered_subnets.insert(
                     reg.subnet_id.clone(),
-                    SubnetInfo {
-                        subnet_id: reg.subnet_id.clone(),
-                        name: reg.name.clone(),
-                        owner: reg.owner.clone(),
-                        subnet_type: format!("{:?}", reg.subnet_type),
-                        token_symbol: reg.token_symbol.clone().unwrap_or_default(),
-                        status: "active".to_string(),
-                        registered_at: event.timestamp / 1000,
-                    },
+                    SubnetInfo::from_registration(reg, event.timestamp),
                 );
             }
             _ => {}

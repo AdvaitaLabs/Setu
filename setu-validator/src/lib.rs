@@ -43,6 +43,7 @@ pub mod network_adapter;
 pub mod persistence;
 pub mod protocol;
 pub mod coin_reservation;
+pub mod dag_replay;
 
 pub use router_manager::{RouterManager, RouterError, SolverConnection};
 pub use network::{

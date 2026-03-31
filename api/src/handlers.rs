@@ -21,6 +21,11 @@ use setu_rpc::{
     GetBalanceResponse as UserGetBalanceResponse,
     GetPowerRequest, GetPowerResponse, GetCreditRequest, GetCreditResponse,
     GetCredentialsRequest, GetCredentialsResponse, TransferRequest, TransferResponse,
+    // Phase 3: Profile & Subnet Membership
+    UpdateProfileRequest, UpdateProfileResponse,
+    GetProfileResponse, JoinSubnetRequest, JoinSubnetResponse,
+    LeaveSubnetRequest, LeaveSubnetResponse,
+    CheckMembershipResponse, GetUserSubnetsResponse,
 };
 use std::sync::Arc;
 
@@ -358,3 +363,60 @@ pub async fn http_user_transfer<S: ValidatorService>(
     Json(handler.transfer(request).await)
 }
 
+// ============================================
+// Phase 3: Profile & Subnet Membership
+// ============================================
+
+/// Update user profile
+pub async fn http_update_profile<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<UpdateProfileRequest>,
+) -> Json<UpdateProfileResponse> {
+    let handler = service.user_handler();
+    Json(handler.update_profile(request).await)
+}
+
+/// Get user profile
+pub async fn http_get_profile<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+) -> Json<GetProfileResponse> {
+    let handler = service.user_handler();
+    Json(handler.get_profile(&address).await)
+}
+
+/// Join subnet
+pub async fn http_join_subnet<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<JoinSubnetRequest>,
+) -> Json<JoinSubnetResponse> {
+    let handler = service.user_handler();
+    Json(handler.join_subnet(request).await)
+}
+
+/// Leave subnet
+pub async fn http_leave_subnet<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<LeaveSubnetRequest>,
+) -> Json<LeaveSubnetResponse> {
+    let handler = service.user_handler();
+    Json(handler.leave_subnet(request).await)
+}
+
+/// Check subnet membership
+pub async fn http_check_membership<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    axum::extract::Path((address, subnet_id)): axum::extract::Path<(String, String)>,
+) -> Json<CheckMembershipResponse> {
+    let handler = service.user_handler();
+    Json(handler.check_membership(&address, &subnet_id).await)
+}
+
+/// Get user's subnet list
+pub async fn http_get_user_subnets<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+) -> Json<GetUserSubnetsResponse> {
+    let handler = service.user_handler();
+    Json(handler.get_user_subnets(&address).await)
+}

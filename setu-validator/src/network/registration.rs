@@ -327,34 +327,29 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             physical_time: current_timestamp_millis(),
         };
 
-        // Create subnet registration event
-        let mut event = Event::subnet_register(
-            registration.clone(),
-            vec![],
-            vlc_snapshot,
-            self.service.validator_id().to_string(),
-        );
-
-        event.set_execution_result(setu_types::event::ExecutionResult {
-            success: true,
-            message: Some("Subnet registration executed".to_string()),
-            state_changes: vec![setu_types::event::StateChange {
-                key: format!("subnet:{}", request.subnet_id),
-                old_value: None,
-                new_value: Some(
-                    serde_json::json!({
-                        "name": request.name,
-                        "owner": request.owner,
-                        "token_symbol": request.token_symbol,
-                        "subnet_type": format!("{:?}", registration.subnet_type),
-                    }).to_string().into_bytes(),
-                ),
-            }],
-        });
+        // Delegate to InfraExecutor (路径 B) — G11-compliant "oid:{hex}" state keys,
+        // and mint_tokens() is actually executed when initial_token_supply > 0.
+        let event = match self
+            .service
+            .infra_executor()
+            .execute_subnet_register(&registration, vlc_snapshot)
+        {
+            Ok(event) => event,
+            Err(e) => {
+                tracing::error!(subnet_id = %request.subnet_id, error = %e,
+                    "InfraExecutor subnet registration failed");
+                return RegisterSubnetResponse {
+                    success: false,
+                    message: format!("Subnet registration failed: {}", e),
+                    subnet_id: None,
+                    event_id: None,
+                };
+            }
+        };
 
         let event_id = event.id.clone();
 
-        // Track subnet locally
+        // Track subnet locally (in-memory DashMap — replayed from DAG on restart)
         self.service.add_subnet(SubnetInfo {
             subnet_id: request.subnet_id.clone(),
             name: request.name.clone(),
@@ -362,7 +357,10 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             subnet_type: format!("{:?}", registration.subnet_type),
             token_symbol: request.token_symbol.clone(),
             status: "active".to_string(),
-            registered_at: event.timestamp / 1000,
+            registered_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
         });
 
         // Add event to DAG
@@ -414,6 +412,26 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             "Processing heartbeat"
         );
 
+        // Check if the solver is known to the RouterManager.
+        // After a validator restart, the RouterManager is empty — solvers that
+        // were previously registered will send heartbeats but we won't find
+        // them. Return acknowledged=false so the solver knows to re-register.
+        let is_known = self.service
+            .router_manager()
+            .get_solver(&request.node_id)
+            .is_some();
+
+        if !is_known {
+            info!(
+                node_id = %request.node_id,
+                "Heartbeat from unknown solver — returning acknowledged=false to trigger re-registration"
+            );
+            return HeartbeatResponse {
+                acknowledged: false,
+                server_timestamp: current_timestamp_secs(),
+            };
+        }
+
         if let Some(load) = request.current_load {
             self.service
                 .router_manager()
@@ -427,7 +445,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
     }
 
     async fn get_solver_list(&self, request: GetSolverListRequest) -> GetSolverListResponse {
-        let solvers = self.service.router_manager().get_all_solvers();
+        // Read from solver_info DashMap (includes both live and replayed solvers)
+        let solvers = self.service.get_all_solvers();
 
         let solver_list: Vec<SolverListItem> = solvers
             .into_iter()
@@ -439,18 +458,13 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
                 }
             })
             .map(|s| SolverListItem {
-                solver_id: s.id,
-                address: s.address.split(':').next().unwrap_or("").to_string(),
-                port: s
-                    .address
-                    .split(':')
-                    .nth(1)
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(0),
-                account_address: None,  // TODO: 从 SolverInfo 中获取
+                solver_id: s.solver_id,
+                address: s.address.clone(),
+                port: s.port,
+                account_address: None,
                 capacity: s.capacity,
-                current_load: s.current_load,
-                status: format!("{:?}", s.status),
+                current_load: 0,
+                status: s.status,
                 shard_id: s.shard_id,
             })
             .collect();

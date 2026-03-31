@@ -514,6 +514,20 @@ impl ConsensusValidator {
             "Event added to DAG (pending finalization)"
         );
         
+        // Step 3: Persist any anchors that were finalized inline (single-node mode).
+        // In single-node mode, add_event() → try_create_cf() → check_finalization()
+        // may finalize a CF immediately. The internal message channel is not consumed
+        // in production, so we must persist here synchronously.
+        for anchor in self.engine.take_pending_anchors().await {
+            if let Err(e) = self.persist_finalized_anchor(&anchor).await {
+                warn!(
+                    anchor_id = %anchor.id,
+                    error = %e,
+                    "Failed to persist inline-finalized anchor"
+                );
+            }
+        }
+        
         Ok(event_id)
     }
     
@@ -903,7 +917,6 @@ impl ConsensusMessageHandler {
             }
             ConsensusMessage::FrameFinalized(cf) => {
                 info!(cf_id = %cf.id, "CF finalized notification");
-                // Could trigger additional actions here
             }
             ConsensusMessage::LeaderChanged { round, new_leader } => {
                 info!(round = round, new_leader = %new_leader, "Leader changed");

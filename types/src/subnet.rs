@@ -304,12 +304,12 @@ impl UserSubnetMembership {
     }
     
     /// Join a subnet
-    pub fn join(&mut self, subnet_id: SubnetId) {
+    pub fn join(&mut self, subnet_id: SubnetId, timestamp: u64) {
         self.joined_subnets.insert(subnet_id);
         if self.primary_subnet.is_none() {
             self.primary_subnet = Some(subnet_id);
         }
-        self.touch(subnet_id);
+        self.touch(subnet_id, timestamp);
     }
     
     /// Leave a subnet
@@ -327,12 +327,8 @@ impl UserSubnetMembership {
     }
     
     /// Update last activity time
-    pub fn touch(&mut self, subnet_id: SubnetId) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        self.last_activity.insert(subnet_id, now);
+    pub fn touch(&mut self, subnet_id: SubnetId, timestamp: u64) {
+        self.last_activity.insert(subnet_id, timestamp);
     }
     
     /// Get all joined subnets
@@ -658,8 +654,8 @@ mod tests {
         let defi = SubnetId::from_str_id("defi");
         let gaming = SubnetId::from_str_id("gaming");
         
-        membership.join(defi);
-        membership.join(gaming);
+        membership.join(defi, 1000);
+        membership.join(gaming, 2000);
         
         assert!(membership.is_member(&defi));
         assert!(membership.is_member(&gaming));

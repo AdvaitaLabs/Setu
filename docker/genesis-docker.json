@@ -1,0 +1,30 @@
+{
+  "chain_id": "setu-devnet",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "accounts": [
+    {
+      "address": "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+      "name": "alice",
+      "balance": 1000000000,
+      "coins_per_account": 5
+    },
+    {
+      "address": "0xeedf1a9c68b3f4a8b1a1032b2b5ad5c4795c026514f8317c7a215e218dccd6cf",
+      "name": "bob",
+      "balance": 1000000000,
+      "coins_per_account": 5
+    },
+    {
+      "address": "0x75bf18e34f9add02a2fe5a146813eb9362372eef6200f3b1dbc3f819671cba69",
+      "name": "charlie",
+      "balance": 1000000000,
+      "coins_per_account": 5
+    }
+  ],
+  "subnet_id": "ROOT",
+  "validators": [
+    { "id": "validator-1", "address": "validator-1", "p2p_port": 9000, "public_key": "a01b00e7a7e616f717534c78ba0a7dd7e7f58e766fdb97d6956a0ba6f3dba5e9" },
+    { "id": "validator-2", "address": "validator-2", "p2p_port": 9000, "public_key": "4fb28576e74a2afd09ea6f035f9f2dfc9508a1fa73a031c50528b806041a8fa6" },
+    { "id": "validator-3", "address": "validator-3", "p2p_port": 9000, "public_key": "8d9c76160efdda6f4f3620f0180887503d2096d3ed832f923f1d4225665ec5ab" }
+  ]
+}

@@ -2,7 +2,7 @@ version: '3.8'
 
 # Multi-validator setup for testing consensus
 services:
-  # Validator Node 1 (Leader)
+  # Validator Node 1
   validator-1:
     build:
       context: ..
@@ -11,18 +11,22 @@ services:
     hostname: validator-1
     ports:
       - "8080:8080"  # HTTP API
-      - "8081:8081"  # P2P Network
+      - "9000:9000"  # P2P Network
     environment:
-      - VALIDATOR_ID=validator-1
+      - NODE_ID=validator-1
       - VALIDATOR_HTTP_PORT=8080
       - VALIDATOR_LISTEN_ADDR=0.0.0.0
-      - VALIDATOR_P2P_PORT=8081
-      - IS_LEADER=true
+      - VALIDATOR_P2P_PORT=9000
+      - PEER_VALIDATORS=
+      - VALIDATOR_DB_PATH=/data/db
+      - GENESIS_FILE=/app/genesis-multi.json
+      - VALIDATOR_KEY_FILE=/app/keys/validator-1.key
       - RUST_LOG=info,setu_validator=debug,consensus=debug
-      - DB_PATH=/data/db
       - LOG_PATH=/data/log
     volumes:
       - validator-1-data:/data
+      - ./genesis-docker.json:/app/genesis-multi.json:ro
+      - ../keys/validator-1.key:/app/keys/validator-1.key:ro
     networks:
       - setu-network
     restart: unless-stopped
@@ -36,19 +40,22 @@ services:
     hostname: validator-2
     ports:
       - "8082:8080"  # HTTP API
-      - "8083:8081"  # P2P Network
+      - "9002:9000"  # P2P Network
     environment:
-      - VALIDATOR_ID=validator-2
+      - NODE_ID=validator-2
       - VALIDATOR_HTTP_PORT=8080
       - VALIDATOR_LISTEN_ADDR=0.0.0.0
-      - VALIDATOR_P2P_PORT=8081
-      - IS_LEADER=false
-      - PEER_VALIDATORS=validator-1:8081
+      - VALIDATOR_P2P_PORT=9000
+      - PEER_VALIDATORS=validator-1:9000
+      - VALIDATOR_DB_PATH=/data/db
+      - GENESIS_FILE=/app/genesis-multi.json
+      - VALIDATOR_KEY_FILE=/app/keys/validator-2.key
       - RUST_LOG=info,setu_validator=debug,consensus=debug
-      - DB_PATH=/data/db
       - LOG_PATH=/data/log
     volumes:
       - validator-2-data:/data
+      - ./genesis-docker.json:/app/genesis-multi.json:ro
+      - ../keys/validator-2.key:/app/keys/validator-2.key:ro
     networks:
       - setu-network
     depends_on:
@@ -64,19 +71,22 @@ services:
     hostname: validator-3
     ports:
       - "8084:8080"  # HTTP API
-      - "8085:8081"  # P2P Network
+      - "9004:9000"  # P2P Network
     environment:
-      - VALIDATOR_ID=validator-3
+      - NODE_ID=validator-3
       - VALIDATOR_HTTP_PORT=8080
       - VALIDATOR_LISTEN_ADDR=0.0.0.0
-      - VALIDATOR_P2P_PORT=8081
-      - IS_LEADER=false
-      - PEER_VALIDATORS=validator-1:8081,validator-2:8081
+      - VALIDATOR_P2P_PORT=9000
+      - PEER_VALIDATORS=validator-1:9000,validator-2:9000
+      - VALIDATOR_DB_PATH=/data/db
+      - GENESIS_FILE=/app/genesis-multi.json
+      - VALIDATOR_KEY_FILE=/app/keys/validator-3.key
       - RUST_LOG=info,setu_validator=debug,consensus=debug
-      - DB_PATH=/data/db
       - LOG_PATH=/data/log
     volumes:
       - validator-3-data:/data
+      - ./genesis-docker.json:/app/genesis-multi.json:ro
+      - ../keys/validator-3.key:/app/keys/validator-3.key:ro
     networks:
       - setu-network
     depends_on:

@@ -6,7 +6,11 @@ use std::net::SocketAddr;
 // Re-export types from api module
 pub use setu_api::{GetBalanceResponse, GetObjectResponse, SubmitEventRequest, SubmitEventResponse};
 
-/// Validator info for registration
+/// Validator info for registration.
+///
+/// G12: Built from `ValidatorRegistration`. Dropped fields:
+///   - account_address, public_key, signature (crypto — not needed for API display)
+///   - stake_amount, commission_rate (economic — not indexed in-memory)
 #[derive(Debug, Clone)]
 pub struct ValidatorInfo {
     pub validator_id: String,
@@ -14,6 +18,26 @@ pub struct ValidatorInfo {
     pub port: u16,
     pub status: String,
     pub registered_at: u64,
+}
+
+impl ValidatorInfo {
+    /// Build from a `ValidatorRegistration` event payload.
+    ///
+    /// `status` is caller-determined ("online" for live, "online" for replay).
+    /// `timestamp_ms` is the event timestamp in milliseconds.
+    pub fn from_registration(
+        reg: &setu_types::registration::ValidatorRegistration,
+        status: &str,
+        timestamp_ms: u64,
+    ) -> Self {
+        Self {
+            validator_id: reg.validator_id.clone(),
+            address: reg.address.clone(),
+            port: reg.port,
+            status: status.to_string(),
+            registered_at: timestamp_ms / 1000,
+        }
+    }
 }
 
 /// Network service configuration
@@ -45,7 +69,11 @@ pub struct TransferTracker {
     pub created_at: u64,
 }
 
-/// Registered Solver information
+/// Registered Solver information.
+///
+/// G12: Built from `SolverRegistration`. Dropped fields:
+///   - account_address, public_key, signature (crypto — not needed for API display)
+/// Retained capability fields (capacity, shard_id, resources) are used for routing.
 #[derive(Debug, Clone)]
 pub struct SolverInfo {
     pub solver_id: String,
@@ -59,6 +87,27 @@ pub struct SolverInfo {
 }
 
 impl SolverInfo {
+    /// Build from a `SolverRegistration` event payload.
+    ///
+    /// `status` is caller-determined ("active" for live, "replayed" for replay).
+    /// `timestamp_ms` is the event timestamp in milliseconds.
+    pub fn from_registration(
+        reg: &setu_types::registration::SolverRegistration,
+        status: &str,
+        timestamp_ms: u64,
+    ) -> Self {
+        Self {
+            solver_id: reg.solver_id.clone(),
+            address: reg.address.clone(),
+            port: reg.port,
+            capacity: reg.capacity,
+            shard_id: reg.shard_id.clone(),
+            resources: reg.resources.clone(),
+            status: status.to_string(),
+            registered_at: timestamp_ms / 1000,
+        }
+    }
+
     /// Get HTTP URL for this solver
     pub fn http_url(&self) -> String {
         format!("http://{}:{}", self.address, self.port)
@@ -95,7 +144,14 @@ pub fn current_timestamp_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// Registered subnet information
+/// Registered subnet information.
+///
+/// G12: Built from `SubnetRegistration`. Dropped fields:
+///   - description (display-only, low priority)
+///   - max_users, resource_limits (governance — not indexed in-memory)
+///   - assigned_solvers (routing — managed separately by RouterManager)
+///   - parent_subnet_id (hierarchy — not needed for flat API query)
+///   - initial_token_supply, token_config, user_airdrop_amount (economics — one-time init)
 #[derive(Debug, Clone)]
 pub struct SubnetInfo {
     pub subnet_id: String,
@@ -105,4 +161,24 @@ pub struct SubnetInfo {
     pub token_symbol: String,
     pub status: String,
     pub registered_at: u64,
+}
+
+impl SubnetInfo {
+    /// Build from a `SubnetRegistration` event payload.
+    ///
+    /// `timestamp_ms` is the event timestamp in milliseconds.
+    pub fn from_registration(
+        reg: &setu_types::registration::SubnetRegistration,
+        timestamp_ms: u64,
+    ) -> Self {
+        Self {
+            subnet_id: reg.subnet_id.clone(),
+            name: reg.name.clone(),
+            owner: reg.owner.clone(),
+            subnet_type: format!("{:?}", reg.subnet_type),
+            token_symbol: reg.token_symbol.clone().unwrap_or_default(),
+            status: "active".to_string(),
+            registered_at: timestamp_ms / 1000,
+        }
+    }
 }

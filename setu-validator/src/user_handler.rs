@@ -2,6 +2,9 @@
 //!
 //! This module implements the UserRpcHandler trait for the Validator,
 //! providing user-facing RPC services for wallets and DApps.
+//!
+//! Registration delegates to InfraExecutor for G11-compliant state changes.
+//! Balance/account queries read from MerkleStateProvider (StateProvider trait).
 
 use crate::ValidatorNetworkService;
 use setu_rpc::{
@@ -9,15 +12,20 @@ use setu_rpc::{
     GetAccountRequest, GetAccountResponse, GetBalanceRequest, GetBalanceResponse,
     GetPowerRequest, GetPowerResponse, GetCreditRequest, GetCreditResponse,
     GetCredentialsRequest, GetCredentialsResponse, TransferRequest, TransferResponse,
-    ProfileInfo, CoinBalance, PowerChange, CreditChange,
-    SubmitTransferRequest,
+    CoinBalance, SubmitTransferRequest,
+    // Phase 3
+    UpdateProfileRequest, UpdateProfileResponse,
+    GetProfileResponse, ProfileInfo,
+    JoinSubnetRequest, JoinSubnetResponse,
+    LeaveSubnetRequest, LeaveSubnetResponse,
+    CheckMembershipResponse, GetUserSubnetsResponse,
 };
-use setu_types::event::{Event};
 use setu_types::registration::UserRegistration;
+use setu_types::{ObjectId, hash_utils::setu_hash_with_domain};
 use setu_vlc::VLCSnapshot;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 
 /// User RPC Handler for Validator
 pub struct ValidatorUserHandler {
@@ -30,6 +38,81 @@ impl ValidatorUserHandler {
     pub fn new(network_service: Arc<ValidatorNetworkService>) -> Self {
         Self { network_service }
     }
+
+    /// Build error response for register_user
+    fn reg_err(message: &str, address: &str) -> RegisterUserResponse {
+        RegisterUserResponse {
+            success: false,
+            message: message.to_string(),
+            address: address.to_string(),
+            event_id: None,
+            initial_flux: 0,
+            initial_power: 0,
+            initial_credit: 0,
+        }
+    }
+
+    /// Verify signature for a write operation (3-branch: MetaMask / Setu native / Nostr).
+    /// Returns Ok(()) if valid, or error message string if invalid.
+    fn verify_signature(
+        address: &str,
+        signature: &[u8],
+        message: &str,
+        nostr_pubkey: Option<&[u8]>,
+        public_key: Option<&str>,
+    ) -> Result<(), String> {
+        if std::env::var("SETU_SKIP_SIG_VERIFY").unwrap_or_default() == "1" {
+            return Ok(());
+        }
+        let result = if let Some(npk) = nostr_pubkey {
+            setu_keys::verify::verify_nostr_schnorr(address, npk, signature, message.as_bytes())
+        } else if let Some(pk_b64) = public_key {
+            let pk_raw = setu_keys::PublicKey::decode_base64(pk_b64)
+                .and_then(|pk| {
+                    let mut v = vec![pk.scheme().flag()];
+                    v.extend(pk.as_bytes());
+                    Ok(v)
+                });
+            match pk_raw {
+                Ok(pk_bytes) => setu_keys::verify::verify_setu_native_raw(
+                    address, &pk_bytes, signature, message.as_bytes(),
+                ),
+                Err(e) => Err(e),
+            }
+        } else {
+            setu_keys::verify::verify_metamask_personal_sign(address, signature, message)
+        };
+        result.map_err(|e| format!("Signature verification failed: {}", e))
+    }
+
+    /// Build VLC snapshot for a new event
+    fn build_vlc_snapshot(&self) -> VLCSnapshot {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let vlc_time = self.network_service.get_vlc_time();
+        let mut vlc = setu_vlc::VectorClock::new();
+        vlc.increment(self.network_service.validator_id());
+        VLCSnapshot {
+            vector_clock: vlc,
+            logical_time: vlc_time,
+            physical_time: now,
+        }
+    }
+
+    /// Validate timestamp is within 5-minute anti-replay window
+    fn check_timestamp(timestamp: u64) -> Result<(), String> {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let req_secs = timestamp / 1000;
+        if now_secs.abs_diff(req_secs) > 300 {
+            return Err("Timestamp too old or too far in the future (5 min window)".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -38,137 +121,144 @@ impl UserRpcHandler for ValidatorUserHandler {
         info!(
             address = %request.address,
             subnet_id = ?request.subnet_id,
-            invite_code = ?request.invite_code,
             is_metamask = %request.nostr_pubkey.is_none(),
             "Processing user registration request"
         );
-        
-        info!("╔════════════════════════════════════════════════════════════╗");
-        info!("║              User Registration Flow                        ║");
-        info!("╚════════════════════════════════════════════════════════════╝");
-        
-        // Step 1: Validate request
-        info!("[REG 1/6] 🔍 Validating registration request...");
+
+        // ── Step 1: Validate request ────────────────────────────────
         if request.address.is_empty() {
-            return RegisterUserResponse {
-                success: false,
-                message: "Wallet address cannot be empty".to_string(),
-                address: request.address,
-                event_id: None,
-                initial_flux: 0,
-                initial_power: 0,
-                initial_credit: 0,
-            };
+            return Self::reg_err("Wallet address cannot be empty", &request.address);
         }
-        
-        // Validate address format
-        if !request.address.starts_with("0x") || request.address.len() != 42 {
-            return RegisterUserResponse {
-                success: false,
-                message: "Invalid Ethereum address format".to_string(),
-                address: request.address,
-                event_id: None,
-                initial_flux: 0,
-                initial_power: 0,
-                initial_credit: 0,
-            };
+
+        // Accept 66-char Setu native (0x + 64 hex) or 42-char Ethereum (0x + 40 hex)
+        if !request.address.starts_with("0x")
+            || (request.address.len() != 66 && request.address.len() != 42)
+        {
+            return Self::reg_err(
+                "Invalid address format: expected 0x + 64 hex (Setu) or 0x + 40 hex (Ethereum)",
+                &request.address,
+            );
         }
-        
-        // Validate based on registration type
+
+        // Nostr-specific validation
         if let Some(ref nostr_pubkey) = request.nostr_pubkey {
-            // Nostr registration
-            info!("           └─ Registration type: Nostr");
             if nostr_pubkey.len() != 32 {
-                return RegisterUserResponse {
-                    success: false,
-                    message: "Nostr public key must be 32 bytes".to_string(),
-                    address: request.address,
-                    event_id: None,
-                    initial_flux: 0,
-                    initial_power: 0,
-                    initial_credit: 0,
-                };
+                return Self::reg_err("Nostr public key must be 32 bytes", &request.address);
             }
-            
             if request.signature.is_none() || request.signature.as_ref().unwrap().is_empty() {
-                return RegisterUserResponse {
-                    success: false,
-                    message: "Nostr signature cannot be empty".to_string(),
-                    address: request.address,
-                    event_id: None,
-                    initial_flux: 0,
-                    initial_power: 0,
-                    initial_credit: 0,
-                };
+                return Self::reg_err("Nostr signature cannot be empty", &request.address);
             }
-        } else {
-            // MetaMask registration
-            info!("           └─ Registration type: MetaMask");
-            // Signature is optional for MetaMask (middle layer already verified)
-            // But if provided, we can do quick_check verification
         }
-        
-        info!("           └─ Request validation passed");
-        
-        // Step 2: Verify signature (optional quick_check)
-        info!("[REG 2/6] 🔐 Verifying signature...");
-        if let Some(ref signature) = request.signature {
-            if let Some(ref nostr_pubkey) = request.nostr_pubkey {
-                // Nostr signature verification
-                info!("           └─ Verifying Nostr Schnorr signature...");
-                // TODO: Implement actual Schnorr signature verification
-                // Expected: Schnorr signature (64 bytes)
-                if signature.len() != 64 {
-                    return RegisterUserResponse {
-                        success: false,
-                        message: "Invalid Nostr signature length (expected 64 bytes)".to_string(),
-                        address: request.address,
-                        event_id: None,
-                        initial_flux: 0,
-                        initial_power: 0,
-                        initial_credit: 0,
-                    };
+
+        // ── Step 2: Timestamp anti-replay ──────────────────────────
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let req_secs = request.timestamp / 1000; // request.timestamp is millis
+        if now_secs.abs_diff(req_secs) > 300 {
+            return Self::reg_err(
+                "Timestamp too old or too far in the future (5 min window)",
+                &request.address,
+            );
+        }
+
+        // ── Step 3: Signature verification ──────────────────────────
+        let skip_sig = std::env::var("SETU_SKIP_SIG_VERIFY").unwrap_or_default() == "1";
+
+        if !skip_sig {
+            let message = match &request.message {
+                Some(m) => m.clone(),
+                None => {
+                    return Self::reg_err(
+                        "Signed message is required for registration",
+                        &request.address,
+                    );
                 }
-                info!("           └─ Nostr signature verification passed (mock)");
+            };
+
+            let signature = match &request.signature {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    return Self::reg_err(
+                        "Signature is required for registration",
+                        &request.address,
+                    );
+                }
+            };
+
+            let sig_result = if let Some(ref nostr_pubkey) = request.nostr_pubkey {
+                // Nostr: Schnorr BIP-340
+                setu_keys::verify::verify_nostr_schnorr(
+                    &request.address,
+                    nostr_pubkey,
+                    signature,
+                    message.as_bytes(),
+                )
+            } else if let Some(ref public_key_b64) = request.public_key {
+                // Setu native: Ed25519 / Secp256k1 / Secp256r1
+                // public_key is base64 (flag || pk_bytes), signature is raw bytes.
+                let pk_raw = setu_keys::PublicKey::decode_base64(public_key_b64)
+                    .and_then(|pk| {
+                        let mut v = vec![pk.scheme().flag()];
+                        v.extend(pk.as_bytes());
+                        Ok(v)
+                    });
+                match pk_raw {
+                    Ok(pk_bytes) => setu_keys::verify::verify_setu_native_raw(
+                        &request.address,
+                        &pk_bytes,
+                        signature,
+                        message.as_bytes(),
+                    ),
+                    Err(e) => Err(e),
+                }
             } else {
-                // MetaMask ECDSA signature verification (optional quick_check)
-                info!("           └─ Verifying MetaMask ECDSA signature...");
-                // TODO: Implement actual ECDSA signature verification
-                // Expected: ECDSA signature (65 bytes: r(32) + s(32) + v(1))
-                // Message format: "Register to Setu: {timestamp}"
-                if signature.len() != 65 {
-                    warn!("           └─ Invalid MetaMask signature length (expected 65 bytes), skipping verification");
-                } else {
-                    info!("           └─ MetaMask signature verification passed (mock)");
-                }
+                // MetaMask: secp256k1 ECDSA with personal_sign recovery
+                setu_keys::verify::verify_metamask_personal_sign(
+                    &request.address,
+                    signature,
+                    &message,
+                )
+            };
+
+            if let Err(e) = sig_result {
+                warn!(address = %request.address, error = %e, "Signature verification failed");
+                return Self::reg_err(
+                    &format!("Signature verification failed: {}", e),
+                    &request.address,
+                );
             }
-        } else {
-            info!("           └─ No signature provided, trusting middle layer verification");
         }
-        
-        // Step 3: Check if user already registered
-        info!("[REG 3/6] 🔍 Checking if user already registered...");
-        // TODO: Query storage to check if address exists
-        info!("           └─ User not registered yet");
-        
-        // Step 4: Resolve invite code to inviter address
-        let invited_by = if let Some(ref code) = request.invite_code {
-            info!("[REG 4/6] 🎫 Resolving invite code: {}", code);
-            // TODO: Query storage to resolve invite code to inviter address
-            Some(format!("0xinviter_{}", code)) // Mock for now
-        } else {
-            info!("[REG 4/6] 🎫 No invite code provided");
-            None
-        };
-        
-        // Step 5: Create UserRegistration event
-        info!("[REG 5/6] 📝 Creating registration event...");
-        
+
+        // ── Step 4: Duplicate registration detection ────────────────
+        let subnet_id = request.subnet_id.as_deref().unwrap_or("subnet-0");
+        let membership_key = format!("user:{}:subnet:{}", request.address, subnet_id);
+        let membership_object_id = ObjectId::new(
+            setu_hash_with_domain(b"SETU_MEMBERSHIP:", membership_key.as_bytes()),
+        );
+
+        if self
+            .network_service
+            .state_provider()
+            .get_object(&membership_object_id)
+            .is_some()
+        {
+            return Self::reg_err(
+                &format!(
+                    "User {} already registered in subnet '{}'",
+                    request.address, subnet_id
+                ),
+                &request.address,
+            );
+        }
+
+        // ── Step 5: Build VLC snapshot ──────────────────────────────
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
+
         let vlc_time = self.network_service.get_vlc_time();
         let mut vlc = setu_vlc::VectorClock::new();
         vlc.increment(self.network_service.validator_id());
@@ -177,7 +267,8 @@ impl UserRpcHandler for ValidatorUserHandler {
             logical_time: vlc_time,
             physical_time: now,
         };
-        
+
+        // ── Step 6: Build UserRegistration ──────────────────────────
         let registration = UserRegistration {
             address: request.address.clone(),
             nostr_pubkey: request.nostr_pubkey.clone(),
@@ -187,129 +278,99 @@ impl UserRpcHandler for ValidatorUserHandler {
             subnet_id: request.subnet_id.clone(),
             display_name: request.display_name.clone(),
             metadata: request.metadata.clone(),
-            invited_by: invited_by.clone(),
+            invited_by: None,
             invite_code: request.invite_code.clone(),
+            public_key: request.public_key.clone(),
         };
-        
-        // Initial allocations
-        let initial_flux = 1000u64;  // Initial Flux balance
-        let initial_power = 100u64;  // Initial Power
-        let initial_credit = 50u64;  // Initial Credit
-        
-        let mut event = Event::user_register(
-            registration,
-            vec![], // No parents for now
-            vlc_snapshot,
-            self.network_service.validator_id().to_string(),
-        );
-        
-        // Set execution result (simulated successful execution)
-        event.set_execution_result(setu_types::event::ExecutionResult {
-            success: true,
-            message: Some("User registration executed successfully".to_string()),
-            state_changes: vec![
-                setu_types::event::StateChange {
-                    key: format!("user:{}", request.address),
-                    old_value: None,
-                    new_value: Some(format!("registered").into_bytes()),
-                },
-                setu_types::event::StateChange {
-                    key: format!("balance:{}:flux", request.address),
-                    old_value: None,
-                    new_value: Some(initial_flux.to_string().into_bytes()),
-                },
-                setu_types::event::StateChange {
-                    key: format!("power:{}", request.address),
-                    old_value: None,
-                    new_value: Some(initial_power.to_string().into_bytes()),
-                },
-                setu_types::event::StateChange {
-                    key: format!("credit:{}", request.address),
-                    old_value: None,
-                    new_value: Some(initial_credit.to_string().into_bytes()),
-                },
-            ],
-        });
-        
+
+        // ── Step 7: Delegate to InfraExecutor (路径 B) ──────────────
+        // InfraExecutor:
+        //   → RuntimeExecutor::execute_user_register()  (G11-compliant "oid:{hex}" state keys)
+        //   → apply_state_changes() to MerkleStateProvider
+        //   → returns Event with execution_result set
+        let event = match self
+            .network_service
+            .infra_executor()
+            .execute_user_register(&registration, vlc_snapshot)
+        {
+            Ok(event) => event,
+            Err(e) => {
+                error!(address = %request.address, error = %e, "InfraExecutor user registration failed");
+                return Self::reg_err(&format!("Registration failed: {}", e), &request.address);
+            }
+        };
+
         let event_id = event.id.clone();
-        
-        info!("           └─ Event ID: {}", &event_id[..20.min(event_id.len())]);
-        info!("           └─ VLC Time: {}", vlc_time);
-        
-        // Step 6: Add event to DAG (async to support consensus submission)
-        info!("[REG 6/6] 🔗 Adding registration event to DAG...");
-        self.network_service.add_event_to_dag(event.clone()).await;
-        
-        info!("           └─ Event added to DAG");
-        
-        // Apply side effects (update user registry)
-        self.network_service.apply_event_side_effects(&event_id).await;
-        
-        info!("╔════════════════════════════════════════════════════════════╗");
-        info!("║              User Registered Successfully                  ║");
-        info!("╠════════════════════════════════════════════════════════════╣");
-        info!("║  Address:    {:^44} ║", &request.address[..20.min(request.address.len())]);
-        info!("║  Event ID:   {:^44} ║", &event_id[..20.min(event_id.len())]);
-        info!("║  Flux:       {:^44} ║", initial_flux);
-        info!("║  Power:      {:^44} ║", initial_power);
-        info!("║  Credit:     {:^44} ║", initial_credit);
-        info!("╚════════════════════════════════════════════════════════════╝");
-        
+
+        // ── Step 8: Add event to DAG ────────────────────────────────
+        self.network_service.add_event_to_dag(event).await;
+
+        info!(
+            address = %request.address,
+            event_id = %event_id,
+            "User registered successfully (zero initial balance — use Faucet for tokens)"
+        );
+
         RegisterUserResponse {
             success: true,
             message: "User registered successfully".to_string(),
             address: request.address,
             event_id: Some(event_id),
-            initial_flux,
-            initial_power,
-            initial_credit,
+            initial_flux: 0,
+            initial_power: 0,
+            initial_credit: 0,
         }
     }
     
     async fn get_account(&self, request: GetAccountRequest) -> GetAccountResponse {
         info!(address = %request.address, "Getting account information");
-        
-        // TODO: Query user from storage layer
-        // For now, return mock data
-        warn!("get_account: Storage integration not implemented, returning mock data");
-        
+
+        let coins = self.network_service.state_provider().get_coins_for_address(&request.address);
+        let flux_balance: u64 = coins.iter()
+            .filter(|c| c.coin_type == "ROOT")
+            .map(|c| c.balance)
+            .sum();
+
         GetAccountResponse {
-            found: true,
-            address: request.address.clone(),
-            flux_balance: 1000, // TODO: Query from storage
-            power: 100,         // TODO: Query from storage
-            credit: 50,         // TODO: Query from storage
-            profile: Some(ProfileInfo {
-                display_name: Some("Mock User".to_string()),
-                avatar_url: None,
-                bio: None,
-                created_at: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            }),
-            credential_count: 0, // TODO: Query from storage
+            found: !coins.is_empty(),
+            address: request.address,
+            flux_balance,
+            power: 0,            // Power system not yet implemented
+            credit: 0,           // Credit system not yet implemented
+            profile: None,       // Profile system not yet implemented
+            credential_count: 0, // Credential system not yet implemented
         }
     }
     
     async fn get_balance(&self, request: GetBalanceRequest) -> GetBalanceResponse {
         info!(address = %request.address, "Getting balance");
-        
-        // TODO: Query balance from storage layer
-        warn!("get_balance: Storage integration not implemented, returning mock data");
-        
-        let balances = vec![
-            CoinBalance {
-                coin_type: "FLUX".to_string(),
-                balance: 1000,
-                coin_count: 5,
-            },
-        ];
-        
+
+        let coins = self.network_service.state_provider().get_coins_for_address(&request.address);
+
+        // Aggregate by coin_type
+        let mut type_map: std::collections::HashMap<String, (u64, u32)> = std::collections::HashMap::new();
+        for c in &coins {
+            let entry = type_map.entry(c.coin_type.clone()).or_insert((0, 0));
+            entry.0 += c.balance;
+            entry.1 += 1;
+        }
+
+        // Optional filter by coin_type
+        let balances: Vec<CoinBalance> = type_map.into_iter()
+            .filter(|(ct, _)| {
+                request.coin_type.as_ref().map_or(true, |filter| ct == filter)
+            })
+            .map(|(coin_type, (balance, coin_count))| CoinBalance {
+                coin_type,
+                balance,
+                coin_count,
+            })
+            .collect();
+
         let total_balance = balances.iter().map(|b| b.balance).sum();
-        
+
         GetBalanceResponse {
-            found: true,
+            found: !coins.is_empty(),
             address: request.address,
             balances,
             total_balance,
@@ -317,63 +378,31 @@ impl UserRpcHandler for ValidatorUserHandler {
     }
     
     async fn get_power(&self, request: GetPowerRequest) -> GetPowerResponse {
-        info!(address = %request.address, "Getting power");
-        
-        // TODO: Query power from storage layer
-        warn!("get_power: Storage integration not implemented, returning mock data");
-        
+        // Power system not yet implemented — return zeros
         GetPowerResponse {
-            found: true,
+            found: false,
             address: request.address,
-            power: 100,
-            rank: Some(42),
-            recent_changes: vec![
-                PowerChange {
-                    amount: 10,
-                    reason: "Initial allocation".to_string(),
-                    timestamp: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    event_id: None,
-                },
-            ],
+            power: 0,
+            rank: None,
+            recent_changes: vec![],
         }
     }
     
     async fn get_credit(&self, request: GetCreditRequest) -> GetCreditResponse {
-        info!(address = %request.address, "Getting credit");
-        
-        // TODO: Query credit from storage layer
-        warn!("get_credit: Storage integration not implemented, returning mock data");
-        
+        // Credit system not yet implemented — return zeros
         GetCreditResponse {
-            found: true,
+            found: false,
             address: request.address,
-            credit: 50,
-            level: Some("Bronze".to_string()),
-            recent_changes: vec![
-                CreditChange {
-                    amount: 5,
-                    reason: "Initial credit".to_string(),
-                    timestamp: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    event_id: None,
-                },
-            ],
+            credit: 0,
+            level: None,
+            recent_changes: vec![],
         }
     }
     
     async fn get_credentials(&self, request: GetCredentialsRequest) -> GetCredentialsResponse {
-        info!(address = %request.address, "Getting credentials");
-        
-        // TODO: Query credentials from storage layer
-        warn!("get_credentials: Storage integration not implemented, returning mock data");
-        
+        // Credential system not yet implemented — return empty
         GetCredentialsResponse {
-            found: true,
+            found: false,
             address: request.address,
             credentials: vec![],
             valid_count: 0,
@@ -408,6 +437,249 @@ impl UserRpcHandler for ValidatorUserHandler {
             message: response.message,
             event_id: response.transfer_id,
             estimated_confirmation: Some(2), // ~2 seconds
+        }
+    }
+
+    // ========== Phase 3: Profile & Subnet Membership ==========
+
+    async fn update_profile(&self, request: UpdateProfileRequest) -> UpdateProfileResponse {
+        info!(address = %request.address, "Processing profile update");
+
+        // Validate address format
+        if !request.address.starts_with("0x")
+            || (request.address.len() != 66 && request.address.len() != 42)
+        {
+            return UpdateProfileResponse {
+                success: false,
+                message: "Invalid address format".to_string(),
+                event_id: None,
+            };
+        }
+
+        // Timestamp anti-replay
+        if let Err(e) = Self::check_timestamp(request.timestamp) {
+            return UpdateProfileResponse { success: false, message: e, event_id: None };
+        }
+
+        // Signature verification
+        if let Err(e) = Self::verify_signature(
+            &request.address, &request.signature, &request.message,
+            request.nostr_pubkey.as_deref(), request.public_key.as_deref(),
+        ) {
+            warn!(address = %request.address, error = %e, "Profile update sig failed");
+            return UpdateProfileResponse { success: false, message: e, event_id: None };
+        }
+
+        let vlc_snapshot = self.build_vlc_snapshot();
+        let attrs = request.attributes.unwrap_or_default();
+
+        let event = match self.network_service.infra_executor().execute_profile_update(
+            &request.address,
+            request.display_name.as_deref(),
+            request.avatar_url.as_deref(),
+            request.bio.as_deref(),
+            &attrs,
+            vlc_snapshot,
+        ) {
+            Ok(event) => event,
+            Err(e) => {
+                error!(address = %request.address, error = %e, "Profile update failed");
+                return UpdateProfileResponse {
+                    success: false, message: format!("Profile update failed: {}", e), event_id: None,
+                };
+            }
+        };
+
+        let event_id = event.id.clone();
+        self.network_service.add_event_to_dag(event).await;
+
+        info!(address = %request.address, event_id = %event_id, "Profile updated");
+        UpdateProfileResponse { success: true, message: "Profile updated".to_string(), event_id: Some(event_id) }
+    }
+
+    async fn get_profile(&self, address: &str) -> GetProfileResponse {
+        let profile_key = format!("profile:{}", address);
+        let profile_object_id = ObjectId::new(
+            setu_hash_with_domain(b"SETU_PROFILE:", profile_key.as_bytes()),
+        );
+
+        match self.network_service.state_provider().get_object(&profile_object_id) {
+            Some(data) => {
+                let profile: serde_json::Value = serde_json::from_slice(&data).unwrap_or_default();
+                GetProfileResponse {
+                    found: true,
+                    address: address.to_string(),
+                    profile: Some(ProfileInfo {
+                        display_name: profile["display_name"].as_str().map(|s| s.to_string()),
+                        avatar_url: profile["avatar_url"].as_str().map(|s| s.to_string()),
+                        bio: profile["bio"].as_str().map(|s| s.to_string()),
+                        created_at: profile["created_at"].as_u64().unwrap_or(0),
+                    }),
+                }
+            }
+            None => GetProfileResponse {
+                found: false,
+                address: address.to_string(),
+                profile: None,
+            },
+        }
+    }
+
+    async fn join_subnet(&self, request: JoinSubnetRequest) -> JoinSubnetResponse {
+        info!(address = %request.address, subnet_id = %request.subnet_id, "Processing subnet join");
+
+        if !request.address.starts_with("0x")
+            || (request.address.len() != 66 && request.address.len() != 42)
+        {
+            return JoinSubnetResponse {
+                success: false, message: "Invalid address format".to_string(), event_id: None,
+            };
+        }
+
+        if let Err(e) = Self::check_timestamp(request.timestamp) {
+            return JoinSubnetResponse { success: false, message: e, event_id: None };
+        }
+
+        if let Err(e) = Self::verify_signature(
+            &request.address, &request.signature, &request.message,
+            request.nostr_pubkey.as_deref(), request.public_key.as_deref(),
+        ) {
+            warn!(address = %request.address, error = %e, "Subnet join sig failed");
+            return JoinSubnetResponse { success: false, message: e, event_id: None };
+        }
+
+        // Duplicate join detection
+        let membership_key = format!("user:{}:subnet:{}", request.address, request.subnet_id);
+        let membership_oid = ObjectId::new(
+            setu_hash_with_domain(b"SETU_MEMBERSHIP:", membership_key.as_bytes()),
+        );
+        if self.network_service.state_provider().get_object(&membership_oid).is_some() {
+            return JoinSubnetResponse {
+                success: false,
+                message: format!("User {} already a member of subnet '{}'", request.address, request.subnet_id),
+                event_id: None,
+            };
+        }
+
+        let vlc_snapshot = self.build_vlc_snapshot();
+        let event = match self.network_service.infra_executor().execute_subnet_join(
+            &request.address, &request.subnet_id, vlc_snapshot,
+        ) {
+            Ok(event) => event,
+            Err(e) => {
+                error!(address = %request.address, error = %e, "Subnet join failed");
+                return JoinSubnetResponse {
+                    success: false, message: format!("Subnet join failed: {}", e), event_id: None,
+                };
+            }
+        };
+
+        let event_id = event.id.clone();
+        self.network_service.add_event_to_dag(event).await;
+
+        info!(address = %request.address, subnet_id = %request.subnet_id, event_id = %event_id, "Joined subnet");
+        JoinSubnetResponse { success: true, message: "Joined subnet".to_string(), event_id: Some(event_id) }
+    }
+
+    async fn leave_subnet(&self, request: LeaveSubnetRequest) -> LeaveSubnetResponse {
+        info!(address = %request.address, subnet_id = %request.subnet_id, "Processing subnet leave");
+
+        if !request.address.starts_with("0x")
+            || (request.address.len() != 66 && request.address.len() != 42)
+        {
+            return LeaveSubnetResponse {
+                success: false, message: "Invalid address format".to_string(), event_id: None,
+            };
+        }
+
+        if let Err(e) = Self::check_timestamp(request.timestamp) {
+            return LeaveSubnetResponse { success: false, message: e, event_id: None };
+        }
+
+        if let Err(e) = Self::verify_signature(
+            &request.address, &request.signature, &request.message,
+            request.nostr_pubkey.as_deref(), request.public_key.as_deref(),
+        ) {
+            warn!(address = %request.address, error = %e, "Subnet leave sig failed");
+            return LeaveSubnetResponse { success: false, message: e, event_id: None };
+        }
+
+        // Existence check: must be a member to leave
+        let membership_key = format!("user:{}:subnet:{}", request.address, request.subnet_id);
+        let membership_oid = ObjectId::new(
+            setu_hash_with_domain(b"SETU_MEMBERSHIP:", membership_key.as_bytes()),
+        );
+        if self.network_service.state_provider().get_object(&membership_oid).is_none() {
+            return LeaveSubnetResponse {
+                success: false,
+                message: format!("User {} is not a member of subnet '{}'", request.address, request.subnet_id),
+                event_id: None,
+            };
+        }
+
+        let vlc_snapshot = self.build_vlc_snapshot();
+        let event = match self.network_service.infra_executor().execute_subnet_leave(
+            &request.address, &request.subnet_id, vlc_snapshot,
+        ) {
+            Ok(event) => event,
+            Err(e) => {
+                error!(address = %request.address, error = %e, "Subnet leave failed");
+                return LeaveSubnetResponse {
+                    success: false, message: format!("Subnet leave failed: {}", e), event_id: None,
+                };
+            }
+        };
+
+        let event_id = event.id.clone();
+        self.network_service.add_event_to_dag(event).await;
+
+        info!(address = %request.address, subnet_id = %request.subnet_id, event_id = %event_id, "Left subnet");
+        LeaveSubnetResponse { success: true, message: "Left subnet".to_string(), event_id: Some(event_id) }
+    }
+
+    async fn check_membership(&self, address: &str, subnet_id: &str) -> CheckMembershipResponse {
+        let membership_key = format!("user:{}:subnet:{}", address, subnet_id);
+        let membership_oid = ObjectId::new(
+            setu_hash_with_domain(b"SETU_MEMBERSHIP:", membership_key.as_bytes()),
+        );
+
+        match self.network_service.state_provider().get_object(&membership_oid) {
+            Some(data) => {
+                let v: serde_json::Value = serde_json::from_slice(&data).unwrap_or_default();
+                CheckMembershipResponse {
+                    is_member: true,
+                    address: address.to_string(),
+                    subnet_id: subnet_id.to_string(),
+                    joined_at: v["joined_at"].as_u64(),
+                }
+            }
+            None => CheckMembershipResponse {
+                is_member: false,
+                address: address.to_string(),
+                subnet_id: subnet_id.to_string(),
+                joined_at: None,
+            },
+        }
+    }
+
+    async fn get_user_subnets(&self, address: &str) -> GetUserSubnetsResponse {
+        // Point-query across all registered subnets (O(subnet_count))
+        let all_subnets = self.network_service.get_all_subnets();
+        let mut joined = Vec::new();
+
+        for subnet_info in &all_subnets {
+            let membership_key = format!("user:{}:subnet:{}", address, subnet_info.subnet_id);
+            let membership_oid = ObjectId::new(
+                setu_hash_with_domain(b"SETU_MEMBERSHIP:", membership_key.as_bytes()),
+            );
+            if self.network_service.state_provider().get_object(&membership_oid).is_some() {
+                joined.push(subnet_info.subnet_id.clone());
+            }
+        }
+
+        GetUserSubnetsResponse {
+            address: address.to_string(),
+            subnets: joined,
         }
     }
 }

@@ -79,6 +79,9 @@ pub struct ConsensusEngine {
     message_rx: Arc<Mutex<mpsc::Receiver<ConsensusMessage>>>,
     /// Network broadcaster for P2P message delivery (optional)
     broadcaster: Arc<RwLock<Option<Arc<dyn ConsensusBroadcaster>>>>,
+    /// Anchors from inline-finalized CFs (single-node mode) pending persistence.
+    /// Callers should drain this after add_event() to persist finalized anchors.
+    pending_persist_anchors: Arc<Mutex<Vec<setu_types::Anchor>>>,
 }
 
 impl ConsensusEngine {
@@ -118,6 +121,7 @@ impl ConsensusEngine {
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
+            pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
         }
     }
     
@@ -162,6 +166,7 @@ impl ConsensusEngine {
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
+            pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
         }
     }
     
@@ -202,6 +207,7 @@ impl ConsensusEngine {
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
+            pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
         }
     }
     
@@ -241,6 +247,7 @@ impl ConsensusEngine {
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
+            pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -255,6 +262,14 @@ impl ConsensusEngine {
     /// Clear the private key (disable vote signing)
     pub async fn clear_private_key(&self) {
         *self.private_key.write().await = None;
+    }
+
+    /// Take all pending anchors that were finalized inline (single-node mode).
+    /// Callers should persist these anchors to durable storage.
+    /// Returns an empty Vec if no anchors are pending.
+    pub async fn take_pending_anchors(&self) -> Vec<setu_types::Anchor> {
+        let mut pending = self.pending_persist_anchors.lock().await;
+        std::mem::take(&mut *pending)
     }
 
     /// Set the network broadcaster for P2P message delivery
@@ -547,10 +562,17 @@ impl ConsensusEngine {
                         new_min_depth = new_anchor_depth,
                         "CF finalized (single-node mode), depth floor updated"
                     );
+                    // Buffer anchor for persistence by caller (submit_event).
+                    // The internal message channel is not consumed in production,
+                    // so persistence must be triggered by the caller.
+                    {
+                        let mut pending = self.pending_persist_anchors.lock().await;
+                        pending.push(frame.anchor.clone());
+                    }
                 }
             }
             
-            // Send to internal channel (legacy)
+            // Send to internal channel (legacy, not consumed in production)
             let _ = self
                 .message_tx
                 .send(ConsensusMessage::ProposeFrame(frame.clone()))

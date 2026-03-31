@@ -74,6 +74,12 @@ enum Commands {
         #[command(subcommand)]
         action: GenKeyAction,
     },
+
+    /// User profile and subnet membership
+    User {
+        #[command(subcommand)]
+        action: UserAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -132,6 +138,109 @@ pub enum GenKeyAction {
         /// Format: base64, hex, public
         #[arg(long, default_value = "base64")]
         format: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum UserAction {
+    /// Profile management
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+    /// Subnet membership management
+    Subnet {
+        #[command(subcommand)]
+        action: UserSubnetAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ProfileAction {
+    /// Update user profile
+    Update {
+        /// User address (0x...)
+        #[arg(long)]
+        address: String,
+        /// Display name
+        #[arg(long)]
+        display_name: Option<String>,
+        /// Avatar URL
+        #[arg(long)]
+        avatar_url: Option<String>,
+        /// Bio text
+        #[arg(long)]
+        bio: Option<String>,
+        /// Key file for signing
+        #[arg(long)]
+        key_file: String,
+        /// Validator address
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        validator: String,
+    },
+    /// Get user profile
+    Get {
+        /// User address (0x...)
+        #[arg(long)]
+        address: String,
+        /// Validator address
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        validator: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum UserSubnetAction {
+    /// Join a subnet
+    Join {
+        /// User address (0x...)
+        #[arg(long)]
+        address: String,
+        /// Subnet ID to join
+        #[arg(long)]
+        subnet_id: String,
+        /// Key file for signing
+        #[arg(long)]
+        key_file: String,
+        /// Validator address
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        validator: String,
+    },
+    /// Leave a subnet
+    Leave {
+        /// User address (0x...)
+        #[arg(long)]
+        address: String,
+        /// Subnet ID to leave
+        #[arg(long)]
+        subnet_id: String,
+        /// Key file for signing
+        #[arg(long)]
+        key_file: String,
+        /// Validator address
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        validator: String,
+    },
+    /// Check membership in a subnet
+    Check {
+        /// User address (0x...)
+        #[arg(long)]
+        address: String,
+        /// Subnet ID to check
+        #[arg(long)]
+        subnet_id: String,
+        /// Validator address
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        validator: String,
+    },
+    /// List user's subnet memberships
+    List {
+        /// User address (0x...)
+        #[arg(long)]
+        address: String,
+        /// Validator address
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        validator: String,
     },
 }
 
@@ -524,6 +633,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::GenKey { action } => {
             commands::gen_key::handle(action).await?;
+        }
+        Commands::User { action } => {
+            commands::user::handle(action, &config).await?;
         }
     }
     

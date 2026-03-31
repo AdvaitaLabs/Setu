@@ -236,6 +236,176 @@ impl InfraExecutor {
 
         Ok(())
     }
+
+    // ========== Phase 3: Profile & Subnet Membership ==========
+
+    /// Execute a profile update event
+    pub fn execute_profile_update(
+        &self,
+        user_address: &str,
+        display_name: Option<&str>,
+        avatar_url: Option<&str>,
+        bio: Option<&str>,
+        attributes: &std::collections::HashMap<String, String>,
+        vlc_snapshot: VLCSnapshot,
+    ) -> Result<Event, String> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_millis() as u64;
+
+        let tx_hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"SETU_TX_HASH:VALIDATOR:PROFILE:");
+            hasher.update(user_address.as_bytes());
+            hasher.update(&timestamp.to_le_bytes());
+            *hasher.finalize().as_bytes()
+        };
+        let ctx = ExecutionContext::new(
+            self.validator_id.clone(), timestamp, false, tx_hash,
+        );
+
+        let temp_store = InMemoryStateStore::new();
+        let mut runtime = RuntimeExecutor::new(temp_store);
+        let address = Address::from_hex(user_address)
+            .map_err(|e| format!("Invalid address '{}': {}", user_address, e))?;
+
+        let output = runtime.execute_profile_update(
+            &address, display_name, avatar_url, bio, attributes, &ctx,
+        ).map_err(|e| format!("Runtime error: {}", e))?;
+
+        if !output.success {
+            return Err(output.message.unwrap_or_else(|| "Profile update failed".to_string()));
+        }
+
+        let mut event = Event::new(
+            setu_types::event::EventType::System, vec![], vlc_snapshot, self.validator_id.clone(),
+        );
+
+        self.apply_state_changes(&output)?;
+
+        let state_changes: Vec<EventStateChange> = output.state_changes.iter()
+            .map(|sc| sc.to_event_state_change())
+            .collect();
+        event.set_execution_result(ExecutionResult {
+            success: true,
+            message: output.message,
+            state_changes,
+        });
+
+        info!(user = %user_address, event_id = %event.id, "Profile updated by Validator");
+        Ok(event)
+    }
+
+    /// Execute a subnet join event
+    pub fn execute_subnet_join(
+        &self,
+        user_address: &str,
+        subnet_id: &str,
+        vlc_snapshot: VLCSnapshot,
+    ) -> Result<Event, String> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_millis() as u64;
+
+        let tx_hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"SETU_TX_HASH:VALIDATOR:JOIN:");
+            hasher.update(user_address.as_bytes());
+            hasher.update(subnet_id.as_bytes());
+            hasher.update(&timestamp.to_le_bytes());
+            *hasher.finalize().as_bytes()
+        };
+        let ctx = ExecutionContext::new(
+            self.validator_id.clone(), timestamp, false, tx_hash,
+        );
+
+        let temp_store = InMemoryStateStore::new();
+        let mut runtime = RuntimeExecutor::new(temp_store);
+        let address = Address::from_hex(user_address)
+            .map_err(|e| format!("Invalid address '{}': {}", user_address, e))?;
+
+        let output = runtime.execute_subnet_join(&address, subnet_id, &ctx)
+            .map_err(|e| format!("Runtime error: {}", e))?;
+
+        if !output.success {
+            return Err(output.message.unwrap_or_else(|| "Subnet join failed".to_string()));
+        }
+
+        let mut event = Event::new(
+            setu_types::event::EventType::System, vec![], vlc_snapshot, self.validator_id.clone(),
+        );
+
+        self.apply_state_changes(&output)?;
+
+        let state_changes: Vec<EventStateChange> = output.state_changes.iter()
+            .map(|sc| sc.to_event_state_change())
+            .collect();
+        event.set_execution_result(ExecutionResult {
+            success: true,
+            message: output.message,
+            state_changes,
+        });
+
+        info!(user = %user_address, subnet_id = %subnet_id, event_id = %event.id, "Subnet join by Validator");
+        Ok(event)
+    }
+
+    /// Execute a subnet leave event
+    pub fn execute_subnet_leave(
+        &self,
+        user_address: &str,
+        subnet_id: &str,
+        vlc_snapshot: VLCSnapshot,
+    ) -> Result<Event, String> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_millis() as u64;
+
+        let tx_hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"SETU_TX_HASH:VALIDATOR:LEAVE:");
+            hasher.update(user_address.as_bytes());
+            hasher.update(subnet_id.as_bytes());
+            hasher.update(&timestamp.to_le_bytes());
+            *hasher.finalize().as_bytes()
+        };
+        let ctx = ExecutionContext::new(
+            self.validator_id.clone(), timestamp, false, tx_hash,
+        );
+
+        let temp_store = InMemoryStateStore::new();
+        let mut runtime = RuntimeExecutor::new(temp_store);
+        let address = Address::from_hex(user_address)
+            .map_err(|e| format!("Invalid address '{}': {}", user_address, e))?;
+
+        let output = runtime.execute_subnet_leave(&address, subnet_id, &ctx)
+            .map_err(|e| format!("Runtime error: {}", e))?;
+
+        if !output.success {
+            return Err(output.message.unwrap_or_else(|| "Subnet leave failed".to_string()));
+        }
+
+        let mut event = Event::new(
+            setu_types::event::EventType::System, vec![], vlc_snapshot, self.validator_id.clone(),
+        );
+
+        self.apply_state_changes(&output)?;
+
+        let state_changes: Vec<EventStateChange> = output.state_changes.iter()
+            .map(|sc| sc.to_event_state_change())
+            .collect();
+        event.set_execution_result(ExecutionResult {
+            success: true,
+            message: output.message,
+            state_changes,
+        });
+
+        info!(user = %user_address, subnet_id = %subnet_id, event_id = %event.id, "Subnet leave by Validator");
+        Ok(event)
+    }
 }
 
 #[cfg(test)]
@@ -289,5 +459,78 @@ mod tests {
         let event = result.unwrap();
         assert!(event.execution_result.is_some());
         assert!(event.execution_result.as_ref().unwrap().success);
+    }
+
+    fn test_vlc() -> VLCSnapshot {
+        VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1000,
+        }
+    }
+
+    #[test]
+    fn test_infra_profile_update_produces_system_event() {
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(shared));
+        let executor = InfraExecutor::new("validator-1".to_string(), provider);
+        let attrs = std::collections::HashMap::new();
+
+        let result = executor.execute_profile_update(
+            "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+            Some("Alice"), None, Some("Hello world"), &attrs, test_vlc(),
+        );
+        assert!(result.is_ok());
+        let event = result.unwrap();
+        assert_eq!(event.event_type, setu_types::event::EventType::System);
+        let er = event.execution_result.as_ref().unwrap();
+        assert!(er.success);
+        assert_eq!(er.state_changes.len(), 1);
+        // Key must be "oid:{hex}" format
+        assert!(er.state_changes[0].key.starts_with("oid:"));
+    }
+
+    #[test]
+    fn test_infra_subnet_join_produces_system_event() {
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(shared));
+        let executor = InfraExecutor::new("validator-1".to_string(), provider);
+
+        let result = executor.execute_subnet_join(
+            "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+            "defi-subnet", test_vlc(),
+        );
+        assert!(result.is_ok());
+        let event = result.unwrap();
+        assert_eq!(event.event_type, setu_types::event::EventType::System);
+        let er = event.execution_result.as_ref().unwrap();
+        assert!(er.success);
+        assert_eq!(er.state_changes.len(), 2);
+        assert!(er.state_changes[0].key.starts_with("oid:"));
+        assert!(er.state_changes[1].key.starts_with("oid:"));
+        // Both have new_value (Create)
+        assert!(er.state_changes[0].new_value.is_some());
+        assert!(er.state_changes[1].new_value.is_some());
+    }
+
+    #[test]
+    fn test_infra_subnet_leave_produces_system_event() {
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(shared));
+        let executor = InfraExecutor::new("validator-1".to_string(), provider);
+
+        let result = executor.execute_subnet_leave(
+            "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+            "defi-subnet", test_vlc(),
+        );
+        assert!(result.is_ok());
+        let event = result.unwrap();
+        assert_eq!(event.event_type, setu_types::event::EventType::System);
+        let er = event.execution_result.as_ref().unwrap();
+        assert!(er.success);
+        assert_eq!(er.state_changes.len(), 2);
+        // Delete: new_value = None
+        assert!(er.state_changes[0].new_value.is_none());
+        assert!(er.state_changes[1].new_value.is_none());
     }
 }

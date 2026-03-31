@@ -660,6 +660,162 @@ impl<S: StateStore> RuntimeExecutor<S> {
         })
     }
     
+    // ========== Profile & Subnet Membership (Phase 3) ==========
+
+    /// Execute profile creation or update (Create-or-Update semantics)
+    pub fn execute_profile_update(
+        &mut self,
+        user_address: &Address,
+        display_name: Option<&str>,
+        avatar_url: Option<&str>,
+        bio: Option<&str>,
+        attributes: &std::collections::HashMap<String, String>,
+        ctx: &ExecutionContext,
+    ) -> RuntimeResult<ExecutionOutput> {
+        let profile_key = format!("profile:{}", user_address);
+        let profile_object_id = ObjectId::new(
+            setu_types::hash_utils::setu_hash_with_domain(
+                b"SETU_PROFILE:", profile_key.as_bytes()
+            )
+        );
+
+        let profile_data = serde_json::json!({
+            "owner": user_address.to_string(),
+            "display_name": display_name,
+            "avatar_url": avatar_url,
+            "bio": bio,
+            "attributes": attributes,
+            "created_at": ctx.timestamp,
+            "updated_at": ctx.timestamp,
+        });
+
+        let state_changes = vec![StateChange {
+            change_type: StateChangeType::Create,
+            object_id: profile_object_id,
+            old_state: None,
+            new_state: Some(serde_json::to_vec(&profile_data)?),
+        }];
+
+        info!(user = %user_address, "Profile updated");
+
+        Ok(ExecutionOutput {
+            success: true,
+            message: Some(format!("Profile updated for {}", user_address)),
+            state_changes,
+            created_objects: vec![],
+            deleted_objects: vec![],
+            query_result: None,
+        })
+    }
+
+    /// Execute subnet join — creates forward membership + reverse member index
+    pub fn execute_subnet_join(
+        &mut self,
+        user_address: &Address,
+        subnet_id: &str,
+        ctx: &ExecutionContext,
+    ) -> RuntimeResult<ExecutionOutput> {
+        let mut state_changes = Vec::new();
+
+        // 1. Forward index: user → subnet
+        let membership_key = format!("user:{}:subnet:{}", user_address, subnet_id);
+        let membership_object_id = ObjectId::new(
+            setu_types::hash_utils::setu_hash_with_domain(
+                b"SETU_MEMBERSHIP:", membership_key.as_bytes()
+            )
+        );
+        let membership_data = serde_json::json!({
+            "user": user_address.to_string(),
+            "subnet_id": subnet_id,
+            "joined_at": ctx.timestamp,
+        });
+        state_changes.push(StateChange {
+            change_type: StateChangeType::Create,
+            object_id: membership_object_id,
+            old_state: None,
+            new_state: Some(serde_json::to_vec(&membership_data)?),
+        });
+
+        // 2. Reverse index: subnet → member
+        let reverse_key = format!("subnet:{}:member:{}", subnet_id, user_address);
+        let reverse_object_id = ObjectId::new(
+            setu_types::hash_utils::setu_hash_with_domain(
+                b"SETU_SUBNET_MEMBER:", reverse_key.as_bytes()
+            )
+        );
+        let reverse_data = serde_json::json!({
+            "user": user_address.to_string(),
+            "subnet_id": subnet_id,
+            "joined_at": ctx.timestamp,
+        });
+        state_changes.push(StateChange {
+            change_type: StateChangeType::Create,
+            object_id: reverse_object_id,
+            old_state: None,
+            new_state: Some(serde_json::to_vec(&reverse_data)?),
+        });
+
+        info!(user = %user_address, subnet_id = %subnet_id, "User joined subnet");
+
+        Ok(ExecutionOutput {
+            success: true,
+            message: Some(format!("User {} joined subnet '{}'", user_address, subnet_id)),
+            state_changes,
+            created_objects: vec![],
+            deleted_objects: vec![],
+            query_result: None,
+        })
+    }
+
+    /// Execute subnet leave — deletes forward membership + reverse member index
+    pub fn execute_subnet_leave(
+        &mut self,
+        user_address: &Address,
+        subnet_id: &str,
+        _ctx: &ExecutionContext,
+    ) -> RuntimeResult<ExecutionOutput> {
+        let mut state_changes = Vec::new();
+
+        // 1. Delete forward index
+        let membership_key = format!("user:{}:subnet:{}", user_address, subnet_id);
+        let membership_object_id = ObjectId::new(
+            setu_types::hash_utils::setu_hash_with_domain(
+                b"SETU_MEMBERSHIP:", membership_key.as_bytes()
+            )
+        );
+        state_changes.push(StateChange {
+            change_type: StateChangeType::Delete,
+            object_id: membership_object_id,
+            old_state: None,
+            new_state: None,
+        });
+
+        // 2. Delete reverse index
+        let reverse_key = format!("subnet:{}:member:{}", subnet_id, user_address);
+        let reverse_object_id = ObjectId::new(
+            setu_types::hash_utils::setu_hash_with_domain(
+                b"SETU_SUBNET_MEMBER:", reverse_key.as_bytes()
+            )
+        );
+        state_changes.push(StateChange {
+            change_type: StateChangeType::Delete,
+            object_id: reverse_object_id,
+            old_state: None,
+            new_state: None,
+        });
+
+        info!(user = %user_address, subnet_id = %subnet_id, "User left subnet");
+
+        Ok(ExecutionOutput {
+            success: true,
+            message: Some(format!("User {} left subnet '{}'", user_address, subnet_id)),
+            state_changes,
+            created_objects: vec![],
+            deleted_objects: vec![],
+            query_result: None,
+        })
+    }
+    
     /// Mint tokens — unified single path (R14 simplified)
     ///
     /// All mint operations use `ctx.new_coin_id()` (i.e., `coin_id_from_tx`)
@@ -1297,5 +1453,137 @@ mod tests {
         // Different output_index → different coin_id
         let id3 = coin_id_from_tx(&tx_hash, 1);
         assert_ne!(id1, id3);
+    }
+
+    // ========== Phase 3: Profile & Subnet Membership Tests ==========
+
+    #[test]
+    fn test_execute_profile_update_creates_state_change() {
+        let store = InMemoryStateStore::new();
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = test_ctx("profile-1");
+        let addr = Address::from_hex("0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf").unwrap();
+        let attrs = std::collections::HashMap::new();
+
+        let output = executor.execute_profile_update(
+            &addr, Some("Alice"), Some("https://img.example.com/a.png"), Some("Hello"), &attrs, &ctx,
+        ).unwrap();
+
+        assert!(output.success);
+        assert_eq!(output.state_changes.len(), 1);
+        assert_eq!(output.state_changes[0].change_type, StateChangeType::Create);
+        assert!(output.state_changes[0].new_state.is_some());
+
+        // Verify ObjectId uses SETU_PROFILE: domain hash
+        let expected_oid = ObjectId::new(setu_types::hash_utils::setu_hash_with_domain(
+            b"SETU_PROFILE:", format!("profile:{}", addr).as_bytes(),
+        ));
+        assert_eq!(output.state_changes[0].object_id, expected_oid);
+
+        // Verify JSON content
+        let data: serde_json::Value = serde_json::from_slice(output.state_changes[0].new_state.as_ref().unwrap()).unwrap();
+        assert_eq!(data["display_name"], "Alice");
+        assert_eq!(data["bio"], "Hello");
+        assert_eq!(data["created_at"], ctx.timestamp);
+    }
+
+    #[test]
+    fn test_execute_profile_update_idempotent() {
+        let store = InMemoryStateStore::new();
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = test_ctx("profile-idem");
+        let addr = Address::from_hex("0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf").unwrap();
+        let attrs = std::collections::HashMap::new();
+
+        let out1 = executor.execute_profile_update(&addr, Some("V1"), None, None, &attrs, &ctx).unwrap();
+        let out2 = executor.execute_profile_update(&addr, Some("V2"), None, None, &attrs, &ctx).unwrap();
+
+        assert!(out1.success);
+        assert!(out2.success);
+        assert_eq!(out1.state_changes.len(), 1);
+        assert_eq!(out2.state_changes.len(), 1);
+        // Same ObjectId (idempotent key)
+        assert_eq!(out1.state_changes[0].object_id, out2.state_changes[0].object_id);
+    }
+
+    #[test]
+    fn test_execute_subnet_join_creates_two_state_changes() {
+        let store = InMemoryStateStore::new();
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = test_ctx("join-1");
+        let addr = Address::from_hex("0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf").unwrap();
+
+        let output = executor.execute_subnet_join(&addr, "defi-subnet", &ctx).unwrap();
+
+        assert!(output.success);
+        assert_eq!(output.state_changes.len(), 2);
+        // Forward index uses SETU_MEMBERSHIP:
+        let fwd_key = format!("user:{}:subnet:defi-subnet", addr);
+        let expected_fwd = ObjectId::new(setu_types::hash_utils::setu_hash_with_domain(
+            b"SETU_MEMBERSHIP:", fwd_key.as_bytes(),
+        ));
+        assert_eq!(output.state_changes[0].object_id, expected_fwd);
+        assert_eq!(output.state_changes[0].change_type, StateChangeType::Create);
+
+        // Reverse index uses SETU_SUBNET_MEMBER:
+        let rev_key = format!("subnet:defi-subnet:member:{}", addr);
+        let expected_rev = ObjectId::new(setu_types::hash_utils::setu_hash_with_domain(
+            b"SETU_SUBNET_MEMBER:", rev_key.as_bytes(),
+        ));
+        assert_eq!(output.state_changes[1].object_id, expected_rev);
+        assert_eq!(output.state_changes[1].change_type, StateChangeType::Create);
+    }
+
+    #[test]
+    fn test_execute_subnet_join_state_change_content() {
+        let store = InMemoryStateStore::new();
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = test_ctx("join-content");
+        let addr = Address::from_hex("0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf").unwrap();
+
+        let output = executor.execute_subnet_join(&addr, "gaming", &ctx).unwrap();
+
+        // Check forward index content
+        let fwd: serde_json::Value = serde_json::from_slice(output.state_changes[0].new_state.as_ref().unwrap()).unwrap();
+        assert_eq!(fwd["user"], addr.to_string());
+        assert_eq!(fwd["subnet_id"], "gaming");
+        assert_eq!(fwd["joined_at"], ctx.timestamp);
+
+        // Check reverse index content
+        let rev: serde_json::Value = serde_json::from_slice(output.state_changes[1].new_state.as_ref().unwrap()).unwrap();
+        assert_eq!(rev["user"], addr.to_string());
+        assert_eq!(rev["subnet_id"], "gaming");
+    }
+
+    #[test]
+    fn test_execute_subnet_leave_deletes_two_state_changes() {
+        let store = InMemoryStateStore::new();
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = test_ctx("leave-1");
+        let addr = Address::from_hex("0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf").unwrap();
+
+        let output = executor.execute_subnet_leave(&addr, "defi-subnet", &ctx).unwrap();
+
+        assert!(output.success);
+        assert_eq!(output.state_changes.len(), 2);
+        assert_eq!(output.state_changes[0].change_type, StateChangeType::Delete);
+        assert_eq!(output.state_changes[1].change_type, StateChangeType::Delete);
+        assert!(output.state_changes[0].new_state.is_none());
+        assert!(output.state_changes[1].new_state.is_none());
+    }
+
+    #[test]
+    fn test_execute_subnet_leave_object_ids_match_join() {
+        let store = InMemoryStateStore::new();
+        let mut executor = RuntimeExecutor::new(store);
+        let ctx = test_ctx("symmetry");
+        let addr = Address::from_hex("0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf").unwrap();
+
+        let join_out = executor.execute_subnet_join(&addr, "test-net", &ctx).unwrap();
+        let leave_out = executor.execute_subnet_leave(&addr, "test-net", &ctx).unwrap();
+
+        // Same ObjectIds for forward and reverse
+        assert_eq!(join_out.state_changes[0].object_id, leave_out.state_changes[0].object_id);
+        assert_eq!(join_out.state_changes[1].object_id, leave_out.state_changes[1].object_id);
     }
 }

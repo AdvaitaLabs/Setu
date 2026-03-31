@@ -170,6 +170,32 @@ impl EventStore {
             .collect()
     }
 
+    /// Get the maximum depth stored (for DAG replay).
+    pub fn get_max_depth(&self) -> Option<u64> {
+        self.depths.iter().map(|r| *r.value()).max()
+    }
+
+    /// Get events within a depth range, sorted by (depth, event_id) for deterministic replay.
+    pub fn get_events_by_depth_range(&self, min_depth: u64, max_depth: u64) -> Vec<(Event, u64)> {
+        let mut result: Vec<(Event, u64)> = self
+            .depths
+            .iter()
+            .filter(|r| {
+                let d = *r.value();
+                d >= min_depth && d <= max_depth
+            })
+            .filter_map(|r| {
+                let event_id = r.key().clone();
+                let depth = *r.value();
+                self.events
+                    .get(&event_id)
+                    .map(|e| (e.value().clone(), depth))
+            })
+            .collect();
+        result.sort_by(|(e1, d1), (e2, d2)| d1.cmp(d2).then_with(|| e1.id.cmp(&e2.id)));
+        result
+    }
+
     /// Get event's parent_ids (for cache warmup)
     pub async fn get_parent_ids(&self, event_id: &EventId) -> Option<Vec<EventId>> {
         self.events.get(event_id).map(|e| e.parent_ids.clone())
@@ -213,6 +239,10 @@ impl EventStore {
     ///
     /// Returns a result indicating success/failure counts.
     ///
+    /// If an event already exists (e.g., arrived via P2P sync before finalization),
+    /// the event data is NOT overwritten, but depth IS still recorded to ensure
+    /// the event is visible to DagReplayManager (sync-before-finalize fix, R4-ISSUE-11).
+    ///
     /// # Error Handling
     /// - Duplicate events are counted as `skipped` (non-critical)
     /// - Other errors are counted as `failed` (critical)
@@ -230,8 +260,10 @@ impl EventStore {
         for (event, depth) in events_with_depths {
             let event_id = event.id.clone();
 
-            // Check for duplicates (non-critical, skip)
+            // Check for duplicates (non-critical, skip event data but upsert depth)
             if self.events.contains_key(&event_id) {
+                // Upsert depth for pre-existing events (sync-before-finalize fix)
+                self.depths.insert(event_id.clone(), depth);
                 result.skipped += 1;
                 result.skipped_ids.push(event_id);
                 continue;

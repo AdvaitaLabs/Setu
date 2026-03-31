@@ -181,4 +181,18 @@ impl EventStoreBackend for EventStore {
     async fn get_events_batch(&self, event_ids: &[EventId]) -> Vec<Event> {
         EventStore::get_events_batch(self, event_ids).await
     }
+
+    async fn get_events_by_depth_range(
+        &self,
+        min_depth: u64,
+        max_depth: u64,
+    ) -> SetuResult<Vec<(Event, u64)>> {
+        Ok(EventStore::get_events_by_depth_range(
+            self, min_depth, max_depth,
+        ))
+    }
+
+    async fn get_max_depth(&self) -> Option<u64> {
+        EventStore::get_max_depth(self)
+    }
 }

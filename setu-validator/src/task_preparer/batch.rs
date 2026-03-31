@@ -89,6 +89,11 @@ impl BatchTaskPreparer {
         }
     }
 
+    /// Get the underlying MerkleStateProvider
+    pub fn merkle_state_provider(&self) -> &Arc<setu_storage::MerkleStateProvider> {
+        &self.state_provider
+    }
+
     /// Create a BatchTaskPreparer with pre-initialized test accounts
     ///
     /// Same initialization as `TaskPreparer::new_for_testing()`:

@@ -47,76 +47,68 @@ pub struct ProfileData {
 pub type Profile = Object<ProfileData>;
 
 impl ProfileData {
-    /// Create new profile data
-    pub fn new(owner: Address) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-
+    /// Create new profile data with explicit timestamp (determinism-safe for consensus paths)
+    pub fn new(owner: Address, timestamp: u64) -> Self {
         Self {
             owner,
             display_name: None,
             avatar_url: None,
             bio: None,
             attributes: HashMap::new(),
-            created_at: now,
-            updated_at: now,
+            created_at: timestamp,
+            updated_at: timestamp,
         }
     }
 
-    pub fn set_display_name(&mut self, name: impl Into<String>) {
+    pub fn set_display_name(&mut self, name: impl Into<String>, timestamp: u64) {
         self.display_name = Some(name.into());
-        self.touch();
+        self.touch(timestamp);
     }
 
-    pub fn set_avatar(&mut self, url: impl Into<String>) {
+    pub fn set_avatar(&mut self, url: impl Into<String>, timestamp: u64) {
         self.avatar_url = Some(url.into());
-        self.touch();
+        self.touch(timestamp);
     }
 
-    pub fn set_bio(&mut self, bio: impl Into<String>) {
+    pub fn set_bio(&mut self, bio: impl Into<String>, timestamp: u64) {
         self.bio = Some(bio.into());
-        self.touch();
+        self.touch(timestamp);
     }
 
-    pub fn set_attribute(&mut self, key: impl Into<String>, value: impl Into<String>) {
+    pub fn set_attribute(&mut self, key: impl Into<String>, value: impl Into<String>, timestamp: u64) {
         self.attributes.insert(key.into(), value.into());
-        self.touch();
+        self.touch(timestamp);
     }
 
     pub fn get_attribute(&self, key: &str) -> Option<&String> {
         self.attributes.get(key)
     }
 
-    pub fn remove_attribute(&mut self, key: &str) -> Option<String> {
+    pub fn remove_attribute(&mut self, key: &str, timestamp: u64) -> Option<String> {
         let result = self.attributes.remove(key);
         if result.is_some() {
-            self.touch();
+            self.touch(timestamp);
         }
         result
     }
 
-    fn touch(&mut self) {
-        self.updated_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+    fn touch(&mut self, timestamp: u64) {
+        self.updated_at = timestamp;
     }
 }
 
 impl Profile {
     /// Create a new Profile object
-    pub fn new(owner: Address) -> Self {
+    pub fn new(owner: Address, timestamp: u64) -> Self {
         let id = generate_object_id(format!("profile:{}", owner).as_bytes());
-        let data = ProfileData::new(owner.clone());
+        let data = ProfileData::new(owner.clone(), timestamp);
         Object::new_owned(id, owner, data)
     }
 }
 
 /// Create a new profile for an address
-pub fn create_profile(owner: Address) -> Profile {
-    Profile::new(owner)
+pub fn create_profile(owner: Address, timestamp: u64) -> Profile {
+    Profile::new(owner, timestamp)
 }
 
 // ============================================================================
@@ -174,22 +166,18 @@ pub struct CredentialData {
 pub type Credential = Object<CredentialData>;
 
 impl CredentialData {
-    /// Create new credential data
+    /// Create new credential data with explicit timestamp
     pub fn new(
         holder: Address,
         credential_type: impl Into<String>,
         issuer: Address,
+        timestamp: u64,
     ) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-
         Self {
             holder,
             credential_type: credential_type.into(),
             issuer,
-            issued_at: now,
+            issued_at: timestamp,
             expires_at: None,
             status: CredentialStatus::Active,
             claims: HashMap::new(),
@@ -197,23 +185,26 @@ impl CredentialData {
         }
     }
 
-    /// Check if credential is valid (active and not expired)
-    pub fn is_valid(&self) -> bool {
+    /// Check if credential is valid at the given time
+    pub fn is_valid_at(&self, now: u64) -> bool {
         if self.status != CredentialStatus::Active {
             return false;
         }
-        
         if let Some(expires_at) = self.expires_at {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
             if now > expires_at {
                 return false;
             }
         }
-        
         true
+    }
+
+    /// Check if credential is currently valid (uses wall clock — only for non-consensus paths)
+    pub fn is_valid(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        self.is_valid_at(now)
     }
 
     /// Set expiration time
@@ -243,12 +234,13 @@ impl Credential {
         holder: Address,
         credential_type: impl Into<String>,
         issuer: Address,
+        timestamp: u64,
     ) -> Self {
         let cred_type = credential_type.into();
         let id = generate_object_id(
             format!("credential:{}:{}:{}", holder, issuer, cred_type).as_bytes()
         );
-        let data = CredentialData::new(holder.clone(), cred_type, issuer);
+        let data = CredentialData::new(holder.clone(), cred_type, issuer, timestamp);
         // Credentials are owned by the holder but issued by issuer
         Object::new_owned(id, holder, data)
     }
@@ -258,9 +250,10 @@ impl Credential {
         holder: Address,
         credential_type: impl Into<String>,
         issuer: Address,
+        timestamp: u64,
         expires_at: u64,
     ) -> Self {
-        let mut cred = Self::new(holder, credential_type, issuer);
+        let mut cred = Self::new(holder, credential_type, issuer, timestamp);
         cred.data.set_expiry(expires_at);
         cred
     }
@@ -270,21 +263,29 @@ impl Credential {
 // Helper Functions
 // ============================================================================
 
-/// Create a KYC credential
+/// Create a KYC credential (uses wall clock — only for non-consensus / test paths)
 pub fn create_kyc_credential(holder: Address, issuer: Address, level: &str) -> Credential {
-    let mut cred = Credential::new(holder, "kyc", issuer);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut cred = Credential::new(holder, "kyc", issuer, now);
     cred.data.add_claim("level", level);
     cred
 }
 
-/// Create a membership credential
+/// Create a membership credential (uses wall clock — only for non-consensus / test paths)
 pub fn create_membership_credential(
     holder: Address,
     issuer: Address,
     organization: &str,
     expires_at: Option<u64>,
 ) -> Credential {
-    let mut cred = Credential::new(holder, "membership", issuer);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut cred = Credential::new(holder, "membership", issuer, now);
     cred.data.add_claim("organization", organization);
     if let Some(exp) = expires_at {
         cred.data.set_expiry(exp);
@@ -292,14 +293,18 @@ pub fn create_membership_credential(
     cred
 }
 
-/// Create an achievement credential
+/// Create an achievement credential (uses wall clock — only for non-consensus / test paths)
 pub fn create_achievement_credential(
     holder: Address,
     issuer: Address,
     achievement: &str,
     description: &str,
 ) -> Credential {
-    let mut cred = Credential::new(holder, "achievement", issuer);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut cred = Credential::new(holder, "achievement", issuer, now);
     cred.data.add_claim("name", achievement);
     cred.data.add_claim("description", description);
     cred
@@ -316,14 +321,14 @@ mod tests {
     #[test]
     fn test_create_profile() {
         let owner = Address::from_str_id("alice");
-        let mut profile = create_profile(owner.clone());
+        let mut profile = create_profile(owner.clone(), 1000);
         
         assert_eq!(profile.data.owner, owner);
         assert!(profile.data.display_name.is_none());
         
-        profile.data.set_display_name("Alice");
-        profile.data.set_bio("Hello, World!");
-        profile.data.set_attribute("twitter", "@alice");
+        profile.data.set_display_name("Alice", 1001);
+        profile.data.set_bio("Hello, World!", 1001);
+        profile.data.set_attribute("twitter", "@alice", 1001);
         
         assert_eq!(profile.data.display_name, Some("Alice".to_string()));
         assert_eq!(profile.data.bio, Some("Hello, World!".to_string()));
@@ -350,7 +355,7 @@ mod tests {
         let issuer = Address::from_str_id("org");
         
         // Create credential that expires in the past
-        let mut cred = Credential::new(holder, "test", issuer);
+        let mut cred = Credential::new(holder, "test", issuer, 500);
         cred.data.set_expiry(1000); // Very old timestamp
         
         assert!(!cred.data.is_valid()); // Should be expired
@@ -361,7 +366,7 @@ mod tests {
         let holder = Address::from_str_id("charlie");
         let issuer = Address::from_str_id("authority");
         
-        let mut cred = Credential::new(holder, "certificate", issuer);
+        let mut cred = Credential::new(holder, "certificate", issuer, 1000);
         assert!(cred.data.is_valid());
         
         cred.data.revoke();

@@ -262,8 +262,8 @@ mod tests {
     fn test_account_view_creation() {
         let alice = Address::from_str_id("alice");
         
-        let mut profile = create_profile(alice.clone());
-        profile.data.set_display_name("Alice");
+        let mut profile = create_profile(alice.clone(), 1000);
+        profile.data.set_display_name("Alice", 1001);
         
         let coins = vec![
             create_coin(alice.clone(), 1000),

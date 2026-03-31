@@ -829,8 +829,8 @@ mod tests {
     fn test_profile_crud() {
         let (store, _temp) = setup_test_store();
         let alice = Address::from_str_id("alice");
-        let mut profile = create_profile(alice);
-        profile.data.set_display_name("Alice");
+        let mut profile = create_profile(alice, 1000);
+        profile.data.set_display_name("Alice", 1001);
         let profile_id = profile.metadata.id;
         store.store_profile(&profile).unwrap();
         let retrieved = store.get_profile(&profile_id).unwrap().unwrap();
@@ -864,8 +864,8 @@ mod tests {
         let (store, _temp) = setup_test_store();
         let alice = Address::from_str_id("alice");
         let issuer = Address::from_str_id("kyc_provider");
-        let mut profile = create_profile(alice);
-        profile.data.set_display_name("Alice");
+        let mut profile = create_profile(alice, 1000);
+        profile.data.set_display_name("Alice", 1001);
         store.store_profile(&profile).unwrap();
         let kyc = create_kyc_credential(alice, issuer, "level_2");
         store.store_credential(&kyc).unwrap();

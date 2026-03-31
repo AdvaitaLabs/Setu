@@ -637,7 +637,7 @@ mod tests {
     fn test_profile_crud() {
         let store = MemoryObjectStore::new();
         let address = Address::from_str_id("alice");
-        let profile = Profile::new(address.clone());
+        let profile = Profile::new(address.clone(), 1000);
         let id = *profile.id();
 
         // Store
@@ -654,7 +654,7 @@ mod tests {
         assert_eq!(*by_address.id(), id);
 
         // Cannot store duplicate profile for same address
-        let profile2 = Profile::new(address.clone());
+        let profile2 = Profile::new(address.clone(), 2000);
         assert!(store.store_profile(&profile2).is_err());
 
         // Delete
@@ -668,7 +668,7 @@ mod tests {
         let store = MemoryObjectStore::new();
         let holder = Address::from_str_id("alice");
         let issuer = Address::from_str_id("issuer");
-        let credential = Credential::new(holder.clone(), "kyc", issuer.clone());
+        let credential = Credential::new(holder.clone(), "kyc", issuer.clone(), 1000);
         let id = *credential.id();
 
         // Store
@@ -725,7 +725,7 @@ mod tests {
         let address = Address::from_str_id("alice");
 
         // Create profile
-        store.store_profile(&Profile::new(address.clone())).unwrap();
+        store.store_profile(&Profile::new(address.clone(), 1000)).unwrap();
 
         // Create coins
         store.store_coin(&Coin::new(address.clone(), 100)).unwrap();
@@ -733,7 +733,7 @@ mod tests {
 
         // Create credential (holder)
         let issuer = Address::from_str_id("issuer");
-        store.store_credential(&Credential::new(address.clone(), "kyc", issuer)).unwrap();
+        store.store_credential(&Credential::new(address.clone(), "kyc", issuer, 1000)).unwrap();
 
         // Create graph
         store.store_graph(&RelationGraph::new(ObjectId::random(), address.clone(), "social".to_string())).unwrap();
@@ -878,7 +878,7 @@ mod tests {
         let issuer = Address::from_str_id("issuer");
 
         // Create a credential
-        let mut credential = Credential::new(holder1.clone(), "kyc", issuer.clone());
+        let mut credential = Credential::new(holder1.clone(), "kyc", issuer.clone(), 1000);
         store.store_credential(&credential).unwrap();
 
         // Verify initial index state

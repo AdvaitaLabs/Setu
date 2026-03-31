@@ -284,6 +284,13 @@ impl SolverNetworkClient {
     }
     
     /// Start the heartbeat loop
+    ///
+    /// This loop handles two cases:
+    /// 1. `is_registered == false` → attempt re-registration (covers validator restart
+    ///    where the heartbeat failed during downtime)
+    /// 2. Heartbeat returns `acknowledged: false` → validator doesn't recognise us,
+    ///    set `is_registered = false` so the next iteration triggers re-registration
+    ///    (covers validator restart that was fast enough that our heartbeat didn't fail)
     pub async fn start_heartbeat_loop(&self) {
         let interval = Duration::from_secs(self.config.heartbeat_interval_secs);
         
@@ -301,8 +308,21 @@ impl SolverNetworkClient {
             
             tokio::time::sleep(interval).await;
             
+            // If not registered (initial failure, or validator restarted), try to re-register
             if !self.is_registered.load(Ordering::Relaxed) {
-                debug!("Not registered, skipping heartbeat");
+                info!(solver_id = %self.config.solver_id, "Not registered, attempting re-registration");
+                match self.register().await {
+                    Ok(resp) if resp.success => {
+                        info!(solver_id = %self.config.solver_id, "Re-registration successful");
+                        // is_registered is set to true inside register()
+                    }
+                    Ok(resp) => {
+                        warn!(message = %resp.message, "Re-registration rejected by validator");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Re-registration failed (validator may be down)");
+                    }
+                }
                 continue;
             }
             
@@ -311,7 +331,10 @@ impl SolverNetworkClient {
                     if response.acknowledged {
                         debug!("Heartbeat acknowledged");
                     } else {
-                        warn!("Heartbeat not acknowledged, may need to re-register");
+                        // Validator doesn't recognise us (e.g. it restarted).
+                        // Mark unregistered so next iteration triggers re-registration.
+                        warn!("Heartbeat not acknowledged — validator may have restarted, will re-register");
+                        self.is_registered.store(false, Ordering::SeqCst);
                     }
                 }
                 Err(e) => {

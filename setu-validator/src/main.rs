@@ -191,7 +191,10 @@ async fn main() -> anyhow::Result<()> {
     // minimizing GlobalStateManager write-lock contention under high TPS.
     // Each anchor commit blocks ALL task preparation reads, so less frequent = higher throughput.
     // 3→5287; 10→5658; 20→5472; 50→5227; 100→4801; 200→4411. Optimal = 10.
-    consensus.vlc_delta_threshold = 10;
+    consensus.vlc_delta_threshold = std::env::var("VLC_DELTA_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
     
     let consensus_config = ConsensusValidatorConfig {
         node_info,
@@ -222,7 +225,14 @@ async fn main() -> anyhow::Result<()> {
     // Create SHARED GlobalStateManager (used by both TaskPreparer and ConsensusValidator)
     let shared_state_manager: Arc<SharedStateManager> = if let Some(ref db) = db {
         let merkle_store: Arc<dyn B4StoreExt> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
-        Arc::new(SharedStateManager::new(GlobalStateManager::with_store(merkle_store)))
+        let mut manager = GlobalStateManager::with_store(merkle_store);
+        // Recover all subnet SMT trees from persisted state (B4 commit data)
+        match manager.recover() {
+            Ok(summary) => info!("✓ GSM recovered: {} subnets, {} leaves",
+                summary.subnets_recovered, summary.total_leaves),
+            Err(e) => warn!("GSM recovery failed: {}, starting fresh: {}", e, e),
+        }
+        Arc::new(SharedStateManager::new(manager))
     } else {
         Arc::new(SharedStateManager::new(GlobalStateManager::new()))
     };
@@ -654,6 +664,36 @@ async fn main() -> anyhow::Result<()> {
     // Start background reservation cleanup task (prevents memory accumulation)
     let _cleanup_handle = network_service.start_reservation_cleanup_task();
     info!("Background reservation cleanup task started (60s interval)");
+
+    // ========================================
+    // Phase 3: DAG Replay — rebuild in-memory registries from persisted events
+    // ========================================
+    {
+        let event_store = consensus_validator.event_store();
+        let replay_manager = setu_validator::dag_replay::DagReplayManager::new(event_store);
+        match replay_manager.replay_all(&network_service).await {
+            Ok(stats) => {
+                if stats.total_events > 0 {
+                    info!(
+                        total = stats.total_events,
+                        replayed = stats.replayed_events,
+                        skipped = stats.skipped_events,
+                        subnets = stats.subnets_registered,
+                        validators = stats.validators_registered,
+                        solvers = stats.solvers_registered,
+                        errors = stats.errors,
+                        duration_ms = stats.duration_ms,
+                        "✓ DAG replay complete — in-memory registries rebuilt"
+                    );
+                } else {
+                    info!("✓ DAG replay: no events to replay (fresh start)");
+                }
+            }
+            Err(e) => {
+                warn!("DAG replay failed (non-fatal, registries may be incomplete): {}", e);
+            }
+        }
+    }
 
     // Spawn HTTP server
     let http_service = network_service.clone();

@@ -13,6 +13,7 @@
 //! - CLI tools
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ============================================================================
 // User Registration
@@ -60,6 +61,11 @@ pub struct RegisterUserRequest {
     
     /// Invite code used for registration
     pub invite_code: Option<String>,
+
+    /// Setu-native users: Base64-encoded PublicKey (flag || pk_bytes).
+    /// MetaMask and Nostr users do not need this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 /// Response to user registration
@@ -309,6 +315,115 @@ pub struct TransferResponse {
 }
 
 // ============================================================================
+// Profile Operations (Phase 3)
+// ============================================================================
+
+/// Request to update user profile
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateProfileRequest {
+    pub address: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub bio: Option<String>,
+    pub attributes: Option<HashMap<String, String>>,
+    pub signature: Vec<u8>,
+    pub message: String,
+    pub timestamp: u64,
+    /// Setu native: Base64-encoded PublicKey (flag || pk_bytes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    /// Nostr: 32-byte x-only public key
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nostr_pubkey: Option<Vec<u8>>,
+}
+
+/// Response to profile update
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateProfileResponse {
+    pub success: bool,
+    pub message: String,
+    pub event_id: Option<String>,
+}
+
+/// Request to get user profile
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetProfileRequest {
+    pub address: String,
+}
+
+/// Response with user profile
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetProfileResponse {
+    pub found: bool,
+    pub address: String,
+    pub profile: Option<ProfileInfo>,
+}
+
+// ============================================================================
+// Subnet Membership Operations (Phase 3)
+// ============================================================================
+
+/// Request to join a subnet
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinSubnetRequest {
+    pub address: String,
+    pub subnet_id: String,
+    pub signature: Vec<u8>,
+    pub message: String,
+    pub timestamp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nostr_pubkey: Option<Vec<u8>>,
+}
+
+/// Response to subnet join
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinSubnetResponse {
+    pub success: bool,
+    pub message: String,
+    pub event_id: Option<String>,
+}
+
+/// Request to leave a subnet
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaveSubnetRequest {
+    pub address: String,
+    pub subnet_id: String,
+    pub signature: Vec<u8>,
+    pub message: String,
+    pub timestamp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nostr_pubkey: Option<Vec<u8>>,
+}
+
+/// Response to subnet leave
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaveSubnetResponse {
+    pub success: bool,
+    pub message: String,
+    pub event_id: Option<String>,
+}
+
+/// Response to membership check
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckMembershipResponse {
+    pub is_member: bool,
+    pub address: String,
+    pub subnet_id: String,
+    pub joined_at: Option<u64>,
+}
+
+/// Response with user's subnet list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetUserSubnetsResponse {
+    pub address: String,
+    pub subnets: Vec<String>,
+}
+
+// ============================================================================
 // User RPC Handler Trait
 // ============================================================================
 
@@ -346,6 +461,28 @@ pub trait UserRpcHandler: Send + Sync {
     
     /// Transfer Flux to another user
     async fn transfer(&self, request: TransferRequest) -> TransferResponse;
+
+    // ========== Profile Operations (Phase 3) ==========
+
+    /// Update user profile
+    async fn update_profile(&self, request: UpdateProfileRequest) -> UpdateProfileResponse;
+
+    /// Get user profile
+    async fn get_profile(&self, address: &str) -> GetProfileResponse;
+
+    // ========== Subnet Membership (Phase 3) ==========
+
+    /// Join a subnet
+    async fn join_subnet(&self, request: JoinSubnetRequest) -> JoinSubnetResponse;
+
+    /// Leave a subnet
+    async fn leave_subnet(&self, request: LeaveSubnetRequest) -> LeaveSubnetResponse;
+
+    /// Check if user is a member of a subnet
+    async fn check_membership(&self, address: &str, subnet_id: &str) -> CheckMembershipResponse;
+
+    /// Get all subnets a user has joined
+    async fn get_user_subnets(&self, address: &str) -> GetUserSubnetsResponse;
 }
 
 // ============================================================================
@@ -401,6 +538,70 @@ impl UserRpcResponse {
     }
 }
 
+// ============================================================================
+// HTTP User Client (Phase 3)
+// ============================================================================
+
+/// HTTP client for User RPC endpoints
+pub struct HttpUserClient {
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl HttpUserClient {
+    pub fn new(base_url: &str) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub async fn register_user(&self, req: RegisterUserRequest) -> Result<RegisterUserResponse, reqwest::Error> {
+        self.client.post(format!("{}/api/v1/user/register", self.base_url))
+            .json(&req).send().await?.json().await
+    }
+
+    pub async fn get_balance(&self, req: GetBalanceRequest) -> Result<GetBalanceResponse, reqwest::Error> {
+        self.client.post(format!("{}/api/v1/user/balance", self.base_url))
+            .json(&req).send().await?.json().await
+    }
+
+    pub async fn get_account(&self, req: GetAccountRequest) -> Result<GetAccountResponse, reqwest::Error> {
+        self.client.post(format!("{}/api/v1/user/account", self.base_url))
+            .json(&req).send().await?.json().await
+    }
+
+    pub async fn update_profile(&self, req: UpdateProfileRequest) -> Result<UpdateProfileResponse, reqwest::Error> {
+        self.client.post(format!("{}/api/v1/user/profile", self.base_url))
+            .json(&req).send().await?.json().await
+    }
+
+    pub async fn get_profile(&self, address: &str) -> Result<GetProfileResponse, reqwest::Error> {
+        self.client.get(format!("{}/api/v1/user/profile/{}", self.base_url, address))
+            .send().await?.json().await
+    }
+
+    pub async fn join_subnet(&self, req: JoinSubnetRequest) -> Result<JoinSubnetResponse, reqwest::Error> {
+        self.client.post(format!("{}/api/v1/user/subnet/join", self.base_url))
+            .json(&req).send().await?.json().await
+    }
+
+    pub async fn leave_subnet(&self, req: LeaveSubnetRequest) -> Result<LeaveSubnetResponse, reqwest::Error> {
+        self.client.post(format!("{}/api/v1/user/subnet/leave", self.base_url))
+            .json(&req).send().await?.json().await
+    }
+
+    pub async fn check_membership(&self, address: &str, subnet_id: &str) -> Result<CheckMembershipResponse, reqwest::Error> {
+        self.client.get(format!("{}/api/v1/user/subnet/check/{}/{}", self.base_url, address, subnet_id))
+            .send().await?.json().await
+    }
+
+    pub async fn get_user_subnets(&self, address: &str) -> Result<GetUserSubnetsResponse, reqwest::Error> {
+        self.client.get(format!("{}/api/v1/user/subnets/{}", self.base_url, address))
+            .send().await?.json().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +619,7 @@ mod tests {
             display_name: Some("Alice".to_string()),
             metadata: None,
             invite_code: Some("INVITE123".to_string()),
+            public_key: None,
         };
         
         let wrapped = UserRpcRequest::RegisterUser(metamask_request);
@@ -447,6 +649,7 @@ mod tests {
             display_name: Some("Bob".to_string()),
             metadata: None,
             invite_code: None,
+            public_key: None,
         };
         
         let wrapped = UserRpcRequest::RegisterUser(nostr_request);
