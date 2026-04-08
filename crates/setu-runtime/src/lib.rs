@@ -9,17 +9,21 @@
 
 pub mod error;
 pub mod executor;
+pub mod setu_state_store;
 pub mod state;
 pub mod sui_vm;
 pub mod transaction;
+pub mod vm_object;
 
 pub use error::{RuntimeError, RuntimeResult};
 pub use executor::{
     ExecutionContext, ExecutionOutput, RuntimeExecutor, StateChange, StateChangeType,
 };
-pub use state::{InMemoryStateStore, StateStore};
+pub use setu_state_store::SetuMerkleStateStore;
+pub use state::{InMemoryStateStore, OverlayStateStore, StateStore};
 pub use sui_vm::{
     compile_package_to_disassembly, execute_sui_entry_from_disassembly,
     execute_sui_entry_with_outcome, SuiVmArg, SuiVmExecutionOutcome, SuiVmWrite,
 };
 pub use transaction::{ProgramTx, QueryTx, Transaction, TransactionType, TransferTx};
+pub use vm_object::{SuiVmStoredObject, SuiVmStoredValue};

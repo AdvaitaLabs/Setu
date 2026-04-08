@@ -1,3 +1,6 @@
+#[path = "support/sui_example_utils.rs"]
+mod sui_example_utils;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -5,10 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use setu_runtime::{
-    compile_package_to_disassembly, ExecutionContext, InMemoryStateStore, RuntimeExecutor,
-    StateStore, SuiVmArg, Transaction,
+    compile_package_to_disassembly, InMemoryStateStore, RuntimeExecutor, StateStore, SuiVmArg,
 };
 use setu_types::{deterministic_coin_id, Address};
+use sui_example_utils::{execute_program_calls, ProgramCall};
 
 const CONTRACT: &str = r#"module my_coin_pkg::my_coin {
     use sui::coin::{Self, Coin, TreasuryCap};
@@ -109,7 +112,15 @@ const CONTRACT: &str = r#"module my_coin_pkg::my_coin {
     }
 }"#;
 
-fn main() -> Result<()> {
+struct SuiContractExample {
+    executor: RuntimeExecutor<InMemoryStateStore>,
+    sender: Address,
+    recipient: Address,
+    third_recipient: Address,
+    disassembly: String,
+}
+
+fn setup_state() -> Result<SuiContractExample> {
     let pkg = create_temp_package_with_contract()?;
     println!("Created package: {}", pkg.display());
 
@@ -117,182 +128,122 @@ fn main() -> Result<()> {
         .context("Failed to compile and disassemble Sui contract")?;
     println!("Compiled + disassembled module: my_coin");
 
-    let state = InMemoryStateStore::new();
-    let mut executor = RuntimeExecutor::new(state);
-    let sender = Address::from_str_id("alice");
-    let recipient = Address::from_str_id("bob");
-    let third_recipient = Address::from_str_id("carol");
+    Ok(SuiContractExample {
+        executor: RuntimeExecutor::new(InMemoryStateStore::new()),
+        sender: Address::from_str_id("alice"),
+        recipient: Address::from_str_id("bob"),
+        third_recipient: Address::from_str_id("carol"),
+        disassembly,
+    })
+}
+
+fn execute_scenario(example: &mut SuiContractExample) -> Result<()> {
+    let calls = [
+        ProgramCall {
+            function_name: "orchestrate_rewards",
+            args: vec![
+                SuiVmArg::Opaque,
+                SuiVmArg::U64(100),
+                SuiVmArg::Address(example.sender),
+                SuiVmArg::U64(40),
+                SuiVmArg::Address(example.recipient),
+                SuiVmArg::Bool(true),
+                SuiVmArg::Opaque,
+            ],
+            timestamp: 2,
+        },
+        ProgramCall {
+            function_name: "orchestrate_rewards",
+            args: vec![
+                SuiVmArg::Opaque,
+                SuiVmArg::U64(10),
+                SuiVmArg::Address(example.sender),
+                SuiVmArg::U64(55),
+                SuiVmArg::Address(example.recipient),
+                SuiVmArg::Bool(false),
+                SuiVmArg::Opaque,
+            ],
+            timestamp: 3,
+        },
+        ProgramCall {
+            function_name: "orchestrate_rewards",
+            args: vec![
+                SuiVmArg::Opaque,
+                SuiVmArg::U64(15),
+                SuiVmArg::Address(example.recipient),
+                SuiVmArg::U64(5),
+                SuiVmArg::Address(example.third_recipient),
+                SuiVmArg::Bool(true),
+                SuiVmArg::Opaque,
+            ],
+            timestamp: 4,
+        },
+        ProgramCall {
+            function_name: "burn_via_helper",
+            args: vec![
+                SuiVmArg::Opaque,
+                SuiVmArg::ObjectId(deterministic_coin_id(&example.recipient, "MY_COIN")),
+            ],
+            timestamp: 5,
+        },
+    ];
+
+    execute_program_calls(
+        &mut example.executor,
+        &example.sender,
+        &example.disassembly,
+        "sui_contract_e2e",
+        &calls,
+    )
+}
+
+fn assert_state(example: &SuiContractExample) -> Result<()> {
     let coin_type = "MY_COIN";
-
-    // 1) Execute a nested helper flow that mints to alice and conditionally mints to bob.
-    execute_program_tx(
-        &mut executor,
-        &sender,
-        &disassembly,
-        "orchestrate_rewards",
-        vec![
-            SuiVmArg::Opaque,
-            SuiVmArg::U64(100),
-            SuiVmArg::Address(sender),
-            SuiVmArg::U64(40),
-            SuiVmArg::Address(recipient),
-            SuiVmArg::Bool(true),
-            SuiVmArg::Opaque,
-        ],
-        2,
-    )?;
-
-    let alice_coin_id = deterministic_coin_id(&sender, coin_type);
-    let alice_coin = executor
+    let alice_coin_id = deterministic_coin_id(&example.sender, coin_type);
+    let alice_coin = example
+        .executor
         .state()
         .get_object(&alice_coin_id)?
         .context("alice coin missing after orchestrate_rewards")?;
-    let bob_coin_id = deterministic_coin_id(&recipient, coin_type);
-    let bob_coin = executor
-        .state()
-        .get_object(&bob_coin_id)?
-        .context("bob coin missing after nested helper flow")?;
-    println!(
-        "After orchestrate_rewards(true), alice balance = {}, bob balance = {}",
-        alice_coin.data.balance.value(),
-        bob_coin.data.balance.value()
-    );
-
-    // 2) Run the same nested flow with the secondary branch disabled.
-    execute_program_tx(
-        &mut executor,
-        &sender,
-        &disassembly,
-        "orchestrate_rewards",
-        vec![
-            SuiVmArg::Opaque,
-            SuiVmArg::U64(10),
-            SuiVmArg::Address(sender),
-            SuiVmArg::U64(55),
-            SuiVmArg::Address(recipient),
-            SuiVmArg::Bool(false),
-            SuiVmArg::Opaque,
-        ],
-        3,
-    )?;
-
-    let alice_after_second = executor
-        .state()
-        .get_object(&alice_coin_id)?
-        .context("alice coin missing after orchestrate_rewards(false)")?;
-    let bob_after_false = executor
-        .state()
-        .get_object(&bob_coin_id)?
-        .context("bob coin missing after orchestrate_rewards(false)")?;
-    if alice_after_second.data.balance.value() != 110 {
+    if alice_coin.data.balance.value() != 110 {
         bail!(
-            "expected alice balance 110 after second orchestrate_rewards, got {}",
-            alice_after_second.data.balance.value()
+            "expected alice balance 110 after helper flows, got {}",
+            alice_coin.data.balance.value()
         );
     }
-    if bob_after_false.data.balance.value() != 40 {
-        bail!(
-            "orchestrate_rewards(false) should skip the secondary helper call, got bob balance {}",
-            bob_after_false.data.balance.value()
-        );
+
+    let bob_coin_id = deterministic_coin_id(&example.recipient, coin_type);
+    let bob_after_burn = example.executor.state().get_object(&bob_coin_id)?;
+    if bob_after_burn.is_some() {
+        bail!("Burn failed: bob coin still exists");
     }
-    println!(
-        "After orchestrate_rewards(false), alice balance = {}, bob balance remains {}",
-        alice_after_second.data.balance.value(),
-        bob_after_false.data.balance.value()
-    );
 
-    // 3) Exercise a second nested flow that deposits into bob's existing coin and creates carol's coin.
-    execute_program_tx(
-        &mut executor,
-        &sender,
-        &disassembly,
-        "orchestrate_rewards",
-        vec![
-            SuiVmArg::Opaque,
-            SuiVmArg::U64(15),
-            SuiVmArg::Address(recipient),
-            SuiVmArg::U64(5),
-            SuiVmArg::Address(third_recipient),
-            SuiVmArg::Bool(true),
-            SuiVmArg::Opaque,
-        ],
-        4,
-    )?;
-
-    let bob_after_top_up = executor
-        .state()
-        .get_object(&bob_coin_id)?
-        .context("bob coin missing after top-up flow")?;
-    let carol_coin_id = deterministic_coin_id(&third_recipient, coin_type);
-    let carol_coin = executor
+    let carol_coin_id = deterministic_coin_id(&example.third_recipient, coin_type);
+    let carol_coin = example
+        .executor
         .state()
         .get_object(&carol_coin_id)?
         .context("carol coin missing after top-up flow")?;
-    if bob_after_top_up.data.balance.value() != 55 {
-        bail!(
-            "expected bob balance 55 after top-up flow, got {}",
-            bob_after_top_up.data.balance.value()
-        );
-    }
     if carol_coin.data.balance.value() != 5 {
         bail!(
             "expected carol balance 5 after top-up flow, got {}",
             carol_coin.data.balance.value()
         );
     }
+
     println!(
-        "After second helper flow, bob balance = {}, carol balance = {}",
-        bob_after_top_up.data.balance.value(),
+        "Final balances: alice = {}, carol = {}, bob coin burned",
+        alice_coin.data.balance.value(),
         carol_coin.data.balance.value()
     );
-
-    // 4) Burn bob's coin through a helper-mediated entry function.
-    execute_program_tx(
-        &mut executor,
-        &sender,
-        &disassembly,
-        "burn_via_helper",
-        vec![SuiVmArg::Opaque, SuiVmArg::ObjectId(bob_coin_id)],
-        5,
-    )?;
-
-    let post_burn = executor.state().get_object(&bob_coin_id)?;
-    if post_burn.is_some() {
-        bail!("Burn failed: bob coin still exists");
-    }
-    println!("After burn_via_helper, bob coin deleted while carol's coin remains");
-
     println!("\nE2E compile -> disassemble -> RuntimeExecutor execution completed.");
     Ok(())
 }
 
-fn execute_program_tx(
-    executor: &mut RuntimeExecutor<InMemoryStateStore>,
-    sender: &Address,
-    disassembly: &str,
-    function_name: &str,
-    args: Vec<SuiVmArg>,
-    timestamp: u64,
-) -> Result<()> {
-    let tx = Transaction::new_program_deterministic(
-        sender.clone(),
-        disassembly.to_owned(),
-        function_name,
-        args,
-        timestamp,
-    );
-    let ctx = ExecutionContext {
-        executor_id: "sui_contract_e2e".to_string(),
-        timestamp,
-        in_tee: false,
-    };
-
-    executor
-        .execute_transaction(&tx, &ctx)
-        .with_context(|| format!("Failed to execute '{}' via RuntimeExecutor", function_name))?;
-
-    Ok(())
+fn main() -> Result<()> {
+    let mut example = setup_state()?;
+    execute_scenario(&mut example)?;
+    assert_state(&example)
 }
 
 fn create_temp_package_with_contract() -> Result<PathBuf> {

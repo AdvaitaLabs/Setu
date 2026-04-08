@@ -1,12 +1,14 @@
 #[path = "support/sui_example_utils.rs"]
 mod sui_example_utils;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use setu_runtime::{
-    compile_package_to_disassembly, InMemoryStateStore, RuntimeExecutor, StateStore, SuiVmArg,
+    compile_package_to_disassembly, InMemoryStateStore, RuntimeExecutor, SuiVmArg,
 };
-use setu_types::{deterministic_coin_id, Address};
-use sui_example_utils::{create_temp_package_with_contract, execute_program_tx};
+use setu_types::Address;
+use sui_example_utils::{
+    create_temp_package_with_contract, execute_program_calls, expect_coin_balance, ProgramCall,
+};
 
 const CONTRACT: &str = r#"module tiered_airdrop::tiered_airdrop {
     use sui::coin::{Self, TreasuryCap};
@@ -84,7 +86,16 @@ const CONTRACT: &str = r#"module tiered_airdrop::tiered_airdrop {
     }
 }"#;
 
-fn main() -> Result<()> {
+struct TieredAirdropExample {
+    executor: RuntimeExecutor<InMemoryStateStore>,
+    sender: Address,
+    bob: Address,
+    carol: Address,
+    dave: Address,
+    disassembly: String,
+}
+
+fn setup_state() -> Result<TieredAirdropExample> {
     let pkg = create_temp_package_with_contract("tiered_airdrop", "tiered_airdrop.move", CONTRACT)?;
     println!("Created package: {}", pkg.display());
 
@@ -92,113 +103,106 @@ fn main() -> Result<()> {
         .context("Failed to compile tiered_airdrop package")?;
     println!("Compiled + disassembled module: tiered_airdrop");
 
-    let state = InMemoryStateStore::new();
-    let mut executor = RuntimeExecutor::new(state);
-    let sender = Address::from_str_id("campaign_owner");
-    let bob = Address::from_str_id("bob");
-    let carol = Address::from_str_id("carol");
-    let dave = Address::from_str_id("dave");
+    Ok(TieredAirdropExample {
+        executor: RuntimeExecutor::new(InMemoryStateStore::new()),
+        sender: Address::from_str_id("campaign_owner"),
+        bob: Address::from_str_id("bob"),
+        carol: Address::from_str_id("carol"),
+        dave: Address::from_str_id("dave"),
+        disassembly,
+    })
+}
+
+fn execute_scenario(example: &mut TieredAirdropExample) -> Result<()> {
+    let calls = [
+        ProgramCall {
+            function_name: "distribute_campaign_rewards",
+            args: vec![
+                SuiVmArg::Opaque,
+                SuiVmArg::Address(example.bob),
+                SuiVmArg::Bool(true),
+                SuiVmArg::Bool(true),
+                SuiVmArg::Opaque,
+            ],
+            timestamp: 1,
+        },
+        ProgramCall {
+            function_name: "distribute_campaign_rewards",
+            args: vec![
+                SuiVmArg::Opaque,
+                SuiVmArg::Address(example.carol),
+                SuiVmArg::Bool(false),
+                SuiVmArg::Bool(true),
+                SuiVmArg::Opaque,
+            ],
+            timestamp: 2,
+        },
+        ProgramCall {
+            function_name: "distribute_campaign_rewards",
+            args: vec![
+                SuiVmArg::Opaque,
+                SuiVmArg::Address(example.dave),
+                SuiVmArg::Bool(false),
+                SuiVmArg::Bool(false),
+                SuiVmArg::Opaque,
+            ],
+            timestamp: 3,
+        },
+        ProgramCall {
+            function_name: "distribute_campaign_rewards",
+            args: vec![
+                SuiVmArg::Opaque,
+                SuiVmArg::Address(example.bob),
+                SuiVmArg::Bool(false),
+                SuiVmArg::Bool(true),
+                SuiVmArg::Opaque,
+            ],
+            timestamp: 4,
+        },
+    ];
+
+    execute_program_calls(
+        &mut example.executor,
+        &example.sender,
+        &example.disassembly,
+        "tiered_airdrop",
+        &calls,
+    )
+}
+
+fn assert_state(example: &TieredAirdropExample) -> Result<()> {
     let coin_type = "TIERED_AIRDROP";
-
-    execute_program_tx(
-        &mut executor,
-        &sender,
-        &disassembly,
-        "distribute_campaign_rewards",
-        vec![
-            SuiVmArg::Opaque,
-            SuiVmArg::Address(bob),
-            SuiVmArg::Bool(true),
-            SuiVmArg::Bool(true),
-            SuiVmArg::Opaque,
-        ],
-        1,
-        "tiered_airdrop",
+    let bob_coin = expect_coin_balance(
+        example.executor.state(),
+        &example.bob,
+        coin_type,
+        145,
+        "bob reward",
     )?;
-
-    execute_program_tx(
-        &mut executor,
-        &sender,
-        &disassembly,
-        "distribute_campaign_rewards",
-        vec![
-            SuiVmArg::Opaque,
-            SuiVmArg::Address(carol),
-            SuiVmArg::Bool(false),
-            SuiVmArg::Bool(true),
-            SuiVmArg::Opaque,
-        ],
-        2,
-        "tiered_airdrop",
+    let carol_coin = expect_coin_balance(
+        example.executor.state(),
+        &example.carol,
+        coin_type,
+        60,
+        "carol reward",
     )?;
-
-    execute_program_tx(
-        &mut executor,
-        &sender,
-        &disassembly,
-        "distribute_campaign_rewards",
-        vec![
-            SuiVmArg::Opaque,
-            SuiVmArg::Address(dave),
-            SuiVmArg::Bool(false),
-            SuiVmArg::Bool(false),
-            SuiVmArg::Opaque,
-        ],
-        3,
-        "tiered_airdrop",
+    let dave_coin = expect_coin_balance(
+        example.executor.state(),
+        &example.dave,
+        coin_type,
+        50,
+        "dave reward",
     )?;
-
-    execute_program_tx(
-        &mut executor,
-        &sender,
-        &disassembly,
-        "distribute_campaign_rewards",
-        vec![
-            SuiVmArg::Opaque,
-            SuiVmArg::Address(bob),
-            SuiVmArg::Bool(false),
-            SuiVmArg::Bool(true),
-            SuiVmArg::Opaque,
-        ],
-        4,
-        "tiered_airdrop",
-    )?;
-
-    let bob_coin = executor
-        .state()
-        .get_object(&deterministic_coin_id(&bob, coin_type))?
-        .context("bob reward coin missing")?;
-    let carol_coin = executor
-        .state()
-        .get_object(&deterministic_coin_id(&carol, coin_type))?
-        .context("carol reward coin missing")?;
-    let dave_coin = executor
-        .state()
-        .get_object(&deterministic_coin_id(&dave, coin_type))?
-        .context("dave reward coin missing")?;
-
-    if bob_coin.data.balance.value() != 145 {
-        bail!(
-            "expected bob reward total 145, got {}",
-            bob_coin.data.balance.value()
-        );
-    }
-    if carol_coin.data.balance.value() != 60 {
-        bail!(
-            "expected carol reward total 60, got {}",
-            carol_coin.data.balance.value()
-        );
-    }
-    if dave_coin.data.balance.value() != 50 {
-        bail!(
-            "expected dave reward total 50, got {}",
-            dave_coin.data.balance.value()
-        );
-    }
 
     println!("Bob reward total   = {}", bob_coin.data.balance.value());
     println!("Carol reward total = {}", carol_coin.data.balance.value());
     println!("Dave reward total  = {}", dave_coin.data.balance.value());
     println!("\nTiered airdrop example completed.");
     Ok(())
+}
+
+fn main() -> Result<()> {
+    let mut example = setup_state()?;
+    execute_scenario(&mut example)?;
+    assert_state(&example)
 }

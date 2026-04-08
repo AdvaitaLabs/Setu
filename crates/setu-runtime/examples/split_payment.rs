@@ -1,12 +1,14 @@
 #[path = "support/sui_example_utils.rs"]
 mod sui_example_utils;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use setu_runtime::{
-    compile_package_to_disassembly, InMemoryStateStore, RuntimeExecutor, StateStore, SuiVmArg,
+    compile_package_to_disassembly, InMemoryStateStore, RuntimeExecutor, SuiVmArg,
 };
-use setu_types::{deterministic_coin_id, Address};
-use sui_example_utils::{create_temp_package_with_contract, execute_program_tx};
+use setu_types::Address;
+use sui_example_utils::{
+    create_temp_package_with_contract, execute_program_calls, expect_coin_balance, ProgramCall,
+};
 
 const CONTRACT: &str = r#"module split_payment::split_payment {
     use sui::coin::{Self, TreasuryCap};
@@ -101,7 +103,17 @@ const CONTRACT: &str = r#"module split_payment::split_payment {
     }
 }"#;
 
-fn main() -> Result<()> {
+struct SplitPaymentExample {
+    executor: RuntimeExecutor<InMemoryStateStore>,
+    sender: Address,
+    merchant: Address,
+    logistics: Address,
+    affiliate: Address,
+    platform: Address,
+    disassembly: String,
+}
+
+fn setup_state() -> Result<SplitPaymentExample> {
     let pkg = create_temp_package_with_contract("split_payment", "split_payment.move", CONTRACT)?;
     println!("Created package: {}", pkg.display());
 
@@ -109,100 +121,94 @@ fn main() -> Result<()> {
         .context("Failed to compile split_payment package")?;
     println!("Compiled + disassembled module: split_payment");
 
-    let state = InMemoryStateStore::new();
-    let mut executor = RuntimeExecutor::new(state);
-    let sender = Address::from_str_id("market_operator");
-    let merchant = Address::from_str_id("merchant");
-    let logistics = Address::from_str_id("logistics");
-    let affiliate = Address::from_str_id("affiliate");
-    let platform = Address::from_str_id("platform");
+    Ok(SplitPaymentExample {
+        executor: RuntimeExecutor::new(InMemoryStateStore::new()),
+        sender: Address::from_str_id("market_operator"),
+        merchant: Address::from_str_id("merchant"),
+        logistics: Address::from_str_id("logistics"),
+        affiliate: Address::from_str_id("affiliate"),
+        platform: Address::from_str_id("platform"),
+        disassembly,
+    })
+}
+
+fn execute_scenario(example: &mut SplitPaymentExample) -> Result<()> {
+    let calls = [
+        ProgramCall {
+            function_name: "settle_order",
+            args: vec![
+                SuiVmArg::Opaque,
+                SuiVmArg::U64(70),
+                SuiVmArg::Address(example.merchant),
+                SuiVmArg::U64(20),
+                SuiVmArg::Address(example.logistics),
+                SuiVmArg::U64(5),
+                SuiVmArg::Address(example.affiliate),
+                SuiVmArg::U64(5),
+                SuiVmArg::Address(example.platform),
+                SuiVmArg::Bool(true),
+                SuiVmArg::Opaque,
+            ],
+            timestamp: 1,
+        },
+        ProgramCall {
+            function_name: "settle_order",
+            args: vec![
+                SuiVmArg::Opaque,
+                SuiVmArg::U64(40),
+                SuiVmArg::Address(example.merchant),
+                SuiVmArg::U64(10),
+                SuiVmArg::Address(example.logistics),
+                SuiVmArg::U64(7),
+                SuiVmArg::Address(example.affiliate),
+                SuiVmArg::U64(8),
+                SuiVmArg::Address(example.platform),
+                SuiVmArg::Bool(false),
+                SuiVmArg::Opaque,
+            ],
+            timestamp: 2,
+        },
+    ];
+
+    execute_program_calls(
+        &mut example.executor,
+        &example.sender,
+        &example.disassembly,
+        "split_payment",
+        &calls,
+    )
+}
+
+fn assert_state(example: &SplitPaymentExample) -> Result<()> {
     let coin_type = "SPLIT_PAYMENT";
-
-    execute_program_tx(
-        &mut executor,
-        &sender,
-        &disassembly,
-        "settle_order",
-        vec![
-            SuiVmArg::Opaque,
-            SuiVmArg::U64(70),
-            SuiVmArg::Address(merchant),
-            SuiVmArg::U64(20),
-            SuiVmArg::Address(logistics),
-            SuiVmArg::U64(5),
-            SuiVmArg::Address(affiliate),
-            SuiVmArg::U64(5),
-            SuiVmArg::Address(platform),
-            SuiVmArg::Bool(true),
-            SuiVmArg::Opaque,
-        ],
-        1,
-        "split_payment",
+    let merchant_coin = expect_coin_balance(
+        example.executor.state(),
+        &example.merchant,
+        coin_type,
+        110,
+        "merchant settlement",
     )?;
-
-    execute_program_tx(
-        &mut executor,
-        &sender,
-        &disassembly,
-        "settle_order",
-        vec![
-            SuiVmArg::Opaque,
-            SuiVmArg::U64(40),
-            SuiVmArg::Address(merchant),
-            SuiVmArg::U64(10),
-            SuiVmArg::Address(logistics),
-            SuiVmArg::U64(7),
-            SuiVmArg::Address(affiliate),
-            SuiVmArg::U64(8),
-            SuiVmArg::Address(platform),
-            SuiVmArg::Bool(false),
-            SuiVmArg::Opaque,
-        ],
-        2,
-        "split_payment",
+    let logistics_coin = expect_coin_balance(
+        example.executor.state(),
+        &example.logistics,
+        coin_type,
+        30,
+        "logistics settlement",
     )?;
-
-    let merchant_coin = executor
-        .state()
-        .get_object(&deterministic_coin_id(&merchant, coin_type))?
-        .context("merchant settlement coin missing")?;
-    let logistics_coin = executor
-        .state()
-        .get_object(&deterministic_coin_id(&logistics, coin_type))?
-        .context("logistics settlement coin missing")?;
-    let affiliate_coin = executor
-        .state()
-        .get_object(&deterministic_coin_id(&affiliate, coin_type))?
-        .context("affiliate settlement coin missing")?;
-    let platform_coin = executor
-        .state()
-        .get_object(&deterministic_coin_id(&platform, coin_type))?
-        .context("platform settlement coin missing")?;
-
-    if merchant_coin.data.balance.value() != 110 {
-        bail!(
-            "expected merchant settlement total 110, got {}",
-            merchant_coin.data.balance.value()
-        );
-    }
-    if logistics_coin.data.balance.value() != 30 {
-        bail!(
-            "expected logistics settlement total 30, got {}",
-            logistics_coin.data.balance.value()
-        );
-    }
-    if affiliate_coin.data.balance.value() != 5 {
-        bail!(
-            "expected affiliate settlement total 5, got {}",
-            affiliate_coin.data.balance.value()
-        );
-    }
-    if platform_coin.data.balance.value() != 13 {
-        bail!(
-            "expected platform settlement total 13, got {}",
-            platform_coin.data.balance.value()
-        );
-    }
+    let affiliate_coin = expect_coin_balance(
+        example.executor.state(),
+        &example.affiliate,
+        coin_type,
+        5,
+        "affiliate settlement",
+    )?;
+    let platform_coin = expect_coin_balance(
+        example.executor.state(),
+        &example.platform,
+        coin_type,
+        13,
+        "platform settlement",
+    )?;
 
     println!("Merchant total  = {}", merchant_coin.data.balance.value());
     println!("Logistics total = {}", logistics_coin.data.balance.value());
@@ -210,4 +216,10 @@ fn main() -> Result<()> {
     println!("Platform total  = {}", platform_coin.data.balance.value());
     println!("\nSplit payment example completed.");
     Ok(())
+}
+
+fn main() -> Result<()> {
+    let mut example = setup_state()?;
+    execute_scenario(&mut example)?;
+    assert_state(&example)
 }

@@ -13,6 +13,7 @@ use setu_types::{deterministic_coin_id, Address, Balance, CoinData, CoinType, Ob
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::state::StateStore;
+use crate::vm_object::SuiVmStoredObject;
 
 /// Compile a Sui Move package and return disassembly text for `module_name`.
 pub fn compile_package_to_disassembly(
@@ -90,6 +91,11 @@ enum SuiVmValue {
     Bool(bool),
     Address(Address),
     Coin(Object<CoinData>),
+    VmObjectRef(ObjectId),
+    VmFieldRef {
+        object_id: ObjectId,
+        field_name: String,
+    },
     Opaque,
 }
 
@@ -102,9 +108,14 @@ enum SuiOpcode {
     LdU8(u8),
     LdTrue,
     LdFalse,
+    Add,
     BrFalse(usize),
     BrTrue(usize),
     Branch(usize),
+    ImmBorrowField(String),
+    MutBorrowField(String),
+    ReadRef,
+    WriteRef,
     Call { function: String, arg_count: usize },
     Pop,
     Ret,
@@ -308,6 +319,17 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
                 SuiOpcode::LdU8(v) => frame.stack.push(SuiVmValue::U64(v as u64)),
                 SuiOpcode::LdTrue => frame.stack.push(SuiVmValue::Bool(true)),
                 SuiOpcode::LdFalse => frame.stack.push(SuiVmValue::Bool(false)),
+                SuiOpcode::Add => {
+                    let rhs = Self::pop_u64(&mut frame.stack)?;
+                    let lhs = Self::pop_u64(&mut frame.stack)?;
+                    frame
+                        .stack
+                        .push(SuiVmValue::U64(lhs.checked_add(rhs).ok_or_else(|| {
+                            RuntimeError::ProgramExecution(
+                                "u64 addition overflow in Sui VM".to_string(),
+                            )
+                        })?));
+                }
                 SuiOpcode::BrFalse(target) => {
                     if !Self::pop_bool(&mut frame.stack)? {
                         pc = Self::jump_target(frame, target)?;
@@ -320,6 +342,23 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
                 }
                 SuiOpcode::Branch(target) => {
                     pc = Self::jump_target(frame, target)?;
+                }
+                SuiOpcode::ImmBorrowField(field_name) | SuiOpcode::MutBorrowField(field_name) => {
+                    let object_id = Self::pop_object_ref(&mut frame.stack)?;
+                    frame.stack.push(SuiVmValue::VmFieldRef {
+                        object_id,
+                        field_name,
+                    });
+                }
+                SuiOpcode::ReadRef => {
+                    let (object_id, field_name) = Self::pop_field_ref(&mut frame.stack)?;
+                    let value = self.read_vm_u64_field(&object_id, &field_name)?;
+                    frame.stack.push(SuiVmValue::U64(value));
+                }
+                SuiOpcode::WriteRef => {
+                    let (object_id, field_name) = Self::pop_field_ref(&mut frame.stack)?;
+                    let value = Self::pop_u64(&mut frame.stack)?;
+                    self.write_vm_u64_field(object_id, &field_name, value)?;
                 }
                 SuiOpcode::Call {
                     function,
@@ -404,6 +443,22 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
             };
         }
 
+        if let SuiVmArg::ObjectId(object_id) = arg {
+            let normalized = normalize_vm_object_type(param_type);
+            if !normalized.is_empty() {
+                let object = state
+                    .get_vm_object(object_id)?
+                    .ok_or(RuntimeError::ObjectNotFound(*object_id))?;
+                if object.type_name != normalized {
+                    return Err(RuntimeError::ProgramExecution(format!(
+                        "Expected VM object type '{}', got '{}'",
+                        normalized, object.type_name
+                    )));
+                }
+                return Ok(SuiVmValue::VmObjectRef(*object_id));
+            }
+        }
+
         Ok(SuiVmValue::Opaque)
     }
 
@@ -413,6 +468,9 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
             | ("bool", SuiVmValue::Bool(_))
             | ("address", SuiVmValue::Address(_)) => Ok(arg.clone()),
             (ty, SuiVmValue::Coin(_)) if ty.starts_with("Coin<") => Ok(arg.clone()),
+            (ty, SuiVmValue::VmObjectRef(_)) if !normalize_vm_object_type(ty).is_empty() => {
+                Ok(arg.clone())
+            }
             _ => Ok(arg.clone()),
         }
     }
@@ -616,6 +674,39 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
         }
     }
 
+    fn pop_u64(stack: &mut Vec<SuiVmValue>) -> RuntimeResult<u64> {
+        match Self::pop(stack)? {
+            SuiVmValue::U64(v) => Ok(v),
+            other => Err(RuntimeError::ProgramExecution(format!(
+                "Expected u64, got {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn pop_object_ref(stack: &mut Vec<SuiVmValue>) -> RuntimeResult<ObjectId> {
+        match Self::pop(stack)? {
+            SuiVmValue::VmObjectRef(object_id) => Ok(object_id),
+            other => Err(RuntimeError::ProgramExecution(format!(
+                "Expected object reference, got {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn pop_field_ref(stack: &mut Vec<SuiVmValue>) -> RuntimeResult<(ObjectId, String)> {
+        match Self::pop(stack)? {
+            SuiVmValue::VmFieldRef {
+                object_id,
+                field_name,
+            } => Ok((object_id, field_name)),
+            other => Err(RuntimeError::ProgramExecution(format!(
+                "Expected field reference, got {:?}",
+                other
+            ))),
+        }
+    }
+
     fn mark_touched(&mut self, object_id: ObjectId) -> RuntimeResult<()> {
         if self.old_states.contains_key(&object_id) {
             return Ok(());
@@ -640,6 +731,61 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
         self.state.set_object(object_id, object)?;
         self.final_states.insert(object_id, Some(new_state));
         Ok(())
+    }
+
+    fn read_vm_u64_field(&mut self, object_id: &ObjectId, field_name: &str) -> RuntimeResult<u64> {
+        let object = self
+            .state
+            .get_vm_object(object_id)?
+            .ok_or(RuntimeError::ObjectNotFound(*object_id))?;
+        object.get_u64_field(field_name).ok_or_else(|| {
+            RuntimeError::ProgramExecution(format!(
+                "VM object {} missing u64 field '{}'",
+                object_id, field_name
+            ))
+        })
+    }
+
+    fn mark_vm_object_touched(&mut self, object_id: ObjectId) -> RuntimeResult<()> {
+        if self.old_states.contains_key(&object_id) {
+            return Ok(());
+        }
+
+        let old_state = self
+            .state
+            .get_vm_object(&object_id)?
+            .map(|object| serialize_vm_object(&object))
+            .transpose()?;
+        self.old_states.insert(object_id, old_state.clone());
+        self.final_states.insert(object_id, old_state);
+        self.write_order.push(object_id);
+        Ok(())
+    }
+
+    fn set_vm_object_tracked(
+        &mut self,
+        object_id: ObjectId,
+        object: SuiVmStoredObject,
+    ) -> RuntimeResult<()> {
+        self.mark_vm_object_touched(object_id)?;
+        let new_state = serialize_vm_object(&object)?;
+        self.state.set_vm_object(object_id, object)?;
+        self.final_states.insert(object_id, Some(new_state));
+        Ok(())
+    }
+
+    fn write_vm_u64_field(
+        &mut self,
+        object_id: ObjectId,
+        field_name: &str,
+        value: u64,
+    ) -> RuntimeResult<()> {
+        let mut object = self
+            .state
+            .get_vm_object(&object_id)?
+            .ok_or(RuntimeError::ObjectNotFound(object_id))?;
+        object.set_u64_field(field_name, value);
+        self.set_vm_object_tracked(object_id, object)
     }
 
     fn delete_object_tracked(&mut self, object_id: &ObjectId) -> RuntimeResult<()> {
@@ -824,6 +970,9 @@ fn parse_instruction(line: &str) -> RuntimeResult<Option<(usize, SuiOpcode)>> {
     if body == "LdFalse" {
         return Ok(Some((idx, SuiOpcode::LdFalse)));
     }
+    if body == "Add" {
+        return Ok(Some((idx, SuiOpcode::Add)));
+    }
     if body.starts_with("BrFalse(") {
         return Ok(Some((idx, SuiOpcode::BrFalse(parse_paren_usize(body)?))));
     }
@@ -832,6 +981,24 @@ fn parse_instruction(line: &str) -> RuntimeResult<Option<(usize, SuiOpcode)>> {
     }
     if body.starts_with("Branch(") {
         return Ok(Some((idx, SuiOpcode::Branch(parse_paren_usize(body)?))));
+    }
+    if body.starts_with("ImmBorrowField[") {
+        return Ok(Some((
+            idx,
+            SuiOpcode::ImmBorrowField(parse_field_name(body)?),
+        )));
+    }
+    if body.starts_with("MutBorrowField[") {
+        return Ok(Some((
+            idx,
+            SuiOpcode::MutBorrowField(parse_field_name(body)?),
+        )));
+    }
+    if body == "ReadRef" {
+        return Ok(Some((idx, SuiOpcode::ReadRef)));
+    }
+    if body == "WriteRef" {
+        return Ok(Some((idx, SuiOpcode::WriteRef)));
     }
     if body.starts_with("Call ") {
         let call = body.trim_start_matches("Call ").trim();
@@ -912,6 +1079,28 @@ fn parse_paren_usize(body: &str) -> RuntimeResult<usize> {
         .map_err(|_| RuntimeError::ProgramExecution(format!("Malformed jump target in '{}'", body)))
 }
 
+fn parse_field_name(body: &str) -> RuntimeResult<String> {
+    let start = body.find('(').ok_or_else(|| {
+        RuntimeError::ProgramExecution(format!("Malformed field borrow '{}'", body))
+    })?;
+    let end = body.rfind(':').ok_or_else(|| {
+        RuntimeError::ProgramExecution(format!("Malformed field borrow '{}'", body))
+    })?;
+    let field = body[start + 1..end]
+        .trim()
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if field.is_empty() {
+        return Err(RuntimeError::ProgramExecution(format!(
+            "Missing field name in '{}'",
+            body
+        )));
+    }
+    Ok(field.to_string())
+}
+
 fn split_top_level(text: &str, sep: char) -> Vec<String> {
     let mut out = Vec::new();
     let mut buf = String::new();
@@ -960,10 +1149,39 @@ fn extract_generic_type(function: &str) -> Option<String> {
     Some(function[start + 1..start + 1 + end].to_string())
 }
 
+fn normalize_vm_object_type(param_type: &str) -> &str {
+    let trimmed = param_type.trim();
+    let trimmed = trimmed.strip_prefix("&mut ").unwrap_or(trimmed);
+    let trimmed = trimmed.strip_prefix('&').unwrap_or(trimmed);
+    let trimmed = trimmed.trim();
+
+    if trimmed.is_empty()
+        || trimmed == "u64"
+        || trimmed == "bool"
+        || trimmed == "address"
+        || trimmed.starts_with("Coin<")
+        || trimmed.starts_with("TreasuryCap<")
+        || trimmed == "TxContext"
+    {
+        return "";
+    }
+
+    trimmed
+}
+
+fn serialize_vm_object(object: &SuiVmStoredObject) -> RuntimeResult<Vec<u8>> {
+    serde_json::to_vec(object).map_err(|e| {
+        RuntimeError::ProgramExecution(format!("Failed to serialize VM object state: {}", e))
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::state::InMemoryStateStore;
+    use crate::vm_object::{SuiVmStoredObject, SuiVmStoredValue};
 
     const DISASSEMBLY: &str = r#"
 entry public mint(treasury_cap#0#0: &mut TreasuryCap<MY_COIN>, amount#0#0: u64, recipient#0#0: address, ctx#0#0: &mut TxContext) {
@@ -1066,6 +1284,21 @@ B0:
 	1: MoveLoc[1](coin#0#0: Coin<MY_COIN>)
 	2: Call burn_inner(&mut TreasuryCap<MY_COIN>, Coin<MY_COIN>)
 	3: Ret
+}
+"#;
+
+    const COUNTER_DISASSEMBLY: &str = r#"
+entry increment(counter#0#0: &mut Counter) {
+B0:
+	0: CopyLoc[0](counter#0#0: &mut Counter)
+	1: ImmBorrowField[0](Counter.value: u64)
+	2: ReadRef
+	3: LdU64(1)
+	4: Add
+	5: MoveLoc[0](counter#0#0: &mut Counter)
+	6: MutBorrowField[0](Counter.value: u64)
+	7: WriteRef
+	8: Ret
 }
 "#;
 
@@ -1191,5 +1424,37 @@ B0:
         .unwrap();
 
         assert!(state.get_object(&bob_coin_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_increment_persisted_counter_object() {
+        let mut state = InMemoryStateStore::new();
+        let alice = Address::from_str_id("alice");
+        let counter_id = ObjectId::new([0x44; 32]);
+
+        state
+            .set_vm_object(
+                counter_id,
+                SuiVmStoredObject::new_owned(
+                    counter_id,
+                    "Counter",
+                    alice,
+                    BTreeMap::from([("value".to_string(), SuiVmStoredValue::U64(41))]),
+                ),
+            )
+            .unwrap();
+
+        execute_sui_entry_with_outcome(
+            &mut state,
+            &alice,
+            COUNTER_DISASSEMBLY,
+            "increment",
+            &[SuiVmArg::ObjectId(counter_id)],
+        )
+        .unwrap();
+
+        let counter = state.get_vm_object(&counter_id).unwrap().unwrap();
+        assert_eq!(counter.get_u64_field("value"), Some(42));
+        assert_eq!(counter.version, 2);
     }
 }

@@ -481,7 +481,13 @@ impl MerkleLeafStore for RocksDBMerkleStore {
                 let mut object_id_bytes = [0u8; 32];
                 object_id_bytes.copy_from_slice(&key_bytes[32..64]);
                 let object_id = Self::bytes_to_hash(object_id_bytes);
-                result.insert(object_id, value_bytes.to_vec());
+                let leaf_value: Vec<u8> = bcs::from_bytes(&value_bytes).map_err(|e| {
+                    MerkleError::StorageError(format!(
+                        "Failed to decode persisted leaf value for {}: {}",
+                        object_id, e
+                    ))
+                })?;
+                result.insert(object_id, leaf_value);
             }
         }
 
@@ -966,5 +972,20 @@ mod tests {
 
         let anchors = store.list_anchors(&subnet_id, 15, 45).unwrap();
         assert_eq!(anchors, vec![20, 30, 40]);
+    }
+
+    #[test]
+    fn test_load_all_leaves_decodes_raw_leaf_values() {
+        let (store, _temp_dir) = create_test_store();
+        let subnet_id = test_subnet(7);
+        let object_id = test_hash(0x31);
+        let leaf_value = br#"{"value":41}"#.to_vec();
+
+        store
+            .batch_put_leaves(&subnet_id, &[(&object_id, leaf_value.as_slice())])
+            .unwrap();
+
+        let leaves = store.load_all_leaves(&subnet_id).unwrap();
+        assert_eq!(leaves.get(&object_id), Some(&leaf_value));
     }
 }

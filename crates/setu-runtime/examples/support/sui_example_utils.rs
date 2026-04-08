@@ -4,11 +4,17 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use setu_runtime::{ExecutionContext, InMemoryStateStore, RuntimeExecutor, SuiVmArg, Transaction};
-use setu_types::Address;
+use setu_runtime::{ExecutionContext, RuntimeExecutor, StateStore, SuiVmArg, Transaction};
+use setu_types::{deterministic_coin_id, Address, CoinData, Object};
 
-pub fn execute_program_tx(
-    executor: &mut RuntimeExecutor<InMemoryStateStore>,
+pub struct ProgramCall<'a> {
+    pub function_name: &'a str,
+    pub args: Vec<SuiVmArg>,
+    pub timestamp: u64,
+}
+
+pub fn execute_program_tx<S: StateStore>(
+    executor: &mut RuntimeExecutor<S>,
     sender: &Address,
     disassembly: &str,
     function_name: &str,
@@ -36,6 +42,53 @@ pub fn execute_program_tx(
     Ok(())
 }
 
+pub fn execute_program_calls<S: StateStore>(
+    executor: &mut RuntimeExecutor<S>,
+    sender: &Address,
+    disassembly: &str,
+    executor_id: &str,
+    calls: &[ProgramCall<'_>],
+) -> Result<()> {
+    for call in calls {
+        execute_program_tx(
+            executor,
+            sender,
+            disassembly,
+            call.function_name,
+            call.args.clone(),
+            call.timestamp,
+            executor_id,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn expect_coin_balance<S: StateStore>(
+    state: &S,
+    owner: &Address,
+    coin_type: &str,
+    expected: u64,
+    label: &str,
+) -> Result<Object<CoinData>> {
+    let coin = state
+        .get_object(&deterministic_coin_id(owner, coin_type))?
+        .with_context(|| format!("{} coin missing", label))?;
+
+    if coin.data.balance.value() != expected {
+        bail!(
+            "expected {} balance {}, got {}",
+            label,
+            expected,
+            coin.data.balance.value()
+        );
+    }
+
+    Ok(coin)
+}
+
+#[allow(dead_code)]
 pub fn create_temp_package_with_contract(
     package_prefix: &str,
     module_filename: &str,
