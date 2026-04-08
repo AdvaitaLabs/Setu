@@ -167,6 +167,7 @@ impl GovernanceHandler {
         // The caller reads this from GOVERNANCE SMT
         proposal: &setu_types::governance::GovernanceProposal,
         validator_id: &str,
+        current_resource_params: Option<&setu_types::ResourceParams>,
     ) -> Result<setu_types::Event, GovernanceHandlerError> {
         // Validate callback token (constant-time comparison)
         if !governance_service.validate_callback_token(&proposal_id, &callback_token) {
@@ -187,6 +188,7 @@ impl GovernanceHandler {
             vlc_snapshot,
             proposal,
             validator_id.to_string(),
+            current_resource_params,
         )?;
 
         // Remove from pending (consume the one-time token)
@@ -208,6 +210,7 @@ impl GovernanceHandler {
         vlc_snapshot: setu_vlc::VLCSnapshot,
         proposal: &setu_types::governance::GovernanceProposal,
         validator_id: &str,
+        current_resource_params: Option<&setu_types::ResourceParams>,
     ) -> Result<setu_types::Event, GovernanceHandlerError> {
         let decision = GovernanceDecision {
             approved: false,
@@ -225,6 +228,7 @@ impl GovernanceHandler {
             vlc_snapshot,
             proposal,
             validator_id.to_string(),
+            current_resource_params,
         )?;
 
         // Remove from pending
@@ -380,6 +384,7 @@ mod tests {
             sample_vlc(),
             &proposal,
             "test-validator",
+            None,
         );
         assert!(result.is_ok());
         // Should be removed from pending
@@ -410,6 +415,7 @@ mod tests {
             sample_vlc(),
             &proposal,
             "test-validator",
+            None,
         );
         assert!(result.is_err());
         assert!(matches!(

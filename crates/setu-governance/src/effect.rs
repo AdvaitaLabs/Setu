@@ -4,7 +4,7 @@
 //! (GovernanceExecutor in setu-validator) materializes these into concrete
 //! StateChanges with correct serialization (BCS for coins, JSON for metadata).
 
-use setu_types::{GovernanceDecision, ProposalEffect, ProposalStatus};
+use setu_types::{GovernanceDecision, ProposalEffect, ProposalStatus, ResourceParamChange};
 
 /// Abstract description of a governance side-effect.
 ///
@@ -32,6 +32,10 @@ pub enum GovernanceEffect {
     ResolveDispute {
         dispute_id: [u8; 32],
         resolution: Vec<u8>,
+    },
+    /// Update a resource governance parameter
+    UpdateResourceParam {
+        change: ResourceParamChange,
     },
 }
 
@@ -78,6 +82,11 @@ impl EffectExecutor {
                         resolution: resolution.clone(),
                     });
                 }
+                ProposalEffect::UpdateResourceParam(change) => {
+                    effects.push(GovernanceEffect::UpdateResourceParam {
+                        change: change.clone(),
+                    });
+                }
             }
         }
 
@@ -118,6 +127,25 @@ mod tests {
         let effects = EffectExecutor::execute([2u8; 32], &effect, &decision(true));
         assert_eq!(effects.len(), 2);
         assert!(matches!(&effects[1], GovernanceEffect::UpdateParameter { key, .. } if key == "max_tps"));
+    }
+
+    #[test]
+    fn test_effect_executor_update_resource_param() {
+        use setu_types::{ResourceGovernanceMode};
+        let effect = ProposalEffect::UpdateResourceParam(
+            ResourceParamChange::SetPowerCostPerEvent(5),
+        );
+        let effects = EffectExecutor::execute([4u8; 32], &effect, &decision(true));
+        assert_eq!(effects.len(), 2);
+        assert!(matches!(&effects[1], GovernanceEffect::UpdateResourceParam { change }
+            if matches!(change, ResourceParamChange::SetPowerCostPerEvent(5))));
+
+        // Verify mode variant works too
+        let mode_effect = ProposalEffect::UpdateResourceParam(
+            ResourceParamChange::SetPowerMode(ResourceGovernanceMode::Enabled),
+        );
+        let mode_effects = EffectExecutor::execute([5u8; 32], &mode_effect, &decision(true));
+        assert_eq!(mode_effects.len(), 2);
     }
 
     #[test]

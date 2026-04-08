@@ -600,6 +600,18 @@ impl BatchTaskPreparer {
             ));
         }
 
+        // Add ResourceParams from GOVERNANCE subnet
+        let rp_oid = setu_types::resource_params_object_id();
+        if let Some(rp_data) = self.state_provider.get_object_from_subnet(
+            rp_oid.as_bytes(),
+            &setu_types::SubnetId::GOVERNANCE,
+        ) {
+            read_set.push(ReadSetEntry::new(
+                format!("oid:{}", hex::encode(rp_oid.as_bytes())),
+                rp_data,
+            ));
+        }
+
         // Derive parent_ids from snapshot (NO LOCK)
         let parent_ids = self.derive_dependencies_from_snapshot(&coin.object_id, snapshot);
 

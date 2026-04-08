@@ -256,6 +256,22 @@ impl MockEnclave {
         }
         (power_state, flux_state)
     }
+
+    /// Extract ResourceParams from read_set.
+    ///
+    /// Returns `ResourceParams::default()` if not found (backward-compatible with
+    /// tasks prepared before governance was initialized).
+    fn extract_resource_params(read_set: &[ReadSetEntry]) -> setu_types::ResourceParams {
+        let rp_key = format!("oid:{}", hex::encode(setu_types::resource_params_object_id().as_bytes()));
+        for entry in read_set {
+            if entry.key == rp_key {
+                if let Ok(rp) = serde_json::from_slice::<setu_types::ResourceParams>(&entry.value) {
+                    return rp;
+                }
+            }
+        }
+        setu_types::ResourceParams::default()
+    }
     
     /// Simulate applying events to state using self.runtime (LEGACY mode)
     /// 
@@ -331,6 +347,7 @@ impl MockEnclave {
             Some(ref addr) => Self::extract_power_flux(&input.read_set, addr),
             None => (None, None),
         };
+        let resource_params = Self::extract_resource_params(&input.read_set);
         
         // Process each event with the isolated local runtime
         for event in &input.events {
@@ -344,7 +361,7 @@ impl MockEnclave {
             // 1. Power decrement BEFORE business logic
             if consumes_power {
                 if let Some(ref mut power) = power_state {
-                    match setu_runtime::decrement_power(power) {
+                    match setu_runtime::decrement_power(power, resource_params.power_cost_per_event) {
                         Ok(sc) => diff.add_state_changes(&[sc]),
                         Err(e) => {
                             failed.push(FailedEvent {
@@ -373,9 +390,11 @@ impl MockEnclave {
                     // 3. Flux increment AFTER successful business logic
                     if consumes_power {
                         if let Some(ref mut flux) = flux_state {
-                            match setu_runtime::increment_flux(flux, event.timestamp) {
-                                Ok(sc) => diff.add_state_changes(&[sc]),
-                                Err(e) => warn!(event_id = %event.id, "Flux increment failed: {}", e),
+                            if resource_params.flux_reward_on_success > 0 {
+                                match setu_runtime::increment_flux(flux, event.timestamp, resource_params.flux_reward_on_success) {
+                                    Ok(sc) => diff.add_state_changes(&[sc]),
+                                    Err(e) => warn!(event_id = %event.id, "Flux increment failed: {}", e),
+                                }
                             }
                         }
                     }
@@ -383,6 +402,15 @@ impl MockEnclave {
                 }
                 Err(reason) => {
                     // Power was already consumed (no rollback — design invariant)
+                    // 3b. Flux penalty on failure (if configured)
+                    if consumes_power && resource_params.flux_penalty_on_failure > 0 {
+                        if let Some(ref mut flux) = flux_state {
+                            match setu_runtime::penalize_flux(flux, event.timestamp, resource_params.flux_penalty_on_failure) {
+                                Ok(sc) => diff.add_state_changes(&[sc]),
+                                Err(e) => warn!(event_id = %event.id, "Flux penalty failed: {}", e),
+                            }
+                        }
+                    }
                     failed.push(FailedEvent {
                         event_id: event.id.clone(),
                         reason,

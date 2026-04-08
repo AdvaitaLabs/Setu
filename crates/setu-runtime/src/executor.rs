@@ -146,17 +146,17 @@ pub fn should_consume_power(event_type: &EventType) -> bool {
     !event_type.is_validator_executed()
 }
 
-/// Decrement Power by 1. Returns a StateChange for the modified PowerState.
+/// Decrement Power by `cost`. Returns a StateChange for the modified PowerState.
 ///
 /// Called BEFORE business logic — Power is consumed regardless of event success/failure.
-/// Returns `AccountFrozen` if `power_remaining == 0` (check-before-serialize, M5).
-pub fn decrement_power(state: &mut PowerState) -> RuntimeResult<StateChange> {
-    if state.power_remaining == 0 {
+/// Returns `AccountFrozen` if `power_remaining < cost` (check-before-serialize, M5).
+pub fn decrement_power(state: &mut PowerState, cost: u64) -> RuntimeResult<StateChange> {
+    if state.power_remaining < cost {
         return Err(RuntimeError::AccountFrozen("Power depleted".into()));
     }
     let object_id = power_state_object_id(&state.address);
     let old_state = serde_json::to_vec(state)?;
-    state.power_remaining -= 1;
+    state.power_remaining -= cost;
     state.version += 1;
     let new_state = serde_json::to_vec(state)?;
     Ok(StateChange {
@@ -167,13 +167,32 @@ pub fn decrement_power(state: &mut PowerState) -> RuntimeResult<StateChange> {
     })
 }
 
-/// Increment Flux by 1. Returns a StateChange for the modified FluxState.
+/// Increment Flux by `reward`. Returns a StateChange for the modified FluxState.
 ///
 /// Called AFTER successful business logic — Flux is only earned on success.
-pub fn increment_flux(state: &mut FluxState, timestamp: u64) -> RuntimeResult<StateChange> {
+pub fn increment_flux(state: &mut FluxState, timestamp: u64, reward: u64) -> RuntimeResult<StateChange> {
     let object_id = flux_state_object_id(&state.address);
     let old_state = serde_json::to_vec(state)?;
-    state.flux += 1;
+    state.flux += reward;
+    state.last_active_at = timestamp;
+    state.version += 1;
+    let new_state = serde_json::to_vec(state)?;
+    Ok(StateChange {
+        change_type: StateChangeType::Update,
+        object_id,
+        old_state: Some(old_state),
+        new_state: Some(new_state),
+    })
+}
+
+/// Decrease Flux by `penalty`. Returns a StateChange for the modified FluxState.
+///
+/// Called AFTER failed business logic — Flux penalty on failure.
+/// Flux cannot go below 0 (saturating subtraction).
+pub fn penalize_flux(state: &mut FluxState, timestamp: u64, penalty: u64) -> RuntimeResult<StateChange> {
+    let object_id = flux_state_object_id(&state.address);
+    let old_state = serde_json::to_vec(state)?;
+    state.flux = state.flux.saturating_sub(penalty);
     state.last_active_at = timestamp;
     state.version += 1;
     let new_state = serde_json::to_vec(state)?;

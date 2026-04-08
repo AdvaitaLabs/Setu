@@ -137,6 +137,7 @@ pub enum ProposalType {
     ValidatorSlash,
     DisputeResolution,
     SubnetPolicy,
+    ResourceParamChange,
 }
 
 /// Concrete effect of a passed proposal
@@ -145,6 +146,7 @@ pub enum ProposalEffect {
     UpdateParameter { key: String, value: Vec<u8> },
     SlashValidator { validator_id: String, amount: u64 },
     ResolveDispute { dispute_id: [u8; 32], resolution: Vec<u8> },
+    UpdateResourceParam(crate::resource::ResourceParamChange),
 }
 
 /// Decision from evaluation (source-agnostic: could be Agent subnet, voting, etc.)
@@ -234,6 +236,32 @@ mod tests {
         let decoded: GovernanceProposal = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.status, ProposalStatus::Pending);
         assert_eq!(decoded.proposal_id, [2u8; 32]);
+    }
+
+    #[test]
+    fn test_proposal_effect_update_resource_param_serde() {
+        use crate::resource::{ResourceParamChange, ResourceGovernanceMode};
+        let effect = ProposalEffect::UpdateResourceParam(
+            ResourceParamChange::SetPowerCostPerEvent(2),
+        );
+        let json = serde_json::to_string(&effect).unwrap();
+        assert!(json.contains("UpdateResourceParam"));
+        assert!(json.contains("SetPowerCostPerEvent"));
+        let decoded: ProposalEffect = serde_json::from_str(&json).unwrap();
+        match decoded {
+            ProposalEffect::UpdateResourceParam(ResourceParamChange::SetPowerCostPerEvent(v)) => {
+                assert_eq!(v, 2);
+            }
+            _ => panic!("Expected UpdateResourceParam"),
+        }
+
+        // Test mode variant serialization
+        let mode_effect = ProposalEffect::UpdateResourceParam(
+            ResourceParamChange::SetPowerMode(ResourceGovernanceMode::Enabled),
+        );
+        let mode_json = serde_json::to_string(&mode_effect).unwrap();
+        assert!(mode_json.contains("Enabled"));
+        let _: ProposalEffect = serde_json::from_str(&mode_json).unwrap();
     }
 
     #[test]

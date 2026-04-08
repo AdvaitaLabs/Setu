@@ -96,10 +96,11 @@ pub use governance::{
     GovernanceDecision, GovernanceProposal, ProposalStatus,
 };
 
-// Resource model (Power / Flux)
+// Resource model (Power / Flux / ResourceParams)
 pub use resource::{
     FluxState, PowerState, ResourceGovernanceMode, AtomicGovernanceMode,
-    flux_state_object_id, power_state_object_id,
+    ResourceParams, ResourceParamChange, apply_resource_param_change,
+    flux_state_object_id, power_state_object_id, resource_params_object_id,
     INITIAL_POWER, INITIAL_FLUX,
 };
 

@@ -13,7 +13,7 @@ use setu_types::governance::{
     SystemSubnetRegistration,
 };
 use setu_types::genesis::GenesisValidator;
-use setu_types::SubnetId;
+use setu_types::{ResourceParams, SubnetId};
 use setu_vlc::VLCSnapshot;
 
 /// Builds Governance Events. Pure construction — no I/O, no SMT writes.
@@ -66,6 +66,7 @@ impl GovernanceExecutor {
     /// Build an Execute Event with a decision.
     ///
     /// `proposal` is read from the committed GOVERNANCE SMT by the caller.
+    /// `current_resource_params` is the current ResourceParams from GOVERNANCE SMT (or None for default).
     /// May produce cross-subnet StateChanges via `target_subnet`.
     pub fn execute_decision(
         proposal_id: [u8; 32],
@@ -74,6 +75,7 @@ impl GovernanceExecutor {
         vlc_snapshot: VLCSnapshot,
         proposal: &GovernanceProposal,
         creator: String,
+        current_resource_params: Option<&ResourceParams>,
     ) -> Result<Event, GovernanceExecutorError> {
         // Validate via setu-governance pure logic
         ProposalValidator::validate_execute(Some(proposal), &decision)?;
@@ -83,7 +85,14 @@ impl GovernanceExecutor {
             ProposalStateMachine::transition(proposal, &decision, timestamp)?;
 
         // Materialize abstract effects → concrete StateChanges
-        let state_changes = Self::materialize_effects(proposal_id, proposal, &updated_proposal, &effects)?;
+        let state_changes = Self::materialize_effects(
+            proposal_id,
+            proposal,
+            &updated_proposal,
+            &effects,
+            current_resource_params,
+            timestamp,
+        )?;
 
         // Build Event
         let payload = GovernancePayload {
@@ -199,6 +208,8 @@ impl GovernanceExecutor {
         original_proposal: &GovernanceProposal,
         updated_proposal: &GovernanceProposal,
         effects: &[GovernanceEffect],
+        current_resource_params: Option<&ResourceParams>,
+        timestamp: u64,
     ) -> Result<Vec<StateChange>, GovernanceExecutorError> {
         let mut changes = Vec::new();
 
@@ -257,6 +268,28 @@ impl GovernanceExecutor {
                         StateChange::insert(key, resolution.clone())
                             .with_target_subnet(SubnetId::ROOT),
                     );
+                }
+                GovernanceEffect::UpdateResourceParam { change } => {
+                    // Read current params (or defaults)
+                    let default_params = ResourceParams::default();
+                    let current = current_resource_params.unwrap_or(&default_params);
+                    let mut updated = current.clone();
+                    setu_types::apply_resource_param_change(&mut updated, change, timestamp);
+
+                    // State key: deterministic singleton in GOVERNANCE SMT
+                    let key = format!("oid:{}", hex::encode(setu_types::resource_params_object_id().as_bytes()));
+                    let new_value = serde_json::to_vec(&updated)
+                        .map_err(|e| GovernanceExecutorError::Serialization(e.to_string()))?;
+
+                    if current_resource_params.is_some() {
+                        // Update existing
+                        let old_value = serde_json::to_vec(current)
+                            .map_err(|e| GovernanceExecutorError::Serialization(e.to_string()))?;
+                        changes.push(StateChange::update(key, old_value, new_value));
+                    } else {
+                        // First-ever insert
+                        changes.push(StateChange::insert(key, new_value));
+                    }
                 }
             }
         }
@@ -423,6 +456,7 @@ mod tests {
             sample_vlc(),
             &proposal,
             "test-validator".to_string(),
+            None,
         );
         let event = result.unwrap();
         assert_eq!(event.event_type, EventType::Governance);
@@ -442,6 +476,7 @@ mod tests {
             sample_vlc(),
             &proposal,
             "test-validator".to_string(),
+            None,
         );
         let event = result.unwrap();
         let er = event.execution_result.as_ref().unwrap();
@@ -466,6 +501,7 @@ mod tests {
             sample_vlc(),
             &proposal,
             "test-validator".to_string(),
+            None,
         );
         let event = result.unwrap();
         let er = event.execution_result.as_ref().unwrap();
@@ -490,6 +526,7 @@ mod tests {
             sample_vlc(),
             &proposal,
             "test-validator".to_string(),
+            None,
         );
         assert!(result.is_err());
         assert!(matches!(
@@ -515,7 +552,7 @@ mod tests {
             decision: Some(sample_decision(true)),
         }];
         let changes =
-            GovernanceExecutor::materialize_effects([1u8; 32], &original, &updated, &effects).unwrap();
+            GovernanceExecutor::materialize_effects([1u8; 32], &original, &updated, &effects, None, 2000).unwrap();
         assert_eq!(changes.len(), 1);
         assert!(changes[0].key.starts_with("oid:"));
         assert!(changes[0].target_subnet.is_none());
@@ -537,7 +574,7 @@ mod tests {
             amount: 100,
         }];
         let changes =
-            GovernanceExecutor::materialize_effects([1u8; 32], &original, &updated, &effects).unwrap();
+            GovernanceExecutor::materialize_effects([1u8; 32], &original, &updated, &effects, None, 2000).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].target_subnet, Some(SubnetId::ROOT));
     }
@@ -583,6 +620,7 @@ mod tests {
             sample_vlc(),
             &stored_proposal,
             "test-validator".to_string(),
+            None,
         )
         .unwrap();
 
@@ -776,5 +814,89 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GovernanceExecutorError::Unauthorized(_)));
+    }
+
+    // ---- Resource param governance tests ----
+
+    #[test]
+    fn test_execute_decision_update_resource_param_first_insert() {
+        use setu_types::{ResourceParamChange, ResourceGovernanceMode, ResourceParams, resource_params_object_id};
+        let mut proposal = sample_proposal_pending();
+        proposal.content.proposal_type = ProposalType::ResourceParamChange;
+        proposal.content.action = ProposalEffect::UpdateResourceParam(
+            ResourceParamChange::SetPowerCostPerEvent(5),
+        );
+        let result = GovernanceExecutor::execute_decision(
+            [1u8; 32],
+            sample_decision(true),
+            2000,
+            sample_vlc(),
+            &proposal,
+            "test-validator".to_string(),
+            None, // first insert — no existing ResourceParams
+        ).unwrap();
+        let er = result.execution_result.as_ref().unwrap();
+        assert!(er.success);
+        // Should have UpdateProposal + insert ResourceParams (2 state changes)
+        assert_eq!(er.state_changes.len(), 2);
+        let rp_sc = &er.state_changes[1];
+        assert!(rp_sc.key.starts_with("oid:"));
+        assert!(rp_sc.old_value.is_none()); // first insert
+        let stored: ResourceParams = serde_json::from_slice(rp_sc.new_value.as_ref().unwrap()).unwrap();
+        assert_eq!(stored.power_cost_per_event, 5);
+        assert_eq!(stored.version, 1);
+        assert_eq!(stored.last_updated_at, 2000);
+    }
+
+    #[test]
+    fn test_execute_decision_update_resource_param_existing() {
+        use setu_types::{ResourceParamChange, ResourceGovernanceMode, ResourceParams, resource_params_object_id};
+        let mut proposal = sample_proposal_pending();
+        proposal.content.proposal_type = ProposalType::ResourceParamChange;
+        proposal.content.action = ProposalEffect::UpdateResourceParam(
+            ResourceParamChange::SetFluxRewardOnSuccess(10),
+        );
+        let existing = ResourceParams {
+            flux_reward_on_success: 1,
+            version: 3,
+            ..ResourceParams::default()
+        };
+        let result = GovernanceExecutor::execute_decision(
+            [1u8; 32],
+            sample_decision(true),
+            3000,
+            sample_vlc(),
+            &proposal,
+            "test-validator".to_string(),
+            Some(&existing),
+        ).unwrap();
+        let er = result.execution_result.as_ref().unwrap();
+        assert_eq!(er.state_changes.len(), 2);
+        let rp_sc = &er.state_changes[1];
+        assert!(rp_sc.old_value.is_some()); // update
+        let stored: ResourceParams = serde_json::from_slice(rp_sc.new_value.as_ref().unwrap()).unwrap();
+        assert_eq!(stored.flux_reward_on_success, 10);
+        assert_eq!(stored.version, 4);
+    }
+
+    #[test]
+    fn test_execute_decision_update_resource_param_rejected() {
+        use setu_types::ResourceParamChange;
+        let mut proposal = sample_proposal_pending();
+        proposal.content.action = ProposalEffect::UpdateResourceParam(
+            ResourceParamChange::SetPowerCostPerEvent(5),
+        );
+        let result = GovernanceExecutor::execute_decision(
+            [1u8; 32],
+            sample_decision(false), // rejected
+            2000,
+            sample_vlc(),
+            &proposal,
+            "test-validator".to_string(),
+            None,
+        ).unwrap();
+        let er = result.execution_result.as_ref().unwrap();
+        // Only UpdateProposal, no ResourceParams change
+        assert_eq!(er.state_changes.len(), 1);
     }
 }

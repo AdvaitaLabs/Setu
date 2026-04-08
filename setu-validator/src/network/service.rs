@@ -491,6 +491,7 @@ impl ValidatorNetworkService {
             .route("/api/v1/governance/callback", post(governance_callback_handler))
             .route("/api/v1/governance/status/:proposal_id", get(governance_status_handler))
             .route("/api/v1/governance/register-system-subnet", post(governance_register_system_subnet_handler))
+            .route("/api/v1/governance/resource-params", get(governance_resource_params_handler))
             .with_state(service);
 
         let listener = tokio::net::TcpListener::bind(self.config.http_listen_addr).await?;
@@ -1125,6 +1126,14 @@ async fn governance_callback_handler(
     };
     let timestamp = current_timestamp_secs();
 
+    // Read current ResourceParams from GOVERNANCE SMT
+    let resource_params = service
+        .get_subnet_object(
+            &setu_types::SubnetId::GOVERNANCE,
+            setu_types::resource_params_object_id().as_bytes(),
+        )
+        .and_then(|b| serde_json::from_slice::<setu_types::ResourceParams>(&b).ok());
+
     match GovernanceHandler::prepare_execute(
         &governance_svc,
         proposal_id_bytes,
@@ -1134,6 +1143,7 @@ async fn governance_callback_handler(
         vlc_snapshot,
         &proposal,
         service.validator_id(),
+        resource_params.as_ref(),
     ) {
         Ok(event) => {
             service.add_event_to_dag(event).await;
@@ -1281,6 +1291,26 @@ async fn governance_register_system_subnet_handler(
             }),
         ),
     }
+}
+
+/// GET /api/v1/governance/resource-params
+///
+/// Returns the current ResourceParams from GOVERNANCE SMT (or defaults if not yet initialized).
+async fn governance_resource_params_handler(
+    State(service): State<Arc<ValidatorNetworkService>>,
+) -> impl IntoResponse {
+    let rp_oid = setu_types::resource_params_object_id();
+    let params = match service.get_subnet_object(
+        &setu_types::SubnetId::GOVERNANCE,
+        rp_oid.as_bytes(),
+    ) {
+        Some(bytes) => {
+            serde_json::from_slice::<setu_types::ResourceParams>(&bytes)
+                .unwrap_or_default()
+        }
+        None => setu_types::ResourceParams::default(),
+    };
+    Json(params)
 }
 
 // ============================================

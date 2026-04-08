@@ -832,6 +832,13 @@ async fn main() -> anyhow::Result<()> {
                                     physical_time: setu_validator::current_timestamp_secs(),
                                 };
                                 let ts = setu_validator::current_timestamp_secs();
+                                // Read current ResourceParams from GOVERNANCE SMT
+                                let resource_params = poll_network_svc
+                                    .get_subnet_object(
+                                        &setu_types::SubnetId::GOVERNANCE,
+                                        setu_types::resource_params_object_id().as_bytes(),
+                                    )
+                                    .and_then(|b| serde_json::from_slice::<setu_types::ResourceParams>(&b).ok());
                                 if let Ok(event) =
                                     GovernanceHandler::prepare_timeout_execute(
                                         &gov_svc_poll,
@@ -840,6 +847,7 @@ async fn main() -> anyhow::Result<()> {
                                         vlc_snapshot,
                                         &proposal,
                                         poll_network_svc.validator_id(),
+                                        resource_params.as_ref(),
                                     )
                                 {
                                     poll_network_svc.add_event_to_dag(event).await;
@@ -870,6 +878,13 @@ async fn main() -> anyhow::Result<()> {
                                         physical_time: setu_validator::current_timestamp_secs(),
                                     };
                                     let ts = setu_validator::current_timestamp_secs();
+                                    // Read current ResourceParams for governance execution
+                                    let resource_params = poll_network_svc
+                                        .get_subnet_object(
+                                            &setu_types::SubnetId::GOVERNANCE,
+                                            setu_types::resource_params_object_id().as_bytes(),
+                                        )
+                                        .and_then(|b| serde_json::from_slice::<setu_types::ResourceParams>(&b).ok());
                                     if let Ok(event) =
                                         GovernanceHandler::prepare_execute(
                                             &gov_svc_poll,
@@ -880,6 +895,7 @@ async fn main() -> anyhow::Result<()> {
                                             vlc_snapshot,
                                             &proposal,
                                             poll_network_svc.validator_id(),
+                                            resource_params.as_ref(),
                                         )
                                     {
                                         poll_network_svc.add_event_to_dag(event).await;
