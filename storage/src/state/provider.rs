@@ -298,7 +298,7 @@ impl MerkleStateProvider {
     }
 
     /// Get object from a specific subnet SMT
-    fn get_object_from_subnet(&self, object_id_bytes: &[u8; 32], subnet_id: &SubnetId) -> Option<Vec<u8>> {
+    pub fn get_object_from_subnet(&self, object_id_bytes: &[u8; 32], subnet_id: &SubnetId) -> Option<Vec<u8>> {
         let snapshot = self.shared.load_snapshot();
         let hash = HashValue::from_slice(object_id_bytes).ok()?;
         snapshot.get_subnet(subnet_id)?.get(&hash).cloned()

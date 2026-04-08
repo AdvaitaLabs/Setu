@@ -23,6 +23,7 @@ setu-storage = { path = "../storage" }
 setu-api = { path = "../api" }
 setu-network-anemo = { path = "../crates/setu-network-anemo" }
 setu-keys = { path = "../crates/setu-keys" }
+setu-governance = { path = "../crates/setu-governance" }
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
@@ -58,4 +59,5 @@ dashmap = "5.5"  # Lock-free concurrent HashMap for TPS optimization
 setu-solver = { path = "../setu-solver" }
 setu-storage = { path = "../storage", features = ["test-utils"] }
 setu-types = { path = "../types", features = ["test-utils"] }
+ed25519-dalek = "2.1"
 tempfile = "3.10"
