@@ -13,6 +13,7 @@ pub mod transaction;
 pub mod error;
 
 pub use executor::{RuntimeExecutor, ExecutionContext, ExecutionOutput, StateChange, StateChangeType};
+pub use executor::{should_consume_power, decrement_power, increment_flux, penalize_flux};
 pub use state::{StateStore, InMemoryStateStore};
 pub use transaction::{Transaction, TransactionType, TransferTx, QueryTx};
 pub use error::{RuntimeError, RuntimeResult};

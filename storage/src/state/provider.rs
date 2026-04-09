@@ -128,6 +128,14 @@ pub trait StateProvider: Send + Sync {
         let proof = self.get_merkle_proof(object_id)?;
         Some((data, proof))
     }
+
+    /// Get object data from a specific subnet SMT.
+    ///
+    /// Default implementation delegates to `get_object()` (ignores subnet).
+    /// Override this in implementations that support multi-subnet state.
+    fn get_object_from_subnet(&self, object_id: &ObjectId, _subnet_id: &SubnetId) -> Option<Vec<u8>> {
+        self.get_object(object_id)
+    }
 }
 
 // ============================================================================
@@ -298,7 +306,7 @@ impl MerkleStateProvider {
     }
 
     /// Get object from a specific subnet SMT
-    fn get_object_from_subnet(&self, object_id_bytes: &[u8; 32], subnet_id: &SubnetId) -> Option<Vec<u8>> {
+    pub fn get_object_from_subnet(&self, object_id_bytes: &[u8; 32], subnet_id: &SubnetId) -> Option<Vec<u8>> {
         let snapshot = self.shared.load_snapshot();
         let hash = HashValue::from_slice(object_id_bytes).ok()?;
         snapshot.get_subnet(subnet_id)?.get(&hash).cloned()
@@ -428,6 +436,13 @@ impl StateProvider for MerkleStateProvider {
         // Fallback to local tracker (for backward compatibility)
         let tracker = self.modification_tracker.read().unwrap();
         tracker.get(object_id.as_bytes()).cloned()
+    }
+
+    fn get_object_from_subnet(&self, object_id: &ObjectId, subnet_id: &SubnetId) -> Option<Vec<u8>> {
+        // Delegate to the existing concrete method
+        let snapshot = self.shared.load_snapshot();
+        let hash = HashValue::from_slice(object_id.as_bytes()).ok()?;
+        snapshot.get_subnet(subnet_id)?.get(&hash).cloned()
     }
 }
 

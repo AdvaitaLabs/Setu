@@ -8,6 +8,7 @@ use setu_types::task::{
     GasBudget, ReadSetEntry,
 };
 use setu_types::{Event, EventType, SubnetId, ObjectId};
+use setu_types::{flux_state_object_id, power_state_object_id};
 use setu_types::event::VLCSnapshot;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -198,7 +199,7 @@ impl TaskPreparer {
         
         let merkle_proof = self.state_provider.get_merkle_proof(&selected_coin.object_id);
         
-        let read_set = vec![
+        let mut read_set = vec![
             ReadSetEntry::new(
                 format!("oid:{}", hex::encode(&selected_coin.object_id)),
                 coin_data,
@@ -208,6 +209,34 @@ impl TaskPreparer {
                     .unwrap_or_default()
             ),
         ];
+        
+        // Add FluxState and PowerState for the sender (for Power/Flux in TEE)
+        let flux_oid = flux_state_object_id(&transfer.from);
+        let power_oid = power_state_object_id(&transfer.from);
+        if let Some(flux_data) = self.state_provider.get_object(&flux_oid) {
+            read_set.push(ReadSetEntry::new(
+                format!("oid:{}", hex::encode(&flux_oid)),
+                flux_data,
+            ));
+        }
+        if let Some(power_data) = self.state_provider.get_object(&power_oid) {
+            read_set.push(ReadSetEntry::new(
+                format!("oid:{}", hex::encode(&power_oid)),
+                power_data,
+            ));
+        }
+
+        // Add ResourceParams from GOVERNANCE subnet (for parameterized Power/Flux in TEE)
+        let rp_oid = setu_types::resource_params_object_id();
+        if let Some(rp_data) = self.state_provider.get_object_from_subnet(
+            &rp_oid,
+            &setu_types::SubnetId::GOVERNANCE,
+        ) {
+            read_set.push(ReadSetEntry::new(
+                format!("oid:{}", hex::encode(rp_oid.as_bytes())),
+                rp_data,
+            ));
+        }
         
         // Step 5: Create Event from Transfer with derived dependencies
         let event = self.create_event_from_transfer(transfer, parent_ids)?;
@@ -344,7 +373,7 @@ impl TaskPreparer {
                 let coin_data = self.state_provider.get_object(&selected_coin.object_id)
                     .ok_or(TaskPrepareError::ObjectNotFound(hex::encode(&selected_coin.object_id)))?;
                 let merkle_proof = self.state_provider.get_merkle_proof(&selected_coin.object_id);
-                let read_set = vec![
+                let mut read_set = vec![
                     setu_types::task::ReadSetEntry::new(
                         format!("oid:{}", hex::encode(&selected_coin.object_id)),
                         coin_data,
@@ -354,6 +383,34 @@ impl TaskPreparer {
                             .unwrap_or_default()
                     ),
                 ];
+                
+                // Add FluxState and PowerState for the sender
+                let flux_oid = flux_state_object_id(&transfer.from);
+                let power_oid = power_state_object_id(&transfer.from);
+                if let Some(flux_data) = self.state_provider.get_object(&flux_oid) {
+                    read_set.push(setu_types::task::ReadSetEntry::new(
+                        format!("oid:{}", hex::encode(&flux_oid)),
+                        flux_data,
+                    ));
+                }
+                if let Some(power_data) = self.state_provider.get_object(&power_oid) {
+                    read_set.push(setu_types::task::ReadSetEntry::new(
+                        format!("oid:{}", hex::encode(&power_oid)),
+                        power_data,
+                    ));
+                }
+
+                // Add ResourceParams from GOVERNANCE subnet
+                let rp_oid = setu_types::resource_params_object_id();
+                if let Some(rp_data) = self.state_provider.get_object_from_subnet(
+                    &rp_oid,
+                    &setu_types::SubnetId::GOVERNANCE,
+                ) {
+                    read_set.push(setu_types::task::ReadSetEntry::new(
+                        format!("oid:{}", hex::encode(rp_oid.as_bytes())),
+                        rp_data,
+                    ));
+                }
 
                 let event = self.create_event_from_transfer(transfer, parent_ids)?;
                 let pre_state_root = self.state_provider.get_state_root();
@@ -846,7 +903,7 @@ mod tests {
     
     fn create_test_transfer() -> Transfer {
         Transfer::new("test-tx-1", "alice", "bob", 100)
-            .with_type(TransferType::FluxTransfer)
+            .with_type(TransferType::SetuTransfer)
             .with_power(10)
     }
 

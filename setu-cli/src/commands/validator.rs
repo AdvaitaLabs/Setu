@@ -139,7 +139,7 @@ pub async fn handle(action: crate::ValidatorAction, _config: &Config) -> Result<
                         println!("  Validator ID:     {}", keypair.node_id.cyan());
                         println!("  Account Address:  {}", keypair.account_address.cyan());
                         println!("  Network Address:  {}:{}", network_address, network_port);
-                        println!("  Stake Amount:     {} FLUX", stake_amount);
+                        println!("  Stake Amount:     {} SETU", stake_amount);
                         println!("  Commission Rate:  {}%", commission_rate);
                     } else {
                         println!("{} Registration failed: {}", "✗".red().bold(), response.message.red());

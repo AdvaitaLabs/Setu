@@ -44,6 +44,7 @@ pub mod persistence;
 pub mod protocol;
 pub mod coin_reservation;
 pub mod dag_replay;
+pub mod governance;
 
 pub use router_manager::{RouterManager, RouterError, SolverConnection};
 pub use network::{

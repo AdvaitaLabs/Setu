@@ -10,7 +10,7 @@ use crate::ValidatorNetworkService;
 use setu_rpc::{
     UserRpcHandler, RegisterUserRequest, RegisterUserResponse,
     GetAccountRequest, GetAccountResponse, GetBalanceRequest, GetBalanceResponse,
-    GetPowerRequest, GetPowerResponse, GetCreditRequest, GetCreditResponse,
+    GetPowerRequest, GetPowerResponse, GetFluxRequest, GetFluxResponse,
     GetCredentialsRequest, GetCredentialsResponse, TransferRequest, TransferResponse,
     CoinBalance, SubmitTransferRequest,
     // Phase 3
@@ -22,6 +22,7 @@ use setu_rpc::{
 };
 use setu_types::registration::UserRegistration;
 use setu_types::{ObjectId, hash_utils::setu_hash_with_domain};
+use setu_types::{FluxState, PowerState, flux_state_object_id, power_state_object_id, INITIAL_POWER, INITIAL_FLUX};
 use setu_vlc::VLCSnapshot;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,9 +47,9 @@ impl ValidatorUserHandler {
             message: message.to_string(),
             address: address.to_string(),
             event_id: None,
-            initial_flux: 0,
+            initial_setu: 0,
             initial_power: 0,
-            initial_credit: 0,
+            initial_flux: 0,
         }
     }
 
@@ -316,9 +317,9 @@ impl UserRpcHandler for ValidatorUserHandler {
             message: "User registered successfully".to_string(),
             address: request.address,
             event_id: Some(event_id),
-            initial_flux: 0,
-            initial_power: 0,
-            initial_credit: 0,
+            initial_setu: 0,
+            initial_power: INITIAL_POWER,
+            initial_flux: INITIAL_FLUX,
         }
     }
     
@@ -326,19 +327,35 @@ impl UserRpcHandler for ValidatorUserHandler {
         info!(address = %request.address, "Getting account information");
 
         let coins = self.network_service.state_provider().get_coins_for_address(&request.address);
-        let flux_balance: u64 = coins.iter()
+        let setu_balance: u64 = coins.iter()
             .filter(|c| c.coin_type == "ROOT")
             .map(|c| c.balance)
             .sum();
 
+        // Read Power from Merkle tree
+        let power_oid = power_state_object_id(&request.address);
+        let power = self.network_service.state_provider()
+            .get_object(&power_oid)
+            .and_then(|bytes| serde_json::from_slice::<PowerState>(&bytes).ok())
+            .map(|ps| ps.power_remaining)
+            .unwrap_or(0);
+
+        // Read Flux from Merkle tree
+        let flux_oid = flux_state_object_id(&request.address);
+        let flux = self.network_service.state_provider()
+            .get_object(&flux_oid)
+            .and_then(|bytes| serde_json::from_slice::<FluxState>(&bytes).ok())
+            .map(|fs| fs.flux)
+            .unwrap_or(0);
+
         GetAccountResponse {
             found: !coins.is_empty(),
             address: request.address,
-            flux_balance,
-            power: 0,            // Power system not yet implemented
-            credit: 0,           // Credit system not yet implemented
-            profile: None,       // Profile system not yet implemented
-            credential_count: 0, // Credential system not yet implemented
+            setu_balance,
+            power,
+            flux,
+            profile: None,
+            credential_count: 0,
         }
     }
     
@@ -378,24 +395,48 @@ impl UserRpcHandler for ValidatorUserHandler {
     }
     
     async fn get_power(&self, request: GetPowerRequest) -> GetPowerResponse {
-        // Power system not yet implemented — return zeros
-        GetPowerResponse {
-            found: false,
-            address: request.address,
-            power: 0,
-            rank: None,
-            recent_changes: vec![],
+        let power_oid = power_state_object_id(&request.address);
+        match self.network_service.state_provider()
+            .get_object(&power_oid)
+            .and_then(|bytes| serde_json::from_slice::<PowerState>(&bytes).ok())
+        {
+            Some(ps) => GetPowerResponse {
+                found: true,
+                address: request.address,
+                power: ps.power_remaining,
+                rank: None,
+                recent_changes: vec![],
+            },
+            None => GetPowerResponse {
+                found: false,
+                address: request.address,
+                power: 0,
+                rank: None,
+                recent_changes: vec![],
+            },
         }
     }
     
-    async fn get_credit(&self, request: GetCreditRequest) -> GetCreditResponse {
-        // Credit system not yet implemented — return zeros
-        GetCreditResponse {
-            found: false,
-            address: request.address,
-            credit: 0,
-            level: None,
-            recent_changes: vec![],
+    async fn get_flux(&self, request: GetFluxRequest) -> GetFluxResponse {
+        let flux_oid = flux_state_object_id(&request.address);
+        match self.network_service.state_provider()
+            .get_object(&flux_oid)
+            .and_then(|bytes| serde_json::from_slice::<FluxState>(&bytes).ok())
+        {
+            Some(fs) => GetFluxResponse {
+                found: true,
+                address: request.address,
+                flux: fs.flux,
+                level: None,
+                recent_changes: vec![],
+            },
+            None => GetFluxResponse {
+                found: false,
+                address: request.address,
+                flux: 0,
+                level: None,
+                recent_changes: vec![],
+            },
         }
     }
     
@@ -422,7 +463,7 @@ impl UserRpcHandler for ValidatorUserHandler {
             from: request.from,
             to: request.to,
             amount: request.amount,
-            transfer_type: request.coin_type.unwrap_or_else(|| "flux".to_string()),
+            transfer_type: request.coin_type.unwrap_or_else(|| "setu".to_string()),
             resources: vec![],
             preferred_solver: None,
             shard_id: None,

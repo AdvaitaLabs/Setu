@@ -85,6 +85,19 @@ impl SubnetId {
     /// The root/system subnet (for global operations)
     pub const ROOT: SubnetId = SubnetId([0u8; 32]);
     
+    /// The governance system subnet (proposals, decisions, effects)
+    ///
+    /// System subnet ID registry (prevent collisions):
+    ///   ROOT:       0x00, 0x00
+    ///   GOVERNANCE: 0x01, 0x10
+    ///   Reserved:   0x01, 0x01-0x0F (future system subnets)
+    pub const GOVERNANCE: SubnetId = {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x01; // SYSTEM_PREFIX
+        bytes[1] = 0x10; // governance identifier
+        SubnetId(bytes)
+    };
+    
     /// Type byte for system reserved subnets
     pub const SYSTEM_PREFIX: u8 = 0x01;
     

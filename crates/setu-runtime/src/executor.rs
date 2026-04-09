@@ -13,6 +13,9 @@ use tracing::{info, debug, warn};
 use setu_types::{
     ObjectId, Address, CoinType, CoinData, Object,
     coin_id_from_tx, create_coin_with_id,
+    FluxState, PowerState,
+    flux_state_object_id, power_state_object_id,
+    EventType,
 };
 // Note: Coin::to_coin_state_bytes() is used via trait method on Object<CoinData>
 use crate::error::{RuntimeError, RuntimeResult};
@@ -128,8 +131,77 @@ impl StateChange {
             key: setu_types::object_key(&self.object_id),
             old_value: self.old_state.clone(),
             new_value: self.new_state.clone(),
+            target_subnet: None,
         }
     }
+}
+
+// ========== Power / Flux helpers ==========
+
+/// Check whether a given event type should consume Power (and earn Flux on success).
+///
+/// All solver-executed events consume Power. Validator-executed (infrastructure/bootstrap)
+/// events are exempt — see design doc §3.6.
+pub fn should_consume_power(event_type: &EventType) -> bool {
+    !event_type.is_validator_executed()
+}
+
+/// Decrement Power by `cost`. Returns a StateChange for the modified PowerState.
+///
+/// Called BEFORE business logic — Power is consumed regardless of event success/failure.
+/// Returns `AccountFrozen` if `power_remaining < cost` (check-before-serialize, M5).
+pub fn decrement_power(state: &mut PowerState, cost: u64) -> RuntimeResult<StateChange> {
+    if state.power_remaining < cost {
+        return Err(RuntimeError::AccountFrozen("Power depleted".into()));
+    }
+    let object_id = power_state_object_id(&state.address);
+    let old_state = serde_json::to_vec(state)?;
+    state.power_remaining -= cost;
+    state.version += 1;
+    let new_state = serde_json::to_vec(state)?;
+    Ok(StateChange {
+        change_type: StateChangeType::Update,
+        object_id,
+        old_state: Some(old_state),
+        new_state: Some(new_state),
+    })
+}
+
+/// Increment Flux by `reward`. Returns a StateChange for the modified FluxState.
+///
+/// Called AFTER successful business logic — Flux is only earned on success.
+pub fn increment_flux(state: &mut FluxState, timestamp: u64, reward: u64) -> RuntimeResult<StateChange> {
+    let object_id = flux_state_object_id(&state.address);
+    let old_state = serde_json::to_vec(state)?;
+    state.flux += reward;
+    state.last_active_at = timestamp;
+    state.version += 1;
+    let new_state = serde_json::to_vec(state)?;
+    Ok(StateChange {
+        change_type: StateChangeType::Update,
+        object_id,
+        old_state: Some(old_state),
+        new_state: Some(new_state),
+    })
+}
+
+/// Decrease Flux by `penalty`. Returns a StateChange for the modified FluxState.
+///
+/// Called AFTER failed business logic — Flux penalty on failure.
+/// Flux cannot go below 0 (saturating subtraction).
+pub fn penalize_flux(state: &mut FluxState, timestamp: u64, penalty: u64) -> RuntimeResult<StateChange> {
+    let object_id = flux_state_object_id(&state.address);
+    let old_state = serde_json::to_vec(state)?;
+    state.flux = state.flux.saturating_sub(penalty);
+    state.last_active_at = timestamp;
+    state.version += 1;
+    let new_state = serde_json::to_vec(state)?;
+    Ok(StateChange {
+        change_type: StateChangeType::Update,
+        object_id,
+        old_state: Some(old_state),
+        new_state: Some(new_state),
+    })
 }
 
 /// Runtime executor
@@ -630,6 +702,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
     ) -> RuntimeResult<ExecutionOutput> {
         let mut state_changes = Vec::new();
         
+        // 1. UserMembership (per address+subnet) — always created
         let membership_key = format!("user:{}:subnet:{}", user_address, subnet_id);
         let membership_data = serde_json::json!({
             "user": user_address.to_string(),
@@ -648,13 +721,45 @@ impl<S: StateStore> RuntimeExecutor<S> {
             new_state: Some(serde_json::to_vec(&membership_data)?),
         });
         
+        // 2. FluxState (per address) — CREATE-IF-NOT-EXISTS (C1 fix)
+        let addr_str = user_address.to_string();
+        let flux_oid = flux_state_object_id(&addr_str);
+        let mut created_objects = vec![membership_object_id];
+        if self.state.get_raw_object(&flux_oid)?.is_none() {
+            let flux = FluxState::new(&addr_str, ctx.timestamp);
+            let flux_bytes = serde_json::to_vec(&flux)?;
+            self.state.set_raw_object(flux_oid, flux_bytes.clone())?;
+            state_changes.push(StateChange {
+                change_type: StateChangeType::Create,
+                object_id: flux_oid,
+                old_state: None,
+                new_state: Some(flux_bytes),
+            });
+            created_objects.push(flux_oid);
+        }
+        
+        // 3. PowerState (per address) — CREATE-IF-NOT-EXISTS (C1 fix)
+        let power_oid = power_state_object_id(&addr_str);
+        if self.state.get_raw_object(&power_oid)?.is_none() {
+            let power = PowerState::new(&addr_str);
+            let power_bytes = serde_json::to_vec(&power)?;
+            self.state.set_raw_object(power_oid, power_bytes.clone())?;
+            state_changes.push(StateChange {
+                change_type: StateChangeType::Create,
+                object_id: power_oid,
+                old_state: None,
+                new_state: Some(power_bytes),
+            });
+            created_objects.push(power_oid);
+        }
+        
         info!(user = %user_address, subnet_id = %subnet_id, "User registered in subnet");
         
         Ok(ExecutionOutput {
             success: true,
             message: Some(format!("User {} registered in subnet '{}'", user_address, subnet_id)),
             state_changes,
-            created_objects: vec![],
+            created_objects,
             deleted_objects: vec![],
             query_result: None,
         })

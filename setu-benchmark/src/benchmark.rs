@@ -477,7 +477,7 @@ impl BenchmarkRunner {
                 from: seed_account.to_string(),
                 to: target_account.to_string(),
                 amount: balance,
-                transfer_type: "flux".to_string(),
+                transfer_type: "setu".to_string(),
                 preferred_solver: None,
                 shard_id: None,
                 subnet_id: None,

@@ -25,7 +25,7 @@ pub type ResourceKey = String;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TransferType {
     /// Flux token transfer between accounts
-    FluxTransfer,
+    SetuTransfer,
     /// Power consumption for computation
     PowerConsume,
     /// Task submission to solvers
@@ -34,7 +34,7 @@ pub enum TransferType {
 
 impl Default for TransferType {
     fn default() -> Self {
-        TransferType::FluxTransfer
+        TransferType::SetuTransfer
     }
 }
 
@@ -110,7 +110,7 @@ impl Transfer {
             from: from.into(),
             to: to.into(),
             amount,
-            transfer_type: TransferType::FluxTransfer,
+            transfer_type: TransferType::SetuTransfer,
             resources: vec![],
             power: 0,
             preferred_solver: None,
@@ -217,7 +217,7 @@ mod tests {
         assert_eq!(transfer.from, "alice");
         assert_eq!(transfer.to, "bob");
         assert_eq!(transfer.amount, 1000);
-        assert_eq!(transfer.transfer_type, TransferType::FluxTransfer);
+        assert_eq!(transfer.transfer_type, TransferType::SetuTransfer);
     }
     
     #[test]

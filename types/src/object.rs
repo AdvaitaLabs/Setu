@@ -160,16 +160,10 @@ impl Address {
             return addr;
         }
 
-        // In test builds, fall back to from_str_id
-        #[cfg(any(test, feature = "test-utils"))]
-        {
-            return Self::from_str_id(s);
-        }
-
-        #[cfg(not(any(test, feature = "test-utils")))]
-        {
-            panic!("Address::normalize: invalid hex address '{}'. In production, only hex addresses are accepted.", s);
-        }
+        // Fallback: hash non-hex strings via blake3 for deterministic address derivation.
+        // This supports genesis name-based addresses (e.g., "alice") in all builds.
+        let hash = blake3::hash(s.as_bytes());
+        Self(*hash.as_bytes())
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {

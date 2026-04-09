@@ -126,6 +126,7 @@ impl From<StateChangeDto> for StateChange {
             key: dto.key,
             old_value: dto.old_value,
             new_value: dto.new_value,
+            target_subnet: None,
         }
     }
 }
@@ -194,6 +195,7 @@ mod tests {
             key: "test_key".to_string(),
             old_value: Some(vec![1, 2, 3]),
             new_value: Some(vec![4, 5, 6]),
+            target_subnet: None,
         };
         
         let dto = StateChangeDto::from(&original);

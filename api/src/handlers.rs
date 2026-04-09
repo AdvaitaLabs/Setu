@@ -19,7 +19,7 @@ use setu_rpc::{
     UserRpcHandler, RegisterUserRequest, RegisterUserResponse,
     GetAccountRequest, GetAccountResponse, GetBalanceRequest, 
     GetBalanceResponse as UserGetBalanceResponse,
-    GetPowerRequest, GetPowerResponse, GetCreditRequest, GetCreditResponse,
+    GetPowerRequest, GetPowerResponse, GetFluxRequest, GetFluxResponse,
     GetCredentialsRequest, GetCredentialsResponse, TransferRequest, TransferResponse,
     // Phase 3: Profile & Subnet Membership
     UpdateProfileRequest, UpdateProfileResponse,
@@ -337,12 +337,12 @@ pub async fn http_get_power<S: ValidatorService>(
 }
 
 /// Get user credit
-pub async fn http_get_credit<S: ValidatorService>(
+pub async fn http_get_flux<S: ValidatorService>(
     State(service): State<Arc<S>>,
-    Json(request): Json<GetCreditRequest>,
-) -> Json<GetCreditResponse> {
+    Json(request): Json<GetFluxRequest>,
+) -> Json<GetFluxResponse> {
     let handler = service.user_handler();
-    Json(handler.get_credit(request).await)
+    Json(handler.get_flux(request).await)
 }
 
 /// Get user credentials

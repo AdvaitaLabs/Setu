@@ -19,6 +19,12 @@ pub trait StateStore {
     /// Get all objects owned by an address
     fn get_owned_objects(&self, owner: &Address) -> RuntimeResult<Vec<ObjectId>>;
     
+    /// Read raw bytes by ObjectId (type-agnostic — works for Coin BCS, FluxState/PowerState JSON, etc.)
+    fn get_raw_object(&self, object_id: &ObjectId) -> RuntimeResult<Option<Vec<u8>>>;
+    
+    /// Write raw bytes by ObjectId (type-agnostic)
+    fn set_raw_object(&mut self, object_id: ObjectId, data: Vec<u8>) -> RuntimeResult<()>;
+    
     /// Check if object exists
     fn exists(&self, object_id: &ObjectId) -> bool {
         self.get_object(object_id).ok().flatten().is_some()
@@ -34,6 +40,8 @@ pub struct InMemoryStateStore {
     ownership_index: HashMap<Address, Vec<ObjectId>>,
     /// Reverse index: ObjectId -> Address (for O(1) old-owner lookup)
     object_owner: HashMap<ObjectId, Address>,
+    /// Raw object storage: ObjectId -> raw bytes (for non-Coin objects like FluxState, PowerState)
+    raw_objects: HashMap<ObjectId, Vec<u8>>,
 }
 
 impl InMemoryStateStore {
@@ -43,6 +51,7 @@ impl InMemoryStateStore {
             objects: HashMap::new(),
             ownership_index: HashMap::new(),
             object_owner: HashMap::new(),
+            raw_objects: HashMap::new(),
         }
     }
     
@@ -117,6 +126,15 @@ impl StateStore for InMemoryStateStore {
             .get(owner)
             .cloned()
             .unwrap_or_default())
+    }
+    
+    fn get_raw_object(&self, object_id: &ObjectId) -> RuntimeResult<Option<Vec<u8>>> {
+        Ok(self.raw_objects.get(object_id).cloned())
+    }
+    
+    fn set_raw_object(&mut self, object_id: ObjectId, data: Vec<u8>) -> RuntimeResult<()> {
+        self.raw_objects.insert(object_id, data);
+        Ok(())
     }
 }
 

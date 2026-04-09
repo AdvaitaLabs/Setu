@@ -12,6 +12,7 @@ members = [
     "crates/setu-runtime",    # Simple runtime executor (pre-Move VM)
     "crates/setu-enclave",    # TEE Enclave abstraction (Mock + Nitro)
     "crates/setu-transport",  # HTTP/WS/gRPC transport for Validator↔Solver
+    "crates/setu-governance", # Governance module (proposal lifecycle)
     "consensus",
     "api",                    # HTTP API layer
     "setu-validator",         # Validator node (with embedded router)

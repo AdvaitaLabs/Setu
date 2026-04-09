@@ -235,12 +235,14 @@ impl TeeExecutionResult {
                 key: w.key,
                 old_value: w.old_value,
                 new_value: Some(w.new_value),
+                target_subnet: None,
             })
             .chain(
                 output.state_diff.deletes.into_iter().map(|k| StateChange {
                     key: k,
                     old_value: None,
                     new_value: None,
+                    target_subnet: None,
                 })
             )
             .collect();

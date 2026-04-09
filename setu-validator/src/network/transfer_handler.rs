@@ -100,8 +100,8 @@ impl TransferHandler {
 
         // Step 4: Create Transfer using builder pattern
         let transfer_type = match request.transfer_type.to_lowercase().as_str() {
-            "flux" | "fluxtransfer" => TransferType::FluxTransfer,
-            _ => TransferType::FluxTransfer,
+            "setu" | "setutransfer" => TransferType::SetuTransfer,
+            _ => TransferType::SetuTransfer,
         };
 
         let resources = if request.resources.is_empty() {
@@ -433,8 +433,8 @@ impl TransferHandler {
             };
 
             let transfer_type = match req.transfer_type.to_lowercase().as_str() {
-                "flux" | "fluxtransfer" => TransferType::FluxTransfer,
-                _ => TransferType::FluxTransfer,
+                "setu" | "setutransfer" => TransferType::SetuTransfer,
+                _ => TransferType::SetuTransfer,
             };
 
             let resources = if req.resources.is_empty() {

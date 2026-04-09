@@ -286,7 +286,10 @@ impl StateDiff {
     
     /// Add writes from setu-runtime ExecutionOutput state changes
     /// 
-    /// This converts runtime's object-based StateChange to enclave's WriteSetEntry
+    /// This converts runtime's object-based StateChange to enclave's WriteSetEntry.
+    /// NOTE: Duplicate keys may occur for the same ObjectId (e.g., Power decremented
+    /// per event in a batch). Consumer (GlobalStateManager) applies writes in order
+    /// with last-write-wins semantics. The `commitment()` hash includes all writes.
     pub fn add_state_changes(&mut self, state_changes: &[setu_runtime::StateChange]) {
         for change in state_changes {
             let entry = WriteSetEntry::from_state_change(

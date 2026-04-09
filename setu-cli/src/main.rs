@@ -459,7 +459,7 @@ enum TransferAction {
         amount: i128,
         
         /// Transfer type (flux/power/task)
-        #[arg(long, default_value = "flux")]
+        #[arg(long, default_value = "setu")]
         transfer_type: String,
         
         /// Preferred solver (optional)

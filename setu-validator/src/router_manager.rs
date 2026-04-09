@@ -416,7 +416,7 @@ mod tests {
     
     fn create_test_transfer(id: &str) -> Transfer {
         Transfer::new(id, "alice", "bob", 100)
-            .with_type(TransferType::FluxTransfer)
+            .with_type(TransferType::SetuTransfer)
             .with_resources(vec!["alice".to_string()])
             .with_power(10)
     }

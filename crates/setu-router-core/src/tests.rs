@@ -5,7 +5,7 @@ use setu_types::{Transfer, TransferType};
 
 fn create_test_transfer(id: &str, resources: Vec<String>) -> Transfer {
     Transfer::new(id, "alice", "bob", 100)
-        .with_type(TransferType::FluxTransfer)
+        .with_type(TransferType::SetuTransfer)
         .with_resources(resources)
 }
 

@@ -86,6 +86,8 @@ pub enum EventType {
     CoinSplit,
     /// Atomic compound: merge coins then transfer (partial or full)
     CoinMergeThenTransfer,
+    /// Governance proposal and execution (payload distinguishes action)
+    Governance,
 }
 
 impl EventType {
@@ -113,6 +115,7 @@ impl EventType {
                 | EventType::CoinMerge
                 | EventType::CoinSplit
                 | EventType::CoinMergeThenTransfer
+                | EventType::Governance
         )
     }
     
@@ -163,11 +166,13 @@ impl EventType {
             EventType::CoinMerge => "CoinMerge",
             EventType::CoinSplit => "CoinSplit",
             EventType::CoinMergeThenTransfer => "CoinMergeThenTransfer",
+            EventType::Governance => "Governance",
         }
     }
 }
 
 use crate::genesis::GenesisConfig;
+use crate::governance::GovernancePayload;
 
 // ========== Event Payload ==========
 
@@ -233,6 +238,8 @@ pub enum EventPayload {
         /// Amount to transfer after merge
         amount: u64,
     },
+    /// Governance action (propose or execute)
+    Governance(GovernancePayload),
 }
 
 impl Default for EventPayload {
@@ -278,6 +285,10 @@ pub struct StateChange {
     pub key: String,
     pub old_value: Option<Vec<u8>>,
     pub new_value: Option<Vec<u8>>,
+    /// Target subnet for this state change. None = use the Event's own subnet_id.
+    /// Enables cross-subnet effects (e.g., Governance event writing to ROOT subnet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_subnet: Option<crate::subnet::SubnetId>,
 }
 
 impl StateChange {
@@ -286,6 +297,7 @@ impl StateChange {
             key: key.into(),
             old_value,
             new_value,
+            target_subnet: None,
         }
     }
     
@@ -299,6 +311,12 @@ impl StateChange {
     
     pub fn update(key: impl Into<String>, old_value: Vec<u8>, new_value: Vec<u8>) -> Self {
         Self::new(key, Some(old_value), Some(new_value))
+    }
+
+    /// Set the target subnet for cross-subnet state changes.
+    pub fn with_target_subnet(mut self, subnet_id: crate::subnet::SubnetId) -> Self {
+        self.target_subnet = Some(subnet_id);
+        self
     }
 }
 
@@ -362,6 +380,8 @@ impl Event {
         // Infer subnet_id from event_type
         let subnet_id = if event_type.is_root_event() {
             Some(crate::subnet::SubnetId::ROOT)
+        } else if matches!(event_type, EventType::Governance) {
+            Some(crate::subnet::SubnetId::GOVERNANCE)
         } else {
             None
         };
@@ -677,6 +697,9 @@ impl Event {
                 resources.push(format!("user:{}", recipient));
                 resources
             }
+            EventPayload::Governance(g) => {
+                vec![format!("governance:{}", hex::encode(g.proposal_id))]
+            }
             EventPayload::None => vec![],
             EventPayload::Genesis(g) => {
                 g.accounts.iter()
@@ -722,7 +745,7 @@ mod tests {
     #[test]
     fn test_transfer_event() {
         let transfer = Transfer::new("tx-1", "alice", "bob", 100)
-            .with_type(TransferType::FluxTransfer);
+            .with_type(TransferType::SetuTransfer);
         
         let event = Event::transfer(
             transfer,
@@ -831,5 +854,75 @@ mod tests {
             .with_changes(vec![StateChange::insert("key1", vec![1, 2, 3])]);
         assert!(result.success);
         assert_eq!(result.state_changes.len(), 1);
+    }
+
+    // ── Governance tests ──
+
+    #[test]
+    fn test_governance_event_type_exists() {
+        let t = EventType::Governance;
+        assert_eq!(t, EventType::Governance);
+    }
+
+    #[test]
+    fn test_governance_requires_execution() {
+        assert!(EventType::Governance.requires_solver_execution());
+    }
+
+    #[test]
+    fn test_governance_not_root_event() {
+        assert!(!EventType::Governance.is_root_event());
+    }
+
+    #[test]
+    fn test_governance_not_validator_executed() {
+        assert!(!EventType::Governance.is_validator_executed());
+    }
+
+    #[test]
+    fn test_governance_event_name() {
+        assert_eq!(EventType::Governance.name(), "Governance");
+    }
+
+    #[test]
+    fn test_state_change_target_subnet() {
+        let change = StateChange::insert("oid:abc", vec![1])
+            .with_target_subnet(crate::subnet::SubnetId::ROOT);
+        assert_eq!(change.target_subnet, Some(crate::subnet::SubnetId::ROOT));
+
+        // Serde round-trip
+        let json = serde_json::to_string(&change).unwrap();
+        let decoded: StateChange = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.target_subnet, Some(crate::subnet::SubnetId::ROOT));
+    }
+
+    #[test]
+    fn test_state_change_target_subnet_default_none() {
+        let change = StateChange::insert("oid:abc", vec![1]);
+        assert_eq!(change.target_subnet, None);
+
+        // Deserializing old-format JSON (no target_subnet field) should default to None
+        let json = r#"{"key":"oid:abc","old_value":null,"new_value":[1]}"#;
+        let decoded: StateChange = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.target_subnet, None);
+    }
+
+    #[test]
+    fn test_subnet_id_governance_const() {
+        let gov = crate::subnet::SubnetId::GOVERNANCE;
+        assert!(gov.is_system());
+        assert!(!gov.is_root());
+        assert!(!gov.is_app());
+    }
+
+    #[test]
+    fn test_governance_event_infers_governance_subnet() {
+        let event = Event::new(
+            EventType::Governance,
+            vec![],
+            create_vlc_snapshot(),
+            "validator1".to_string(),
+        );
+        assert_eq!(event.get_subnet_id(), crate::subnet::SubnetId::GOVERNANCE);
     }
 }

@@ -79,12 +79,12 @@ pub struct RegisterUserResponse {
     pub address: String,
     /// Event ID for this registration
     pub event_id: Option<String>,
-    /// Initial Flux balance allocated
-    pub initial_flux: u64,
+    /// Initial SETU balance allocated
+    pub initial_setu: u64,
     /// Initial Power allocated
     pub initial_power: u64,
-    /// Initial Credit allocated
-    pub initial_credit: u64,
+    /// Initial Flux allocated
+    pub initial_flux: u64,
 }
 
 // ============================================================================
@@ -119,11 +119,11 @@ pub struct GetAccountResponse {
     /// User's address
     pub address: String,
     /// Flux balance (main transferable token)
-    pub flux_balance: u64,
+    pub setu_balance: u64,
     /// Power value (computational/voting power)
     pub power: u64,
-    /// Credit value (reputation score)
-    pub credit: u64,
+    /// Flux value (reputation score)
+    pub flux: u64,
     /// User profile information
     pub profile: Option<ProfileInfo>,
     /// Number of credentials the user holds
@@ -142,7 +142,7 @@ pub struct GetBalanceRequest {
 /// Balance information for a coin type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoinBalance {
-    /// Coin type (e.g., "FLUX", "SETU")
+    /// Coin type (e.g., "SETU", "WETH")
     pub coin_type: String,
     /// Total balance
     pub balance: u64,
@@ -200,29 +200,29 @@ pub struct PowerChange {
 
 /// Request to get user credit
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetCreditRequest {
+pub struct GetFluxRequest {
     /// User's address
     pub address: String,
 }
 
 /// Response with user credit information
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetCreditResponse {
+pub struct GetFluxResponse {
     /// Whether the account was found
     pub found: bool,
     /// User's address
     pub address: String,
     /// Current credit value
-    pub credit: u64,
+    pub flux: u64,
     /// Credit level/tier
     pub level: Option<String>,
     /// Recent credit changes
-    pub recent_changes: Vec<CreditChange>,
+    pub recent_changes: Vec<FluxChange>,
 }
 
 /// A credit change record
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreditChange {
+pub struct FluxChange {
     /// Amount changed
     pub amount: i64,
     /// Reason for change
@@ -293,7 +293,7 @@ pub struct TransferRequest {
     pub to: String,
     /// Amount to transfer
     pub amount: u64,
-    /// Coin type (default: "FLUX")
+    /// Coin type (default: "SETU")
     pub coin_type: Option<String>,
     /// Optional memo/note
     pub memo: Option<String>,
@@ -450,7 +450,7 @@ pub trait UserRpcHandler: Send + Sync {
     async fn get_power(&self, request: GetPowerRequest) -> GetPowerResponse;
     
     /// Get user credit
-    async fn get_credit(&self, request: GetCreditRequest) -> GetCreditResponse;
+    async fn get_flux(&self, request: GetFluxRequest) -> GetFluxResponse;
     
     // ========== Credential Queries ==========
     
@@ -496,7 +496,7 @@ pub enum UserRpcRequest {
     GetAccount(GetAccountRequest),
     GetBalance(GetBalanceRequest),
     GetPower(GetPowerRequest),
-    GetCredit(GetCreditRequest),
+    GetFlux(GetFluxRequest),
     GetCredentials(GetCredentialsRequest),
     Transfer(TransferRequest),
 }
@@ -508,7 +508,7 @@ pub enum UserRpcResponse {
     GetAccount(GetAccountResponse),
     GetBalance(GetBalanceResponse),
     GetPower(GetPowerResponse),
-    GetCredit(GetCreditResponse),
+    GetFlux(GetFluxResponse),
     GetCredentials(GetCredentialsResponse),
     Transfer(TransferResponse),
     Error(String),
@@ -672,9 +672,9 @@ mod tests {
         let response = GetAccountResponse {
             found: true,
             address: "0x123".to_string(),
-            flux_balance: 1000,
+            setu_balance: 1000,
             power: 50,
-            credit: 100,
+            flux: 100,
             profile: Some(ProfileInfo {
                 display_name: Some("Alice".to_string()),
                 avatar_url: None,
@@ -691,9 +691,9 @@ mod tests {
         match decoded {
             UserRpcResponse::GetAccount(resp) => {
                 assert!(resp.found);
-                assert_eq!(resp.flux_balance, 1000);
+                assert_eq!(resp.setu_balance, 1000);
                 assert_eq!(resp.power, 50);
-                assert_eq!(resp.credit, 100);
+                assert_eq!(resp.flux, 100);
             }
             _ => panic!("Wrong response type"),
         }

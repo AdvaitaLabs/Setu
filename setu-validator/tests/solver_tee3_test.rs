@@ -25,7 +25,7 @@ fn init_tracing() {
 /// Create a test transfer
 fn create_test_transfer(id: &str, from: &str, to: &str, amount: u64) -> Transfer {
     Transfer::new(id, from, to, amount)
-        .with_type(TransferType::FluxTransfer)
+        .with_type(TransferType::SetuTransfer)
 }
 
 #[tokio::test]

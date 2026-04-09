@@ -893,7 +893,7 @@ mod tests {
         // Create coins with different types
         let setu_coin = Coin::new(alice, 1000); // Default SETU type
         let usdc_coin = Coin::new_with_type(alice, 500, CoinType::new("USDC"));
-        let flux_coin = Coin::new_with_type(alice, 200, CoinType::new("FLUX"));
+        let flux_coin = Coin::new_with_type(alice, 200, CoinType::new("WETH"));
         let usdc_coin2 = Coin::new_with_type(alice, 300, CoinType::new("USDC"));
         
         store.store_coin(&setu_coin).unwrap();
@@ -915,7 +915,7 @@ mod tests {
         let usdc_total: u64 = usdc_coins.iter().map(|c| c.value()).sum();
         assert_eq!(usdc_total, 800);
         
-        let flux_coins = store.get_coins_by_owner_and_type(&alice, &CoinType::new("FLUX")).unwrap();
+        let flux_coins = store.get_coins_by_owner_and_type(&alice, &CoinType::new("WETH")).unwrap();
         assert_eq!(flux_coins.len(), 1);
         
         // Non-existent type returns empty
@@ -992,7 +992,7 @@ mod tests {
         
         // Store coins
         let coin1 = Coin::new(alice, 1000);
-        let coin2 = Coin::new_with_type(alice, 500, CoinType::new("FLUX"));
+        let coin2 = Coin::new_with_type(alice, 500, CoinType::new("WETH"));
         
         store.store_coin(&coin1).unwrap();
         store.store_coin(&coin2).unwrap();
@@ -1007,7 +1007,7 @@ mod tests {
         let setu_coins = store.get_coins_by_owner_and_type(&alice, &CoinType::native()).unwrap();
         assert_eq!(setu_coins.len(), 1);
         
-        let flux_coins = store.get_coins_by_owner_and_type(&alice, &CoinType::new("FLUX")).unwrap();
+        let flux_coins = store.get_coins_by_owner_and_type(&alice, &CoinType::new("WETH")).unwrap();
         assert_eq!(flux_coins.len(), 1);
     }
 }

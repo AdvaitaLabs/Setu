@@ -25,9 +25,17 @@ use super::tee_executor::TeeExecutor;
 use super::event_handler::EventHandler;
 use crate::{RouterManager, TaskPreparer, BatchTaskPreparer, ConsensusValidator, InfraExecutor};
 use crate::coin_reservation::CoinReservationManager;
+use crate::governance::service::GovernanceService;
+use crate::governance::handler::{
+    GovernanceHandler, ProposeRequest, ProposeResponse, CallbackRequest,
+    CallbackResponse, StatusResponse, RegisterSystemSubnetRequest, RegisterSystemSubnetResponse,
+};
 use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use dashmap::DashMap;
 use setu_types::Transfer;
@@ -120,6 +128,9 @@ pub struct ValidatorNetworkService {
 
     /// TEE executor for parallel task execution
     tee_executor: TeeExecutor,
+
+    /// Governance service for Agent subnet integration (optional)
+    governance_service: Option<Arc<GovernanceService>>,
 }
 
 impl ValidatorNetworkService {
@@ -197,6 +208,7 @@ impl ValidatorNetworkService {
             event_counter: AtomicU64::new(0),
             coin_reservation_manager,
             tee_executor,
+            governance_service: None,
         }
     }
 
@@ -275,6 +287,7 @@ impl ValidatorNetworkService {
             event_counter: AtomicU64::new(0),
             coin_reservation_manager,
             tee_executor,
+            governance_service: None,
         }
     }
 
@@ -310,6 +323,28 @@ impl ValidatorNetworkService {
     /// Check if consensus is enabled
     pub fn consensus_enabled(&self) -> bool {
         self.consensus_validator.is_some()
+    }
+
+    /// Set the governance service (called during startup after construction).
+    pub fn set_governance_service(&mut self, service: Arc<GovernanceService>) {
+        self.governance_service = Some(service);
+    }
+
+    /// Get the governance service (if enabled).
+    pub fn governance_service(&self) -> Option<&Arc<GovernanceService>> {
+        self.governance_service.as_ref()
+    }
+
+    /// Get a reference to the events DashMap (for governance background tasks).
+    pub fn events_map(&self) -> &Arc<DashMap<String, Event>> {
+        &self.events
+    }
+
+    /// Read an object from a specific subnet SMT.
+    /// Used by governance handlers to read proposals from the GOVERNANCE subnet.
+    pub fn get_subnet_object(&self, subnet_id: &setu_types::SubnetId, object_id_bytes: &[u8; 32]) -> Option<Vec<u8>> {
+        self.batch_task_preparer.merkle_state_provider()
+            .get_object_from_subnet(object_id_bytes, subnet_id)
     }
 
     pub fn start_time(&self) -> u64 {
@@ -441,7 +476,7 @@ impl ValidatorNetworkService {
             .route("/api/v1/user/account", post(setu_api::http_get_account::<ValidatorNetworkService>))
             .route("/api/v1/user/balance", post(setu_api::http_get_user_balance::<ValidatorNetworkService>))
             .route("/api/v1/user/power", post(setu_api::http_get_power::<ValidatorNetworkService>))
-            .route("/api/v1/user/credit", post(setu_api::http_get_credit::<ValidatorNetworkService>))
+            .route("/api/v1/user/flux", post(setu_api::http_get_flux::<ValidatorNetworkService>))
             .route("/api/v1/user/credentials", post(setu_api::http_get_credentials::<ValidatorNetworkService>))
             .route("/api/v1/user/transfer", post(setu_api::http_user_transfer::<ValidatorNetworkService>))
             // Phase 3: Profile & Subnet Membership
@@ -451,6 +486,12 @@ impl ValidatorNetworkService {
             .route("/api/v1/user/subnet/leave", post(setu_api::http_leave_subnet::<ValidatorNetworkService>))
             .route("/api/v1/user/subnet/check/:address/:subnet_id", get(setu_api::http_check_membership::<ValidatorNetworkService>))
             .route("/api/v1/user/subnets/:address", get(setu_api::http_get_user_subnets::<ValidatorNetworkService>))
+            // Governance endpoints (Agent subnet integration)
+            .route("/api/v1/governance/propose", post(governance_propose_handler))
+            .route("/api/v1/governance/callback", post(governance_callback_handler))
+            .route("/api/v1/governance/status/:proposal_id", get(governance_status_handler))
+            .route("/api/v1/governance/register-system-subnet", post(governance_register_system_subnet_handler))
+            .route("/api/v1/governance/resource-params", get(governance_resource_params_handler))
             .with_state(service);
 
         let listener = tokio::net::TcpListener::bind(self.config.http_listen_addr).await?;
@@ -763,6 +804,43 @@ impl ValidatorNetworkService {
                 self.solver_info.remove(&unreg.node_id);
                 ReplayAction::Applied(ReplayKind::SolverUnregister)
             }
+            EventPayload::Governance(payload) => {
+                // During replay, governance events are tracked for Propose→Execute matching.
+                // Unmatched Propose events become pending governance for re-dispatch.
+                // RegisterSystemSubnet events directly update the SystemSubnetRegistry.
+                use setu_types::governance::GovernanceAction;
+                match &payload.action {
+                    GovernanceAction::Propose(content) => {
+                        ReplayAction::Applied(ReplayKind::GovernancePropose(
+                            payload.proposal_id,
+                            content.clone(),
+                        ))
+                    }
+                    GovernanceAction::Execute(_) => {
+                        ReplayAction::Applied(ReplayKind::GovernanceExecute(
+                            payload.proposal_id,
+                        ))
+                    }
+                    GovernanceAction::RegisterSystemSubnet(reg) => {
+                        // Direct modification pattern (R3-ISSUE-2): write to DashMap directly
+                        if let Some(gov_svc) = &self.governance_service {
+                            use crate::governance::service::{SystemSubnetConfig, ConfigSource};
+                            gov_svc.register_system_endpoint(
+                                reg.subnet_id,
+                                SystemSubnetConfig {
+                                    agent_endpoint: reg.agent_endpoint.clone(),
+                                    callback_addr: reg.callback_addr.clone(),
+                                    timeout: std::time::Duration::from_secs(
+                                        reg.timeout_secs.unwrap_or(300),
+                                    ),
+                                    source: ConfigSource::OnChain,
+                                },
+                            );
+                        }
+                        ReplayAction::Applied(ReplayKind::SystemSubnetRegister)
+                    }
+                }
+            }
             _ => ReplayAction::Skipped,
         }
     }
@@ -891,6 +969,348 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
     fn get_object(&self, key: &str) -> setu_api::GetObjectResponse {
         self.get_object(key)
     }
+}
+
+// ============================================
+// Governance Axum Route Handlers
+// ============================================
+
+/// POST /api/v1/governance/propose
+async fn governance_propose_handler(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(req): Json<ProposeRequest>,
+) -> impl IntoResponse {
+    let governance_svc = match service.governance_service() {
+        Some(g) => g.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ProposeResponse {
+                    success: false,
+                    proposal_id: None,
+                    message: "Governance not enabled".into(),
+                }),
+            );
+        }
+    };
+
+    let vlc_time = service.get_vlc_time();
+    let vlc_snapshot = setu_vlc::VLCSnapshot {
+        vector_clock: setu_vlc::VectorClock::new(),
+        logical_time: vlc_time,
+        physical_time: current_timestamp_secs(),
+    };
+    let timestamp = current_timestamp_secs();
+
+    match GovernanceHandler::prepare_propose(&governance_svc, req.content.clone(), timestamp, vlc_snapshot, service.validator_id()) {
+        Ok(prepared) => {
+            // Submit event to DAG
+            service.add_event_to_dag(prepared.event).await;
+            // Async dispatch to Agent (fire-and-forget)
+            let svc = governance_svc.clone();
+            let content = req.content;
+            let pid = prepared.proposal_id;
+            let token = prepared.callback_token;
+            let sys_ctx = serde_json::json!({
+                "validator_id": service.validator_id(),
+            });
+            tokio::spawn(async move {
+                let _ = svc.dispatch_to_agent(&setu_types::SubnetId::GOVERNANCE, pid, &content, token, sys_ctx).await;
+            });
+            (
+                StatusCode::OK,
+                Json(ProposeResponse {
+                    success: true,
+                    proposal_id: Some(hex::encode(prepared.proposal_id)),
+                    message: "Proposal submitted".into(),
+                }),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ProposeResponse {
+                success: false,
+                proposal_id: None,
+                message: e.to_string(),
+            }),
+        ),
+    }
+}
+
+/// POST /api/v1/governance/callback
+async fn governance_callback_handler(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(req): Json<CallbackRequest>,
+) -> impl IntoResponse {
+    let governance_svc = match service.governance_service() {
+        Some(g) => g.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(CallbackResponse {
+                    success: false,
+                    message: "Governance not enabled".into(),
+                }),
+            );
+        }
+    };
+
+    // Parse proposal_id from hex
+    let proposal_id_bytes = match hex::decode(&req.proposal_id) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(CallbackResponse {
+                    success: false,
+                    message: "Invalid proposal_id hex".into(),
+                }),
+            );
+        }
+    };
+
+    // Parse callback_token from hex
+    let callback_token = match hex::decode(&req.callback_token) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(CallbackResponse {
+                    success: false,
+                    message: "Invalid callback_token hex".into(),
+                }),
+            );
+        }
+    };
+
+    // Read current proposal from GOVERNANCE SMT
+    let proposal = match service
+        .get_subnet_object(&setu_types::SubnetId::GOVERNANCE, &proposal_id_bytes)
+    {
+        Some(bytes) => match serde_json::from_slice::<setu_types::governance::GovernanceProposal>(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(CallbackResponse {
+                        success: false,
+                        message: format!("Failed to deserialize proposal: {}", e),
+                    }),
+                );
+            }
+        },
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(CallbackResponse {
+                    success: false,
+                    message: "Proposal not found in SMT".into(),
+                }),
+            );
+        }
+    };
+
+    let vlc_time = service.get_vlc_time();
+    let vlc_snapshot = setu_vlc::VLCSnapshot {
+        vector_clock: setu_vlc::VectorClock::new(),
+        logical_time: vlc_time,
+        physical_time: current_timestamp_secs(),
+    };
+    let timestamp = current_timestamp_secs();
+
+    // Read current ResourceParams from GOVERNANCE SMT
+    let resource_params = service
+        .get_subnet_object(
+            &setu_types::SubnetId::GOVERNANCE,
+            setu_types::resource_params_object_id().as_bytes(),
+        )
+        .and_then(|b| serde_json::from_slice::<setu_types::ResourceParams>(&b).ok());
+
+    match GovernanceHandler::prepare_execute(
+        &governance_svc,
+        proposal_id_bytes,
+        callback_token,
+        req.decision,
+        timestamp,
+        vlc_snapshot,
+        &proposal,
+        service.validator_id(),
+        resource_params.as_ref(),
+    ) {
+        Ok(event) => {
+            service.add_event_to_dag(event).await;
+            (
+                StatusCode::OK,
+                Json(CallbackResponse {
+                    success: true,
+                    message: "Decision executed".into(),
+                }),
+            )
+        }
+        Err(crate::governance::handler::GovernanceHandlerError::Forbidden(msg)) => (
+            StatusCode::FORBIDDEN,
+            Json(CallbackResponse {
+                success: false,
+                message: msg,
+            }),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(CallbackResponse {
+                success: false,
+                message: e.to_string(),
+            }),
+        ),
+    }
+}
+
+/// GET /api/v1/governance/status/:proposal_id
+async fn governance_status_handler(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Path(proposal_id_hex): Path<String>,
+) -> impl IntoResponse {
+    let governance_svc = match service.governance_service() {
+        Some(g) => g.clone(),
+        None => {
+            return Json(StatusResponse {
+                found: false,
+                pending: false,
+                proposal_id: proposal_id_hex,
+                message: "Governance not enabled".into(),
+            });
+        }
+    };
+
+    let proposal_id_bytes = match hex::decode(&proposal_id_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => {
+            return Json(StatusResponse {
+                found: false,
+                pending: false,
+                proposal_id: proposal_id_hex,
+                message: "Invalid proposal_id hex".into(),
+            });
+        }
+    };
+
+    // Check local pending first
+    if governance_svc.get_pending(&proposal_id_bytes).is_some() {
+        return Json(StatusResponse {
+            found: true,
+            pending: true,
+            proposal_id: proposal_id_hex,
+            message: "Awaiting Agent decision".into(),
+        });
+    }
+
+    // Check GOVERNANCE SMT
+    if service
+        .get_subnet_object(&setu_types::SubnetId::GOVERNANCE, &proposal_id_bytes)
+        .is_some()
+    {
+        return Json(StatusResponse {
+            found: true,
+            pending: false,
+            proposal_id: proposal_id_hex,
+            message: "Proposal found in committed state".into(),
+        });
+    }
+
+    Json(StatusResponse {
+        found: false,
+        pending: false,
+        proposal_id: proposal_id_hex,
+        message: "Proposal not found".into(),
+    })
+}
+
+/// POST /api/v1/governance/register-system-subnet
+async fn governance_register_system_subnet_handler(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(req): Json<RegisterSystemSubnetRequest>,
+) -> impl IntoResponse {
+    if service.governance_service().is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(RegisterSystemSubnetResponse {
+                success: false,
+                event_id: None,
+                message: "Governance not enabled".into(),
+            }),
+        );
+    }
+
+    let vlc_time = service.get_vlc_time();
+    let vlc_snapshot = setu_vlc::VLCSnapshot {
+        vector_clock: setu_vlc::VectorClock::new(),
+        logical_time: vlc_time,
+        physical_time: current_timestamp_secs(),
+    };
+    let timestamp = current_timestamp_secs();
+
+    let gov_svc = service.governance_service().unwrap();
+    let genesis_validators = gov_svc.genesis_validators();
+    let prepare_result = GovernanceHandler::prepare_register_system_subnet(
+        req,
+        timestamp,
+        vlc_snapshot,
+        service.validator_id(),
+        genesis_validators,
+    );
+    match prepare_result {
+        Ok(event) => {
+            let event_id = event.id.to_string();
+            service.add_event_to_dag(event).await;
+            (
+                StatusCode::OK,
+                Json(RegisterSystemSubnetResponse {
+                    success: true,
+                    event_id: Some(event_id),
+                    message: "System subnet registration submitted to DAG".into(),
+                }),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(RegisterSystemSubnetResponse {
+                success: false,
+                event_id: None,
+                message: e.to_string(),
+            }),
+        ),
+    }
+}
+
+/// GET /api/v1/governance/resource-params
+///
+/// Returns the current ResourceParams from GOVERNANCE SMT (or defaults if not yet initialized).
+async fn governance_resource_params_handler(
+    State(service): State<Arc<ValidatorNetworkService>>,
+) -> impl IntoResponse {
+    let rp_oid = setu_types::resource_params_object_id();
+    let params = match service.get_subnet_object(
+        &setu_types::SubnetId::GOVERNANCE,
+        rp_oid.as_bytes(),
+    ) {
+        Some(bytes) => {
+            serde_json::from_slice::<setu_types::ResourceParams>(&bytes)
+                .unwrap_or_default()
+        }
+        None => setu_types::ResourceParams::default(),
+    };
+    Json(params)
 }
 
 // ============================================

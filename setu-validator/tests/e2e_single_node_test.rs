@@ -139,7 +139,7 @@ impl SingleNodeTestHarness {
         info!("╚════════════════════════════════════════════════════════════╝");
         
         Transfer::new(&transfer_id, from, to, amount)
-            .with_type(TransferType::FluxTransfer)
+            .with_type(TransferType::SetuTransfer)
     }
     
     /// Step 2: Validator prepares SolverTask

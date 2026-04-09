@@ -8,12 +8,13 @@ use setu_types::task::{
     GasBudget, ReadSetEntry,
 };
 use setu_types::{Event, EventType, SubnetId, ObjectId};
+use setu_types::{flux_state_object_id, power_state_object_id};
 use setu_types::event::VLCSnapshot;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use super::{TaskPrepareError, CoinInfo, SimpleMerkleProof, BatchStateSnapshot};
+use super::{TaskPrepareError, CoinInfo, SimpleMerkleProof, BatchStateSnapshot, StateProvider};
 use crate::coin_reservation::{CoinReservationManager, ReservationHandle};
 
 /// Result of batch task preparation
@@ -573,7 +574,7 @@ impl BatchTaskPreparer {
         let resolved_inputs = ResolvedInputs::transfer(resolved_coin, transfer.amount);
 
         // Build read_set
-        let read_set = vec![ReadSetEntry::new(
+        let mut read_set = vec![ReadSetEntry::new(
             format!("oid:{}", hex::encode(&coin.object_id)),
             object_data,
         )
@@ -582,6 +583,34 @@ impl BatchTaskPreparer {
                 .map(|p| bcs::to_bytes(p).unwrap_or_default())
                 .unwrap_or_default(),
         )];
+        
+        // Add FluxState and PowerState for the sender (for Power/Flux in TEE)
+        let flux_oid = flux_state_object_id(&transfer.from);
+        let power_oid = power_state_object_id(&transfer.from);
+        if let Some(flux_data) = self.state_provider.get_object(&flux_oid) {
+            read_set.push(ReadSetEntry::new(
+                format!("oid:{}", hex::encode(&flux_oid)),
+                flux_data,
+            ));
+        }
+        if let Some(power_data) = self.state_provider.get_object(&power_oid) {
+            read_set.push(ReadSetEntry::new(
+                format!("oid:{}", hex::encode(&power_oid)),
+                power_data,
+            ));
+        }
+
+        // Add ResourceParams from GOVERNANCE subnet
+        let rp_oid = setu_types::resource_params_object_id();
+        if let Some(rp_data) = self.state_provider.get_object_from_subnet(
+            rp_oid.as_bytes(),
+            &setu_types::SubnetId::GOVERNANCE,
+        ) {
+            read_set.push(ReadSetEntry::new(
+                format!("oid:{}", hex::encode(rp_oid.as_bytes())),
+                rp_data,
+            ));
+        }
 
         // Derive parent_ids from snapshot (NO LOCK)
         let parent_ids = self.derive_dependencies_from_snapshot(&coin.object_id, snapshot);
@@ -664,7 +693,7 @@ mod tests {
     fn test_batch_prepare_single_transfer() {
         let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
         let transfer = Transfer::new("batch-tx-1", "alice", "bob", 100)
-            .with_type(TransferType::FluxTransfer)
+            .with_type(TransferType::SetuTransfer)
             .with_power(10);
 
         let result = preparer.prepare_transfers_batch(&[transfer]);
@@ -692,11 +721,11 @@ mod tests {
 
         let transfers = vec![
             Transfer::new("batch-tx-1", "alice", "bob", 100)
-                .with_type(TransferType::FluxTransfer),
+                .with_type(TransferType::SetuTransfer),
             Transfer::new("batch-tx-2", "bob", "charlie", 200)
-                .with_type(TransferType::FluxTransfer),
+                .with_type(TransferType::SetuTransfer),
             Transfer::new("batch-tx-3", "charlie", "alice", 300)
-                .with_type(TransferType::FluxTransfer),
+                .with_type(TransferType::SetuTransfer),
         ];
 
         let result = preparer.prepare_transfers_batch(&transfers);
@@ -717,11 +746,11 @@ mod tests {
         // Send 3 transfers totaling 15M - should detect overdraft
         let transfers = vec![
             Transfer::new("tx-1", "alice", "bob", 6_000_000)
-                .with_type(TransferType::FluxTransfer),
+                .with_type(TransferType::SetuTransfer),
             Transfer::new("tx-2", "alice", "charlie", 6_000_000)
-                .with_type(TransferType::FluxTransfer),
+                .with_type(TransferType::SetuTransfer),
             Transfer::new("tx-3", "alice", "bob", 3_000_000)  // This should fail
-                .with_type(TransferType::FluxTransfer),
+                .with_type(TransferType::SetuTransfer),
         ];
 
         let result = preparer.prepare_transfers_batch(&transfers);
@@ -758,7 +787,7 @@ mod tests {
 
         // alice only has 10,000,000 - requesting 100M should fail
         let transfer = Transfer::new("tx-over", "alice", "bob", 100_000_000)
-            .with_type(TransferType::FluxTransfer);
+            .with_type(TransferType::SetuTransfer);
 
         let result = preparer.prepare_transfers_batch(&[transfer]);
 
@@ -783,13 +812,13 @@ mod tests {
         let transfers = vec![
             // alice -> bob: should succeed
             Transfer::new("tx-1", "alice", "bob", 1_000)
-                .with_type(TransferType::FluxTransfer),
+                .with_type(TransferType::SetuTransfer),
             // alice -> charlie: should succeed (different transfer, same coin)
             Transfer::new("tx-2", "alice", "charlie", 2_000)
-                .with_type(TransferType::FluxTransfer),
+                .with_type(TransferType::SetuTransfer),
             // bob -> charlie: should succeed (different sender)
             Transfer::new("tx-3", "bob", "charlie", 3_000)
-                .with_type(TransferType::FluxTransfer),
+                .with_type(TransferType::SetuTransfer),
         ];
 
         let result = preparer.prepare_transfers_batch(&transfers);

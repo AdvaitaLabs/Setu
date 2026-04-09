@@ -464,6 +464,7 @@ impl TeeExecutor {
                                         key: sc.key.clone(),
                                         old_value: sc.old_value.clone(),
                                         new_value: sc.new_value.clone(),
+                                        target_subnet: None,
                                     })
                                     .collect(),
                             };
@@ -770,6 +771,7 @@ impl TeeExecutor {
                                         key: sc.key.clone(),
                                         old_value: sc.old_value.clone(),
                                         new_value: sc.new_value.clone(),
+                                        target_subnet: None,
                                     })
                                     .collect(),
                             };
@@ -1286,6 +1288,7 @@ impl TeeExecutor {
                                     key: sc.key.clone(),
                                     old_value: sc.old_value.clone(),
                                     new_value: sc.new_value.clone(),
+                                        target_subnet: None,
                                 })
                                 .collect(),
                         };
@@ -1357,6 +1360,7 @@ impl TeeExecutor {
                                         key: sc.key.clone(),
                                         old_value: sc.old_value.clone(),
                                         new_value: sc.new_value.clone(),
+                                        target_subnet: None,
                                     })
                                     .collect(),
                             };
@@ -1535,6 +1539,7 @@ pub async fn send_solver_task_sync(
                 key: sc.key.clone(),
                 old_value: sc.old_value.clone(),
                 new_value: sc.new_value.clone(),
+                                        target_subnet: None,
             })
             .collect(),
     };

@@ -169,10 +169,15 @@ impl MockEnclave {
                 // verify_proof(leaf_hash, entry.proof, pre_state_root)?;
                 
                 // Deserialize CoinState from BCS (raw storage format)
-                let coin_state: CoinState = bcs::from_bytes(&entry.value)
-                    .map_err(|e| StfError::InvalidResolvedInputs(format!(
-                        "Failed to deserialize CoinState {}: {}", hex_id, e
-                    )))?;
+                // Non-CoinState entries (e.g. FluxState/PowerState JSON) will fail BCS
+                // deserialization — skip them (they're read separately for Power/Flux).
+                let coin_state: CoinState = match bcs::from_bytes(&entry.value) {
+                    Ok(cs) => cs,
+                    Err(_) => {
+                        debug!(key = %entry.key, "Skipping non-CoinState read_set entry");
+                        continue;
+                    }
+                };
                 
                 // Convert CoinState → Object<CoinData> for runtime
                 // CoinState.owner is stored in hex format ("0x..."), use from_hex.
@@ -224,6 +229,48 @@ impl MockEnclave {
         );
         
         Ok(store)
+    }
+    
+    /// Extract PowerState and FluxState from read_set entries by key matching (R8-ISSUE-2).
+    ///
+    /// Matches read_set entries by their `oid:{hex}` key against the deterministic
+    /// ObjectIds computed from the sender address, then deserializes as JSON.
+    fn extract_power_flux(
+        read_set: &[ReadSetEntry],
+        sender_address: &str,
+    ) -> (Option<setu_types::PowerState>, Option<setu_types::FluxState>) {
+        let power_key = format!("oid:{}", hex::encode(setu_types::power_state_object_id(sender_address)));
+        let flux_key = format!("oid:{}", hex::encode(setu_types::flux_state_object_id(sender_address)));
+        let mut power_state = None;
+        let mut flux_state = None;
+        for entry in read_set {
+            if entry.key == power_key {
+                if let Ok(ps) = serde_json::from_slice::<setu_types::PowerState>(&entry.value) {
+                    power_state = Some(ps);
+                }
+            } else if entry.key == flux_key {
+                if let Ok(fs) = serde_json::from_slice::<setu_types::FluxState>(&entry.value) {
+                    flux_state = Some(fs);
+                }
+            }
+        }
+        (power_state, flux_state)
+    }
+
+    /// Extract ResourceParams from read_set.
+    ///
+    /// Returns `ResourceParams::default()` if not found (backward-compatible with
+    /// tasks prepared before governance was initialized).
+    fn extract_resource_params(read_set: &[ReadSetEntry]) -> setu_types::ResourceParams {
+        let rp_key = format!("oid:{}", hex::encode(setu_types::resource_params_object_id().as_bytes()));
+        for entry in read_set {
+            if entry.key == rp_key {
+                if let Ok(rp) = serde_json::from_slice::<setu_types::ResourceParams>(&entry.value) {
+                    return rp;
+                }
+            }
+        }
+        setu_types::ResourceParams::default()
     }
     
     /// Simulate applying events to state using self.runtime (LEGACY mode)
@@ -291,6 +338,17 @@ impl MockEnclave {
         let mut processed = Vec::new();
         let mut failed = Vec::new();
         
+        // Pre-extract Power/Flux state from read_set (JSON entries)
+        // Derive sender address from the first event (all events in a task share the same sender)
+        let sender_address = input.events.first()
+            .and_then(|e| e.transfer.as_ref())
+            .map(|t| t.from.clone());
+        let (mut power_state, mut flux_state) = match sender_address {
+            Some(ref addr) => Self::extract_power_flux(&input.read_set, addr),
+            None => (None, None),
+        };
+        let resource_params = Self::extract_resource_params(&input.read_set);
+        
         // Process each event with the isolated local runtime
         for event in &input.events {
             // Check timeout
@@ -298,7 +356,28 @@ impl MockEnclave {
                 return Err(StfError::ExecutionTimeout);
             }
             
-            // Execute event using the LOCAL runtime (not self.runtime!)
+            let consumes_power = setu_runtime::should_consume_power(&event.event_type);
+            
+            // 1. Power decrement BEFORE business logic
+            if consumes_power {
+                if let Some(ref mut power) = power_state {
+                    match setu_runtime::decrement_power(power, resource_params.power_cost_per_event) {
+                        Ok(sc) => diff.add_state_changes(&[sc]),
+                        Err(e) => {
+                            failed.push(FailedEvent {
+                                event_id: event.id.clone(),
+                                reason: format!("Power check failed: {}", e),
+                            });
+                            continue;
+                        }
+                    }
+                } else {
+                    // R8-ISSUE-3: PowerState not in read_set — user may not be registered
+                    warn!(event_id = %event.id, "PowerState not found in read_set — skipping Power check");
+                }
+            }
+            
+            // 2. Execute business logic
             let result = self.execute_single_event_with_runtime(
                 event, 
                 &input.resolved_inputs, 
@@ -308,9 +387,30 @@ impl MockEnclave {
             
             match result {
                 Ok(()) => {
+                    // 3. Flux increment AFTER successful business logic
+                    if consumes_power {
+                        if let Some(ref mut flux) = flux_state {
+                            if resource_params.flux_reward_on_success > 0 {
+                                match setu_runtime::increment_flux(flux, event.timestamp, resource_params.flux_reward_on_success) {
+                                    Ok(sc) => diff.add_state_changes(&[sc]),
+                                    Err(e) => warn!(event_id = %event.id, "Flux increment failed: {}", e),
+                                }
+                            }
+                        }
+                    }
                     processed.push(event.id.clone());
                 }
                 Err(reason) => {
+                    // Power was already consumed (no rollback — design invariant)
+                    // 3b. Flux penalty on failure (if configured)
+                    if consumes_power && resource_params.flux_penalty_on_failure > 0 {
+                        if let Some(ref mut flux) = flux_state {
+                            match setu_runtime::penalize_flux(flux, event.timestamp, resource_params.flux_penalty_on_failure) {
+                                Ok(sc) => diff.add_state_changes(&[sc]),
+                                Err(e) => warn!(event_id = %event.id, "Flux penalty failed: {}", e),
+                            }
+                        }
+                    }
                     failed.push(FailedEvent {
                         event_id: event.id.clone(),
                         reason,

@@ -88,6 +88,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
                 new_value: Some(
                     format!("registered:{}:{}", request.address, request.port).into_bytes(),
                 ),
+                target_subnet: None,
             }],
         });
 
@@ -156,6 +157,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
                 new_value: Some(
                     format!("registered:{}:{}", request.address, request.port).into_bytes(),
                 ),
+                target_subnet: None,
             }],
         });
 

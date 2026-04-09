@@ -93,7 +93,7 @@ TRANSFER_OUTPUT=$(cargo run --release -p setu-cli -- transfer submit \
     --from alice \
     --to bob \
     --amount 1000 \
-    --transfer-type flux \
+    --transfer-type setu \
     --router $VALIDATOR_ADDR 2>&1)
 
 echo "$TRANSFER_OUTPUT"

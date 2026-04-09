@@ -205,13 +205,13 @@ impl TeeVerifier {
     
     /// Verify an event's execution result
     ///
-    /// For ROOT subnet events (validator-executed), returns NotApplicable.
+    /// For system subnet events (ROOT, GOVERNANCE etc.) and validator-executed events, returns NotApplicable.
     /// For App subnet events, verifies the TEE attestation.
     pub fn verify_event(&self, event: &Event) -> VerificationResult {
         let subnet_id = event.get_subnet_id();
         
-        // ROOT subnet events are executed by validators, no TEE needed
-        if subnet_id.is_root() || event.is_validator_executed() {
+        // System subnet events (ROOT, GOVERNANCE) are executed by validators, no TEE needed
+        if subnet_id.is_system() || event.is_validator_executed() {
             return VerificationResult::NotApplicable;
         }
         
@@ -337,6 +337,7 @@ mod tests {
                     key: format!("oid:{}", hex::encode(setu_types::hash_utils::setu_hash(b"balance:alice"))),
                     old_value: Some(vec![100]),
                     new_value: Some(vec![90]),
+                    target_subnet: None,
                 },
             ],
         });
@@ -384,6 +385,7 @@ mod tests {
                 key: format!("oid:{}", hex::encode(setu_types::hash_utils::setu_hash(b"balance:alice"))),
                 old_value: Some(vec![100]),
                 new_value: Some(vec![90]),
+                    target_subnet: None,
             },
         ];
         
@@ -398,6 +400,7 @@ mod tests {
                 key: format!("oid:{}", hex::encode(setu_types::hash_utils::setu_hash(b"balance:bob"))),
                 old_value: Some(vec![50]),
                 new_value: Some(vec![60]),
+                    target_subnet: None,
             },
         ];
         

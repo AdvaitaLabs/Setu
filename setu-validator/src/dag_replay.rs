@@ -6,7 +6,8 @@
 
 use crate::ValidatorNetworkService;
 use setu_storage::EventStoreBackend;
-use setu_types::{Event, EventPayload};
+use setu_types::governance::ProposalContent;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -20,13 +21,17 @@ pub enum ReplayAction {
 }
 
 /// The kind of registration side-effect that was applied.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ReplayKind {
     SubnetRegister,
     ValidatorRegister,
     ValidatorUnregister,
     SolverRegister,
     SolverUnregister,
+    GovernancePropose([u8; 32], ProposalContent),
+    GovernanceExecute([u8; 32]),
+    /// System subnet endpoint registered directly into GovernanceService registry.
+    SystemSubnetRegister,
 }
 
 /// Statistics collected during a replay run.
@@ -40,6 +45,12 @@ pub struct ReplayStats {
     pub validators_unregistered: usize,
     pub solvers_registered: usize,
     pub solvers_unregistered: usize,
+    pub governance_proposals: usize,
+    pub governance_executions: usize,
+    /// System subnet registrations replayed.
+    pub system_subnet_registers: usize,
+    /// Unmatched Propose events (no Execute) — pending governance proposals to re-dispatch.
+    pub pending_governance: Vec<([u8; 32], ProposalContent)>,
     pub errors: usize,
     pub duration_ms: u64,
 }
@@ -83,6 +94,8 @@ impl DagReplayManager {
     ) -> Result<ReplayStats, ReplayError> {
         let start = Instant::now();
         let mut stats = ReplayStats::default();
+        // Track Propose→Execute matching for pending governance discovery
+        let mut governance_pending: HashMap<[u8; 32], ProposalContent> = HashMap::new();
 
         // 1. Determine the depth range
         let max_depth = match self.event_store.get_max_depth().await {
@@ -119,6 +132,17 @@ impl DagReplayManager {
                             ReplayKind::ValidatorUnregister => stats.validators_unregistered += 1,
                             ReplayKind::SolverRegister => stats.solvers_registered += 1,
                             ReplayKind::SolverUnregister => stats.solvers_unregistered += 1,
+                            ReplayKind::GovernancePropose(id, content) => {
+                                stats.governance_proposals += 1;
+                                governance_pending.insert(id, content);
+                            }
+                            ReplayKind::GovernanceExecute(id) => {
+                                stats.governance_executions += 1;
+                                governance_pending.remove(&id);
+                            }
+                            ReplayKind::SystemSubnetRegister => {
+                                stats.system_subnet_registers += 1;
+                            }
                         }
                     }
                     ReplayAction::Skipped => {
@@ -133,6 +157,9 @@ impl DagReplayManager {
 
             current_min = current_max + 1;
         }
+
+        // Unmatched proposals → pending governance (need re-dispatch)
+        stats.pending_governance = governance_pending.into_iter().collect();
 
         stats.duration_ms = start.elapsed().as_millis() as u64;
         Ok(stats)

@@ -316,6 +316,8 @@ impl GlobalStateManager {
         let mut subnet_states = HashMap::new();
         // Always initialize ROOT subnet
         subnet_states.insert(SubnetId::ROOT, SubnetStateSMT::new(SubnetId::ROOT));
+        // Always initialize GOVERNANCE subnet (system subnet for governance proposals)
+        subnet_states.insert(SubnetId::GOVERNANCE, SubnetStateSMT::new(SubnetId::GOVERNANCE));
         
         Self {
             subnet_states,
@@ -926,7 +928,8 @@ impl GlobalStateManager {
         result: &ExecutionResult,
     ) -> [u8; 32] {
         for change in &result.state_changes {
-            self.apply_state_change(subnet_id, change);
+            let target = change.target_subnet.unwrap_or(subnet_id);
+            self.apply_state_change(target, change);
         }
         self.get_subnet_mut(subnet_id).root_bytes()
     }
@@ -986,18 +989,21 @@ impl GlobalStateManager {
                 // write's old_value would be compared against the un-updated SMT value,
                 // causing a false conflict. pending_writes tracks in-flight writes so
                 // the second check sees the first write's new_value.
-                let smt = self.get_subnet_mut(subnet_id);
-                let mut pending_writes: HashMap<HashValue, Option<Vec<u8>>> = HashMap::new();
+                //
+                // Governance target_subnet: a state change may target a different subnet
+                // than the event's own subnet. pending_writes is keyed by (SubnetId, HashValue).
+                let mut pending_writes: HashMap<(SubnetId, HashValue), Option<Vec<u8>>> = HashMap::new();
                 for change in &result.state_changes {
+                    let target = change.target_subnet.unwrap_or(subnet_id);
                     let object_id = Self::parse_state_change_key(&change.key);
 
                     if let Some(ref expected_old) = change.old_value {
                         // Check pending_writes first (prior change within same event),
                         // fall back to SMT for the ground-truth current value.
-                        let effective_current = if let Some(pending) = pending_writes.get(&object_id) {
+                        let effective_current = if let Some(pending) = pending_writes.get(&(target, object_id)) {
                             pending.clone()
                         } else {
-                            smt.get(&object_id).cloned()
+                            self.get_subnet_mut(target).get(&object_id).cloned()
                         };
                         if effective_current.as_ref() != Some(expected_old) {
                             // Stale read detected: current state differs from what
@@ -1016,10 +1022,10 @@ impl GlobalStateManager {
                         // — defense-in-depth.
                         // If the key already exists in SMT or pending_writes, something
                         // is wrong (duplicate coin ID or replayed creation).
-                        let exists_in_pending = pending_writes.get(&object_id)
+                        let exists_in_pending = pending_writes.get(&(target, object_id))
                             .map(|v| v.is_some())
                             .unwrap_or(false);
-                        let exists_in_smt = smt.get(&object_id).is_some();
+                        let exists_in_smt = self.get_subnet_mut(target).get(&object_id).is_some();
                         if exists_in_pending || exists_in_smt {
                             if event.is_genesis() {
                                 // Genesis state was pre-applied to GSM at startup for
@@ -1047,7 +1053,7 @@ impl GlobalStateManager {
 
                     // Record this write in pending_writes so subsequent changes
                     // within the same event see the updated value.
-                    pending_writes.insert(object_id, change.new_value.clone());
+                    pending_writes.insert((target, object_id), change.new_value.clone());
                 }
                 
                 let changes_count = result.state_changes.len();
@@ -1292,7 +1298,7 @@ mod tests {
         
         // ROOT subnet always exists
         assert!(manager.has_subnet(&SubnetId::ROOT));
-        assert_eq!(manager.subnet_count(), 1);
+        assert_eq!(manager.subnet_count(), 2); // ROOT + GOVERNANCE
         
         // Add object to ROOT subnet
         let object_id = [1u8; 32];
@@ -1303,12 +1309,12 @@ mod tests {
         let app_subnet = SubnetId::from_str_id("my-app");
         manager.upsert_object(app_subnet, [3u8; 32], vec![4u8; 32]);
         
-        assert_eq!(manager.subnet_count(), 2);
+        assert_eq!(manager.subnet_count(), 3); // ROOT + GOVERNANCE + app
         
         // Compute global root
         let (global_root, subnet_roots) = manager.compute_global_root();
         assert_ne!(global_root, HashValue::zero());
-        assert_eq!(subnet_roots.len(), 2);
+        assert_eq!(subnet_roots.len(), 3);
         assert!(subnet_roots.contains_key(&SubnetId::ROOT));
         assert!(subnet_roots.contains_key(&app_subnet));
         
@@ -1319,7 +1325,7 @@ mod tests {
         
         assert_eq!(anchor_roots.events_root, events_root);
         assert_eq!(anchor_roots.global_state_root, *global_root.as_bytes());
-        assert_eq!(anchor_roots.subnet_roots.len(), 2);
+        assert_eq!(anchor_roots.subnet_roots.len(), 3);
     }
     
     #[test]

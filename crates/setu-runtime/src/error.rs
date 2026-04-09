@@ -28,6 +28,9 @@ pub enum RuntimeError {
     #[error("Serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
     
+    #[error("Account frozen: {0}")]
+    AccountFrozen(String),
+    
     #[error("Unknown error: {0}")]
     Unknown(String),
 }

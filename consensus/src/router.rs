@@ -14,6 +14,9 @@ pub struct RoutedEvents {
     /// Events for the ROOT subnet (SubnetId=0), executed by validators
     pub root_events: Vec<Event>,
     
+    /// Events for system subnets (e.g. GOVERNANCE), keyed by SubnetId
+    pub system_events: HashMap<SubnetId, Vec<Event>>,
+    
     /// Events for App subnets, keyed by SubnetId, executed by solvers/TEE
     pub app_events: HashMap<SubnetId, Vec<Event>>,
     
@@ -30,6 +33,7 @@ impl RoutedEvents {
     /// Total number of events across all categories
     pub fn total_count(&self) -> usize {
         self.root_events.len() 
+            + self.system_events.values().map(|v| v.len()).sum::<usize>()
             + self.app_events.values().map(|v| v.len()).sum::<usize>()
             + self.unrouted_events.len()
     }
@@ -37,6 +41,7 @@ impl RoutedEvents {
     /// Get all subnet IDs that have events
     pub fn active_subnets(&self) -> Vec<SubnetId> {
         let mut subnets: Vec<SubnetId> = self.app_events.keys().cloned().collect();
+        subnets.extend(self.system_events.keys().cloned());
         if !self.root_events.is_empty() {
             subnets.insert(0, SubnetId::ROOT);
         }
@@ -51,6 +56,11 @@ impl RoutedEvents {
     /// Check if there are any App subnet events
     pub fn has_app_events(&self) -> bool {
         !self.app_events.is_empty()
+    }
+
+    /// Check if there are any system subnet events (e.g. Governance)
+    pub fn has_system_events(&self) -> bool {
+        !self.system_events.is_empty()
     }
 }
 
@@ -84,6 +94,12 @@ impl EventRouter {
             
             if event.is_validator_executed() || subnet_id.is_root() {
                 result.root_events.push(event.clone());
+            } else if subnet_id.is_system() && !subnet_id.is_root() {
+                // System subnets (e.g. GOVERNANCE) — not ROOT, not App
+                result.system_events
+                    .entry(subnet_id)
+                    .or_insert_with(Vec::new)
+                    .push(event.clone());
             } else if subnet_id.is_app() {
                 result.app_events
                     .entry(subnet_id)

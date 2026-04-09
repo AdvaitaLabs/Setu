@@ -84,6 +84,9 @@ impl PendingAnchorBuild {
     /// Get all events from routed_events
     pub fn all_events(&self) -> Vec<Event> {
         let mut events = self.routed_events.root_events.clone();
+        for system_events in self.routed_events.system_events.values() {
+            events.extend(system_events.iter().cloned());
+        }
         for app_events in self.routed_events.app_events.values() {
             events.extend(app_events.iter().cloned());
         }
@@ -724,6 +727,7 @@ mod tests {
                     key: test_oid_key("balance:alice"),
                     old_value: Some(vec![0; 8]),
                     new_value: Some(vec![100; 8]),
+                    target_subnet: None,
                 },
             ],
         );
@@ -763,6 +767,7 @@ mod tests {
                 key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
+                    target_subnet: None,
             }],
         );
         
@@ -802,6 +807,7 @@ mod tests {
                 key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
+                    target_subnet: None,
             }],
         );
         
@@ -833,6 +839,7 @@ mod tests {
                 key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
+                    target_subnet: None,
             }],
         );
         let event2 = create_event_with_result(
@@ -841,6 +848,7 @@ mod tests {
                 key: test_oid_key("balance:bob"),
                 old_value: None,
                 new_value: Some(vec![200; 8]),
+                    target_subnet: None,
             }],
         );
         
@@ -878,6 +886,7 @@ mod tests {
                     key: test_oid_key("balance:alice"),
                     old_value: None,
                     new_value: Some(vec![100; 8]),
+                    target_subnet: None,
                 }],
             ),
             create_event_with_result(
@@ -886,6 +895,7 @@ mod tests {
                     key: test_oid_key("nft:token1"),
                     old_value: None,
                     new_value: Some(vec![1; 32]),
+                    target_subnet: None,
                 }],
             ),
         ];
@@ -895,7 +905,7 @@ mod tests {
         
         // Verify pending has computed roots for both subnets
         let merkle_roots = pending.anchor.merkle_roots.as_ref().unwrap();
-        assert_eq!(merkle_roots.subnet_roots.len(), 2);
+        assert_eq!(merkle_roots.subnet_roots.len(), 3); // ROOT + GOVERNANCE + app_subnet
         
         let result = builder.commit_build(pending).unwrap();
         
@@ -922,6 +932,7 @@ mod tests {
                 key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
+                    target_subnet: None,
             }],
         );
         let pending1 = builder.force_prepare_build(vec![event1], &vlc1, 1).unwrap();
@@ -937,6 +948,7 @@ mod tests {
                 key: test_oid_key("balance:bob"),
                 old_value: None,
                 new_value: Some(vec![200; 8]),
+                    target_subnet: None,
             }],
         );
         let pending2 = builder.force_prepare_build(vec![event2], &vlc2, 2).unwrap();
