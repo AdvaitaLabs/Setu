@@ -1,5 +1,6 @@
+#![allow(dead_code)]
+
 use std::fs;
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,26 +40,13 @@ impl<S: StateStore> ExampleState<S> {
 
 #[derive(Debug, Clone, Default)]
 pub struct ExampleArgs {
-    pub executor_id: String,
-    pub disassembly: Option<String>,
-    pub addresses: BTreeMap<String, Address>,
-    pub object_ids: BTreeMap<String, ObjectId>,
-    pub strings: BTreeMap<String, String>,
-    pub numbers: BTreeMap<String, u64>,
-    pub bools: BTreeMap<String, bool>,
+    pub addresses: std::collections::BTreeMap<String, Address>,
+    pub object_ids: std::collections::BTreeMap<String, ObjectId>,
 }
 
 impl ExampleArgs {
-    pub fn new(executor_id: impl Into<String>) -> Self {
-        Self {
-            executor_id: executor_id.into(),
-            ..Self::default()
-        }
-    }
-
-    pub fn with_disassembly(mut self, disassembly: String) -> Self {
-        self.disassembly = Some(disassembly);
-        self
+    pub fn new(_executor_id: impl Into<String>) -> Self {
+        Self::default()
     }
 
     pub fn insert_address(&mut self, key: impl Into<String>, value: Address) {
@@ -67,18 +55,6 @@ impl ExampleArgs {
 
     pub fn insert_object_id(&mut self, key: impl Into<String>, value: ObjectId) {
         self.object_ids.insert(key.into(), value);
-    }
-
-    pub fn insert_string(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.strings.insert(key.into(), value.into());
-    }
-
-    pub fn insert_number(&mut self, key: impl Into<String>, value: u64) {
-        self.numbers.insert(key.into(), value);
-    }
-
-    pub fn insert_bool(&mut self, key: impl Into<String>, value: bool) {
-        self.bools.insert(key.into(), value);
     }
 
     pub fn address(&self, key: &str) -> Result<Address> {
@@ -94,39 +70,6 @@ impl ExampleArgs {
             .copied()
             .with_context(|| format!("missing object id '{}'", key))
     }
-
-    pub fn string(&self, key: &str) -> Result<&str> {
-        self.strings
-            .get(key)
-            .map(String::as_str)
-            .with_context(|| format!("missing string '{}'", key))
-    }
-
-    pub fn number(&self, key: &str) -> Result<u64> {
-        self.numbers
-            .get(key)
-            .copied()
-            .with_context(|| format!("missing number '{}'", key))
-    }
-
-    pub fn bool(&self, key: &str) -> Result<bool> {
-        self.bools
-            .get(key)
-            .copied()
-            .with_context(|| format!("missing bool '{}'", key))
-    }
-
-    pub fn disassembly(&self) -> Result<&str> {
-        self.disassembly
-            .as_deref()
-            .context("missing contract disassembly")
-    }
-}
-
-pub struct ProgramCall<'a> {
-    pub function_name: &'a str,
-    pub args: Vec<SuiVmArg>,
-    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -164,28 +107,6 @@ pub fn execute_program_tx<S: StateStore>(
     executor
         .execute_transaction(&tx, &ctx)
         .with_context(|| format!("Failed to execute '{}' via RuntimeExecutor", function_name))?;
-
-    Ok(())
-}
-
-pub fn execute_program_calls<S: StateStore>(
-    executor: &mut RuntimeExecutor<S>,
-    sender: &Address,
-    disassembly: &str,
-    executor_id: &str,
-    calls: &[ProgramCall<'_>],
-) -> Result<()> {
-    for call in calls {
-        execute_program_tx(
-            executor,
-            sender,
-            disassembly,
-            call.function_name,
-            call.args.clone(),
-            call.timestamp,
-            executor_id,
-        )?;
-    }
 
     Ok(())
 }
