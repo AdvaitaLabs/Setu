@@ -2,8 +2,47 @@
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::vm_object::SuiVmStoredObject;
+use serde::{Deserialize, Serialize};
+use setu_types::hash_utils::setu_hash_with_domain;
 use setu_types::{Address, CoinData, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
+
+/// A published Sui Move module represented as direct VM disassembly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishedSuiContract {
+    /// Module identifier used by program calls.
+    pub module_name: String,
+    /// Sui `.mvb` disassembly instructions for this module.
+    pub disassembly: String,
+    /// Address that published the module.
+    pub publisher: Address,
+    /// Deterministic publish timestamp from the execution context.
+    pub published_at: u64,
+}
+
+impl PublishedSuiContract {
+    pub fn new(
+        module_name: impl Into<String>,
+        disassembly: String,
+        publisher: Address,
+        published_at: u64,
+    ) -> Self {
+        Self {
+            module_name: module_name.into(),
+            disassembly,
+            publisher,
+            published_at,
+        }
+    }
+}
+
+/// Deterministic storage object id for a published Sui contract.
+pub fn published_contract_id(module_name: &str) -> ObjectId {
+    ObjectId::new(setu_hash_with_domain(
+        b"SETU_SUI_CONTRACT:",
+        module_name.as_bytes(),
+    ))
+}
 
 /// State storage trait
 /// Can be replaced with persistent storage or Move VM state management in the future
@@ -45,6 +84,26 @@ pub trait StateStore {
         )))
     }
 
+    /// Read a published Sui contract by module name.
+    fn get_published_contract(
+        &self,
+        _module_name: &str,
+    ) -> RuntimeResult<Option<PublishedSuiContract>> {
+        Ok(None)
+    }
+
+    /// Write a published Sui contract.
+    fn set_published_contract(
+        &mut self,
+        module_name: String,
+        _contract: PublishedSuiContract,
+    ) -> RuntimeResult<()> {
+        Err(RuntimeError::StateError(format!(
+            "Published contract storage unsupported for {}",
+            module_name
+        )))
+    }
+
     /// Finalize pending writes after a scenario step or batch completes.
     ///
     /// In-memory stores can treat this as a no-op, while persistent backends
@@ -66,6 +125,8 @@ pub struct InMemoryStateStore {
     objects: HashMap<ObjectId, Object<CoinData>>,
     /// Generic VM object storage: ObjectId -> stored object
     vm_objects: HashMap<ObjectId, SuiVmStoredObject>,
+    /// Published Sui contracts: module name -> contract instructions
+    published_contracts: HashMap<String, PublishedSuiContract>,
     /// Ownership index: Address -> Vec<ObjectId>
     ownership_index: HashMap<Address, Vec<ObjectId>>,
 }
@@ -76,6 +137,7 @@ impl InMemoryStateStore {
         Self {
             objects: HashMap::new(),
             vm_objects: HashMap::new(),
+            published_contracts: HashMap::new(),
             ownership_index: HashMap::new(),
         }
     }
@@ -121,6 +183,11 @@ impl InMemoryStateStore {
         self.vm_objects.contains_key(object_id)
     }
 
+    /// Return whether an in-memory published contract exists.
+    pub fn contains_published_contract(&self, module_name: &str) -> bool {
+        self.published_contracts.contains_key(module_name)
+    }
+
     /// Snapshot all in-memory coin objects.
     pub fn snapshot_objects(&self) -> Vec<(ObjectId, Object<CoinData>)> {
         self.objects
@@ -134,6 +201,14 @@ impl InMemoryStateStore {
         self.vm_objects
             .iter()
             .map(|(object_id, object)| (*object_id, object.clone()))
+            .collect()
+    }
+
+    /// Snapshot all in-memory published contracts.
+    pub fn snapshot_published_contracts(&self) -> Vec<(String, PublishedSuiContract)> {
+        self.published_contracts
+            .iter()
+            .map(|(module_name, contract)| (module_name.clone(), contract.clone()))
             .collect()
     }
 }
@@ -192,6 +267,22 @@ impl StateStore for InMemoryStateStore {
         self.remove_from_ownership_index(object_id);
         Ok(())
     }
+
+    fn get_published_contract(
+        &self,
+        module_name: &str,
+    ) -> RuntimeResult<Option<PublishedSuiContract>> {
+        Ok(self.published_contracts.get(module_name).cloned())
+    }
+
+    fn set_published_contract(
+        &mut self,
+        module_name: String,
+        contract: PublishedSuiContract,
+    ) -> RuntimeResult<()> {
+        self.published_contracts.insert(module_name, contract);
+        Ok(())
+    }
 }
 
 /// Overlay state store that combines a persistent base store with
@@ -240,6 +331,7 @@ impl<S: StateStore> OverlayStateStore<S> {
         let deleted_vm_objects: Vec<_> = self.deleted_vm_objects.drain().collect();
         let overlay_objects = self.overlay.snapshot_objects();
         let overlay_vm_objects = self.overlay.snapshot_vm_objects();
+        let overlay_contracts = self.overlay.snapshot_published_contracts();
 
         for object_id in deleted_objects {
             self.base.delete_object(&object_id)?;
@@ -252,6 +344,9 @@ impl<S: StateStore> OverlayStateStore<S> {
         }
         for (object_id, object) in overlay_vm_objects {
             self.base.set_vm_object(object_id, object)?;
+        }
+        for (module_name, contract) in overlay_contracts {
+            self.base.set_published_contract(module_name, contract)?;
         }
 
         self.overlay = InMemoryStateStore::new();
@@ -327,6 +422,24 @@ impl<S: StateStore> StateStore for OverlayStateStore<S> {
         self.overlay.delete_vm_object(object_id)?;
         self.deleted_vm_objects.insert(*object_id);
         Ok(())
+    }
+
+    fn get_published_contract(
+        &self,
+        module_name: &str,
+    ) -> RuntimeResult<Option<PublishedSuiContract>> {
+        if self.overlay.contains_published_contract(module_name) {
+            return self.overlay.get_published_contract(module_name);
+        }
+        self.base.get_published_contract(module_name)
+    }
+
+    fn set_published_contract(
+        &mut self,
+        module_name: String,
+        contract: PublishedSuiContract,
+    ) -> RuntimeResult<()> {
+        self.overlay.set_published_contract(module_name, contract)
     }
 
     fn commit_pending(&mut self) -> RuntimeResult<()> {

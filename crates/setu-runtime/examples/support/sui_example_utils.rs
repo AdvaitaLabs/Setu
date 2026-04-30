@@ -82,6 +82,49 @@ pub struct ProgramCallSpec {
     pub executor_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PublishedProgramCallSpec {
+    pub sender: Address,
+    pub module_name: String,
+    pub function_name: String,
+    pub args: Vec<SuiVmArg>,
+    pub timestamp: u64,
+    pub executor_id: String,
+}
+
+pub fn publish_contract<S: StateStore>(
+    mut state: ExampleState<S>,
+    sender: Address,
+    module_name: &str,
+    disassembly: String,
+    timestamp: u64,
+    executor_id: &str,
+) -> Result<ExampleState<S>> {
+    let tx = Transaction::new_contract_publish_deterministic(
+        sender,
+        module_name.to_string(),
+        disassembly,
+        timestamp,
+    );
+    let ctx = ExecutionContext {
+        executor_id: executor_id.to_string(),
+        timestamp,
+        in_tee: false,
+    };
+
+    state
+        .executor
+        .execute_transaction(&tx, &ctx)
+        .with_context(|| format!("Failed to publish Sui contract '{}'", module_name))?;
+    state
+        .executor
+        .state_mut()
+        .commit_pending()
+        .context("Failed to commit published contract")?;
+
+    Ok(state)
+}
+
 pub fn execute_program_tx<S: StateStore>(
     executor: &mut RuntimeExecutor<S>,
     sender: &Address,
@@ -111,6 +154,31 @@ pub fn execute_program_tx<S: StateStore>(
     Ok(())
 }
 
+pub fn execute_published_contract_tx<S: StateStore>(
+    executor: &mut RuntimeExecutor<S>,
+    sender: &Address,
+    module_name: &str,
+    function_name: &str,
+    args: Vec<SuiVmArg>,
+    timestamp: u64,
+    executor_id: &str,
+) -> Result<()> {
+    let contract = executor
+        .state()
+        .get_published_contract(module_name)?
+        .with_context(|| format!("Sui contract '{}' has not been published", module_name))?;
+
+    execute_program_tx(
+        executor,
+        sender,
+        &contract.disassembly,
+        function_name,
+        args,
+        timestamp,
+        executor_id,
+    )
+}
+
 pub fn execute_program_scenario<S: StateStore>(
     mut state: ExampleState<S>,
     calls: &[ProgramCallSpec],
@@ -120,6 +188,31 @@ pub fn execute_program_scenario<S: StateStore>(
             &mut state.executor,
             &call.sender,
             &call.disassembly,
+            &call.function_name,
+            call.args.clone(),
+            call.timestamp,
+            &call.executor_id,
+        )?;
+    }
+
+    state
+        .executor
+        .state_mut()
+        .commit_pending()
+        .context("Failed to commit scenario state")?;
+
+    Ok(state)
+}
+
+pub fn execute_published_contract_scenario<S: StateStore>(
+    mut state: ExampleState<S>,
+    calls: &[PublishedProgramCallSpec],
+) -> Result<ExampleState<S>> {
+    for call in calls {
+        execute_published_contract_tx(
+            &mut state.executor,
+            &call.sender,
+            &call.module_name,
             &call.function_name,
             call.args.clone(),
             call.timestamp,

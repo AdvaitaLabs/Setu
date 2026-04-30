@@ -13,9 +13,11 @@ use setu_types::{deterministic_coin_id, Address, Balance, CoinData, CoinType, Ob
 use tracing::{debug, info, warn};
 // Note: Coin::to_coin_state_bytes() is used via trait method on Object<CoinData>
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::state::StateStore;
+use crate::state::{published_contract_id, PublishedSuiContract, StateStore};
 use crate::sui_vm::execute_sui_entry_with_outcome;
-use crate::transaction::{ProgramTx, QueryTx, QueryType, Transaction, TransactionType, TransferTx};
+use crate::transaction::{
+    ContractPublishTx, ProgramTx, QueryTx, QueryType, Transaction, TransactionType, TransferTx,
+};
 
 /// Execution context
 #[derive(Debug, Clone)]
@@ -114,6 +116,9 @@ impl<S: StateStore> RuntimeExecutor<S> {
             TransactionType::Transfer(transfer_tx) => self.execute_transfer(tx, transfer_tx, ctx),
             TransactionType::Query(query_tx) => self.execute_query(tx, query_tx, ctx),
             TransactionType::Program(program_tx) => self.execute_program(tx, program_tx, ctx),
+            TransactionType::ContractPublish(publish_tx) => {
+                self.execute_contract_publish(tx, publish_tx, ctx)
+            }
         };
 
         match &result {
@@ -388,6 +393,70 @@ impl<S: StateStore> RuntimeExecutor<S> {
             state_changes,
             created_objects,
             deleted_objects,
+            query_result: None,
+        })
+    }
+
+    /// Publish Sui contract instructions into runtime state.
+    fn execute_contract_publish(
+        &mut self,
+        tx: &Transaction,
+        publish_tx: &ContractPublishTx,
+        ctx: &ExecutionContext,
+    ) -> RuntimeResult<ExecutionOutput> {
+        if publish_tx.module_name.trim().is_empty() {
+            return Err(RuntimeError::InvalidTransaction(
+                "Contract publish requires a module name".to_string(),
+            ));
+        }
+        if publish_tx.disassembly.trim().is_empty() {
+            return Err(RuntimeError::InvalidTransaction(
+                "Contract publish requires disassembly instructions".to_string(),
+            ));
+        }
+
+        let object_id = published_contract_id(&publish_tx.module_name);
+        let old_contract = self.state.get_published_contract(&publish_tx.module_name)?;
+        let old_state = old_contract
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(RuntimeError::SerializationError)?;
+
+        let contract = PublishedSuiContract::new(
+            publish_tx.module_name.clone(),
+            publish_tx.disassembly.clone(),
+            tx.sender,
+            ctx.timestamp,
+        );
+        let new_state = serde_json::to_vec(&contract).map_err(RuntimeError::SerializationError)?;
+        self.state
+            .set_published_contract(publish_tx.module_name.clone(), contract)?;
+
+        let change_type = if old_contract.is_some() {
+            StateChangeType::Update
+        } else {
+            StateChangeType::Create
+        };
+
+        Ok(ExecutionOutput {
+            success: true,
+            message: Some(format!(
+                "Contract '{}' published successfully",
+                publish_tx.module_name
+            )),
+            state_changes: vec![StateChange {
+                change_type,
+                object_id,
+                old_state,
+                new_state: Some(new_state),
+            }],
+            created_objects: if old_contract.is_some() {
+                vec![]
+            } else {
+                vec![object_id]
+            },
+            deleted_objects: vec![],
             query_result: None,
         })
     }
@@ -956,6 +1025,42 @@ B3:
     9: Ret
 }
 "#;
+
+    #[test]
+    fn test_contract_publish_stores_disassembly() {
+        let sender = Address::from_str_id("publisher");
+        let mut executor = RuntimeExecutor::new(InMemoryStateStore::new());
+        let tx = Transaction::new_contract_publish_deterministic(
+            sender,
+            "published_coin",
+            PROGRAM_TX_DISASSEMBLY.to_string(),
+            42,
+        );
+        let ctx = ExecutionContext {
+            executor_id: "validator1".to_string(),
+            timestamp: 42,
+            in_tee: false,
+        };
+
+        let output = executor.execute_transaction(&tx, &ctx).unwrap();
+        assert!(output.success);
+        assert_eq!(output.state_changes.len(), 1);
+        assert_eq!(output.state_changes[0].change_type, StateChangeType::Create);
+        assert_eq!(
+            output.created_objects,
+            vec![published_contract_id("published_coin")]
+        );
+
+        let stored = executor
+            .state()
+            .get_published_contract("published_coin")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.module_name, "published_coin");
+        assert_eq!(stored.disassembly, PROGRAM_TX_DISASSEMBLY);
+        assert_eq!(stored.publisher, sender);
+        assert_eq!(stored.published_at, 42);
+    }
 
     #[test]
     fn test_full_transfer() {

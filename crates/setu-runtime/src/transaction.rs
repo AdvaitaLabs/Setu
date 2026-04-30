@@ -13,6 +13,8 @@ pub enum TransactionType {
     Query(QueryTx),
     /// Program transaction (Sui disassembly subset execution)
     Program(ProgramTx),
+    /// Publish Sui disassembly instructions for later program execution.
+    ContractPublish(ContractPublishTx),
 }
 
 /// Simplified transaction structure
@@ -61,6 +63,15 @@ pub struct ProgramTx {
     pub args: Vec<SuiVmArg>,
     /// Optional gas budget (reserved for future accounting).
     pub gas_budget: Option<u64>,
+}
+
+/// Sui contract publish transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractPublishTx {
+    /// Module identifier used by subsequent program calls.
+    pub module_name: String,
+    /// Sui `.mvb` disassembly instructions to store.
+    pub disassembly: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +224,54 @@ impl Transaction {
                 function_name: function_name.into(),
                 args,
                 gas_budget: None,
+            }),
+            input_objects: vec![],
+            timestamp: ctx_timestamp,
+        }
+    }
+
+    /// Create a new Sui contract publish transaction.
+    pub fn new_contract_publish(
+        sender: Address,
+        module_name: impl Into<String>,
+        disassembly: String,
+    ) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let module_name = module_name.into();
+        let id = format!("publish_{}_{:x}", module_name, timestamp);
+
+        Self {
+            id,
+            sender,
+            tx_type: TransactionType::ContractPublish(ContractPublishTx {
+                module_name,
+                disassembly,
+            }),
+            input_objects: vec![],
+            timestamp,
+        }
+    }
+
+    /// Create a deterministic Sui contract publish transaction.
+    pub fn new_contract_publish_deterministic(
+        sender: Address,
+        module_name: impl Into<String>,
+        disassembly: String,
+        ctx_timestamp: u64,
+    ) -> Self {
+        let module_name = module_name.into();
+        let id = format!("publish_{}_{:x}", module_name, ctx_timestamp);
+
+        Self {
+            id,
+            sender,
+            tx_type: TransactionType::ContractPublish(ContractPublishTx {
+                module_name,
+                disassembly,
             }),
             input_objects: vec![],
             timestamp: ctx_timestamp,

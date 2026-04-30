@@ -7,7 +7,7 @@ use setu_storage::{
 use setu_types::{object_key, Address, CoinData, Object, ObjectId, StateChange, SubnetId};
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::state::StateStore;
+use crate::state::{published_contract_id, PublishedSuiContract, StateStore};
 use crate::vm_object::SuiVmStoredObject;
 
 /// StateStore adapter backed by Setu's Merkle state manager and provider.
@@ -182,6 +182,39 @@ impl StateStore for SetuMerkleStateStore {
             .write()
             .map_err(|_| RuntimeError::StateError("GlobalStateManager lock poisoned".to_string()))?
             .apply_state_change(self.subnet_id, &change);
+        Ok(())
+    }
+
+    fn get_published_contract(
+        &self,
+        module_name: &str,
+    ) -> RuntimeResult<Option<PublishedSuiContract>> {
+        let object_id = published_contract_id(module_name);
+        self.get_object_bytes(&object_id)
+            .map(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    RuntimeError::StateError(format!(
+                        "Failed to decode published contract {} from Setu state: {}",
+                        module_name, e
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    fn set_published_contract(
+        &mut self,
+        module_name: String,
+        contract: PublishedSuiContract,
+    ) -> RuntimeResult<()> {
+        let object_id = published_contract_id(&module_name);
+        let bytes = serde_json::to_vec(&contract).map_err(|e| {
+            RuntimeError::StateError(format!("Failed to encode published contract: {}", e))
+        })?;
+        self.state_manager
+            .write()
+            .map_err(|_| RuntimeError::StateError("GlobalStateManager lock poisoned".to_string()))?
+            .upsert_object(self.subnet_id, *object_id.as_bytes(), bytes);
         Ok(())
     }
 

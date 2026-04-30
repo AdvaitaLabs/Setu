@@ -20,10 +20,14 @@ pub use executor::{
     ExecutionContext, ExecutionOutput, RuntimeExecutor, StateChange, StateChangeType,
 };
 pub use setu_state_store::SetuMerkleStateStore;
-pub use state::{InMemoryStateStore, OverlayStateStore, StateStore};
+pub use state::{
+    published_contract_id, InMemoryStateStore, OverlayStateStore, PublishedSuiContract, StateStore,
+};
 pub use sui_vm::{
     compile_package_to_disassembly, execute_sui_entry_from_disassembly,
     execute_sui_entry_with_outcome, SuiVmArg, SuiVmExecutionOutcome, SuiVmWrite,
 };
-pub use transaction::{ProgramTx, QueryTx, Transaction, TransactionType, TransferTx};
+pub use transaction::{
+    ContractPublishTx, ProgramTx, QueryTx, Transaction, TransactionType, TransferTx,
+};
 pub use vm_object::{SuiVmStoredObject, SuiVmStoredValue};

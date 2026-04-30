@@ -8,6 +8,7 @@ Current executable components:
 
 1. Runtime executor for transaction flows (`Transfer`, `Query`, `Program`)
 2. Direct Sui disassembly subset VM (`sui_vm.rs`) for smart-contract entry execution
+3. Published Sui disassembly storage for module-like contract execution
 
 ## 2. Runtime Transaction Model
 
@@ -16,6 +17,7 @@ Current executable components:
 1. `Transfer(TransferTx)`
 2. `Query(QueryTx)`
 3. `Program(ProgramTx)`
+4. `ContractPublish(ContractPublishTx)`
 
 `ProgramTx` payload:
 
@@ -23,6 +25,11 @@ Current executable components:
 2. `function_name` (entry to execute)
 3. `args` (`Vec<SuiVmArg>`)
 4. optional `gas_budget` (reserved)
+
+`ContractPublishTx` payload:
+
+1. `module_name` (module identifier for later calls)
+2. `disassembly` (module `.mvb` instructions to store)
 
 ## 3. State Model
 
@@ -62,6 +69,14 @@ Supported query types:
 1. Execute target entry via `execute_sui_entry_with_outcome(...)`
 2. Convert VM write records into `StateChange` values
 3. Classify writes as `Create` / `Update` / `Delete`
+
+## 4.4 Contract Publish
+
+`RuntimeExecutor` routes `ContractPublish` transactions to state storage:
+
+1. Validate module name and disassembly instructions
+2. Store `PublishedSuiContract` under deterministic `published_contract_id(module_name)`
+3. Emit a `Create` or `Update` state change for the published instructions
 
 ## 5. Direct Sui Disassembly Subset VM (`sui_vm.rs`)
 
@@ -167,7 +182,26 @@ Run:
 cargo run -p setu-runtime --example sui_lightning_contract_e2e
 ```
 
-## 8. Determinism and Safety
+## 8. Example C: Publish Then Execute
+
+Reference:
+
+- [sui_contract_publish_e2e.rs](/home/gyp/repo/Setu/crates/setu-runtime/examples/sui_contract_publish_e2e.rs)
+
+Flow:
+
+1. Compile + disassemble `published_coin`
+2. Publish the disassembly instructions into runtime state
+3. Resolve the published module by name
+4. Execute mint and burn entries through the existing program execution utility
+
+Run:
+
+```bash
+cargo run -p setu-runtime --example sui_contract_publish_e2e
+```
+
+## 9. Determinism and Safety
 
 Determinism constraints:
 
@@ -182,7 +216,7 @@ Safety checks:
 3. argument/param coercion checks
 4. unsupported opcode/call rejection
 
-## 9. Current Limitations
+## 10. Current Limitations
 
 Not implemented yet:
 
@@ -190,9 +224,9 @@ Not implemented yet:
 2. Full Sui native function set (`table`, `object`, `event`, `hash`, `ecdsa`, etc.)
 3. Full capability/object-kind semantics
 4. Bytecode verifier and gas metering
-5. On-chain module publish/upgrade semantics
+5. Full Sui on-chain package publish/upgrade semantics
 
-## 10. Roadmap
+## 11. Roadmap
 
 Near-term priorities:
 
