@@ -26,9 +26,10 @@ module examples::dex_pool {
     use setu::object::{Self, UID};
     use setu::dynamic_field as df;
     use setu::transfer;
-    use setu::tx_context::TxContext;
+    use setu::tx_context::{Self, TxContext};
     use setu::bcs;
     use setu::hash;
+    use setu::event;
 
     // ── Abort codes ──────────────────────────────────────────────────────
     const E_PAIR_EXISTS:  u64 = 1;
@@ -57,6 +58,20 @@ module examples::dex_pool {
         reserve_b: u64,
     }
 
+    // ── Events ──────────────────────────────────────────────────────────
+
+    /// Emitted whenever a pair's reserves change (created or replaced).
+    /// `pair_bcs` is the BCS encoding of the `Pair` key — proves the
+    /// `bcs::to_bytes` native is wired in (B3 acceptance §9 item 5).
+    /// Off-chain indexers can decode it back into `(token_a, token_b)`.
+    /// `copy + drop` are required by `event::emit<T: copy + drop>`.
+    struct PriceObservation has copy, drop {
+        pair_bcs: vector<u8>,
+        reserve_a: u64,
+        reserve_b: u64,
+        epoch: u64,
+    }
+
     // ── Constructors ─────────────────────────────────────────────────────
 
     /// One-step create + share. After this, anyone can call the entry
@@ -75,6 +90,7 @@ module examples::dex_pool {
         token_b: address,
         reserve_a: u64,
         reserve_b: u64,
+        ctx: &TxContext,
     ) {
         let pair = Pair { token_a, token_b };
         assert!(!df::exists_<Pair>(&pool.id, pair), E_PAIR_EXISTS);
@@ -83,6 +99,12 @@ module examples::dex_pool {
             pair,
             Liquidity { reserve_a, reserve_b },
         );
+        event::emit(PriceObservation {
+            pair_bcs: bcs::to_bytes(&pair),
+            reserve_a,
+            reserve_b,
+            epoch: tx_context::epoch(ctx),
+        });
     }
 
     /// Replace an existing pair's liquidity.
@@ -96,6 +118,7 @@ module examples::dex_pool {
         token_b: address,
         reserve_a: u64,
         reserve_b: u64,
+        ctx: &TxContext,
     ) {
         let pair = Pair { token_a, token_b };
         assert!(df::exists_<Pair>(&pool.id, pair), E_PAIR_MISSING);
@@ -105,6 +128,12 @@ module examples::dex_pool {
             pair,
             Liquidity { reserve_a, reserve_b },
         );
+        event::emit(PriceObservation {
+            pair_bcs: bcs::to_bytes(&pair),
+            reserve_a,
+            reserve_b,
+            epoch: tx_context::epoch(ctx),
+        });
     }
 
     /// Remove a pair entirely (listing delisted, etc).
