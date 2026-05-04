@@ -753,6 +753,15 @@ impl SetuMoveEngine {
     /// - **F6**: callers (TaskPreparer) MUST have already invoked
     ///   `setu_types::ptb::validate_wire(ptb)` before calling this method.
     ///   The skeleton repeats `validate_wire` as defense-in-depth.
+    ///
+    /// # Returns
+    ///
+    /// `MoveExecutionOutput.return_values` carries ONLY the LAST command's
+    /// MoveCall return values, and is reset to `vec![]` by any non-MoveCall
+    /// command (SplitCoins / MergeCoins / TransferObjects / MakeMoveVec /
+    /// Publish). The in-VM `PtbContext` result table is the source of truth
+    /// for cross-command data flow; `return_values` is a convenience for
+    /// callers whose PTB ends with a MoveCall (R2-ISSUE-5).
     #[allow(clippy::too_many_arguments)]
     pub fn execute_ptb<S: RawStore>(
         &self,
@@ -1449,7 +1458,7 @@ impl SetuMoveEngine {
 
     /// Build BCS-serialized TxContext for Move function calls.
     /// `n` calls of `0x1::coin::transfer<T>(Coin<T>, address)`. All listed
-    /// objects MUST be `Coin<T>` (per design §2 non-goals — TransferObjects
+    /// objects MUST be `Coin<T>` (per design.md §10 F7 — TransferObjects
     /// for non-Coin objects is intentionally deferred). Each object is
     /// consumed (linear-type) and the recipient bytes are passed by-value.
     /// `coin::transfer` is `entry` and takes no TxContext, so no PTB-scoped
@@ -1494,7 +1503,7 @@ impl SetuMoveEngine {
             let inner_t = coin_inner_type_from_tag(obj_tag).ok_or_else(|| {
                 RuntimeError::PtbUnsupportedTransferType(format!(
                     "TransferObjects[{i}] TypeTag {obj_tag} is not 0x1::coin::Coin<T> \
-                     — non-Coin transfer support is deferred (design §2 non-goals)"
+                     — non-Coin transfer support is deferred (design.md §10 F7)"
                 ))
             })?;
             let ty_arg_t = session.load_type(&inner_t).map_err(|e| {
@@ -3067,8 +3076,8 @@ mod tests {
         }
 
         // I7-neg — TransferObjects on an object whose TypeTag is not Coin<T>
-        //          must fail with PtbUnsupportedTransferType (design §2 says
-        //          non-Coin transfers are deferred). Synthesize a non-Coin
+        //          must fail with PtbUnsupportedTransferType (design.md §10 F7
+        //          says non-Coin transfers are deferred). Synthesize a non-Coin
         //          object as an input.
         #[test]
         fn transfer_objects_non_coin_rejected() {
