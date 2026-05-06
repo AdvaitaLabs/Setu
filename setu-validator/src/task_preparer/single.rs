@@ -1350,7 +1350,15 @@ impl TaskPreparer {
             std::collections::HashSet::new();
         for cmd in &ptb.commands {
             if let setu_types::ptb::Command::MoveCall(mc) = cmd {
-                let pkg_hex = format!("0x{}", hex::encode(mc.package.as_bytes()));
+                // Use canonical (zero-stripped) form to match how `mod:`
+                // SMT keys are written — `infra_executor.rs::execute_contract_publish`
+                // uses `to_hex_literal()`. Padded `hex::encode(.as_bytes())` here
+                // would mis-key for any package whose address has leading zeros
+                // (e.g. v0 family `0xcafe`). See iter-7
+                // docs/feat/fix-package-addr-hex-encoding/.
+                let pkg_hex = crate::network::move_handler::canonical_addr_hex(
+                    &format!("0x{}", hex::encode(mc.package.as_bytes())),
+                );
                 if !seen.insert((pkg_hex.clone(), mc.module.clone())) {
                     continue;
                 }
@@ -3411,6 +3419,59 @@ mod tests {
             assert!(
                 matches!(result, Err(TaskPrepareError::ObjectNotFound(_))),
                 "got: {:?}", result
+            );
+        }
+
+        /// U12 — iter-7 regression gate: PTB lowering of a `Command::MoveCall`
+        /// against a v0-family package address with leading-zero bytes
+        /// (e.g. `0xcafe`) must reach the `mod:0xcafe::counter` SMT key,
+        /// not the padded `mod:0x000…cafe::counter` form.
+        ///
+        /// Pre-iter-7 hex-encoding-fix the PTB read-set computation used
+        /// `format!("0x{}", hex::encode(mc.package.as_bytes()))` which
+        /// produced the padded form, so this test would have hit
+        /// `ModuleNotFound("mod:0x000…cafe::counter")`.
+        ///
+        /// See docs/feat/fix-package-addr-hex-encoding/.
+        #[test]
+        fn u12_ptb_movecall_v0_family_addr_finds_module() {
+            use setu_types::ptb::{Command, MoveCall};
+            use move_core_types::account_address::AccountAddress;
+
+            // Module is keyed under canonical (zero-stripped) form, matching
+            // how `infra_executor::execute_contract_publish` writes it.
+            let addr = AccountAddress::from_hex_literal("0xcafe").unwrap();
+            let bytecode = make_module_bytes(
+                move_binary_format::file_format::AddressIdentifierIndex(0),
+                addr,
+                "counter",
+            );
+            let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+            assert_eq!(module_key, "mod:0xcafe::counter");
+            let preparer = make_preparer_with_module(&module_key, &bytecode);
+
+            // Build a single-Command PTB targeting `0xcafe::counter::increment`.
+            // `mc.package` is an ObjectId whose raw bytes left-pad `0xcafe`.
+            let mut pkg_bytes = [0u8; 32];
+            pkg_bytes[30..].copy_from_slice(&[0xca, 0xfe]);
+            let mut ptb = empty_ptb();
+            ptb.commands.push(Command::MoveCall(MoveCall {
+                package: ObjectId::new(pkg_bytes),
+                module: "counter".to_string(),
+                function: "increment".to_string(),
+                type_arguments: vec![],
+                arguments: vec![],
+            }));
+            let payload = ptb_payload(ptb);
+
+            let task = preparer
+                .prepare_move_ptb_task(&test_event(), &payload, SubnetId::ROOT)
+                .expect("PTB MoveCall against 0xcafe must resolve module");
+            // Module read-set must contain the canonical key.
+            assert!(
+                task.module_read_set.iter().any(|e| e.key == "mod:0xcafe::counter"),
+                "module_read_set missing canonical key; got: {:?}",
+                task.module_read_set.iter().map(|e| &e.key).collect::<Vec<_>>()
             );
         }
     }
