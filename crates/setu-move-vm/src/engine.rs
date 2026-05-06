@@ -1918,10 +1918,18 @@ impl SetuMoveEngine {
             .map_err(|e| RuntimeError::VMExecutionError(format!(
                 "consume_ticket family_id BCS decode failed: {e}"
             )))?;
-        let _policy_u8: u8 = bcs::from_bytes(&consume_ret.return_values[2].0)
+        let policy_u8: u8 = bcs::from_bytes(&consume_ret.return_values[2].0)
             .map_err(|e| RuntimeError::VMExecutionError(format!(
                 "consume_ticket policy BCS decode failed: {e}"
             )))?;
+        // iter-8β: decode policy now so the compat-check stage below can
+        // dispatch on it. Unknown values reject — Sui upstream semantics.
+        let policy = crate::compat::UpgradePolicy::from_u8(policy_u8).ok_or_else(|| {
+            RuntimeError::InvalidTransaction(format!(
+                "UpgradeTicket policy byte {policy_u8} is not a valid UpgradePolicy \
+                 (0=Compatible, 1=AdditiveOnly, 2=DepOnly)"
+            ))
+        })?;
         let digest_vec: Vec<u8> = bcs::from_bytes(&consume_ret.return_values[3].0)
             .map_err(|e| RuntimeError::VMExecutionError(format!(
                 "consume_ticket digest BCS decode failed: {e}"
@@ -2020,6 +2028,105 @@ impl SetuMoveEngine {
             })?;
             module_names.push(cm.self_id().name().to_owned());
             relinked_bytes.push(relinked);
+        }
+
+        // 4½. iter-8β: ABI compatibility check. For each relinked module,
+        //      load the corresponding old module from the prev package's
+        //      `mod:{prev_addr_hex}::{name}` entry and run the upstream
+        //      `Compatibility::check` under the ticket-declared policy.
+        //      If the policy is `DepOnly` the helper short-circuits, so
+        //      we still call it (single auditable point per compat.rs
+        //      module docs). Failures abort the whole upgrade — atomicity
+        //      per design §4.5.
+        //
+        //      G11/G15: storage key uses `to_hex_literal()` zero-stripped
+        //      form (matches resolver.rs:37 + storage layer writer).
+        //      Old modules are NOT re-verified here — they were verified
+        //      at their original publish time and the storage layer is
+        //      treated as a trusted producer (G3 deferred-commit ensures
+        //      no half-applied bundle is observable).
+        for (i, (relinked, name)) in relinked_bytes
+            .iter()
+            .zip(module_names.iter())
+            .enumerate()
+        {
+            use move_binary_format::CompiledModule;
+            let old_key = format!(
+                "mod:{}::{}",
+                prev_account.to_hex_literal(),
+                name.as_str()
+            );
+            let old_bytes = store.get_raw(&old_key).map_err(|e| {
+                RuntimeError::VMExecutionError(format!(
+                    "Command::Upgrade: storage read failed for {old_key}: {e}"
+                ))
+            })?;
+            // Missing old module under prev_addr means the upgrade input
+            // bundle introduced a new module name — under all upgrade
+            // policies (incl. `Compatible`) this is currently rejected,
+            // matching Sui's behaviour: new modules must come via a fresh
+            // publish, not an upgrade. (`AdditiveOnly` allowing new modules
+            // is on Sui's roadmap but not implemented in upstream
+            // `Compatibility::upgrade_check()` either.)
+            let old_bytes = old_bytes.ok_or_else(|| {
+                RuntimeError::InvalidTransaction(format!(
+                    "Command::Upgrade: module[{i}] '{}' has no entry under \
+                     prev_addr={} (new modules cannot be introduced via Upgrade; \
+                     publish them in a separate package)",
+                    name.as_str(),
+                    prev_account.to_hex_literal(),
+                ))
+            })?;
+            let old_module = CompiledModule::deserialize_with_defaults(&old_bytes).map_err(|e| {
+                RuntimeError::VMExecutionError(format!(
+                    "Command::Upgrade: prev module[{i}] '{}' deserialization failed: {e}",
+                    name.as_str(),
+                ))
+            })?;
+            let new_module = CompiledModule::deserialize_with_defaults(relinked).map_err(|e| {
+                RuntimeError::VMExecutionError(format!(
+                    "Command::Upgrade: relinked module[{i}] '{}' deserialization failed: {e}",
+                    name.as_str(),
+                ))
+            })?;
+
+            // Charge gas based on the OLD module's handle counts (the
+            // amount of work upstream `Compatibility::check` must do is
+            // bounded by what it walks on the reference side). Per
+            // gas.rs::PtbOverhead docs and design.md §9.1.
+            // Sui fork: structs are tracked via `datatype_handles` (which
+            // also covers enums; gas charge stays compatible because the
+            // upstream `Compatibility::check` walks the same vector).
+            let old_struct_count = old_module.datatype_handles.len() as u64;
+            let old_function_count = old_module.function_handles.len() as u64;
+            let compat_gas = crate::gas::PTB_OVERHEAD_TABLE
+                .compat_check_per_struct
+                .saturating_mul(old_struct_count)
+                .saturating_add(
+                    crate::gas::PTB_OVERHEAD_TABLE
+                        .compat_check_per_function
+                        .saturating_mul(old_function_count),
+                );
+            gas_meter.charge_outer(compat_gas).map_err(|_e| {
+                RuntimeError::OutOfGas {
+                    used: gas_meter.instructions_executed(),
+                }
+            })?;
+
+            crate::compat::check_upgrade_compat(&old_module, &new_module, policy).map_err(
+                |e| match e {
+                    crate::compat::CompatError::Incompatible { status, msg } => {
+                        RuntimeError::InvalidTransaction(format!(
+                            "Command::Upgrade: module[{i}] '{}' compat check failed \
+                             (policy={:?}, status={:?}): {}",
+                            name.as_str(),
+                            policy,
+                            status,
+                            msg,
+                        ))
+                    }
+                },
+            )?;
         }
 
         // 5. Publish relinked bundle at new_account.

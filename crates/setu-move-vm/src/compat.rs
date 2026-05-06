@@ -145,4 +145,32 @@ mod tests {
         }
         assert!(UpgradePolicy::from_u8(99).is_none());
     }
+
+    /// iter-8β: end-to-end semantic gate — prove `Compatibility::check`
+    /// actually rejects a non-trivial pair under `Compatible`. We pair two
+    /// distinct stdlib modules (different self_module_handle, ABI, friends,
+    /// etc.) — any of those differences is a compat fault under
+    /// `Compatibility::full_check()`. If this ever becomes flaky because
+    /// upstream relaxes module-identity checks, replace it with an in-test
+    /// `CompiledModule` mutation; for now it costs zero new fixtures and
+    /// catches integration-level regressions where the helper would
+    /// silently no-op. Skips when stdlib is empty (matches `u_co*` pattern).
+    #[test]
+    fn u_co4_distinct_modules_rejected_under_compatible() {
+        let mods = crate::engine::STDLIB_MODULES;
+        if mods.len() < 2 {
+            eprintln!("SKIP: stdlib too small for cross-module compat negative test");
+            return;
+        }
+        let old = CompiledModule::deserialize_with_defaults(mods[0].1).unwrap();
+        let new = CompiledModule::deserialize_with_defaults(mods[1].1).unwrap();
+        let result = check_upgrade_compat(&old, &new, UpgradePolicy::Compatible);
+        assert!(
+            matches!(result, Err(CompatError::Incompatible { .. })),
+            "expected Incompatible for distinct stdlib modules ({} vs {}), got {:?}",
+            mods[0].0,
+            mods[1].0,
+            result,
+        );
+    }
 }
