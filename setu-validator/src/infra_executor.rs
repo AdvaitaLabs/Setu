@@ -467,10 +467,18 @@ impl InfraExecutor {
         }
 
         // 4. Emit linkage:latest:{family} = bcs((new_addr, new_version)).
+        //
+        // MUST use `update` (carries old_value) — at publish time we already
+        // wrote bcs((family_addr, 0u64)) under this key, so the apply-path
+        // R15 "create-where-key-exists" defence in
+        // storage::state::manager::apply_committed_events would silently
+        // skip the entire upgrade event if we used `insert` here, dropping
+        // the sibling `mod:{new_addr}::{name}` writes too.
+        // See docs/feat/fix-upgraded-module-not-visible/design.md.
         {
             let payload = bcs::to_bytes(&(new_addr, new_version))
                 .map_err(|e| format!("Move upgrade: linkage:latest BCS encode: {}", e))?;
-            state_changes.push(EventStateChange::insert(linkage_key, payload));
+            state_changes.push(EventStateChange::update(linkage_key, linkage_bytes, payload));
         }
 
         // 5. Build payload + Event.
