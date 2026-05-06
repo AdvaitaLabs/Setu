@@ -1095,6 +1095,72 @@ impl MockEnclave {
                                 bytes.clone(),
                             ));
                         }
+                        setu_move_vm::engine::ModuleChange::PublishWithLinkage {
+                            module_id,
+                            bytecode,
+                            family_id,
+                            package_addr,
+                            version,
+                        } => {
+                            // mod:{addr}::{name}
+                            diff.add_write(WriteSetEntry::new(
+                                format!(
+                                    "mod:{}::{}",
+                                    module_id.address(),
+                                    module_id.name()
+                                ),
+                                bytecode.clone(),
+                            ));
+                            // linkage:latest:{family_id} → bcs(LinkageEntry { package_addr, version })
+                            // linkage:hist:{family_id}:{version} → bcs({ package_addr })
+                            // Both keys are content-addressed in the SMT via
+                            // `update_indexes_for_value` ignoring linkage:* prefix.
+                            let latest = bcs::to_bytes(&(*package_addr, *version))
+                                .expect("LinkageEntry serializes");
+                            diff.add_write(WriteSetEntry::new(
+                                format!("linkage:latest:{}", hex::encode(family_id.as_bytes())),
+                                latest.clone(),
+                            ));
+                            diff.add_write(WriteSetEntry::new(
+                                format!(
+                                    "linkage:hist:{}:{:020}",
+                                    hex::encode(family_id.as_bytes()),
+                                    version
+                                ),
+                                latest,
+                            ));
+                        }
+                        setu_move_vm::engine::ModuleChange::Upgrade {
+                            module_id,
+                            bytecode,
+                            family_id,
+                            prev_package: _,
+                            new_package_addr,
+                            new_version,
+                        } => {
+                            diff.add_write(WriteSetEntry::new(
+                                format!(
+                                    "mod:{}::{}",
+                                    module_id.address(),
+                                    module_id.name()
+                                ),
+                                bytecode.clone(),
+                            ));
+                            let latest = bcs::to_bytes(&(*new_package_addr, *new_version))
+                                .expect("LinkageEntry serializes");
+                            diff.add_write(WriteSetEntry::new(
+                                format!("linkage:latest:{}", hex::encode(family_id.as_bytes())),
+                                latest.clone(),
+                            ));
+                            diff.add_write(WriteSetEntry::new(
+                                format!(
+                                    "linkage:hist:{}:{:020}",
+                                    hex::encode(family_id.as_bytes()),
+                                    new_version
+                                ),
+                                latest,
+                            ));
+                        }
                     }
                 }
 

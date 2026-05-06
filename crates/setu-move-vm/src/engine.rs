@@ -67,9 +67,42 @@ pub struct MoveExecutionContext {
 }
 
 /// Module publish/change record.
+///
+/// Variants are deliberately enumerated rather than collapsed behind an
+/// `Option<LinkageMeta>` so that every downstream consumer (mock TEE, real
+/// TEE, replay, infra_executor) is forced to consider linkage on a
+/// per-variant basis. Adding linkage as an optional sidecar field would
+/// silently lose information whenever a future contributor forgot to thread
+/// it through (G12 — historical class of cross-layer field-drop bugs).
 #[derive(Debug, Clone)]
 pub enum ModuleChange {
+    /// Pre-B5 publish: legacy ChangeSet path (ADR-4) with no linkage meta.
+    /// Emitted for stdlib/genesis publishes and for any callsite still on
+    /// the old `infra_executor::execute_contract_publish` flow that hasn't
+    /// been migrated to B5.
     Publish(ModuleId, Vec<u8>),
+    /// B5 fresh publish: first-time package emission carrying the linkage
+    /// metadata that the storage layer needs to write `linkage:latest:` and
+    /// `linkage:hist:` entries (design.md §4.5 step a).
+    PublishWithLinkage {
+        module_id: ModuleId,
+        bytecode: Vec<u8>,
+        family_id: ObjectId,
+        package_addr: setu_types::object::Address,
+        version: u64,
+    },
+    /// B5 upgrade: republishes a relinked module at a freshly-derived
+    /// package address. The `prev_package` field tells the storage layer
+    /// which `linkage:latest:` entry to overwrite and which `linkage:hist:`
+    /// pointer to append (design.md §4.5 step c).
+    Upgrade {
+        module_id: ModuleId,
+        bytecode: Vec<u8>,
+        family_id: ObjectId,
+        prev_package: ObjectId,
+        new_package_addr: setu_types::object::Address,
+        new_version: u64,
+    },
 }
 
 /// State change produced by Move execution.
@@ -1030,9 +1063,15 @@ impl SetuMoveEngine {
                     last_return_values = vec![];
                     pctx.record_result(idx, vec![]);
                 }
-                // NOTE: `Command::Upgrade` is intentionally absent (B6a R1-FOLLOWUP-A).
-                // The exhaustive match guarantees this file fails to compile when
-                // B5 appends `Upgrade` to the enum, prompting a B6b revision.
+                setu_types::ptb::Command::Upgrade { .. } => {
+                    // B5-IMPL: full lowering wired in a follow-up commit
+                    // (relink + compat + publish_module_bundle). Today
+                    // surface a typed NotImplemented so existing flows do
+                    // not silently no-op.
+                    return Err(RuntimeError::VMExecutionError(
+                        "Command::Upgrade lowering not yet implemented (B5)".to_string(),
+                    ));
+                }
             }
         }
 
@@ -1798,8 +1837,8 @@ mod tests {
         let engine = SetuMoveEngine::new_with_embedded_stdlib().unwrap();
         assert_eq!(
             engine.stdlib_module_count(),
-            21,
-            "Expected 21 stdlib modules (object, transfer, tx_context, balance, coin, setu, vector, option, string, vec_map, vec_set, event, clock, access_control, dynamic_field, bcs, address, hash, crypto, table, bag)"
+            22,
+            "Expected 22 stdlib modules (object, transfer, tx_context, balance, coin, setu, vector, option, string, vec_map, vec_set, event, clock, access_control, dynamic_field, bcs, address, hash, crypto, table, bag, package)"
         );
     }
 

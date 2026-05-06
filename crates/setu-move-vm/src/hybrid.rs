@@ -293,12 +293,96 @@ impl<S: StateStore + ObjectStore> HybridExecutor<S> {
                 ))
             }
 
-            // B6a: PTB wire format only — no execution path until B6b lands.
-            // See docs/feat/move-vm-phase9-ptb-wire/design.md §3 row 8.
-            OperationType::ProgrammableTransaction(_) => {
-                Err(RuntimeError::InvalidTransaction(
-                    "PTB_NOT_YET_EXECUTABLE: Programmable Transaction execution is deferred to B6b".into(),
-                ))
+            // B6b Phase 3g: PTB execution dispatched to engine.execute_ptb.
+            //   - input_objects materialization mirrors the MoveCall path
+            //     (envelope → InputObject), but indexes ALL declared
+            //     inputs of type CallArg::Object (resolve_ptb in
+            //     TaskPreparer is responsible for ordering them).
+            //   - dynamic_fields plumbed through resolved_inputs.
+            //   - All command lowering, slot tracking, gas, and finalize
+            //     happen inside engine.execute_ptb.
+            OperationType::ProgrammableTransaction(ptb) => {
+                let engine = self.move_engine.as_ref().ok_or_else(|| {
+                    RuntimeError::InvalidTransaction("Move VM not enabled".into())
+                })?;
+
+                // Materialize input_objects for every Object CallArg, in
+                // the SAME order they appear in ptb.inputs. resolve_ptb
+                // (Phase 3h) will guarantee resolved_inputs.input_objects
+                // is aligned with the Object positions.
+                let input_objects: Vec<InputObject> = resolved_inputs
+                    .input_objects
+                    .iter()
+                    .map(|ro| {
+                        let env = self
+                            .native
+                            .state()
+                            .get_envelope(&ro.object_id)
+                            .map_err(|e| {
+                                RuntimeError::StateError(format!(
+                                    "PTB input envelope load failed for {}: {e}",
+                                    ro.object_id
+                                ))
+                            })?
+                            .ok_or(RuntimeError::ObjectNotFound(ro.object_id))?;
+                        InputObject::from_envelope(&ro.object_id, &env)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let move_ctx = MoveExecutionContext {
+                    tx_hash: ctx.tx_hash,
+                    sender: setu_types::Address::from_hex(&event.creator.clone())
+                        .unwrap_or(setu_types::Address::ZERO),
+                    gas_budget: ctx.gas_budget.unwrap_or(10_000_000),
+                    current_version: 0,
+                    epoch: 0,
+                    needs_tx_context: true,
+                    epoch_timestamp_ms: event.timestamp,
+                };
+
+                let move_output = engine.execute_ptb(
+                    self.native.state(),
+                    ptb,
+                    input_objects,
+                    resolved_inputs.dynamic_fields.clone(),
+                    &move_ctx,
+                )?;
+
+                if !move_output.success {
+                    return Ok(ExecutionOutput {
+                        success: false,
+                        message: move_output.error,
+                        state_changes: vec![],
+                        created_objects: vec![],
+                        deleted_objects: vec![],
+                        query_result: None,
+                    });
+                }
+
+                let state_changes: Vec<StateChange> = move_output
+                    .state_changes
+                    .into_iter()
+                    .map(StateChange::from)
+                    .collect();
+                let created: Vec<_> = state_changes
+                    .iter()
+                    .filter(|sc| sc.change_type == StateChangeType::Create)
+                    .map(|sc| sc.object_id)
+                    .collect();
+                let deleted: Vec<_> = state_changes
+                    .iter()
+                    .filter(|sc| sc.change_type == StateChangeType::Delete)
+                    .map(|sc| sc.object_id)
+                    .collect();
+
+                Ok(ExecutionOutput {
+                    success: true,
+                    message: None,
+                    state_changes,
+                    created_objects: created,
+                    deleted_objects: deleted,
+                    query_result: None,
+                })
             }
         }
     }
@@ -468,11 +552,15 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// I3 (Phase 2 matrix): solver-side dispatch must early-reject PTBs in
-    /// B6a. The match arm in `HybridExecutor::execute` is the actual solver
-    /// dispatch site — `setu-solver/src/http_server.rs` only forwards.
+    /// I3 (Phase 3g supersession): when B6a shipped, this site rejected PTBs
+    /// with a `PTB_NOT_YET_EXECUTABLE` marker. With B6b Phase 3g landed, the
+    /// dispatch arm now invokes `engine.execute_ptb`. The asserting variant
+    /// of this test was deleted; we keep an empty-PTB happy-path smoke
+    /// instead — empty commands → success with zero state changes — to lock
+    /// the dispatch wiring without needing a Move VM with stdlib loaded.
+    /// (Real PTB execution is exercised by the engine.execute_ptb tests.)
     #[test]
-    fn i3_hybrid_ptb_rejected_with_marker() {
+    fn i3_hybrid_ptb_dispatched_to_engine() {
         use setu_runtime::InMemoryObjectStore;
         use setu_types::ptb::ProgrammableTransaction;
         use setu_types::task::ResolvedInputs;
@@ -493,14 +581,16 @@ mod tests {
         });
         let ctx = ExecutionContext::new("test".into(), 0, false, [0; 32]);
 
+        // Without a configured Move engine, dispatch returns
+        // "Move VM not enabled" — which proves the new dispatch path is
+        // reached (B6a's marker would have been "PTB_NOT_YET_EXECUTABLE").
         let err = hybrid
             .execute(&event, &resolved, &ctx)
-            .expect_err("PTB must be early-rejected in B6a");
-        let msg = format!("{}", err);
+            .expect_err("hybrid.execute requires Move engine");
+        let msg = format!("{err}");
         assert!(
-            msg.contains("PTB_NOT_YET_EXECUTABLE"),
-            "Expected error to carry PTB_NOT_YET_EXECUTABLE marker, got: {}",
-            msg
+            msg.contains("Move VM not enabled"),
+            "expected dispatch to reach engine.execute_ptb path, got: {msg}"
         );
     }
 

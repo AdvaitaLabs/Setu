@@ -249,6 +249,39 @@ pub struct MovePublishPayload {
     pub modules: Vec<Vec<u8>>,
 }
 
+/// Move package upgrade payload (B5 — paired with EventType::ContractPublish
+/// umbrella, distinguished from publish via `EventPayload::MoveUpgrade`).
+///
+/// **BCS field order is LOCKED** (design.md §3 R1g) — appending fields is fine,
+/// re-ordering or inserting silently invalidates every upgrade event in storage
+/// and all historical hashes (G1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MoveUpgradePayload {
+    /// EOA submitting the upgrade (cap holder).
+    pub sender: crate::object::Address,
+    /// Family root = v0 package address (immutable).
+    pub family_id: crate::object::ObjectId,
+    /// Current latest package being superseded (= prev package address).
+    pub prev_package: crate::object::ObjectId,
+    /// Post-relink, deterministically derived (design.md §4.5).
+    pub new_package_addr: crate::object::Address,
+    /// = prev_version + 1; replay-asserted.
+    pub new_version: u64,
+    /// Post-relink BCS bytes for each module in the bundle.
+    pub modules: Vec<Vec<u8>>,
+    /// Dependency package IDs (matches `Command::Publish.deps` shape).
+    pub deps: Vec<crate::object::ObjectId>,
+    /// Ticket-supplied digest = bcs(modules || deps); validator re-derives
+    /// and asserts equality at apply time.
+    pub digest: Vec<u8>,
+    /// Owned object ID of the UpgradeCap consumed by this upgrade. Used at
+    /// replay for mutation-order assertion.
+    pub upgrade_cap_id: crate::object::ObjectId,
+    /// Compatibility policy copied from the ticket (0=Compatible, 1=Additive,
+    /// 2=DepOnly).
+    pub policy: u8,
+}
+
 /// Programmable Transaction Block payload (paired with EventType::ContractCall).
 ///
 /// PTB is the "many commands, one atomic effect" Move execution mode.
@@ -344,6 +377,13 @@ pub enum EventPayload {
     /// variant of `EventPayload`; appending future variants is fine, mid-enum
     /// insertion silently invalidates every PTB event already in storage.
     MovePtb(MovePtbPayload),
+    /// Move package upgrade (B5 — paired with `EventType::ContractPublish`
+    /// umbrella, see design.md §4 path 乙').
+    ///
+    /// **MUST stay the tail variant.** Inserting variants between `MovePtb`
+    /// and `MoveUpgrade` is forbidden — it would shift the BCS discriminant
+    /// for every previously-stored event payload (G1).
+    MoveUpgrade(MoveUpgradePayload),
 }
 
 impl Default for EventPayload {
@@ -666,6 +706,26 @@ impl Event {
         event
     }
 
+    /// Create a Move package upgrade event (B5).
+    ///
+    /// Reuses the `EventType::ContractPublish` umbrella per design.md §4
+    /// path 乙' so the EventType variant count stays at 19 (G13). The
+    /// payload's `MoveUpgrade` discriminant distinguishes it from
+    /// `MovePublish` at apply / replay time.
+    pub fn move_upgrade(
+        payload: MoveUpgradePayload,
+        parent_ids: Vec<EventId>,
+        vlc_snapshot: VLCSnapshot,
+        creator: String,
+    ) -> Self {
+        let sender_hex = format!("0x{}", hex::encode(payload.sender.as_bytes()));
+        let mut event = Self::new(EventType::ContractPublish, parent_ids, vlc_snapshot, creator);
+        event.payload = EventPayload::MoveUpgrade(payload);
+        event.creator = sender_hex;
+        event.recompute_id();
+        event
+    }
+
     fn compute_id(
         parent_ids: &[EventId],
         vlc_snapshot: &VLCSnapshot,
@@ -885,6 +945,16 @@ impl Event {
                     }
                 }
                 resources
+            }
+            EventPayload::MoveUpgrade(payload) => {
+                // Resources: the cap object, the prev package, plus a
+                // contract:* marker so concurrent upgrades on the same
+                // family serialize through the dependency scheduler.
+                vec![
+                    format!("oid:{}", hex::encode(payload.upgrade_cap_id.as_bytes())),
+                    format!("oid:{}", hex::encode(payload.prev_package.as_bytes())),
+                    format!("contract:{}", hex::encode(payload.family_id.as_bytes())),
+                ]
             }
             EventPayload::None => vec![],
             EventPayload::Genesis(g) => {
@@ -1233,13 +1303,11 @@ mod tests {
         assert!(matches!(event.payload, EventPayload::MovePtb(_)));
     }
 
-    /// U3 — `EventPayload::MovePtb` is the **tail** variant (BCS discriminant
-    /// stability). Adding mid-enum variants in the future would silently break
-    /// every PTB event already in storage.
+    /// U3 — `EventPayload::MoveUpgrade` is the **tail** variant (BCS
+    /// discriminant stability). Adding mid-enum variants in the future
+    /// would silently break every Move event already in storage.
     #[test]
     fn event_payload_move_ptb_is_tail_variant() {
-        // Encode each existing variant; MovePtb's discriminant index must be
-        // strictly greater than every other one we know about.
         let move_publish = EventPayload::MovePublish(MovePublishPayload { modules: vec![] });
         let move_ptb = EventPayload::MovePtb(MovePtbPayload {
             sender: String::new(),
@@ -1249,15 +1317,29 @@ mod tests {
                 dynamic_field_accesses: vec![],
             },
         });
+        let move_upgrade = EventPayload::MoveUpgrade(MoveUpgradePayload {
+            sender: crate::object::Address::ZERO,
+            family_id: crate::object::ObjectId::new([0u8; 32]),
+            prev_package: crate::object::ObjectId::new([0u8; 32]),
+            new_package_addr: crate::object::Address::ZERO,
+            new_version: 0,
+            modules: vec![],
+            deps: vec![],
+            digest: vec![],
+            upgrade_cap_id: crate::object::ObjectId::new([0u8; 32]),
+            policy: 0,
+        });
         let publish_bytes = bcs::to_bytes(&move_publish).unwrap();
         let ptb_bytes = bcs::to_bytes(&move_ptb).unwrap();
-        // BCS encodes enum discriminants as ULEB128. For variant counts < 128
-        // this is one byte; MovePtb must be > MovePublish.
+        let upgrade_bytes = bcs::to_bytes(&move_upgrade).unwrap();
+        // BCS encodes enum discriminants as ULEB128. Variant counts stay
+        // < 128, so the discriminant byte is the first byte.
+        assert!(ptb_bytes[0] > publish_bytes[0], "MovePtb must be after MovePublish");
         assert!(
-            ptb_bytes[0] > publish_bytes[0],
-            "MovePtb must be appended after MovePublish (ptb={} publish={})",
-            ptb_bytes[0],
-            publish_bytes[0]
+            upgrade_bytes[0] > ptb_bytes[0],
+            "MoveUpgrade must be the tail variant (upgrade={} ptb={})",
+            upgrade_bytes[0],
+            ptb_bytes[0]
         );
     }
 }

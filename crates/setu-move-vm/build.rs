@@ -51,6 +51,8 @@ fn main() {
         // B4 (Phase 7) — table / bag stdlib (pure Move shims over DF)
         "table",
         "bag",
+        // B5 (Phase 8) — package upgrade primitives (UpgradeCap / Ticket / Receipt)
+        "package",
     ];
 
     let mut code = String::from(

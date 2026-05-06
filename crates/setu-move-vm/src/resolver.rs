@@ -40,7 +40,20 @@ impl<'a, S: RawStore> SetuModuleResolver<'a, S> {
 
 impl<'a, S: RawStore> LinkageResolver for SetuModuleResolver<'a, S> {
     type Error = PartialVMError;
-    // Use default implementations — Setu does not need module relinking.
+    // Use default implementations.
+    //
+    // Setu does NOT install a per-package linkage table at the LinkageResolver
+    // level — the upstream Sui mechanism (resolve type/module via "linkage
+    // context") is bypassed. Instead, B5's package upgrade strategy (Phase 8 /
+    // design.md §4.5) bakes the new self-address directly into module
+    // bytecode at upgrade time via [`crate::relink::relink_module`], so by
+    // the time the VM reads a module out of storage its
+    // `address_identifiers[0]` already points at the correct version. The
+    // `linkage:latest:{family_id}` and `linkage:hist:{family_id}:{version}`
+    // state-key entries written by `lower_publish_inline` / `lower_upgrade_inline`
+    // are read by callers (RPC, `submit_move_call`) to discover *which*
+    // package address to invoke; once the address is chosen, normal
+    // ModuleResolver lookup is sufficient.
 }
 
 impl<'a, S: RawStore> ModuleResolver for SetuModuleResolver<'a, S> {

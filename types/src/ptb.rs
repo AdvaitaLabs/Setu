@@ -139,8 +139,21 @@ pub enum Command {
         modules: Vec<Vec<u8>>,
         deps: Vec<ObjectId>,
     },
-    // NOTE: `Upgrade` deliberately omitted in B6a (see module-level docs).
-    // B5 will append it as the next tail variant.
+    /// Upgrade an existing package — B5 hot-potato pattern.
+    ///
+    /// `upgrade_ticket` MUST resolve to an `UpgradeTicket` Move value
+    /// produced by an earlier `MoveCall(setu::package::authorize_upgrade(...))`
+    /// in the *same* PTB. Policy + digest live on the ticket, not on the
+    /// command — this prevents PTB-level forgery (the ticket type has no
+    /// `copy`/`drop`/`store`/`key` abilities, so it can only be created and
+    /// consumed inside one transaction). Result arity: `UpgradeReceipt`
+    /// (consumed by a later `commit_upgrade` MoveCall).
+    Upgrade {
+        modules: Vec<Vec<u8>>,
+        deps: Vec<ObjectId>,
+        current_package: ObjectId,
+        upgrade_ticket: Argument,
+    },
 }
 
 /// A Move call command.
@@ -344,6 +357,12 @@ fn check_command(
         }
         Command::Publish { modules: _, deps: _ } => {
             // bytecode + dep IDs validated semantically in B6b
+        }
+        Command::Upgrade { modules: _, deps: _, current_package: _, upgrade_ticket } => {
+            // Bytecode + dep IDs + current_package presence are validated
+            // semantically by the engine (relink + compat check); here we
+            // only verify the ticket Argument is well-formed.
+            check_argument(upgrade_ticket, cmd_idx, inputs_len, all_commands)?;
         }
     }
     Ok(())

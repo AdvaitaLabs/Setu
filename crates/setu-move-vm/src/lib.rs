@@ -13,12 +13,15 @@
 //! - `engine`         — SetuMoveEngine (VM lifecycle, session, execute)
 
 pub mod address_compat;
+pub mod compat;
 pub mod engine;
 pub mod gas;
 pub mod hybrid;
 pub mod natives;
 pub mod natives_b3;
 pub mod object_runtime;
+pub mod ptb_executor;
+pub mod relink;
 pub mod resolver;
 
 // Re-export move-core-types so downstream crates (e.g. setu-enclave)

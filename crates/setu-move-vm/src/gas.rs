@@ -106,12 +106,34 @@ pub struct PtbOverhead {
     pub publish: u64,
     pub make_move_vec: u64,
     /// Charged once per state-key written by the PTB (covers all G11
-    /// prefixes: `oid:`, `mod:`, `pkg:`, `user:`, `solver:`, `event:`).
+    /// prefixes: `oid:`, `mod:`, `pkg:`, `user:`, `solver:`, `event:`,
+    /// `linkage:latest:`, `linkage:hist:`).
     pub storage_write_per_key: u64,
     /// Charged once per state-key read into the executor (input objects
     /// + dynamic-field preload entries).
     pub storage_read_per_key: u64,
+    // ── B5 package upgrade gas (design.md §9.1, R1g baseline) ─────────
+    /// Per module in an upgrade bundle. Charged at the start of
+    /// `lower_upgrade_inline` / `execute_move_upgrade` after deserialization.
+    pub relink_per_module: u64,
+    /// Per `address_identifiers` slot scanned inside `relink_module`.
+    pub relink_per_address_identifier: u64,
+    /// Per `StructHandle` compared inside `check_upgrade_compat`.
+    pub compat_check_per_struct: u64,
+    /// Per `FunctionHandle` signature compared inside `check_upgrade_compat`.
+    pub compat_check_per_function: u64,
+    /// Per byte of relinked bytecode handed to `publish_module_bundle`.
+    pub publish_module_bundle_per_module_byte: u64,
+    /// Charged once per `Command::Publish` for the implicit
+    /// `make_upgrade_cap` + `transfer::public_transfer<UpgradeCap>` calls
+    /// (design.md §4.5 v0 sequence).
+    pub publish_cap_creation: u64,
 }
+
+/// Baseline used by upgrade-related charges. Equal to Sui's
+/// `MOVE_BYTECODE_VERIFY_BASE` order of magnitude; precise values calibrated
+/// in R2 against the existing publish charge.
+pub const MOVE_BYTECODE_VERIFY_BASE: u64 = 5_000;
 
 pub const PTB_OVERHEAD_TABLE: PtbOverhead = PtbOverhead {
     move_call: 100,
@@ -122,6 +144,12 @@ pub const PTB_OVERHEAD_TABLE: PtbOverhead = PtbOverhead {
     make_move_vec: 10,
     storage_write_per_key: 100,
     storage_read_per_key: 50,
+    relink_per_module: MOVE_BYTECODE_VERIFY_BASE,
+    relink_per_address_identifier: 10,
+    compat_check_per_struct: MOVE_BYTECODE_VERIFY_BASE / 4,
+    compat_check_per_function: MOVE_BYTECODE_VERIFY_BASE / 4,
+    publish_module_bundle_per_module_byte: 1,
+    publish_cap_creation: MOVE_BYTECODE_VERIFY_BASE / 8,
 };
 
 /// Compute the outer-tier overhead cost for a single PTB command. The
@@ -156,6 +184,22 @@ pub fn ptb_overhead_cost(cmd: &setu_types::ptb::Command) -> u64 {
             PTB_OVERHEAD_TABLE
                 .make_move_vec
                 .saturating_mul(args.len() as u64)
+        }
+        Command::Upgrade { modules, .. } => {
+            // Upgrade pays the publish baseline plus per-module relink and
+            // per-byte bundle charges. Compat-check tier charges happen
+            // inside the helper itself.
+            let base = PTB_OVERHEAD_TABLE
+                .publish
+                .saturating_mul((modules.len() as u64).max(1));
+            let relink = PTB_OVERHEAD_TABLE
+                .relink_per_module
+                .saturating_mul(modules.len() as u64);
+            let bytes: u64 = modules.iter().map(|m| m.len() as u64).sum();
+            let publish = PTB_OVERHEAD_TABLE
+                .publish_module_bundle_per_module_byte
+                .saturating_mul(bytes);
+            base.saturating_add(relink).saturating_add(publish)
         }
     }
 }

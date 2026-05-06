@@ -994,7 +994,8 @@ impl GlobalStateManager {
     fn update_indexes_for_value(&mut self, object_id: &HashValue, value: &[u8], key: &str) {
         // Module keys don't participate in object indexing
         if key.starts_with("mod:") || key.starts_with("user:") || key.starts_with("solver:")
-            || key.starts_with("validator:") || key.starts_with("event:") {
+            || key.starts_with("validator:") || key.starts_with("event:")
+            || key.starts_with("linkage:") {
             return;
         }
         
@@ -1366,18 +1367,21 @@ impl GlobalStateManager {
             // Hash with BLAKE3 — consistent with MerkleStateProvider::get_raw_data()
             let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
             return HashValue::from_slice(&hash).expect("32 bytes");
-        } else if key.starts_with("user:") || key.starts_with("solver:") || key.starts_with("validator:") || key.starts_with("event:") {
+        } else if key.starts_with("user:") || key.starts_with("solver:") || key.starts_with("validator:") || key.starts_with("event:") || key.starts_with("linkage:") {
             // Known non-object metadata key prefixes.
             // These don't have a native 32-byte ObjectId, so we hash the key.
             // "event:" keys are produced by MockTeeEnclave::record_event_processed()
             // to track processed events in the state tree.
+            // "linkage:" keys (B5 / Phase 8) hold per-package latest+history
+            // pointers for the fresh-address upgrade path; both `linkage:latest:`
+            // and `linkage:hist:` flavours land here.
             let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
             return HashValue::from_slice(&hash).expect("32 bytes");
         } else {
             // Unknown prefix — this is a bug in the calling code
             tracing::error!(
                 key = %key,
-                "Unknown key prefix — expected 'oid:', 'user:', 'solver:', or 'validator:' prefix."
+                "Unknown key prefix — expected 'oid:', 'user:', 'solver:', 'validator:', 'event:', 'linkage:', or 'mod:' prefix."
             );
         }
         // Fallback: use BLAKE3 hash to produce a deterministic value
