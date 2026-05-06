@@ -1087,14 +1087,26 @@ impl SetuMoveEngine {
                     last_return_values = vec![];
                     pctx.record_result(idx, vec![]);
                 }
-                setu_types::ptb::Command::Upgrade { .. } => {
-                    // B5-IMPL: full lowering wired in a follow-up commit
-                    // (relink + compat + publish_module_bundle). Today
-                    // surface a typed NotImplemented so existing flows do
-                    // not silently no-op.
-                    return Err(RuntimeError::VMExecutionError(
-                        "Command::Upgrade lowering not yet implemented (B5)".to_string(),
-                    ));
+                setu_types::ptb::Command::Upgrade {
+                    modules,
+                    deps: _,
+                    current_package,
+                    upgrade_ticket,
+                } => {
+                    self.lower_upgrade_inline(
+                        store,
+                        &mut session,
+                        modules,
+                        current_package,
+                        upgrade_ticket,
+                        &mut pctx,
+                        gas_meter,
+                        ctx,
+                        idx,
+                        &mut explicit_module_changes,
+                    )?;
+                    last_return_values = vec![];
+                    pctx.record_result(idx, vec![]);
                 }
             }
         }
@@ -1712,6 +1724,162 @@ impl SetuMoveEngine {
                 family_id,
                 package_addr,
                 version: 1,
+            });
+        }
+        Ok(())
+    }
+
+    /// B5: lower `Command::Upgrade { modules, current_package, upgrade_ticket, .. }`
+    /// (path β-1, fresh-address-per-version).
+    ///
+    /// Pipeline:
+    /// 1. Consume `upgrade_ticket` slot (linear-type enforcement).
+    ///    **v0**: ticket bytes are NOT decoded — UpgradeCap minting is
+    ///    deferred so an authoritatively-issued ticket cannot yet exist.
+    ///    The slot consumption preserves hot-potato semantics; the policy
+    ///    field that would gate compat-check is currently treated as
+    ///    `Compatible` (most permissive disallowed-anything-checked).
+    /// 2. Read `linkage:latest:{hex(current_package)}` from `store`.
+    ///    Must be present (caller-provided redundancy: `current_package`
+    ///    is the family_id from the ticket). Decoded as
+    ///    `(Address prev_addr, u64 prev_version)`.
+    /// 3. Compute `new_version = prev_version + 1` and derive
+    ///    `new_package_addr = blake3("SETU_PKG_VER:" || tx_hash || cmd_idx || new_version)`.
+    /// 4. Relink each input module from `prev_addr` → `new_package_addr`
+    ///    via [`crate::relink::relink_module`]. Each module's
+    ///    `address_identifiers[i] == prev_addr` slot is rewritten in place
+    ///    and the result is bytecode-verified (deterministic, no gas tier).
+    /// 5. Publish the relinked bundle at `new_package_addr` via
+    ///    `Session::publish_module_bundle`.
+    /// 6. Emit `ModuleChange::Upgrade` per module with the linkage payload
+    ///    that the storage layer needs for `linkage:latest:` overwrite +
+    ///    `linkage:hist:{family}:{new_version}` append.
+    ///
+    /// **Deferred for v0** (documented in design.md §4.5 deferred-items):
+    /// - `Compatibility::check` invocation — helper exists in `compat.rs`
+    ///   but old-module bytecode lookup + Normalized::Module construction
+    ///   add ~80 LoC; gate left for the iteration that mints UpgradeCap.
+    /// - `commit_upgrade` MoveCall to bump UpgradeCap.version on-chain.
+    /// - Returning an `UpgradeReceipt` slot (record_result is empty Vec).
+    #[allow(clippy::too_many_arguments)]
+    fn lower_upgrade_inline<S: RawStore>(
+        &self,
+        store: &S,
+        session: &mut move_vm_runtime::session::Session<
+            '_,
+            '_,
+            crate::resolver::SetuModuleResolver<'_, S>,
+        >,
+        modules: &[Vec<u8>],
+        current_package: &setu_types::object::ObjectId,
+        upgrade_ticket: &setu_types::ptb::Argument,
+        pctx: &mut crate::ptb_executor::PtbContext,
+        gas_meter: &mut InstructionCountGasMeter,
+        ctx: &MoveExecutionContext,
+        cmd_idx: usize,
+        out_changes: &mut Vec<ModuleChange>,
+    ) -> Result<(), RuntimeError> {
+        if modules.is_empty() {
+            return Err(RuntimeError::InvalidTransaction(
+                "Command::Upgrade with empty module bundle is not allowed".to_string(),
+            ));
+        }
+        // 1. Consume ticket (linearity). Bytes are intentionally discarded:
+        //    v0 has no UpgradeCap minting path so any ticket reaching here
+        //    was constructed off-chain by the caller as Argument::Input.
+        let _ticket_slot = pctx.consume(upgrade_ticket)?;
+        // 2. Read prev linkage entry. Key format mirrors mock TEE writer
+        //    (`crates/setu-enclave/src/mock/mod.rs:~1100`).
+        let linkage_key = format!(
+            "linkage:latest:{}",
+            hex::encode(current_package.as_bytes())
+        );
+        let linkage_bytes = store.get_raw(&linkage_key).map_err(|e| {
+            RuntimeError::VMExecutionError(format!(
+                "Command::Upgrade: storage read failed for {linkage_key}: {e}"
+            ))
+        })?;
+        let linkage_bytes = linkage_bytes.ok_or_else(|| {
+            RuntimeError::InvalidTransaction(format!(
+                "Command::Upgrade: no linkage entry for family={} \
+                 (was the package ever published via PTB?)",
+                hex::encode(current_package.as_bytes())
+            ))
+        })?;
+        let (prev_addr, prev_version): (setu_types::object::Address, u64) =
+            bcs::from_bytes(&linkage_bytes).map_err(|e| {
+                RuntimeError::VMExecutionError(format!(
+                    "Command::Upgrade: linkage entry BCS decode failed: {e}"
+                ))
+            })?;
+
+        // 3. Derive new_version and new_package_addr deterministically.
+        let new_version = prev_version
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::InvalidTransaction(
+                "Command::Upgrade: version overflow".to_string(),
+            ))?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_PKG_VER:");
+        hasher.update(&ctx.tx_hash);
+        hasher.update(&(cmd_idx as u64).to_le_bytes());
+        hasher.update(&new_version.to_le_bytes());
+        let new_addr_bytes = *hasher.finalize().as_bytes();
+        let new_package_addr = setu_types::object::Address::new(new_addr_bytes);
+        let prev_account = AccountAddress::new(*prev_addr.as_bytes());
+        let new_account = AccountAddress::new(new_addr_bytes);
+
+        // 4. Relink each module: rewrite address_identifiers[*]==prev_addr
+        //    to new_addr, then verify_module_unmetered each result.
+        let mut relinked_bytes: Vec<Vec<u8>> = Vec::with_capacity(modules.len());
+        let mut module_names: Vec<move_core_types::identifier::Identifier> =
+            Vec::with_capacity(modules.len());
+        for (i, bytecode) in modules.iter().enumerate() {
+            let (relinked, _stats) = crate::relink::relink_module(
+                bytecode,
+                prev_account,
+                new_account,
+            )
+            .map_err(|e| {
+                RuntimeError::VMExecutionError(format!(
+                    "Command::Upgrade: relink module[{i}] failed: {e}"
+                ))
+            })?;
+            // Re-read self_id from the relinked bytecode to get the module name.
+            use move_binary_format::CompiledModule;
+            let cm = CompiledModule::deserialize_with_defaults(&relinked).map_err(|e| {
+                RuntimeError::VMExecutionError(format!(
+                    "Command::Upgrade: relinked module[{i}] re-deserialize failed: {e}"
+                ))
+            })?;
+            module_names.push(cm.self_id().name().to_owned());
+            relinked_bytes.push(relinked);
+        }
+
+        // 5. Publish relinked bundle at new_account.
+        session
+            .publish_module_bundle(relinked_bytes.clone(), new_account, gas_meter)
+            .map_err(|e| {
+                RuntimeError::VMExecutionError(format!(
+                    "Command::Upgrade: publish_module_bundle ({} modules) at \
+                     new_addr={} failed: {e}",
+                    relinked_bytes.len(),
+                    new_account.to_hex_literal(),
+                ))
+            })?;
+
+        // 6. Emit per-module Upgrade entries. The storage layer keys
+        //    linkage:latest by family_id (== current_package); prev_package
+        //    is informational only (unused by mock TEE writer today).
+        for (bytecode, name) in relinked_bytes.into_iter().zip(module_names.into_iter()) {
+            let module_id = ModuleId::new(new_account, name);
+            out_changes.push(ModuleChange::Upgrade {
+                module_id,
+                bytecode,
+                family_id: *current_package,
+                prev_package: *current_package,
+                new_package_addr,
+                new_version,
             });
         }
         Ok(())
@@ -3493,6 +3661,92 @@ mod tests {
                 .expect("empty publish is no-op");
             assert!(out.success);
             assert!(out.module_changes.is_empty());
+        }
+
+        // I11 (B5) — Command::Upgrade with no prior linkage:latest entry
+        //          surfaces an InvalidTransaction error from
+        //          lower_upgrade_inline. Validates the storage-probe
+        //          guardrail; full upgrade paths are exercised by the
+        //          mo_pkg_upgrade_*.sh shell suite (deferred).
+        #[test]
+        fn upgrade_without_linkage_entry_rejected() {
+            use setu_types::ptb::{Argument, CallArg, Command};
+            let engine = SetuMoveEngine::new().unwrap();
+            let store = InMemoryObjectStore::new();
+            // Family ObjectId never published — linkage:latest:* will be missing.
+            let family = ObjectId::new([0xAB; 32]);
+            // Ticket as opaque pure input (v0 ignores ticket bytes).
+            let ticket_bytes = vec![0u8; 64];
+            let ptb = ProgrammableTransaction {
+                inputs: vec![CallArg::Pure(ticket_bytes)],
+                commands: vec![Command::Upgrade {
+                    modules: vec![vec![1, 2, 3]], // body never reached
+                    deps: vec![],
+                    current_package: family,
+                    upgrade_ticket: Argument::Input(0),
+                }],
+                dynamic_field_accesses: vec![],
+            };
+            let out = engine
+                .execute_ptb(&store, &ptb, vec![], vec![], &make_ctx());
+            // execute_ptb wraps body errors into success=false outputs for
+            // most paths, but pre-execution `InvalidTransaction` (linkage
+            // miss is a wire-level precondition violation) bubbles up as
+            // Err — the contract is `Result<MoveExecutionOutput,_>` so we
+            // accept either shape and just check the error text.
+            let err_text = match out {
+                Ok(o) => {
+                    assert!(!o.success, "expected success=false");
+                    o.error.unwrap_or_default()
+                }
+                Err(e) => format!("{e}"),
+            };
+            assert!(
+                err_text.contains("no linkage entry"),
+                "wrong error: {err_text}"
+            );
+        }
+
+        // I12 (B5) — Command::Upgrade with a populated linkage:latest entry
+        //          progresses past the storage-probe gate and reaches the
+        //          relink stage. Invalid bytecode then fails with a relink
+        //          error — proving the read path is correct without
+        //          requiring a real CompiledModule synthesis.
+        #[test]
+        fn upgrade_storage_probe_reaches_relink() {
+            use setu_runtime::state::RawStore;
+            use setu_types::ptb::{Argument, CallArg, Command};
+            let engine = SetuMoveEngine::new().unwrap();
+            let mut store = InMemoryObjectStore::new();
+            let family = ObjectId::new([0xCD; 32]);
+            let prev_addr = setu_types::object::Address::new([0x42; 32]);
+            // BCS-encode (Address, u64) — same shape mock TEE writes.
+            let linkage_payload = bcs::to_bytes(&(prev_addr, 1u64)).unwrap();
+            let key = format!(
+                "linkage:latest:{}",
+                hex::encode(family.as_bytes())
+            );
+            store.set_raw(&key, linkage_payload).unwrap();
+
+            let ptb = ProgrammableTransaction {
+                inputs: vec![CallArg::Pure(vec![0u8; 16])],
+                commands: vec![Command::Upgrade {
+                    modules: vec![vec![0xDE, 0xAD, 0xBE, 0xEF]], // bogus bytecode
+                    deps: vec![],
+                    current_package: family,
+                    upgrade_ticket: Argument::Input(0),
+                }],
+                dynamic_field_accesses: vec![],
+            };
+            let out = engine.execute_ptb(&store, &ptb, vec![], vec![], &make_ctx());
+            let err_text = match out {
+                Ok(o) => o.error.unwrap_or_default(),
+                Err(e) => format!("{e}"),
+            };
+            assert!(
+                err_text.contains("relink module") || err_text.contains("Deserialize"),
+                "expected relink/deserialize error, got: {err_text}"
+            );
         }
 
         // ═══════════════════════════════════════════════════════
