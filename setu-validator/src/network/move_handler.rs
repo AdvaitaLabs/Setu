@@ -335,6 +335,7 @@ impl MovePublishHandler {
                 module_count: 0,
                 success: false,
                 error: Some("Empty module list".into()),
+                package_addr: None,
             }, None);
         }
 
@@ -350,6 +351,7 @@ impl MovePublishHandler {
                     module_count: 0,
                     success: false,
                     error: Some(e),
+                    package_addr: None,
                 }, None);
             }
         };
@@ -369,12 +371,22 @@ impl MovePublishHandler {
         match infra_executor.execute_contract_publish(&request.sender, &modules_bytes, vlc_snapshot) {
             Ok(event) => {
                 let event_id = event.id.clone();
-                info!(event_id = %event_id, module_count, "MovePublish executed successfully");
+                // B5: extract family_addr from the `linkage:latest:{hex}` key
+                // so the client can chain into MoveUpgradeRequest.current_package.
+                // Falls back to `None` if no linkage row was written (should
+                // not happen for a successful publish — defensive only).
+                let package_addr = event.execution_result.as_ref().and_then(|er| {
+                    er.state_changes.iter().find_map(|sc| {
+                        sc.key.strip_prefix("linkage:latest:").map(|hex| format!("0x{}", hex))
+                    })
+                });
+                info!(event_id = %event_id, module_count, ?package_addr, "MovePublish executed successfully");
                 (MovePublishResponse {
                     event_id,
                     module_count,
                     success: true,
                     error: None,
+                    package_addr,
                 }, Some(event))
             }
             Err(e) => {
@@ -384,6 +396,7 @@ impl MovePublishHandler {
                     module_count: 0,
                     success: false,
                     error: Some(e),
+                    package_addr: None,
                 }, None)
             }
         }

@@ -797,6 +797,10 @@ impl MockEnclave {
                 warn!(event_id = %event.id, "MovePublish event incorrectly routed to TEE");
                 return Err("MovePublish is a ROOT event, should not reach TEE".to_string());
             }
+            setu_types::event::EventPayload::MoveUpgrade(_) => {
+                warn!(event_id = %event.id, "MoveUpgrade event incorrectly routed to TEE");
+                return Err("MoveUpgrade is a ROOT event (rides on ContractPublish umbrella), should not reach TEE".to_string());
+            }
 
             // CoinMerge
             setu_types::event::EventPayload::CoinMerge { .. } => {

@@ -142,6 +142,12 @@ pub struct MovePublishResponse {
     /// Error message (if failed)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// B5: package address (= family_id) for the freshly-published bundle.
+    /// Hex with `0x` prefix. Clients chain this into the next
+    /// `MoveUpgradeRequest::current_package`. Tail-appended (JSON, backward
+    /// compatible). `None` when the publish failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_addr: Option<String>,
 }
 
 /// Request to upgrade a Move package (B5).
