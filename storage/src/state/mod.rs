@@ -12,6 +12,7 @@ pub mod provider;
 pub mod batch_snapshot;
 pub mod shared;
 pub mod speculative_overlay;
+pub mod version_watcher;
 
 pub use manager::{SubnetStateSMT, GlobalStateManager, StateApplySummary, StateApplyError, RecoverySummary, B4StoreExt, ConflictRecord};
 pub use provider::{
@@ -24,3 +25,4 @@ pub use shared::{SharedStateManager, OverlayView};
 pub use speculative_overlay::{
     OverlayClearStats, OverlayStats, SpeculativeOverlay, StageError,
 };
+pub use version_watcher::{ObjKey, WaitGuard, WatcherCaps, WatcherError, WatcherRegistry};

@@ -665,6 +665,19 @@ async fn main() -> anyhow::Result<()> {
         network_config,
     );
 
+    // B1 · attach a shared `WatcherRegistry` so the storage layer's
+    // `apply_committed_events` (single canonical write site) can wake any
+    // pending `wait_min_version` long-poll handlers. See
+    // `docs/feat/pwoo-r6-wait-api/design.md` §4.4.
+    {
+        let watcher = setu_storage::WatcherRegistry::new(setu_storage::WatcherCaps::default());
+        shared_state_manager
+            .lock_write()
+            .set_version_watcher(Arc::clone(&watcher));
+        network_service.set_version_watcher(Arc::clone(&watcher));
+        info!("✓ B1 wait_min_version WatcherRegistry attached (per-object cap=32, global cap=1024)");
+    }
+
     // ========================================
     // Governance Subsystem
     // ========================================

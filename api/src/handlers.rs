@@ -88,8 +88,9 @@ pub trait ValidatorService: Send + Sync {
 
     /// Submit a Programmable Transaction Block (PTB).
     ///
-    /// **B6a**: returns HTTP 501 with `code = PTB_NOT_YET_EXECUTABLE` for
-    /// well-formed PTBs; malformed PTBs surface as 4xx via `Err`.
+    /// `Ok(resp)` → HTTP 200 with execution result;
+    /// `Err(resp)` → HTTP 400 with the wire/domain error explained in
+    /// `resp.error`. See `docs/feat/move-vm-phase9-ptb-event-wire/design.md`.
     fn submit_move_ptb(
         &self,
         request: MovePtbRequest,
@@ -101,6 +102,20 @@ pub trait ValidatorService: Send + Sync {
     /// committed SMT only. Required for cross-validator state comparisons
     /// (see docs/bugs/20260424-state-get-overlay-leak-cross-node.md).
     fn get_move_object(&self, object_id: &str, finalized: bool) -> GetMoveObjectResponse;
+
+    /// B1 · Long-poll variant of [`get_move_object`](Self::get_move_object).
+    ///
+    /// Blocks until the object's `version` field is `>= min_version`, the
+    /// caller-specified `timeout_ms` elapses, or the per-object / global
+    /// waiter cap is exceeded. See
+    /// [`docs/feat/pwoo-r6-wait-api/design.md`](../../docs/feat/pwoo-r6-wait-api/design.md).
+    fn wait_move_object_min_version(
+        &self,
+        object_id: &str,
+        finalized: bool,
+        min_version: u64,
+        timeout_ms: u64,
+    ) -> impl std::future::Future<Output = WaitMoveObjectOutcome> + Send;
 
     /// Query module ABI (function list)
     fn get_module_abi(&self, address: &str, name: &str) -> GetModuleAbiResponse;
@@ -371,18 +386,20 @@ pub async fn http_submit_move_publish<S: ValidatorService>(
 
 /// Submit a Programmable Transaction Block (PTB).
 ///
-/// Two terminal HTTP states (B6a):
-/// - **400 Bad Request** when PTB validation fails (see `Err` arm of
-///   `ValidatorService::submit_move_ptb`).
-/// - **501 Not Implemented** for well-formed PTBs, with body
-///   `{ code: "PTB_NOT_YET_EXECUTABLE", ... }`. Once B6b lands the executor,
-///   this branch flips to 200/4xx based on execution outcome.
+/// HTTP status mapping (post move-vm-phase9-ptb-event-wire):
+/// - **200 OK** — PTB executed successfully (`success = true`).
+/// - **400 Bad Request** — wire-format failure (hex / BCS / `validate_wire`)
+///   OR domain-level execution failure (NotOwnedBySender, ObjectNotFound,
+///   StaleObjectVersion, ObjectDigestMismatch, SharedObjectsNotYetSupported,
+///   …). The response body's `error` / `code` fields describe which.
+///
+/// See `docs/feat/move-vm-phase9-ptb-event-wire/design.md` §10.
 pub async fn http_submit_move_ptb<S: ValidatorService>(
     State(service): State<Arc<S>>,
     Json(request): Json<MovePtbRequest>,
 ) -> (axum::http::StatusCode, Json<MovePtbResponse>) {
     match service.submit_move_ptb(request).await {
-        Ok(resp) => (axum::http::StatusCode::NOT_IMPLEMENTED, Json(resp)),
+        Ok(resp) => (axum::http::StatusCode::OK, Json(resp)),
         Err(resp) => (axum::http::StatusCode::BAD_REQUEST, Json(resp)),
     }
 }
@@ -394,6 +411,32 @@ pub struct GetMoveObjectQuery {
     /// Default false preserves read-your-writes semantics for clients on the
     /// same node that submitted a write.
     pub finalized: Option<bool>,
+    /// B1: long-poll until the object's `version` reaches at least this value.
+    /// Treated as 0 if absent (non-blocking GET, the legacy semantics).
+    pub wait_min_version: Option<u64>,
+    /// B1: max wait time in milliseconds. Defaults to
+    /// [`DEFAULT_WAIT_TIMEOUT_MS`] when `wait_min_version` is set.
+    pub timeout_ms: Option<u64>,
+}
+
+/// B1 default long-poll timeout. Picked under the assumption that most
+/// reverse proxies idle-cut at 60s; clients can shorten via `?timeout_ms=`.
+pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
+
+/// B1 outcome returned by
+/// [`ValidatorService::wait_move_object_min_version`]. The HTTP handler maps
+/// each variant to an appropriate status code.
+#[derive(Debug)]
+pub enum WaitMoveObjectOutcome {
+    /// Object materialized at `version >= min_version`. → HTTP 200.
+    Resolved(GetMoveObjectResponse),
+    /// Timeout elapsed before the version target was reached. → HTTP 408.
+    /// Carries the most recently observed state for diagnostics.
+    Timeout(GetMoveObjectResponse),
+    /// Per-object or global waiter cap exceeded. → HTTP 429.
+    CapExceeded { reason: String },
+    /// Validator service has no watcher attached (mis-configured node). → HTTP 503.
+    Unavailable,
 }
 
 /// Query a Move object by object ID (hex)
@@ -401,8 +444,55 @@ pub async fn http_get_move_object<S: ValidatorService>(
     State(service): State<Arc<S>>,
     axum::extract::Path(object_id): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<GetMoveObjectQuery>,
-) -> Json<GetMoveObjectResponse> {
-    Json(service.get_move_object(&object_id, q.finalized.unwrap_or(false)))
+) -> (axum::http::StatusCode, Json<GetMoveObjectResponse>) {
+    let finalized = q.finalized.unwrap_or(false);
+    match q.wait_min_version {
+        // No wait requested → preserve legacy non-blocking 200 path.
+        None | Some(0) => (
+            axum::http::StatusCode::OK,
+            Json(service.get_move_object(&object_id, finalized)),
+        ),
+        Some(min_version) => {
+            let timeout_ms = q.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
+            match service
+                .wait_move_object_min_version(&object_id, finalized, min_version, timeout_ms)
+                .await
+            {
+                WaitMoveObjectOutcome::Resolved(resp) => (axum::http::StatusCode::OK, Json(resp)),
+                WaitMoveObjectOutcome::Timeout(resp) => {
+                    (axum::http::StatusCode::REQUEST_TIMEOUT, Json(resp))
+                }
+                WaitMoveObjectOutcome::CapExceeded { reason } => (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    Json(GetMoveObjectResponse {
+                        key: format!("oid:{}", object_id.strip_prefix("0x").unwrap_or(&object_id)),
+                        object_id,
+                        owner: String::new(),
+                        ownership: String::new(),
+                        type_tag: String::new(),
+                        version: 0,
+                        data_hex: String::new(),
+                        exists: false,
+                        error: Some(reason),
+                    }),
+                ),
+                WaitMoveObjectOutcome::Unavailable => (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(GetMoveObjectResponse {
+                        key: format!("oid:{}", object_id.strip_prefix("0x").unwrap_or(&object_id)),
+                        object_id,
+                        owner: String::new(),
+                        ownership: String::new(),
+                        type_tag: String::new(),
+                        version: 0,
+                        data_hex: String::new(),
+                        exists: false,
+                        error: Some("wait_min_version not supported on this validator".into()),
+                    }),
+                ),
+            }
+        }
+    }
 }
 
 /// Query a module's ABI (function list)

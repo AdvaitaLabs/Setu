@@ -50,6 +50,7 @@ pub use state::{StateProvider, MerkleStateProvider, CoinInfo, CoinState, SimpleM
 pub use state::{init_coin, init_coins_split, get_coin_state};
 pub use state::{BatchStateSnapshot, BatchSnapshotStats};
 pub use state::SharedStateManager;
+pub use state::{ObjKey, WaitGuard, WatcherCaps, WatcherError, WatcherRegistry};
 
 // Re-export MerkleStore trait from setu-merkle for convenience
 pub use setu_merkle::storage::{MerkleStore, MerkleLeafStore, MerkleMetaStore, B4Store};

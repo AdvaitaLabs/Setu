@@ -279,6 +279,15 @@ pub struct GlobalStateManager {
     /// Updated during apply_committed_events to track which event last modified
     /// each object. Used by TaskPreparer to derive DAG parent_ids for causal ordering.
     modification_tracker: HashMap<[u8; 32], String>,
+    /// Optional version watcher (B1 wait_min_version API).
+    ///
+    /// When attached via [`set_version_watcher`](Self::set_version_watcher),
+    /// `apply_committed_events` calls `notify_objects` for every object id
+    /// touched by the committed events AFTER all SMT writes for the batch
+    /// commit. The notifier is fired in the same `&mut self` scope as the
+    /// writes — leaders and followers both go through this single hook
+    /// (design.md §4.4 A').
+    version_watcher: Option<Arc<crate::state::version_watcher::WatcherRegistry>>,
 }
 
 /// Extended B4Store trait that combines all required storage capabilities.
@@ -320,6 +329,9 @@ impl Clone for GlobalStateManager {
             coin_type_index: HashMap::new(),
             owner_object_index: HashMap::new(),
             modification_tracker: HashMap::new(),
+            // Clones are throw-away snapshots — wakeup notifications are scoped
+            // to the canonical instance only.
+            version_watcher: None,
         }
     }
 }
@@ -351,6 +363,9 @@ impl GlobalStateManager {
             coin_type_index: self.coin_type_index.clone(),
             owner_object_index: self.owner_object_index.clone(),
             modification_tracker: self.modification_tracker.clone(),
+            // Read snapshots do not fire wakeups; the canonical instance owns
+            // the watcher.
+            version_watcher: None,
         }
     }
 
@@ -369,6 +384,7 @@ impl GlobalStateManager {
             coin_type_index: HashMap::new(),
             owner_object_index: HashMap::new(),
             modification_tracker: HashMap::new(),
+            version_watcher: None,
         }
     }
     
@@ -380,7 +396,17 @@ impl GlobalStateManager {
         manager.store = Some(store);
         manager
     }
-    
+
+    /// Attach a `WatcherRegistry` so `apply_committed_events` notifies any
+    /// pending `wait_min_version` waiters whenever it materializes new state.
+    /// Designed to be called once at validator boot, before the first event
+    /// applies. See [`docs/feat/pwoo-r6-wait-api/design.md`](../../../../docs/feat/pwoo-r6-wait-api/design.md) §4.4.
+    pub fn set_version_watcher(
+        &mut self,
+        watcher: Arc<crate::state::version_watcher::WatcherRegistry>,
+    ) {
+        self.version_watcher = Some(watcher);
+    }
     /// Get or create a subnet's SMT
     pub fn get_subnet_mut(&mut self, subnet_id: SubnetId) -> &mut SubnetStateSMT {
         self.subnet_states
@@ -1230,6 +1256,27 @@ impl GlobalStateManager {
                     new_root,
                 );
             }
+        }
+
+        // B1 wait_min_version (design.md §4.4 A'): wake any pending waiters
+        // whose object id was just bumped. Fired AFTER all SMT writes for this
+        // batch have committed (single hook serves leader and follower —
+        // symmetric by construction).
+        if let Some(watcher) = self.version_watcher.as_ref() {
+            // Collect once per event so duplicate writes in the same batch
+            // don't redundantly traverse the DashMap.
+            let oids = sorted_events
+                .iter()
+                .filter(|e| e.execution_result.as_ref().is_some_and(|r| r.success))
+                .flat_map(|e| {
+                    e.execution_result
+                        .as_ref()
+                        .map(|r| r.state_changes.iter())
+                        .into_iter()
+                        .flatten()
+                })
+                .map(|change| *Self::parse_state_change_key(&change.key).as_bytes());
+            watcher.notify_objects(oids);
         }
 
         // Phase 4 audit probe (design.md §6.1 item 2): exit half. Log the
