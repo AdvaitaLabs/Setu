@@ -1023,8 +1023,12 @@ impl ValidatorNetworkService {
         };
 
         // Try storage first, then embedded stdlib
-        let stripped = address.strip_prefix("0x").unwrap_or(address);
-        let module_key = format!("mod:{}::{}", address, name);
+        // Normalize the URL-supplied address so both padded 64-hex and
+        // zero-stripped forms reach the same SMT key.
+        // See docs/feat/fix-package-addr-hex-encoding/.
+        let canonical = crate::network::move_handler::canonical_addr_hex(address);
+        let stripped = canonical.strip_prefix("0x").unwrap_or(&canonical);
+        let module_key = format!("mod:{}::{}", canonical, name);
         let bytecode = self.task_preparer.state_provider().get_raw(&module_key)
             .or_else(|| {
                 if stripped == "1" || stripped == "0000000000000000000000000000000000000000000000000000000000000001" {

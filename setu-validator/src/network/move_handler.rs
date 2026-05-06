@@ -287,7 +287,11 @@ impl MoveCallHandler {
 
         Ok(MoveCallPayload {
             sender: sender_hex,
-            package: request.package.clone(),
+            // Normalize package address so clients can pass either padded 64-hex
+            // (e.g. as returned pre-fix from /api/v1/move/publish) or canonical
+            // zero-stripped form. Both must reach the same SMT key on lookup.
+            // See docs/feat/fix-package-addr-hex-encoding/.
+            package: canonical_addr_hex(&request.package),
             module: request.module.clone(),
             function: request.function.clone(),
             type_args: request.type_args.clone(),
@@ -375,9 +379,15 @@ impl MovePublishHandler {
                 // so the client can chain into MoveUpgradeRequest.current_package.
                 // Falls back to `None` if no linkage row was written (should
                 // not happen for a successful publish — defensive only).
+                // Decode the padded `linkage:latest:{family_hex}` key fragment
+                // through `canonical_addr_hex` so the response carries the same
+                // form `mod:` SMT keys use — clients can directly round-trip
+                // this into MoveCallRequest.package.
                 let package_addr = event.execution_result.as_ref().and_then(|er| {
                     er.state_changes.iter().find_map(|sc| {
-                        sc.key.strip_prefix("linkage:latest:").map(|hex| format!("0x{}", hex))
+                        sc.key
+                            .strip_prefix("linkage:latest:")
+                            .map(|hex| canonical_addr_hex(&format!("0x{}", hex)))
                     })
                 });
                 info!(event_id = %event_id, module_count, ?package_addr, "MovePublish executed successfully");
@@ -520,9 +530,17 @@ impl MoveUpgradeHandler {
         ) {
             Ok(event) => {
                 let event_id = event.id.clone();
+                // Same canonicalization as MovePublish — return the form
+                // `mod:` SMT keys use so clients can directly call against
+                // the upgraded package. (Empirically blake3-derived addresses
+                // have no leading zeros so canonicalization is a no-op here,
+                // but keep symmetry with publish for robustness.)
                 let (new_addr_hex, new_version) = match &event.payload {
                     setu_types::event::EventPayload::MoveUpgrade(p) => (
-                        Some(format!("0x{}", hex::encode(p.new_package_addr.as_bytes()))),
+                        Some(canonical_addr_hex(&format!(
+                            "0x{}",
+                            hex::encode(p.new_package_addr.as_bytes())
+                        ))),
                         Some(p.new_version),
                     ),
                     _ => (None, None),
@@ -558,16 +576,101 @@ impl MoveUpgradeHandler {
     }
 }
 
-/// Decode a 32-byte ObjectId from a hex string (with or without `0x`).
+/// Decode a 32-byte ObjectId from a hex string.
+///
+/// Accepts both:
+/// * canonical zero-stripped form (e.g. `0xcafe`) — left-padded to 32 bytes
+/// * full padded 64-hex (e.g. `0x000…cafe`) — used as-is
+///
+/// Both forms must round-trip to the same `ObjectId` because that's the
+/// invariant the SMT key normalization (`canonical_addr_hex`) preserves.
 fn decode_object_id_hex(s: &str) -> Result<ObjectId, String> {
     let stripped = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(stripped).map_err(|e| format!("hex decode: {}", e))?;
-    if bytes.len() != 32 {
-        return Err(format!("expected 32 bytes, got {}", bytes.len()));
+    if stripped.is_empty() || stripped.len() > 64 {
+        return Err(format!("expected 1..=64 hex chars, got {}", stripped.len()));
     }
+    // Left-pad to 64 hex chars (32 bytes).
+    let padded = if stripped.len() < 64 {
+        let mut p = String::with_capacity(64);
+        for _ in 0..(64 - stripped.len()) {
+            p.push('0');
+        }
+        p.push_str(stripped);
+        p
+    } else {
+        stripped.to_string()
+    };
+    let bytes = hex::decode(&padded).map_err(|e| format!("hex decode: {}", e))?;
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(ObjectId::new(arr))
+}
+
+/// Canonicalize a hex address string to the `to_hex_literal()` form
+/// (zero-stripped, `0x`-prefixed). Accepts either padded 64-hex or
+/// already-canonical input.
+///
+/// Background: `mod:{addr}::{name}` SMT keys are written using
+/// `AccountAddress::to_hex_literal()` (zero-stripped), but several producer
+/// paths surface the same address as full padded 64-hex (e.g. extracting
+/// from `linkage:latest:{family_hex}`). Without this normalization, clients
+/// that round-trip a publish response into a `MoveCallRequest.package`
+/// would hit a `Module not found` lookup miss.
+///
+/// On parse failure, returns the input unchanged so downstream error
+/// reporting still surfaces the original (likely invalid) value.
+///
+/// See docs/feat/fix-package-addr-hex-encoding/.
+pub(crate) fn canonical_addr_hex(input: &str) -> String {
+    use move_core_types::account_address::AccountAddress;
+    AccountAddress::from_hex_literal(input)
+        .map(|a| a.to_hex_literal())
+        .unwrap_or_else(|_| input.to_string())
+}
+
+#[cfg(test)]
+mod hex_canonical_tests {
+    use super::canonical_addr_hex;
+
+    #[test]
+    fn padded_and_stripped_collapse_to_same_form() {
+        let stripped = canonical_addr_hex("0xcafe");
+        let padded = canonical_addr_hex(
+            "0x000000000000000000000000000000000000000000000000000000000000cafe",
+        );
+        assert_eq!(stripped, padded);
+        // Canonical form for non-stdlib short addresses is the zero-stripped one.
+        assert_eq!(stripped, "0xcafe");
+    }
+
+    #[test]
+    fn idempotent_on_canonical_input() {
+        let once = canonical_addr_hex("0xcafe");
+        let twice = canonical_addr_hex(&once);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn passes_through_invalid_input() {
+        assert_eq!(canonical_addr_hex("not_hex"), "not_hex");
+        assert_eq!(canonical_addr_hex(""), "");
+    }
+
+    #[test]
+    fn full_blake3_addr_is_already_canonical() {
+        // Addresses without leading-zero bytes (e.g. blake3-derived upgrade
+        // addresses) round-trip unchanged.
+        let addr = "0xbe581e863fed7a6e758e039ed306dd5801c3eec3aa9883d019d7b014d5d5d035";
+        assert_eq!(canonical_addr_hex(addr), addr);
+    }
+
+    #[test]
+    fn stdlib_address_canonicalizes_to_short() {
+        // 0x1 is the canonical stdlib address; padded form must reduce to it.
+        let padded = "0x0000000000000000000000000000000000000000000000000000000000000001";
+        assert_eq!(canonical_addr_hex(padded), "0x1");
+        assert_eq!(canonical_addr_hex("0x1"), "0x1");
+    }
 }
 
 /// PTB handler — unit struct matching MoveCallHandler pattern.
