@@ -419,10 +419,26 @@ impl SetuMoveEngine {
         &self,
         change_set: &ChangeSet,
     ) -> Result<Vec<ModuleChange>, RuntimeError> {
+        self.extract_module_changes_skipping(change_set, &std::collections::BTreeSet::new())
+    }
+
+    /// B5 variant of `extract_module_changes` that skips ModuleIds the
+    /// PTB lowering already accounted for via the explicit
+    /// `PublishWithLinkage` / `Upgrade` push path. Without this skip, a
+    /// `Command::Publish` would surface twice — once with rich linkage
+    /// and once via the legacy ChangeSet `Op::New` walk.
+    fn extract_module_changes_skipping(
+        &self,
+        change_set: &ChangeSet,
+        skip: &std::collections::BTreeSet<ModuleId>,
+    ) -> Result<Vec<ModuleChange>, RuntimeError> {
         let mut changes = vec![];
         // ChangeSet.modules() returns Iterator<(AccountAddress, &Identifier, Op<&[u8]>)>
         for (addr, name, op) in change_set.modules() {
             let mid = ModuleId::new(addr, name.clone());
+            if skip.contains(&mid) {
+                continue;
+            }
             match op {
                 Op::New(bytes) => {
                     changes.push(ModuleChange::Publish(mid, bytes.to_vec()));
@@ -988,6 +1004,12 @@ impl SetuMoveEngine {
         //    inner per-instruction tier and the outer per-Command tier
         //    accumulate into the same counter.
         let mut last_return_values: Vec<Vec<u8>> = vec![];
+        // B5: PTB lowering pushes rich `ModuleChange::PublishWithLinkage`
+        // / `ModuleChange::Upgrade` entries here so we keep the linkage
+        // metadata that the ChangeSet alone cannot carry. Merged with the
+        // legacy ChangeSet-derived list at finalize time, with the IDs we
+        // pushed explicitly skipped (so each module surfaces exactly once).
+        let mut explicit_module_changes: Vec<ModuleChange> = Vec::new();
         for (idx, cmd) in ptb.commands.iter().enumerate() {
             // B6c · outer-tier per-Command surcharge BEFORE dispatch
             //       (charge-on-abort determinism, design §4.3).
@@ -1059,6 +1081,8 @@ impl SetuMoveEngine {
                         modules,
                         gas_meter,
                         ctx,
+                        idx,
+                        &mut explicit_module_changes,
                     )?;
                     last_return_values = vec![];
                     pctx.record_result(idx, vec![]);
@@ -1086,7 +1110,18 @@ impl SetuMoveEngine {
             .map_err(|e| RuntimeError::VMExecutionError(e.to_string()))?;
         let obj_results = obj_runtime.into_results();
 
-        let module_changes = self.extract_module_changes(&_change_set)?;
+        // Build skip-set from explicit-changes module IDs so they aren't
+        // double-counted when ChangeSet also surfaces an Op::New for them.
+        let skip: std::collections::BTreeSet<ModuleId> = explicit_module_changes
+            .iter()
+            .map(|c| match c {
+                ModuleChange::Publish(mid, _) => mid.clone(),
+                ModuleChange::PublishWithLinkage { module_id, .. } => module_id.clone(),
+                ModuleChange::Upgrade { module_id, .. } => module_id.clone(),
+            })
+            .collect();
+        let mut module_changes = self.extract_module_changes_skipping(&_change_set, &skip)?;
+        module_changes.extend(explicit_module_changes);
         let state_changes =
             self.convert_results_to_state_changes(&obj_results, ctx.current_version)?;
 
@@ -1590,12 +1625,27 @@ impl SetuMoveEngine {
         })
     }
 
-    /// Phase 3f: lower `Command::Publish { modules, deps }` by delegating
-    /// to `Session::publish_module_bundle`. The published modules surface
-    /// at finalize via the ChangeSet → `ModuleChange::Publish` extraction
-    /// path (lines 380-410). `deps` is ignored at the VM level — link-time
-    /// dependency resolution is the resolver's responsibility (handled by
-    /// `SetuModuleResolver`).
+    /// Phase 3f / B5: lower `Command::Publish { modules, deps }` by
+    /// delegating to `Session::publish_module_bundle` and emitting one
+    /// `ModuleChange::PublishWithLinkage` entry per module so the storage
+    /// layer writes the corresponding `linkage:latest:` and
+    /// `linkage:hist:` keys (design.md §4.5 step a). `deps` is ignored at
+    /// the VM level — link-time dependency resolution is the resolver's
+    /// responsibility (handled by `SetuModuleResolver`).
+    ///
+    /// `family_id` is derived deterministically from `(tx_hash, cmd_idx)`
+    /// so every module in a single publish bundle shares the same family
+    /// (one package family per `Command::Publish`). `package_addr` is
+    /// taken from each module's first `address_identifiers[0]` slot
+    /// (the module's declared self-address) — caller-supplied authoritative.
+    /// `version` is hard-coded to `1` since this is a fresh publish.
+    ///
+    /// **B5 v0 limitation**: this iteration does NOT yet mint an
+    /// `UpgradeCap` Move object — that requires synthesising an internal
+    /// `MoveCall` to `setu::package::make_upgrade_cap` after the bundle
+    /// publish, which is deferred. Without an `UpgradeCap`, downstream
+    /// `Command::Upgrade` will fail-fast at ticket validation.
+    #[allow(clippy::too_many_arguments)]
     fn lower_publish_inline<S: RawStore>(
         &self,
         session: &mut move_vm_runtime::session::Session<
@@ -1606,11 +1656,31 @@ impl SetuMoveEngine {
         modules: &[Vec<u8>],
         gas_meter: &mut InstructionCountGasMeter,
         ctx: &MoveExecutionContext,
+        cmd_idx: usize,
+        out_changes: &mut Vec<ModuleChange>,
     ) -> Result<(), RuntimeError> {
         if modules.is_empty() {
             // Nothing to publish — no-op (validates against empty bundle).
             return Ok(());
         }
+
+        // Pre-publish: deserialize each module locally to extract the
+        // (self_addr, name) pair for ModuleId construction and the
+        // `package_addr` linkage field. We do this BEFORE publish so a
+        // malformed bundle fails before mutating session state.
+        use move_binary_format::CompiledModule;
+        let mut parsed: Vec<(AccountAddress, move_core_types::identifier::Identifier)> =
+            Vec::with_capacity(modules.len());
+        for (i, bytecode) in modules.iter().enumerate() {
+            let cm = CompiledModule::deserialize_with_defaults(bytecode).map_err(|e| {
+                RuntimeError::VMExecutionError(format!(
+                    "PTB Publish module[{i}] deserialize failed: {e}"
+                ))
+            })?;
+            let self_id = cm.self_id();
+            parsed.push((*self_id.address(), self_id.name().to_owned()));
+        }
+
         let sender = AccountAddress::new(*ctx.sender.as_bytes());
         session
             .publish_module_bundle(modules.to_vec(), sender, gas_meter)
@@ -1620,6 +1690,30 @@ impl SetuMoveEngine {
                     modules.len()
                 ))
             })?;
+
+        // Derive family_id deterministically per Command::Publish so all
+        // modules in this bundle share the same package family. This is
+        // independent of `SetuObjectRuntime::fresh_id` because object_runtime
+        // is owned by the session here and not directly accessible.
+        // Domain separator scoped to package family to avoid collision with
+        // the SETU_FRESH_ID:* domain used for object IDs.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_PKG_FAMILY:");
+        hasher.update(&ctx.tx_hash);
+        hasher.update(&(cmd_idx as u64).to_le_bytes());
+        let family_id = setu_types::object::ObjectId::new(*hasher.finalize().as_bytes());
+
+        for (bytecode, (addr, name)) in modules.iter().zip(parsed.into_iter()) {
+            let module_id = ModuleId::new(addr, name);
+            let package_addr = setu_types::object::Address::new(addr.into_bytes());
+            out_changes.push(ModuleChange::PublishWithLinkage {
+                module_id,
+                bytecode: bytecode.clone(),
+                family_id,
+                package_addr,
+                version: 1,
+            });
+        }
         Ok(())
     }
 
