@@ -39,11 +39,123 @@ impl InstructionCountGasMeter {
     }
 
     fn charge(&mut self, cost: u64) -> PartialVMResult<()> {
-        self.instructions_executed += cost;
-        if self.instructions_executed > self.max_instructions {
+        // B6c · atomic charge: reject BEFORE mutating the counter so that
+        // `instructions_executed()` after an OOM still reflects only work
+        // that was successfully committed. Required for the `gas_used <=
+        // gas_budget` invariant on the abort path (design §4.3).
+        let new_total = self.instructions_executed.saturating_add(cost);
+        if new_total > self.max_instructions {
             Err(PartialVMError::new(StatusCode::OUT_OF_GAS))
         } else {
+            self.instructions_executed = new_total;
             Ok(())
+        }
+    }
+
+    /// B6c · public outer-tier surcharge entry point.
+    ///
+    /// PTB executor calls this BEFORE invoking each command (overhead for
+    /// argument resolution, lowering, result-table push) and AFTER
+    /// finalize for storage-key writes / reads. Reuses the same counter as
+    /// the inner per-instruction `charge` so a single `OUT_OF_GAS` boundary
+    /// covers both tiers.
+    pub fn charge_outer(&mut self, cost: u64) -> PartialVMResult<()> {
+        self.charge(cost)
+    }
+
+    /// B6c · raw remaining-budget probe; lets the executor capture
+    /// `instructions_executed()` BEFORE returning the abort path so that
+    /// `MoveExecutionOutput.gas_used` reflects work done up to the failure
+    /// point (G1 cross-solver determinism).
+    pub fn instructions_remaining(&self) -> u64 {
+        self.max_instructions.saturating_sub(self.instructions_executed)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// B6c · PTB outer-tier overhead table
+// ════════════════════════════════════════════════════════════════════════
+//
+// These constants are charged on top of the existing per-instruction inner
+// tier (see `InstructionCountGasMeter::charge_*` impls above) so a malicious
+// or oversized PTB cannot pin a validator. Values are ~10× the inner
+// `charge_call` cost to reflect per-Command argument resolution + result
+// table maintenance overhead.
+//
+// Native-function rows (e.g. `bcs::to_bytes`) are intentionally **omitted**
+// in v1; they will be added when B3 (natives) lands and finalizes the list.
+
+/// PTB-only minimum gas budget (charged at PTB start, NOT applied to the
+/// legacy `OperationType::MoveCall` path — see B6c design §4.5).
+pub const MIN_GAS_PTB: u64 = 1_000;
+
+/// PTB-only maximum gas budget; submissions above this are rejected at the
+/// validator entry (`network/move_handler.rs`).
+pub const MAX_GAS_BUDGET: u64 = 50_000_000;
+
+/// Per-command outer-tier surcharge table. Values represent the cost of
+/// the executor-side bookkeeping for one command, NOT the cost of any
+/// bytecode it triggers (that is accounted for separately by the inner
+/// per-instruction meter).
+#[derive(Debug, Clone, Copy)]
+pub struct PtbOverhead {
+    pub move_call: u64,
+    pub split_coins: u64,
+    pub merge_coins: u64,
+    pub transfer_objects: u64,
+    pub publish: u64,
+    pub make_move_vec: u64,
+    /// Charged once per state-key written by the PTB (covers all G11
+    /// prefixes: `oid:`, `mod:`, `pkg:`, `user:`, `solver:`, `event:`).
+    pub storage_write_per_key: u64,
+    /// Charged once per state-key read into the executor (input objects
+    /// + dynamic-field preload entries).
+    pub storage_read_per_key: u64,
+}
+
+pub const PTB_OVERHEAD_TABLE: PtbOverhead = PtbOverhead {
+    move_call: 100,
+    split_coins: 50,
+    merge_coins: 50,
+    transfer_objects: 20,
+    publish: 5_000,
+    make_move_vec: 10,
+    storage_write_per_key: 100,
+    storage_read_per_key: 50,
+};
+
+/// Compute the outer-tier overhead cost for a single PTB command. The
+/// executor charges this on the shared `InstructionCountGasMeter` BEFORE
+/// dispatching the command (B6c design §5 step 3a).
+pub fn ptb_overhead_cost(cmd: &setu_types::ptb::Command) -> u64 {
+    use setu_types::ptb::Command;
+    match cmd {
+        Command::MoveCall(_) => PTB_OVERHEAD_TABLE.move_call,
+        Command::SplitCoins(_, amounts) => {
+            // One outer charge per resulting coin so a 1×1024 SplitCoins
+            // cannot dodge per-element overhead.
+            PTB_OVERHEAD_TABLE.split_coins.saturating_mul(amounts.len() as u64)
+        }
+        Command::MergeCoins(_, sources) => {
+            PTB_OVERHEAD_TABLE.merge_coins.saturating_mul(sources.len() as u64)
+        }
+        Command::TransferObjects(objs, _) => {
+            PTB_OVERHEAD_TABLE
+                .transfer_objects
+                .saturating_mul(objs.len() as u64)
+        }
+        Command::Publish { modules, .. } => {
+            // Charge the per-bundle baseline plus 5 000 per module
+            // bytecode-verify; clamping `len().max(1)` so that an empty
+            // module list still pays the bundle baseline (anti-DoS).
+            PTB_OVERHEAD_TABLE
+                .publish
+                .saturating_mul((modules.len() as u64).max(1))
+        }
+        Command::MakeMoveVec { args, .. } => {
+            PTB_OVERHEAD_TABLE
+                .make_move_vec
+                .saturating_mul(args.len() as u64)
         }
     }
 }

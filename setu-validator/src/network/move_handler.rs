@@ -419,7 +419,31 @@ impl MovePtbHandler {
         sender: String,
         ptb: ProgrammableTransaction,
         subnet_id_hint: Option<String>,
+        gas_budget: Option<u64>,
     ) -> setu_api::MovePtbResponse {
+        // B6c · resolve + validate gas_budget BEFORE any task work. Default
+        // sits at `MAX_GAS_BUDGET / 5` so a typical PTB has plenty of head
+        // room without blanket-permitting the absolute ceiling.
+        let resolved_gas: u64 = match gas_budget {
+            Some(b) => b,
+            None => setu_move_vm::gas::MAX_GAS_BUDGET / 5,
+        };
+        if resolved_gas < setu_move_vm::gas::MIN_GAS_PTB
+            || resolved_gas > setu_move_vm::gas::MAX_GAS_BUDGET
+        {
+            return setu_api::MovePtbResponse {
+                event_id: String::new(),
+                success: false,
+                error: Some(format!(
+                    "gas_budget {} outside [{}..{}]",
+                    resolved_gas,
+                    setu_move_vm::gas::MIN_GAS_PTB,
+                    setu_move_vm::gas::MAX_GAS_BUDGET,
+                )),
+                code: None,
+            };
+        }
+
         // 1. Resolve sender to canonical hex address.
         let sender_hex = MoveCallHandler::resolve_address(&sender);
         let payload = MovePtbPayload { sender: sender_hex, ptb };
@@ -453,7 +477,15 @@ impl MovePtbHandler {
 
         // 5. Prepare SolverTask.
         let solver_task = match task_preparer.prepare_move_ptb_task(&event, &payload, subnet_id) {
-            Ok(t) => t,
+            Ok(mut t) => {
+                // B6c · stamp the validated PTB gas budget onto the task so
+                // it propagates through the solver / TEE path into
+                // `MoveExecutionContext.gas_budget`. Other `GasBudget`
+                // fields (gas_price, estimated_fee) are left at the
+                // preparer's defaults; v1 charges no fee.
+                t.gas_budget.max_gas_units = resolved_gas;
+                t
+            }
             Err(e) => {
                 error!(error = %e, "PTB task preparation failed");
                 return setu_api::MovePtbResponse {

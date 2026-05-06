@@ -532,6 +532,7 @@ impl MockEnclave {
                 &input.resolved_inputs, 
                 &mut diff,
                 &mut local_runtime,
+                input.gas_budget.max_gas_units,
             ).await;
             
             match result {
@@ -762,6 +763,12 @@ impl MockEnclave {
         resolved_inputs: &ResolvedInputs,
         diff: &mut StateDiff,
         local_runtime: &mut RuntimeExecutor<InMemoryObjectStore>,
+        // B6c follow-up: caller-supplied PTB / MoveCall gas budget.
+        // Validator clamps to [MIN_GAS_PTB..MAX_GAS_BUDGET]; test fixtures
+        // pass `u64::MAX` (default), which we map below to the same
+        // `MAX_GAS_BUDGET / 5` default the validator applies when the
+        // API caller omits the field.
+        gas_budget: u64,
     ) -> Result<(), String> {
         debug!(event_id = %event.id, event_type = ?event.event_type, "Executing event via object store runtime");
         
@@ -1008,10 +1015,23 @@ impl MockEnclave {
                     .map_err(|e| format!("Invalid type arg: {}", e))?;
 
                 // 4. MoveExecutionContext
+                //
+                // B6c follow-up fix: honour caller-supplied `gas_budget`
+                // (validator's MovePtbHandler clamps it to
+                // [MIN_GAS_PTB..MAX_GAS_BUDGET] before reaching here).
+                // Test fixtures use `GasBudget::default() = u64::MAX`,
+                // which would fail engine bounds; map that sentinel to
+                // the same `MAX_GAS_BUDGET / 5` default the validator
+                // applies when the API caller omits the field.
+                let resolved_budget = if gas_budget == u64::MAX || gas_budget == 0 {
+                    setu_move_vm::gas::MAX_GAS_BUDGET / 5
+                } else {
+                    gas_budget
+                };
                 let move_ctx = MoveExecutionContext {
                     tx_hash: Self::derive_tx_hash(&event.id),
                     sender: sender_addr,
-                    gas_budget: 10_000_000,
+                    gas_budget: resolved_budget,
                     current_version: 0,
                     epoch: 0,
                     needs_tx_context: payload.needs_tx_context,
@@ -1151,10 +1171,18 @@ impl MockEnclave {
                     })
                     .collect::<Result<Vec<_>, String>>()?;
 
+                // B6c follow-up fix: honour caller-supplied `gas_budget`
+                // (same handling as the legacy MoveCall arm above —
+                // see comment there).
+                let resolved_budget = if gas_budget == u64::MAX || gas_budget == 0 {
+                    setu_move_vm::gas::MAX_GAS_BUDGET / 5
+                } else {
+                    gas_budget
+                };
                 let move_ctx = MoveExecutionContext {
                     tx_hash: Self::derive_tx_hash(&event.id),
                     sender: sender_addr,
-                    gas_budget: 10_000_000,
+                    gas_budget: resolved_budget,
                     current_version: 0,
                     epoch: 0,
                     needs_tx_context: true,
@@ -1377,6 +1405,19 @@ impl EnclaveRuntime for MockEnclave {
         // Previous bug: We replaced self.runtime with a new temp_store, causing
         // race conditions where concurrent tasks would see each other's (or empty) state.
         let use_read_set_state = !input.read_set.is_empty() || !input.module_read_set.is_empty();
+
+        // Bug-fix (docs/feat/fix-mock-enclave-ptb-empty-readset-route): the
+        // legacy `simulate_execution` → `execute_single_event_with_runtime`
+        // path has NO `MovePtb` arm (only `MoveCall`), so a PTB with no
+        // Object inputs and no `Command::MoveCall` (e.g. a `Publish`-only
+        // PTB, or a PTB whose inputs are all `Pure`) silently falls through
+        // to `_ => {}` and reports a no-op success. Force such events onto
+        // the isolated path which DOES handle `MovePtb`.
+        let has_move_ptb = input
+            .events
+            .iter()
+            .any(|e| matches!(e.payload, setu_types::event::EventPayload::MovePtb(_)));
+        let use_read_set_state = use_read_set_state || has_move_ptb;
         
         let (diff, events_processed, events_failed) = if use_read_set_state {
             // Build temporary state from read_set into a LOCAL ObjectStore
@@ -1424,8 +1465,18 @@ impl EnclaveRuntime for MockEnclave {
         let execution_time = start.elapsed();
         let writes_count = diff.writes.len() as u64;
         
-        // Calculate gas usage (mock: 100 gas per write, 10 gas per read)
-        let gas_used = execution_time.as_micros() as u64 / 10 + writes_count * 100 + input.read_set.len() as u64 * 10;
+        // B6c follow-up fix: gas_used must be **deterministic** across
+        // solvers (design §4.3, G1). The previous formula folded in
+        // `execution_time.as_micros() / 10`, making `gas_used` depend on
+        // wall-clock and CPU speed — two solvers running an identical
+        // task would report different values. We drop the time term and
+        // keep the deterministic component (writes + reads). This is a
+        // mock heuristic only; production gas accounting lives in the
+        // Move VM `InstructionCountGasMeter` and surfaces via
+        // `MoveExecutionOutput.gas_used` (currently logged at the PTB
+        // arm; full propagation through `simulate_execution_isolated`
+        // is tracked in docs/bugs/20260506-mock-gas-used-not-plumbed.md).
+        let gas_used = writes_count * 100 + input.read_set.len() as u64 * 10;
         let gas_usage = GasUsage::new(gas_used, Some(1)); // mock gas_price = 1
         
         Ok(StfOutput {

@@ -771,12 +771,119 @@ impl SetuMoveEngine {
         df_preload: Vec<setu_types::task::ResolvedDynamicField>,
         ctx: &MoveExecutionContext,
     ) -> Result<MoveExecutionOutput, RuntimeError> {
+        // B6c · validate gas_budget bounds at entry (defense-in-depth;
+        // submission-side `move_handler` rejects earlier). Out-of-bounds
+        // is surfaced as a normal `success=false` output rather than `Err`
+        // so callers see a uniform PTB shape.
+        if ctx.gas_budget < crate::gas::MIN_GAS_PTB
+            || ctx.gas_budget > crate::gas::MAX_GAS_BUDGET
+        {
+            return Ok(MoveExecutionOutput {
+                success: false,
+                state_changes: vec![],
+                module_changes: vec![],
+                return_values: vec![],
+                events: vec![],
+                gas_used: 0,
+                error: Some(format!(
+                    "PTB gas_budget {} outside [{}..{}]",
+                    ctx.gas_budget,
+                    crate::gas::MIN_GAS_PTB,
+                    crate::gas::MAX_GAS_BUDGET,
+                )),
+            });
+        }
+
+        // B6c · ONE meter for the whole PTB (single-meter invariant, design
+        // §4.1 R1-ISSUE-5). Created OUTSIDE the body so the abort path can
+        // capture `instructions_executed()` after the body returns Err.
+        let mut gas_meter = InstructionCountGasMeter::new(ctx.gas_budget);
+
+        match self.execute_ptb_body(store, ptb, input_objects, df_preload, ctx, &mut gas_meter) {
+            Ok((state_changes, module_changes, events, last_return_values)) => {
+                Ok(MoveExecutionOutput {
+                    success: true,
+                    state_changes,
+                    module_changes,
+                    return_values: last_return_values,
+                    events,
+                    gas_used: gas_meter.instructions_executed(),
+                    error: None,
+                })
+            }
+            // B6c · ONLY translate `OutOfGas` to `success=false`; all other
+            // RuntimeError variants (wire validation, borrow-stack, coin
+            // layout, etc.) propagate as `Err` so existing tests + callers
+            // see the same shape they always did. Design §5 R1-ISSUE-6.
+            Err(RuntimeError::OutOfGas { used }) => Ok(MoveExecutionOutput {
+                success: false,
+                state_changes: vec![],
+                module_changes: vec![],
+                return_values: vec![],
+                events: vec![],
+                gas_used: used,
+                error: Some(format!(
+                    "PTB out of gas after {used} units (budget = {})",
+                    ctx.gas_budget,
+                )),
+            }),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// B6c · inner PTB body. The shared `gas_meter` is borrowed `&mut` so
+    /// that `execute_ptb` can read `instructions_executed()` after this
+    /// returns — including on the Err path, which is how `gas_used` reaches
+    /// the caller's `MoveExecutionOutput` even when the PTB aborts.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
+    fn execute_ptb_body<S: RawStore>(
+        &self,
+        store: &S,
+        ptb: &setu_types::ptb::ProgrammableTransaction,
+        input_objects: Vec<InputObject>,
+        df_preload: Vec<setu_types::task::ResolvedDynamicField>,
+        ctx: &MoveExecutionContext,
+        gas_meter: &mut InstructionCountGasMeter,
+    ) -> Result<
+        (
+            Vec<MoveStateChange>,
+            Vec<ModuleChange>,
+            Vec<(String, Vec<u8>)>,
+            Vec<Vec<u8>>,
+        ),
+        RuntimeError,
+    > {
         use crate::ptb_executor::{PtbContext, Slot};
 
         // 0. Defense-in-depth wire validation (F6).
         ptb.validate_wire().map_err(|e| {
             RuntimeError::InvalidTransaction(format!("PTB wire validation failed: {e}"))
         })?;
+
+        // B6c · floor charge (PTB-only; legacy `OperationType::MoveCall`
+        // path remains unchanged — see design §4.5 / R1-ISSUE-8).
+        gas_meter
+            .charge_outer(crate::gas::MIN_GAS_PTB)
+            .map_err(|_| RuntimeError::OutOfGas {
+                used: gas_meter.instructions_executed(),
+            })?;
+
+        // B6c · per-key read surcharge for declared inputs + dynamic-field
+        // preload entries. Charged once up front so a malicious PTB cannot
+        // burn budget elsewhere before paying for what it loaded.
+        let read_keys = (input_objects.len() as u64)
+            .saturating_add(df_preload.len() as u64);
+        let read_cost = crate::gas::PTB_OVERHEAD_TABLE
+            .storage_read_per_key
+            .saturating_mul(read_keys);
+        if read_cost > 0 {
+            gas_meter
+                .charge_outer(read_cost)
+                .map_err(|_| RuntimeError::OutOfGas {
+                    used: gas_meter.instructions_executed(),
+                })?;
+        }
 
         // 1. Build initial Slot vec from PTB inputs BEFORE moving
         //    `input_objects` into the runtime. Object inputs are looked up by
@@ -843,19 +950,28 @@ impl SetuMoveEngine {
         //    (§4.5: ONE ExecutionContext per PTB).
         let mut tx_ctx_bytes = Self::build_tx_context_bcs(ctx);
 
-        // 7. Gas meter — ONE per PTB (B6c will share it across commands).
-        let mut gas_meter = InstructionCountGasMeter::new(ctx.gas_budget);
-
-        // 8. Sequential command loop.
+        // 8. Sequential command loop. The shared `gas_meter` (outer
+        //    parameter) is threaded into every lowering helper so the
+        //    inner per-instruction tier and the outer per-Command tier
+        //    accumulate into the same counter.
         let mut last_return_values: Vec<Vec<u8>> = vec![];
         for (idx, cmd) in ptb.commands.iter().enumerate() {
+            // B6c · outer-tier per-Command surcharge BEFORE dispatch
+            //       (charge-on-abort determinism, design §4.3).
+            let overhead = crate::gas::ptb_overhead_cost(cmd);
+            gas_meter
+                .charge_outer(overhead)
+                .map_err(|_| RuntimeError::OutOfGas {
+                    used: gas_meter.instructions_executed(),
+                })?;
+
             match cmd {
                 setu_types::ptb::Command::MoveCall(mc) => {
                     let (result_slots, raw_returns) = self.lower_move_call_inline(
                         &mut session,
                         mc,
                         &mut pctx,
-                        &mut gas_meter,
+                        gas_meter,
                     )?;
                     last_return_values = raw_returns;
                     pctx.record_result(idx, result_slots);
@@ -866,7 +982,7 @@ impl SetuMoveEngine {
                         coin_arg,
                         amounts,
                         &mut pctx,
-                        &mut gas_meter,
+                        gas_meter,
                         &mut tx_ctx_bytes,
                     )?;
                     last_return_values = vec![];
@@ -878,7 +994,7 @@ impl SetuMoveEngine {
                         target,
                         sources,
                         &mut pctx,
-                        &mut gas_meter,
+                        gas_meter,
                     )?;
                     last_return_values = vec![];
                     // MergeCoins returns unit `()` per design.
@@ -890,7 +1006,7 @@ impl SetuMoveEngine {
                         objs,
                         recipient,
                         &mut pctx,
-                        &mut gas_meter,
+                        gas_meter,
                     )?;
                     last_return_values = vec![];
                     pctx.record_result(idx, vec![]);
@@ -908,7 +1024,7 @@ impl SetuMoveEngine {
                     self.lower_publish_inline(
                         &mut session,
                         modules,
-                        &mut gas_meter,
+                        gas_meter,
                         ctx,
                     )?;
                     last_return_values = vec![];
@@ -934,21 +1050,33 @@ impl SetuMoveEngine {
         let module_changes = self.extract_module_changes(&_change_set)?;
         let state_changes =
             self.convert_results_to_state_changes(&obj_results, ctx.current_version)?;
+
+        // B6c · per-key write surcharge over the *materialised* state change
+        // set + module publishes. Charged AFTER finalize because the exact
+        // count depends on the `SetuObjectRuntime` results; if the charge
+        // exceeds budget the body returns Err and the wrapper builds an
+        // `(success=false, state_changes=[])` output, so the writes never
+        // reach storage.
+        let write_keys = (state_changes.len() as u64)
+            .saturating_add(module_changes.len() as u64);
+        let write_cost = crate::gas::PTB_OVERHEAD_TABLE
+            .storage_write_per_key
+            .saturating_mul(write_keys);
+        if write_cost > 0 {
+            gas_meter
+                .charge_outer(write_cost)
+                .map_err(|_| RuntimeError::OutOfGas {
+                    used: gas_meter.instructions_executed(),
+                })?;
+        }
+
         let events = obj_results
             .emitted_events
             .iter()
             .map(|(tag, bytes)| (tag.to_string(), bytes.clone()))
             .collect();
 
-        Ok(MoveExecutionOutput {
-            success: true,
-            state_changes,
-            module_changes,
-            return_values: last_return_values,
-            events,
-            gas_used: gas_meter.instructions_executed(),
-            error: None,
-        })
+        Ok((state_changes, module_changes, events, last_return_values))
     }
 
     /// Phase 3c: lower a single `Command::MoveCall` against the active PTB
@@ -3232,6 +3360,245 @@ mod tests {
                 .expect("empty publish is no-op");
             assert!(out.success);
             assert!(out.module_changes.is_empty());
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // B6c · Gas budget & metering tests
+        // ═══════════════════════════════════════════════════════
+        //
+        // Test #1 — empty PTB still pays MIN_GAS_PTB floor.
+        #[test]
+        fn b6c_empty_ptb_pays_floor() {
+            let engine = SetuMoveEngine::new().expect("engine init");
+            let store = InMemoryObjectStore::new();
+            let ptb = ProgrammableTransaction {
+                inputs: vec![],
+                commands: vec![],
+                dynamic_field_accesses: vec![],
+            };
+            let out = engine
+                .execute_ptb(&store, &ptb, vec![], vec![], &make_ctx())
+                .expect("empty PTB executes");
+            assert!(out.success);
+            assert!(
+                out.gas_used >= crate::gas::MIN_GAS_PTB,
+                "floor not charged: gas_used={}",
+                out.gas_used,
+            );
+        }
+
+        // Test #2 — gas_budget below MIN_GAS_PTB rejected with success=false
+        // and zero state changes; gas_used = 0 because nothing was charged.
+        #[test]
+        fn b6c_below_min_rejected() {
+            let engine = SetuMoveEngine::new().expect("engine init");
+            let store = InMemoryObjectStore::new();
+            let mut ctx = make_ctx();
+            ctx.gas_budget = crate::gas::MIN_GAS_PTB - 1;
+            let ptb = ProgrammableTransaction {
+                inputs: vec![],
+                commands: vec![],
+                dynamic_field_accesses: vec![],
+            };
+            let out = engine
+                .execute_ptb(&store, &ptb, vec![], vec![], &ctx)
+                .expect("returns Ok with success=false");
+            assert!(!out.success);
+            assert_eq!(out.gas_used, 0);
+            assert!(out.state_changes.is_empty());
+            assert!(out.error.as_ref().unwrap().contains("outside"));
+        }
+
+        // Test #3 — gas_budget above MAX_GAS_BUDGET rejected.
+        #[test]
+        fn b6c_above_max_rejected() {
+            let engine = SetuMoveEngine::new().expect("engine init");
+            let store = InMemoryObjectStore::new();
+            let mut ctx = make_ctx();
+            ctx.gas_budget = crate::gas::MAX_GAS_BUDGET + 1;
+            let ptb = ProgrammableTransaction {
+                inputs: vec![],
+                commands: vec![],
+                dynamic_field_accesses: vec![],
+            };
+            let out = engine
+                .execute_ptb(&store, &ptb, vec![], vec![], &ctx)
+                .expect("returns Ok");
+            assert!(!out.success);
+            assert_eq!(out.gas_used, 0);
+        }
+
+        // Test #4 — budget too small to cover MIN_GAS_PTB at the floor charge
+        //           is impossible (floor == MIN_GAS_PTB), but a budget that
+        //           ONLY covers the floor still succeeds for an empty PTB.
+        #[test]
+        fn b6c_exact_floor_budget_succeeds_for_empty_ptb() {
+            let engine = SetuMoveEngine::new().expect("engine init");
+            let store = InMemoryObjectStore::new();
+            let mut ctx = make_ctx();
+            ctx.gas_budget = crate::gas::MIN_GAS_PTB;
+            let ptb = ProgrammableTransaction {
+                inputs: vec![],
+                commands: vec![],
+                dynamic_field_accesses: vec![],
+            };
+            let out = engine
+                .execute_ptb(&store, &ptb, vec![], vec![], &ctx)
+                .expect("executes");
+            assert!(out.success, "error={:?}", out.error);
+            assert_eq!(out.gas_used, crate::gas::MIN_GAS_PTB);
+        }
+
+        // Test #5 — out of gas mid-loop: low budget + many no-op Publish
+        //           commands. Floor (1 000) fits, first Publish overhead
+        //           (5 000) does NOT — outer-charge fails BEFORE lowering,
+        //           so this exercises the pure OOM-translation path.
+        #[test]
+        fn b6c_oom_mid_loop_returns_abort_with_captured_gas() {
+            let engine = SetuMoveEngine::new().expect("engine init");
+            let store = InMemoryObjectStore::new();
+            let mut ctx = make_ctx();
+            ctx.gas_budget = 1_100;
+            let cmd = setu_types::ptb::Command::Publish {
+                modules: vec![],
+                deps: vec![],
+            };
+            let mut commands = Vec::with_capacity(50);
+            for _ in 0..50 {
+                commands.push(cmd.clone());
+            }
+            let ptb = ProgrammableTransaction {
+                inputs: vec![],
+                commands,
+                dynamic_field_accesses: vec![],
+            };
+            let out = engine
+                .execute_ptb(&store, &ptb, vec![], vec![], &ctx)
+                .expect("returns Ok with abort output");
+            assert!(!out.success);
+            assert!(
+                out.gas_used >= crate::gas::MIN_GAS_PTB,
+                "gas_used should include floor: {}",
+                out.gas_used,
+            );
+            assert!(
+                out.gas_used <= ctx.gas_budget,
+                "gas_used must not exceed budget: {} > {}",
+                out.gas_used,
+                ctx.gas_budget,
+            );
+            assert!(out.state_changes.is_empty());
+            assert!(out.module_changes.is_empty());
+            assert!(out.error.is_some());
+            assert!(out.error.as_ref().unwrap().contains("out of gas"));
+        }
+
+        // Test #6 — single-meter invariant: N empty Publish commands accumulate
+        //           gas_used MONOTONICALLY (no per-command reset).
+        #[test]
+        fn b6c_single_meter_invariant_monotone_gas() {
+            let engine = SetuMoveEngine::new().expect("engine init");
+            let store = InMemoryObjectStore::new();
+            let mut last_gas = 0u64;
+            for n_cmds in 1..=5u64 {
+                let mut commands = Vec::new();
+                for _ in 0..n_cmds {
+                    commands.push(setu_types::ptb::Command::Publish {
+                        modules: vec![],
+                        deps: vec![],
+                    });
+                }
+                let ptb = ProgrammableTransaction {
+                    inputs: vec![],
+                    commands,
+                    dynamic_field_accesses: vec![],
+                };
+                let out = engine
+                    .execute_ptb(&store, &ptb, vec![], vec![], &make_ctx())
+                    .expect("executes");
+                assert!(out.success);
+                assert!(
+                    out.gas_used > last_gas,
+                    "non-monotone gas: prev={}, n_cmds={}, now={}",
+                    last_gas,
+                    n_cmds,
+                    out.gas_used,
+                );
+                // Each extra Publish adds the publish-overhead surcharge.
+                last_gas = out.gas_used;
+            }
+        }
+
+        // Test #7 — cross-run determinism: same PTB executed twice yields
+        //           byte-identical gas_used (G1 cross-solver determinism
+        //           foundation, design §4.3).
+        #[test]
+        fn b6c_cross_run_determinism() {
+            let engine_a = SetuMoveEngine::new().expect("engine A init");
+            let engine_b = SetuMoveEngine::new().expect("engine B init");
+            let store = InMemoryObjectStore::new();
+            // 4 empty Publish commands; deterministic, lowering-safe.
+            let cmds = vec![
+                setu_types::ptb::Command::Publish {
+                    modules: vec![],
+                    deps: vec![],
+                },
+                setu_types::ptb::Command::Publish {
+                    modules: vec![],
+                    deps: vec![],
+                },
+                setu_types::ptb::Command::Publish {
+                    modules: vec![],
+                    deps: vec![],
+                },
+                setu_types::ptb::Command::Publish {
+                    modules: vec![],
+                    deps: vec![],
+                },
+            ];
+            let ptb = ProgrammableTransaction {
+                inputs: vec![],
+                commands: cmds,
+                dynamic_field_accesses: vec![],
+            };
+            let out_a = engine_a
+                .execute_ptb(&store, &ptb, vec![], vec![], &make_ctx())
+                .expect("a");
+            let out_b = engine_b
+                .execute_ptb(&store, &ptb, vec![], vec![], &make_ctx())
+                .expect("b");
+            assert_eq!(
+                out_a.gas_used, out_b.gas_used,
+                "cross-run determinism violated: a={} b={}",
+                out_a.gas_used, out_b.gas_used,
+            );
+        }
+
+        // Test #8 — `ptb_overhead_cost` shapes (smoke test for the helper
+        //           that the executor relies on; guards against silent
+        //           drift if the table is edited).
+        #[test]
+        fn b6c_overhead_cost_shape() {
+            use crate::gas::{ptb_overhead_cost, PTB_OVERHEAD_TABLE};
+            let move_call = setu_types::ptb::Command::MoveCall(
+                setu_types::ptb::MoveCall {
+                    package: ObjectId::new([0u8; 32]),
+                    module: "m".into(),
+                    function: "f".into(),
+                    type_arguments: vec![],
+                    arguments: vec![],
+                },
+            );
+            assert_eq!(ptb_overhead_cost(&move_call), PTB_OVERHEAD_TABLE.move_call);
+
+            let publish_2 = setu_types::ptb::Command::Publish {
+                modules: vec![vec![], vec![]],
+                deps: vec![],
+            };
+            assert_eq!(
+                ptb_overhead_cost(&publish_2),
+                PTB_OVERHEAD_TABLE.publish.saturating_mul(2),
+            );
         }
     }
 }

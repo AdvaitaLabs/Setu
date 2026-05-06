@@ -145,17 +145,20 @@ pub struct MovePublishResponse {
 }
 
 // ============================================
-// Programmable Transaction Block (PTB) — B6a wire-only
+// Programmable Transaction Block (PTB) — executable
 // ============================================
 //
-// Submission endpoint for Programmable Transaction Blocks. **B6a ships only
-// the wire format**: the validator parses + validates the PTB, then returns
-// HTTP 501 with `code = "PTB_NOT_YET_EXECUTABLE"` until B6b lands the
-// executor. Malformed PTBs are still rejected with 4xx (validation runs
-// before the 501 stub).
+// Submission endpoint for Programmable Transaction Blocks. After FDP
+// `move-vm-phase9-ptb-event-wire`, the validator parses + validates the PTB,
+// then dispatches it through TaskPreparer → solver → engine.execute_ptb.
+// Malformed PTBs are rejected with HTTP 4xx; successful executions return
+// HTTP 200.
 
-/// Stable error code returned by the PTB stub handler when a well-formed PTB
-/// is submitted but execution is not yet available.
+/// Stable error code historically returned (HTTP 501) by the B6a stub branch
+/// of `submit_move_ptb` for well-formed PTBs. After FDP
+/// `move-vm-phase9-ptb-event-wire` removed the stub, the live system no
+/// longer emits this code; the constant is retained only for backward
+/// compatibility with B6a-era clients still pattern-matching on it.
 pub const PTB_NOT_YET_EXECUTABLE: &str = "PTB_NOT_YET_EXECUTABLE";
 
 /// Request to submit a Programmable Transaction Block.
@@ -171,24 +174,33 @@ pub struct MovePtbRequest {
     /// Target subnet (defaults to ROOT)
     #[serde(default)]
     pub subnet_id: Option<String>,
+    /// B6c · Optional max gas units for this PTB. When omitted, the
+    /// validator applies a default within `[MIN_GAS_PTB..MAX_GAS_BUDGET]`.
+    /// Submissions outside that range are rejected at the validator entry
+    /// (`network/move_handler.rs`); see B6c design §4.5.
+    #[serde(default)]
+    pub gas_budget: Option<u64>,
 }
 
 /// Response to a PTB submission.
 ///
-/// In B6a, well-formed PTBs always yield `success = false`, `code =
-/// PTB_NOT_YET_EXECUTABLE`, and HTTP 501. Malformed PTBs are surfaced via
-/// HTTP 4xx with `code = None` (or an explicit validation code).
+/// HTTP mapping (post `move-vm-phase9-ptb-event-wire`):
+///   * `success = true`  → HTTP 200, `event_id` populated, `code = None`.
+///   * `success = false` → HTTP 400, `error` describes the wire/domain
+///                          rejection, `code = None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MovePtbResponse {
-    /// Event ID of the submitted event (empty when stubbed).
+    /// Event ID of the submitted event (empty when wire validation failed).
     pub event_id: String,
     /// Whether execution succeeded.
     pub success: bool,
-    /// Error message (if failed or stubbed).
+    /// Error message (if failed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Stable error code. `Some("PTB_NOT_YET_EXECUTABLE")` while B6b is
-    /// pending; `None` on a real success or for plain validation errors.
+    /// Reserved for stable error codes. Currently always `None`; retained as
+    /// an extension point for future error taxonomies and for backward
+    /// compatibility with B6a-era clients that pattern-matched on
+    /// `PTB_NOT_YET_EXECUTABLE`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
 }
@@ -413,11 +425,17 @@ mod b6a_ptb_tests {
         }
     }
 
-    /// Helper that drives the validator-side stub logic locally (the same
-    /// flow the real `submit_move_ptb` runs). Mirrors hex → BCS → validate →
-    /// 501-or-error decision so we can exercise it without a running
-    /// validator service.
-    fn drive_stub(req: MovePtbRequest) -> Result<MovePtbResponse, MovePtbResponse> {
+    /// Helper exercising the wire-validation steps that the live
+    /// `submit_move_ptb` performs before delegating to the executor:
+    /// hex → BCS → `validate_wire`. The terminal branches we test:
+    ///   * Ok  — wire validation passed (live system would proceed to
+    ///           prepare/route/execute; this helper stops there).
+    ///   * Err — wire validation rejected the PTB (4xx in the live system).
+    ///
+    /// This is intentionally decoupled from the validator service so the
+    /// tests stay pure-unit. End-to-end coverage of the live path lives in
+    /// `tests/end-to-end/e2e_ptb_wire_smoke.sh`.
+    fn drive_wire_validation(req: MovePtbRequest) -> Result<(), MovePtbResponse> {
         let hex_str = req.ptb.trim_start_matches("0x");
         let bcs_bytes = hex::decode(hex_str).map_err(|e| MovePtbResponse {
             event_id: String::new(),
@@ -438,34 +456,28 @@ mod b6a_ptb_tests {
             error: Some(format!("PTB validation failed: {}", e)),
             code: None,
         })?;
-        Ok(MovePtbResponse {
-            event_id: String::new(),
-            success: false,
-            error: Some("Programmable Transaction execution is not yet available (deferred to B6b)".into()),
-            code: Some(PTB_NOT_YET_EXECUTABLE.to_string()),
-        })
+        Ok(())
     }
 
-    /// I1: well-formed PTB → Ok(501-style response with code).
+    /// I1: well-formed PTB passes wire validation (live system would proceed
+    /// to execute; pre-event-wire this returned a 501 stub, now it does not).
     #[test]
-    fn i1_submit_move_ptb_well_formed_returns_501_response() {
+    fn i1_submit_move_ptb_well_formed_passes_wire_validation() {
         let ptb = well_formed_ptb();
         let req = MovePtbRequest {
             sender: "alice".into(),
             ptb: hex::encode(bcs::to_bytes(&ptb).unwrap()),
             subnet_id: None,
         };
-        let resp = drive_stub(req).expect("well-formed PTB must hit the 501 stub branch");
-        assert!(!resp.success);
-        assert_eq!(resp.code.as_deref(), Some(PTB_NOT_YET_EXECUTABLE));
-        assert!(resp.event_id.is_empty());
+        drive_wire_validation(req).expect("well-formed PTB must pass wire validation");
     }
 
-    /// I2: malformed PTB (over MAX_PTB_COMMANDS) returns Err → 4xx, NOT 501.
-    /// The `code` field is None for plain validation errors so a client can
-    /// distinguish "your PTB is broken" from "we don't execute PTBs yet".
+    /// I2: malformed PTB (over MAX_PTB_COMMANDS) is rejected at wire
+    /// validation — maps to HTTP 4xx in the live system. The `code` field
+    /// must be `None`: there is no longer a `PTB_NOT_YET_EXECUTABLE` marker
+    /// to distinguish from (event-wire FDP removed it).
     #[test]
-    fn i2_submit_move_ptb_malformed_returns_4xx_before_501() {
+    fn i2_submit_move_ptb_malformed_rejected_with_code_none() {
         let mut ptb = well_formed_ptb();
         ptb.commands = (0..MAX_PTB_COMMANDS + 1)
             .map(|_| {
@@ -483,11 +495,10 @@ mod b6a_ptb_tests {
             ptb: hex::encode(bcs::to_bytes(&ptb).unwrap()),
             subnet_id: None,
         };
-        let resp = drive_stub(req).expect_err("oversize PTB must be rejected");
+        let resp = drive_wire_validation(req).expect_err("oversize PTB must be rejected");
         assert!(!resp.success);
-        // Critically: code is None — this is NOT the 501 stub.
         assert!(resp.code.is_none(),
-            "Validation error must not return PTB_NOT_YET_EXECUTABLE — clients need to distinguish.");
+            "Plain validation error — no PTB_NOT_YET_EXECUTABLE marker after event-wire FDP.");
         assert!(resp.error.unwrap().contains("validation failed"));
     }
 
