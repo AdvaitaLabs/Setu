@@ -1342,4 +1342,56 @@ mod tests {
             ptb_bytes[0]
         );
     }
+
+    /// U4 — `MoveUpgradePayload` BCS field-order **golden vector**
+    /// (design.md §3 R1g, §12 acceptance gate; G1 historical-hash safety).
+    ///
+    /// Re-orders or insertions of fields silently invalidate every upgrade
+    /// event already stored in the DAG. To prevent this, we serialize a
+    /// fixed instance and compare against a hex snapshot committed to the
+    /// repo at `tests/golden/move_upgrade_payload_v1.hex`. If the field
+    /// layout ever changes, this test fails — the diff is then a code-review
+    /// gate, not a silent storage corruption.
+    ///
+    /// To regenerate after an *intentional* layout change (which itself
+    /// requires a new tail variant per §3 LOCKED rule), run with
+    /// `UPDATE_GOLDENS=1 cargo test -p setu-types u4_move_upgrade_payload_golden`.
+    #[test]
+    fn u4_move_upgrade_payload_golden() {
+        let payload = MoveUpgradePayload {
+            sender: crate::object::Address::new([0x11; 32]),
+            family_id: crate::object::ObjectId::new([0x22; 32]),
+            prev_package: crate::object::ObjectId::new([0x33; 32]),
+            new_package_addr: crate::object::Address::new([0x44; 32]),
+            new_version: 7,
+            modules: vec![vec![0xAA, 0xBB, 0xCC], vec![0xDD]],
+            deps: vec![crate::object::ObjectId::new([0x55; 32])],
+            digest: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            upgrade_cap_id: crate::object::ObjectId::new([0x66; 32]),
+            policy: 1,
+        };
+        let bytes = bcs::to_bytes(&payload).expect("BCS encode");
+        let actual_hex = hex::encode(&bytes);
+
+        let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/golden/move_upgrade_payload_v1.hex");
+
+        if std::env::var("UPDATE_GOLDENS").is_ok() {
+            std::fs::create_dir_all(golden_path.parent().unwrap()).unwrap();
+            std::fs::write(&golden_path, format!("{}\n", actual_hex)).unwrap();
+            eprintln!("UPDATED golden at {}", golden_path.display());
+            return;
+        }
+
+        let expected_hex = std::fs::read_to_string(&golden_path)
+            .unwrap_or_else(|e| panic!("read {}: {}", golden_path.display(), e));
+        let expected_hex = expected_hex.trim();
+        assert_eq!(
+            actual_hex, expected_hex,
+            "MoveUpgradePayload BCS layout drift detected — field order changed since v1.\n\
+             If this change is intentional, you MUST instead add a new tail variant to \
+             EventPayload (see design.md §3 R1g LOCKED rule). Do NOT regenerate the golden \
+             unless you are creating a fresh payload type."
+        );
+    }
 }
