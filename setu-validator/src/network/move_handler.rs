@@ -7,7 +7,7 @@ use crate::InfraExecutor;
 use crate::RouterManager;
 use crate::TaskPreparer;
 use super::tee_executor::TeeExecutor;
-use setu_api::{MoveCallRequest, MoveCallResponse, MovePublishRequest, MovePublishResponse};
+use setu_api::{MoveCallRequest, MoveCallResponse, MovePublishRequest, MovePublishResponse, MoveUpgradeRequest, MoveUpgradeResponse};
 use setu_types::event::{Event, MoveCallPayload, MovePtbPayload, VLCSnapshot};
 use setu_types::object::ObjectId;
 use setu_types::ptb::ProgrammableTransaction;
@@ -388,6 +388,173 @@ impl MovePublishHandler {
             }
         }
     }
+}
+
+/// MoveUpgrade handler — unit struct mirroring MovePublishHandler (B5).
+pub struct MoveUpgradeHandler;
+
+impl MoveUpgradeHandler {
+    /// Process a Move package upgrade submission (legacy HTTP path).
+    ///
+    /// Flow: hex-decode modules + current_package + deps →
+    ///       InfraExecutor::execute_move_upgrade →
+    ///       return (response, event).
+    pub async fn submit_move_upgrade(
+        infra_executor: &InfraExecutor,
+        vlc_time: u64,
+        request: MoveUpgradeRequest,
+    ) -> (MoveUpgradeResponse, Option<Event>) {
+        // 1. Validate empty bundle.
+        if request.modules.is_empty() {
+            return (
+                MoveUpgradeResponse {
+                    event_id: String::new(),
+                    module_count: 0,
+                    new_package_addr: None,
+                    new_version: None,
+                    success: false,
+                    error: Some("Empty module list".into()),
+                },
+                None,
+            );
+        }
+
+        // 2. Decode current_package (hex ObjectId).
+        let current_package = match decode_object_id_hex(&request.current_package) {
+            Ok(id) => id,
+            Err(e) => {
+                return (
+                    MoveUpgradeResponse {
+                        event_id: String::new(),
+                        module_count: 0,
+                        new_package_addr: None,
+                        new_version: None,
+                        success: false,
+                        error: Some(format!("Invalid current_package: {}", e)),
+                    },
+                    None,
+                );
+            }
+        };
+
+        // 3. Decode modules (hex bytecode).
+        let modules_bytes: Vec<Vec<u8>> = match request
+            .modules
+            .iter()
+            .map(|s| {
+                hex::decode(s.strip_prefix("0x").unwrap_or(s))
+                    .map_err(|e| format!("Invalid hex in module: {}", e))
+            })
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(m) => m,
+            Err(e) => {
+                return (
+                    MoveUpgradeResponse {
+                        event_id: String::new(),
+                        module_count: 0,
+                        new_package_addr: None,
+                        new_version: None,
+                        success: false,
+                        error: Some(e),
+                    },
+                    None,
+                );
+            }
+        };
+
+        // 4. Decode deps (hex ObjectIds).
+        let deps: Vec<ObjectId> = match request
+            .deps
+            .iter()
+            .map(|s| decode_object_id_hex(s))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(d) => d,
+            Err(e) => {
+                return (
+                    MoveUpgradeResponse {
+                        event_id: String::new(),
+                        module_count: 0,
+                        new_package_addr: None,
+                        new_version: None,
+                        success: false,
+                        error: Some(format!("Invalid dep ObjectId: {}", e)),
+                    },
+                    None,
+                );
+            }
+        };
+
+        // 5. Build VLCSnapshot.
+        let vlc_snapshot = VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: vlc_time,
+            physical_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        };
+
+        // 6. Execute via InfraExecutor.
+        let module_count = modules_bytes.len();
+        match infra_executor.execute_move_upgrade(
+            &request.sender,
+            current_package,
+            &modules_bytes,
+            deps,
+            vlc_snapshot,
+        ) {
+            Ok(event) => {
+                let event_id = event.id.clone();
+                let (new_addr_hex, new_version) = match &event.payload {
+                    setu_types::event::EventPayload::MoveUpgrade(p) => (
+                        Some(format!("0x{}", hex::encode(p.new_package_addr.as_bytes()))),
+                        Some(p.new_version),
+                    ),
+                    _ => (None, None),
+                };
+                info!(event_id = %event_id, module_count, "MoveUpgrade executed successfully");
+                (
+                    MoveUpgradeResponse {
+                        event_id,
+                        module_count,
+                        new_package_addr: new_addr_hex,
+                        new_version,
+                        success: true,
+                        error: None,
+                    },
+                    Some(event),
+                )
+            }
+            Err(e) => {
+                warn!(error = %e, "MoveUpgrade execution failed");
+                (
+                    MoveUpgradeResponse {
+                        event_id: String::new(),
+                        module_count: 0,
+                        new_package_addr: None,
+                        new_version: None,
+                        success: false,
+                        error: Some(e),
+                    },
+                    None,
+                )
+            }
+        }
+    }
+}
+
+/// Decode a 32-byte ObjectId from a hex string (with or without `0x`).
+fn decode_object_id_hex(s: &str) -> Result<ObjectId, String> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(stripped).map_err(|e| format!("hex decode: {}", e))?;
+    if bytes.len() != 32 {
+        return Err(format!("expected 32 bytes, got {}", bytes.len()));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(ObjectId::new(arr))
 }
 
 /// PTB handler — unit struct matching MoveCallHandler pattern.

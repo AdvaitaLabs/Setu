@@ -144,6 +144,48 @@ pub struct MovePublishResponse {
     pub error: Option<String>,
 }
 
+/// Request to upgrade a Move package (B5).
+///
+/// **v0 simplification**: `family_id == current_package` is assumed
+/// (no chained upgrades v1 → v2 yet — that requires either a reverse
+/// `family_of:` index or a client-supplied `family_id`). Chained-upgrade
+/// support is gated until the linkage:latest probe can resolve any
+/// version address back to its family root.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveUpgradeRequest {
+    /// Upgrader address (hex). Should hold the UpgradeCap.
+    pub sender: String,
+    /// Hex ObjectId of the package being superseded. For v0 this is also
+    /// the `family_id` (the v0 publish address).
+    pub current_package: String,
+    /// Compiled module bytecodes (hex-encoded, pre-relink — validator
+    /// rewrites self-address to the freshly derived `new_package_addr`).
+    pub modules: Vec<String>,
+    /// Dependency package ObjectIds (hex). Optional; defaults to empty.
+    #[serde(default)]
+    pub deps: Vec<String>,
+}
+
+/// Response to Move package upgrade.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveUpgradeResponse {
+    /// Event ID of the submitted MoveUpgrade event.
+    pub event_id: String,
+    /// Number of modules in the upgrade bundle.
+    pub module_count: usize,
+    /// New package address (hex, post-relink).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_package_addr: Option<String>,
+    /// New version (= prev_version + 1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_version: Option<u64>,
+    /// Whether upgrade succeeded.
+    pub success: bool,
+    /// Error message (if failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 // ============================================
 // Programmable Transaction Block (PTB) — executable
 // ============================================

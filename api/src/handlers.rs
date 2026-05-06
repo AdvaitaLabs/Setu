@@ -86,6 +86,9 @@ pub trait ValidatorService: Send + Sync {
     /// Submit a Move module publish
     fn submit_move_publish(&self, request: MovePublishRequest) -> impl std::future::Future<Output = MovePublishResponse> + Send;
 
+    /// Submit a Move package upgrade (B5).
+    fn submit_move_upgrade(&self, request: MoveUpgradeRequest) -> impl std::future::Future<Output = MoveUpgradeResponse> + Send;
+
     /// Submit a Programmable Transaction Block (PTB).
     ///
     /// `Ok(resp)` → HTTP 200 with execution result;
@@ -382,6 +385,14 @@ pub async fn http_submit_move_publish<S: ValidatorService>(
     Json(request): Json<MovePublishRequest>,
 ) -> Json<MovePublishResponse> {
     Json(service.submit_move_publish(request).await)
+}
+
+/// Submit Move package upgrade (B5)
+pub async fn http_submit_move_upgrade<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<MoveUpgradeRequest>,
+) -> Json<MoveUpgradeResponse> {
+    Json(service.submit_move_upgrade(request).await)
 }
 
 /// Submit a Programmable Transaction Block (PTB).

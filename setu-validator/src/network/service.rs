@@ -545,6 +545,7 @@ impl ValidatorNetworkService {
             // Phase 4: Move VM endpoints
             .route("/api/v1/move/call", post(setu_api::http_submit_move_call::<ValidatorNetworkService>))
             .route("/api/v1/move/publish", post(setu_api::http_submit_move_publish::<ValidatorNetworkService>))
+            .route("/api/v1/move/upgrade", post(setu_api::http_submit_move_upgrade::<ValidatorNetworkService>))
             // Phase 9 / B6a: Programmable Transaction Block (wire-only stub).
             .route("/api/v1/move/ptb", post(setu_api::http_submit_move_ptb::<ValidatorNetworkService>))
             // Phase 5b: Move object/module query endpoints
@@ -761,6 +762,20 @@ impl ValidatorNetworkService {
         ).await;
 
         // If successful, submit event to DAG (same as SubnetRegister flow)
+        if let Some(event) = event {
+            self.add_event_to_dag(event).await;
+        }
+
+        response
+    }
+
+    pub async fn submit_move_upgrade(&self, request: setu_api::MoveUpgradeRequest) -> setu_api::MoveUpgradeResponse {
+        let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst);
+        let executor = self.infra_executor();
+        let (response, event) = move_handler::MoveUpgradeHandler::submit_move_upgrade(
+            &executor, vlc_time, request,
+        ).await;
+
         if let Some(event) = event {
             self.add_event_to_dag(event).await;
         }
@@ -1466,6 +1481,10 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
 
     async fn submit_move_publish(&self, request: setu_api::MovePublishRequest) -> setu_api::MovePublishResponse {
         self.submit_move_publish(request).await
+    }
+
+    async fn submit_move_upgrade(&self, request: setu_api::MoveUpgradeRequest) -> setu_api::MoveUpgradeResponse {
+        self.submit_move_upgrade(request).await
     }
 
     async fn submit_move_ptb(
