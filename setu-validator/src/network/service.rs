@@ -802,6 +802,7 @@ impl ValidatorNetworkService {
                     success: false,
                     error: Some(format!("Invalid hex in `ptb` field: {}", e)),
                     code: None,
+                    cap_ids: vec![],
                 });
             }
         };
@@ -815,6 +816,7 @@ impl ValidatorNetworkService {
                     success: false,
                     error: Some(format!("BCS deserialize failed: {}", e)),
                     code: None,
+                    cap_ids: vec![],
                 });
             }
         };
@@ -826,6 +828,7 @@ impl ValidatorNetworkService {
                 success: false,
                 error: Some(format!("PTB validation failed: {}", e)),
                 code: None,
+                cap_ids: vec![],
             });
         }
 

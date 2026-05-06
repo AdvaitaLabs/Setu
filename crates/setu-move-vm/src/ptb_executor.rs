@@ -45,6 +45,15 @@ pub(crate) const SETU_FRAMEWORK_ADDR: move_core_types::account_address::AccountA
     move_core_types::account_address::AccountAddress::ONE;
 /// Move module name for `Coin`/`TreasuryCap`/`CoinMetadata`.
 pub(crate) const COIN_MODULE: &str = "coin";
+/// Move module name for `UpgradeCap`/`UpgradeTicket`/`UpgradeReceipt`.
+/// Engine PTB lowering for `Command::Publish` / `Command::Upgrade` issues
+/// MoveCalls into `0x1::package::{make_upgrade_cap, consume_ticket, make_receipt}`.
+pub(crate) const PACKAGE_MODULE: &str = "package";
+/// Type-tag suffix that identifies an UpgradeCap state-change in the
+/// engine's per-PTB `state_changes` output. Used by the validator handler
+/// (`network::move_handler::submit_move_ptb`) to surface fresh cap UIDs
+/// on `MovePtbResponse.cap_ids` — see design.md §15.3.
+pub const UPGRADE_CAP_TYPE_TAG_SUFFIX: &str = "::package::UpgradeCap";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ArgumentSlot — canonical key into the consumed-set

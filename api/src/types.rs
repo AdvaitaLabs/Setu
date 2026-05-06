@@ -251,6 +251,15 @@ pub struct MovePtbResponse {
     /// `PTB_NOT_YET_EXECUTABLE`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// B5 / Phase 8 iter-8α — fresh `UpgradeCap` UIDs minted by `Command::Publish`
+    /// commands in the executed PTB. Length equals the number of `Command::Publish`
+    /// commands in the submitted PTB. **Set semantics**: the engine guarantees
+    /// `cap_ids` contains every minted cap exactly once, but does NOT guarantee
+    /// positional alignment with command index (iteration order follows the
+    /// engine's internal transfers map). Each entry is canonical hex (`0x{hex}`).
+    /// Empty / omitted for PTBs without any `Command::Publish`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_ids: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -490,6 +499,7 @@ mod b6a_ptb_tests {
             success: false,
             error: Some(format!("Invalid hex in `ptb` field: {}", e)),
             code: None,
+            cap_ids: vec![],
         })?;
         let ptb: ProgrammableTransaction =
             bcs::from_bytes(&bcs_bytes).map_err(|e| MovePtbResponse {
@@ -497,12 +507,14 @@ mod b6a_ptb_tests {
                 success: false,
                 error: Some(format!("BCS deserialize failed: {}", e)),
                 code: None,
+                cap_ids: vec![],
             })?;
         ptb.validate_wire().map_err(|e| MovePtbResponse {
             event_id: String::new(),
             success: false,
             error: Some(format!("PTB validation failed: {}", e)),
             code: None,
+            cap_ids: vec![],
         })?;
         Ok(())
     }
@@ -516,6 +528,7 @@ mod b6a_ptb_tests {
             sender: "alice".into(),
             ptb: hex::encode(bcs::to_bytes(&ptb).unwrap()),
             subnet_id: None,
+            gas_budget: None,
         };
         drive_wire_validation(req).expect("well-formed PTB must pass wire validation");
     }
@@ -542,6 +555,7 @@ mod b6a_ptb_tests {
             sender: "alice".into(),
             ptb: hex::encode(bcs::to_bytes(&ptb).unwrap()),
             subnet_id: None,
+            gas_budget: None,
         };
         let resp = drive_wire_validation(req).expect_err("oversize PTB must be rejected");
         assert!(!resp.success);

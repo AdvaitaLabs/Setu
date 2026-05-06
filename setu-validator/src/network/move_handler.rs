@@ -724,11 +724,22 @@ impl MovePtbHandler {
                     setu_move_vm::gas::MAX_GAS_BUDGET,
                 )),
                 code: None,
+                cap_ids: vec![],
             };
         }
 
         // 1. Resolve sender to canonical hex address.
         let sender_hex = MoveCallHandler::resolve_address(&sender);
+
+        // iter-8α — count Publish commands before the PTB is moved into the
+        // event payload. Used as a defensive cross-check after execution to
+        // confirm the engine minted exactly one UpgradeCap per Publish.
+        let expected_publish_caps = ptb
+            .commands
+            .iter()
+            .filter(|c| matches!(c, setu_types::ptb::Command::Publish { .. }))
+            .count();
+
         let payload = MovePtbPayload { sender: sender_hex, ptb };
 
         // 2. Build VLCSnapshot.
@@ -776,6 +787,7 @@ impl MovePtbHandler {
                     success: false,
                     error: Some(format!("Task preparation failed: {}", e)),
                     code: None,
+                    cap_ids: vec![],
                 };
             }
         };
@@ -790,6 +802,7 @@ impl MovePtbHandler {
                     success: false,
                     error: Some(format!("No solver available: {}", e)),
                     code: None,
+                    cap_ids: vec![],
                 };
             }
         };
@@ -803,11 +816,65 @@ impl MovePtbHandler {
                 let event_id = result_event.id.clone();
                 let exec_result = result_event.execution_result.as_ref();
                 let success = exec_result.map(|r| r.success).unwrap_or(false);
-                let error = if success {
+                let mut error = if success {
                     None
                 } else {
                     exec_result.and_then(|r| r.message.clone())
                 };
+
+                // iter-8α — surface fresh `UpgradeCap` UIDs minted by the
+                // engine on `Command::Publish`. Filter is structural:
+                // every UpgradeCap arrives as a Create state-change
+                // (`old_value: None`) whose new envelope's `type_tag`
+                // ends with `::package::UpgradeCap`. Set semantics — order
+                // is implementation-defined (see design.md §15.3 + R1-iter8-ISSUE-6).
+                // Empty/non-envelope state_changes (legacy CoinState, etc.)
+                // are silently skipped via `from_bytes` returning `None`.
+                let mut cap_ids: Vec<String> = Vec::new();
+                if success {
+                    if let Some(r) = result_event.execution_result.as_ref() {
+                        for sc in &r.state_changes {
+                            if sc.old_value.is_some() {
+                                continue;
+                            }
+                            let Some(new_bytes) = sc.new_value.as_ref() else {
+                                continue;
+                            };
+                            let Some(env) = setu_types::ObjectEnvelope::from_bytes(new_bytes)
+                            else {
+                                continue;
+                            };
+                            if env
+                                .type_tag
+                                .ends_with(setu_move_vm::ptb_executor::UPGRADE_CAP_TYPE_TAG_SUFFIX)
+                            {
+                                cap_ids.push(format!(
+                                    "0x{}",
+                                    hex::encode(env.metadata.id.as_bytes())
+                                ));
+                            }
+                        }
+                    }
+                }
+                // Defensive cross-check: count must match the number of
+                // `Command::Publish` in the submitted PTB. Mismatch means
+                // either the engine forgot to mint or someone leaked an
+                // unrelated cap into state_changes — surface as a failure
+                // rather than silently shipping a wrong cap_ids set.
+                if success && cap_ids.len() != expected_publish_caps {
+                    error!(
+                        event_id = %event_id,
+                        got = cap_ids.len(),
+                        expected = expected_publish_caps,
+                        "iter-8α: cap minting count mismatch"
+                    );
+                    error = Some(format!(
+                        "cap minting count mismatch: got {} caps for {} Publish commands",
+                        cap_ids.len(),
+                        expected_publish_caps,
+                    ));
+                }
+                let final_success = success && error.is_none();
 
                 // Stage to speculative overlay so the client can immediately
                 // read-your-writes from this validator. CF finalize will
@@ -841,9 +908,10 @@ impl MovePtbHandler {
 
                 setu_api::MovePtbResponse {
                     event_id,
-                    success,
+                    success: final_success,
                     error,
                     code: None,
+                    cap_ids,
                 }
             }
             Err(e) => {
@@ -853,6 +921,7 @@ impl MovePtbHandler {
                     success: false,
                     error: Some(format!("Execution failed: {}", e)),
                     code: None,
+                    cap_ids: vec![],
                 }
             }
         }
