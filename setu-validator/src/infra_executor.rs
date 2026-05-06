@@ -351,9 +351,12 @@ impl InfraExecutor {
     /// - `current_package` is treated as both the family root AND the previous
     ///   package head (i.e. only v0 → v1 upgrades supported; v1 → v2 chained
     ///   upgrades require a `family_of:{addr}` reverse index, deferred).
-    /// - Compatibility check (`compat::check_upgrade_compat`) is NOT
-    ///   invoked yet — the helper exists but needs old-module bytecode
-    ///   resolution + `Normalized::Module` construction (~80 LoC, deferred).
+    /// - Compatibility check via `setu_move_vm::compat::check_upgrade_compat`
+    ///   is invoked per-module (policy hard-coded to `Compatible` until
+    ///   `MoveUpgradeRequest` carries an explicit policy field). Bundles
+    ///   that introduce module names absent from the prev package are
+    ///   rejected, mirroring `engine.rs::lower_upgrade_inline`.
+    ///   See `docs/feat/fix-infra-executor-skips-compat-check/`.
     /// - UpgradeCap minting + version-bump MoveCall is NOT performed
     ///   (parallels engine-path v0).
     /// - The upgrade derives `new_package_addr` deterministically as
@@ -451,6 +454,56 @@ impl InfraExecutor {
             let new_addr_hex = format!("0x{}", hex::encode(new_addr_bytes));
             let module_key = format!("mod:{}::{}", new_addr_hex, module_name);
 
+            // ABI compatibility check — mirrors
+            // `engine.rs::lower_upgrade_inline`. Without this, the legacy
+            // /api/v1/move/upgrade endpoint would accept ABI-breaking
+            // upgrades that the PTB-encoded equivalent rejects.
+            // See docs/bugs/20260506-infra-executor-skips-compat-check.md.
+            //
+            // CRITICAL: pass the PRE-relink `compiled` module (self-addr ==
+            // prev_addr by the guard above), NOT `relinked_module` (self-addr
+            // == new_addr). Upstream `Compatibility::check` rejects on
+            // address mismatch (move-binary-format/compatibility.rs L120),
+            // so comparing prev_addr-vs-new_addr would fail every reflexive
+            // upgrade. Sui handles this via `MovePackage::normalize` which
+            // relinks all modules to a common original_package_id before
+            // compat — we get the same effect by feeding compat the
+            // pre-relink (still-prev-addressed) bytecode.
+            let old_key = format!(
+                "mod:{}::{}",
+                prev_account.to_hex_literal(),
+                module_name
+            );
+            let old_bytes = self.state_provider.get_raw_data(&old_key).ok_or_else(|| {
+                format!(
+                    "Move upgrade: module '{}' has no prior entry under \
+                     prev_addr={} (introducing new modules via upgrade is \
+                     rejected — publish them in a fresh package instead)",
+                    module_name,
+                    prev_account.to_hex_literal()
+                )
+            })?;
+            let old_module = CompiledModule::deserialize_with_defaults(&old_bytes)
+                .map_err(|e| {
+                    format!(
+                        "Move upgrade: prev module '{}' deserialize failed: {}",
+                        module_name, e
+                    )
+                })?;
+            // Policy hard-coded to Compatible (= upstream `full_check`). This
+            // is the strictest policy; userspace clients wanting AdditiveOnly
+            // / DepOnly must use the PTB upgrade path which carries policy
+            // on the ticket. MUST stay in sync with `payload.policy = 0` below.
+            let policy = setu_move_vm::compat::UpgradePolicy::Compatible;
+            setu_move_vm::compat::check_upgrade_compat(&old_module, &compiled, policy)
+                .map_err(|setu_move_vm::compat::CompatError::Incompatible { status, msg }| {
+                    format!(
+                        "Move upgrade: compat check failed for module '{}' \
+                         (policy={:?}, status={:?}): {}",
+                        module_name, policy, status, msg
+                    )
+                })?;
+
             // Defensive duplicate check (fresh address ⇒ should always pass).
             if self.state_provider.get_raw_data(&module_key).is_some() {
                 return Err(format!(
@@ -507,7 +560,8 @@ impl InfraExecutor {
             // v0: UpgradeCap not minted; reuse current_package as a placeholder
             // sentinel so the payload field stays valid for replay assertion.
             upgrade_cap_id: current_package,
-            // 0 = Compatible (default policy until UpgradeCap minting lands).
+            // 0 = Compatible. MUST stay in sync with `UpgradePolicy::Compatible`
+            // passed to `check_upgrade_compat` above.
             policy: 0,
         };
         let mut event = Event::move_upgrade(
@@ -1003,5 +1057,97 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Empty module list"));
+    }
+
+    /// Helper for B5-fix tests: seed prev `mod:` key + `linkage:latest:` so
+    /// `execute_move_upgrade` can probe them. Mirrors the on-chain effect of
+    /// a successful `execute_contract_publish` having been CF-finalized.
+    fn seed_published_v0(
+        shared: &Arc<SharedStateManager>,
+        addr: move_core_types::account_address::AccountAddress,
+        module_name: &str,
+        module_bytes: &[u8],
+    ) {
+        use setu_types::SubnetId;
+        let addr_bytes = addr.into_bytes();
+        let setu_addr = setu_types::object::Address::new(addr_bytes);
+        let mod_key = format!("mod:{}::{}", addr.to_hex_literal(), module_name);
+        let linkage_key = format!("linkage:latest:{}", hex::encode(addr_bytes));
+        let linkage_payload = bcs::to_bytes(&(setu_addr, 0u64)).expect("bcs encode");
+
+        let mut gsm = shared.lock_write();
+        let sc1 = EventStateChange::insert(mod_key, module_bytes.to_vec());
+        let sc2 = EventStateChange::insert(linkage_key, linkage_payload);
+        gsm.apply_state_change(SubnetId::ROOT, &sc1);
+        gsm.apply_state_change(SubnetId::ROOT, &sc2);
+        shared.publish_snapshot(&gsm);
+    }
+
+    /// T1 (fix-infra-compat): self-replace upgrade passes the new compat
+    /// gate. Proves the inserted `check_upgrade_compat` call does not
+    /// regress the happy path. Reflexive compat semantics are covered by
+    /// `setu_move_vm::compat::tests::u_co1`.
+    #[test]
+    fn test_execute_move_upgrade_compat_check_passes_self_replace() {
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(Arc::clone(&shared)));
+        let executor = InfraExecutor::new("validator-1".to_string(), Arc::clone(&provider));
+
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead")
+            .expect("valid addr");
+        let module_bytes = make_module_bytes(addr, "counter");
+        seed_published_v0(&shared, addr, "counter", &module_bytes);
+
+        let family = setu_types::object::ObjectId::new(addr.into_bytes());
+        let result = executor.execute_move_upgrade(
+            "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+            family,
+            &[module_bytes],
+            vec![],
+            test_vlc(),
+        );
+        assert!(result.is_ok(), "self-replace should pass compat: {:?}", result.err());
+        let event = result.unwrap();
+        assert_eq!(event.event_type, setu_types::event::EventType::ContractPublish);
+        let er = event.execution_result.as_ref().unwrap();
+        assert!(er.success);
+        // mod:{new}::counter + linkage:latest update (= 2 changes)
+        assert_eq!(er.state_changes.len(), 2);
+        assert!(er.state_changes.iter().any(|sc| sc.key.starts_with("mod:")));
+        assert!(er.state_changes.iter().any(|sc| sc.key.starts_with("linkage:latest:")));
+    }
+
+    /// T2 (fix-infra-compat): bundle whose module name is absent from the
+    /// prev package is rejected before reaching the compat check. Mirrors
+    /// `engine.rs::lower_upgrade_inline`'s "new modules cannot be
+    /// introduced via Upgrade" rejection.
+    #[test]
+    fn test_execute_move_upgrade_rejects_new_module_name() {
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(Arc::clone(&shared)));
+        let executor = InfraExecutor::new("validator-1".to_string(), Arc::clone(&provider));
+
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead")
+            .expect("valid addr");
+        // Prev package has only "counter".
+        let counter_bytes = make_module_bytes(addr, "counter");
+        seed_published_v0(&shared, addr, "counter", &counter_bytes);
+
+        // Upgrade bundle introduces a new name "other" at the same self-addr.
+        let other_bytes = make_module_bytes(addr, "other");
+        let family = setu_types::object::ObjectId::new(addr.into_bytes());
+        let result = executor.execute_move_upgrade(
+            "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+            family,
+            &[other_bytes],
+            vec![],
+            test_vlc(),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("no prior entry under prev_addr"),
+            "wrong error: {err}"
+        );
     }
 }

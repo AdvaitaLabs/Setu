@@ -2045,7 +2045,7 @@ impl SetuMoveEngine {
         //      at their original publish time and the storage layer is
         //      treated as a trusted producer (G3 deferred-commit ensures
         //      no half-applied bundle is observable).
-        for (i, (relinked, name)) in relinked_bytes
+        for (i, (_relinked, name)) in relinked_bytes
             .iter()
             .zip(module_names.iter())
             .enumerate()
@@ -2083,9 +2083,19 @@ impl SetuMoveEngine {
                     name.as_str(),
                 ))
             })?;
-            let new_module = CompiledModule::deserialize_with_defaults(relinked).map_err(|e| {
+            // CRITICAL: feed compat the PRE-relink bytecode (self-addr ==
+            // prev_addr) NOT the post-relink `relinked` (self-addr ==
+            // new_addr). Upstream `Compatibility::check` rejects on address
+            // mismatch (move-binary-format/compatibility.rs:120) so any
+            // policy except `DepOnly` would reject every reflexive upgrade.
+            // Sui's `MovePackage::normalize` achieves the same effect by
+            // relinking all modules to a common original_package_id before
+            // compat. Mirrors the infra-path fix at
+            // `setu-validator/src/infra_executor.rs::execute_move_upgrade`
+            // (docs/feat/fix-infra-executor-skips-compat-check/).
+            let new_module = CompiledModule::deserialize_with_defaults(&modules[i]).map_err(|e| {
                 RuntimeError::VMExecutionError(format!(
-                    "Command::Upgrade: relinked module[{i}] '{}' deserialization failed: {e}",
+                    "Command::Upgrade: pre-relink module[{i}] '{}' deserialization failed: {e}",
                     name.as_str(),
                 ))
             })?;
