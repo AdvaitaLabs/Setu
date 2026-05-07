@@ -27,7 +27,9 @@
 //!   `0x1::coin::Coin<T>` shape and never fabricates a fallback `T`.
 
 use std::collections::BTreeSet;
+use std::fmt;
 
+use move_binary_format::file_format::AbilitySet;
 use move_core_types::language_storage::TypeTag;
 use move_core_types::runtime_value::MoveTypeLayout;
 
@@ -94,13 +96,15 @@ impl ArgumentSlot {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One entry in the result/input table — a serialized Move value with its
-/// runtime layout and optionally tracked TypeTag.
+/// runtime layout, optionally tracked TypeTag, and optionally tracked abilities.
 ///
-/// The TypeTag is `None` for slots whose type is not statically known to the
-/// PTB executor (e.g. a generic `MoveCall` result whose return type comes from
-/// an instantiated function signature we don't introspect). Coin-command
-/// lowerings (`SplitCoins`, `MergeCoins`, `TransferObjects`) require the
-/// TypeTag and abort with `PtbInvalidCoinLayout` when it is `None`.
+/// The TypeTag is `None` for slots whose type cannot be represented cheaply as
+/// a concrete `TypeTag` at the PTB layer (e.g. generic `MoveCall` results).
+/// Generic `MoveCall` results still carry `abilities` from the instantiated VM
+/// return `Type`, so the hot-potato sweep can enforce no-drop/no-key values
+/// even when no `TypeTag` is available. Coin-command lowerings (`SplitCoins`,
+/// `MergeCoins`, `TransferObjects`) still require the `TypeTag` and abort with
+/// `PtbInvalidCoinLayout` when it is `None`.
 ///
 /// The `layout` field is also `Option`-al: PTB inputs (`CallArg::Pure(bytes)`)
 /// are passed verbatim to the Move VM which deserializes them against the
@@ -108,7 +112,7 @@ impl ArgumentSlot {
 /// construction time. Layouts are populated for `MoveCall` return values
 /// (the VM gives us `MoveTypeLayout` per return slot) and for serialized
 /// object inputs (where the layout matches the on-chain envelope's struct).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Slot {
     pub bytes: Vec<u8>,
     /// Move VM type layout. Populated for MoveCall return slots and for
@@ -120,6 +124,28 @@ pub(crate) struct Slot {
     #[allow(dead_code)]
     pub layout: Option<MoveTypeLayout>,
     pub type_tag: Option<TypeTag>,
+    pub abilities: Option<AbilitySet>,
+}
+
+impl fmt::Debug for Slot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Slot")
+            .field("bytes", &self.bytes)
+            .field("layout", &self.layout)
+            .field("type_tag", &self.type_tag)
+            .field(
+                "abilities",
+                &self.abilities.map(|abilities| {
+                    (
+                        abilities.has_copy(),
+                        abilities.has_drop(),
+                        abilities.has_store(),
+                        abilities.has_key(),
+                    )
+                }),
+            )
+            .finish()
+    }
 }
 
 /// PTB-scoped state carried across commands.
@@ -162,12 +188,24 @@ impl PtbContext {
     /// - [`RuntimeError::PtbArgumentOutOfBounds`] for `GasCoin` (not yet
     ///   supported in B6b — see [`ArgumentSlot::from_argument`] doc).
     pub(crate) fn resolve(&self, arg: &Argument) -> Result<&Slot, RuntimeError> {
+        if let Some(slot_id) = ArgumentSlot::from_argument(arg) {
+            if self.consumed.contains(&slot_id) {
+                return Err(RuntimeError::PtbArgumentAlreadyConsumed(format!(
+                    "resolve on consumed slot: {:?}",
+                    slot_id
+                )));
+            }
+        }
         match arg {
             Argument::GasCoin => Err(RuntimeError::PtbArgumentOutOfBounds(
                 "GasCoin not supported in B6b".to_string(),
             )),
             Argument::Input(i) => self.inputs.get(*i as usize).ok_or_else(|| {
-                RuntimeError::PtbArgumentOutOfBounds(format!("Input({}) of {}", i, self.inputs.len()))
+                RuntimeError::PtbArgumentOutOfBounds(format!(
+                    "Input({}) of {}",
+                    i,
+                    self.inputs.len()
+                ))
             }),
             Argument::Result(c) => self.lookup_cmd(*c, 0),
             Argument::NestedResult(c, j) => self.lookup_cmd(*c, *j),
@@ -206,7 +244,10 @@ impl PtbContext {
             RuntimeError::PtbArgumentOutOfBounds("GasCoin not supported in B6b".to_string())
         })?;
         if self.consumed.contains(&slot_id) {
-            return Err(RuntimeError::PtbArgumentAlreadyConsumed(format!("{:?}", slot_id)));
+            return Err(RuntimeError::PtbArgumentAlreadyConsumed(format!(
+                "{:?}",
+                slot_id
+            )));
         }
         // Resolve first (validates index) THEN mark consumed. Order matters:
         // a resolve-error MUST NOT poison the consumed set.
@@ -224,6 +265,21 @@ impl PtbContext {
             cmd_idx
         );
         self.results[cmd_idx] = slots;
+    }
+
+    /// Read-only access to the result table. Used by the engine's end-of-PTB
+    /// hot-potato sweep (engine.rs::execute_ptb_body) to walk every result
+    /// slot and check its type's `drop` ability against the `consumed` set.
+    pub(crate) fn results_for_sweep(&self) -> &[Vec<Slot>] {
+        &self.results
+    }
+
+    /// Whether the given canonical slot has been consumed via `consume()`.
+    /// Used by the engine's end-of-PTB hot-potato sweep to skip slots that
+    /// were properly moved out (e.g. an `UpgradeReceipt` consumed by a
+    /// trailing `commit_upgrade` MoveCall).
+    pub(crate) fn is_consumed(&self, slot: ArgumentSlot) -> bool {
+        self.consumed.contains(&slot)
     }
 
     /// Phase 3d — write-back path for `&mut` argument mutations.
@@ -332,6 +388,7 @@ mod tests {
             bytes: bytes.to_vec(),
             layout: Some(MoveTypeLayout::U64),
             type_tag: None,
+            abilities: None,
         }
     }
 
@@ -340,6 +397,16 @@ mod tests {
             bytes: bytes.to_vec(),
             layout: Some(MoveTypeLayout::U64),
             type_tag: Some(tag),
+            abilities: None,
+        }
+    }
+
+    fn slot_with_abilities(bytes: &[u8], abilities: AbilitySet) -> Slot {
+        Slot {
+            bytes: bytes.to_vec(),
+            layout: Some(MoveTypeLayout::U64),
+            type_tag: None,
+            abilities: Some(abilities),
         }
     }
 
@@ -404,7 +471,9 @@ mod tests {
 
         // Both consumable in any order; neither blocks the other.
         let _ = ctx.consume(&Argument::Input(0)).expect("Input consume ok");
-        let _ = ctx.consume(&Argument::Result(0)).expect("Result consume ok");
+        let _ = ctx
+            .consume(&Argument::Result(0))
+            .expect("Result consume ok");
 
         // Each individually now blocked.
         assert!(matches!(
@@ -481,13 +550,22 @@ mod tests {
         ctx.record_result(1, vec![]);
         ctx.record_result(2, vec![slot(&[3])]);
 
-        assert_eq!(ctx.resolve(&Argument::NestedResult(0, 0)).unwrap().bytes, vec![1]);
-        assert_eq!(ctx.resolve(&Argument::NestedResult(0, 1)).unwrap().bytes, vec![2]);
+        assert_eq!(
+            ctx.resolve(&Argument::NestedResult(0, 0)).unwrap().bytes,
+            vec![1]
+        );
+        assert_eq!(
+            ctx.resolve(&Argument::NestedResult(0, 1)).unwrap().bytes,
+            vec![2]
+        );
         assert!(matches!(
             ctx.resolve(&Argument::Result(1)),
             Err(RuntimeError::PtbArgumentOutOfBounds(_))
         ));
-        assert_eq!(ctx.resolve(&Argument::NestedResult(2, 0)).unwrap().bytes, vec![3]);
+        assert_eq!(
+            ctx.resolve(&Argument::NestedResult(2, 0)).unwrap().bytes,
+            vec![3]
+        );
     }
 
     // ── U7 ── coin_inner_type_from_tag on Coin<u64> ────────────────────────
@@ -647,7 +725,8 @@ mod tests {
     #[test]
     fn u12_mutate_slot_updates_input() {
         let mut pctx = PtbContext::new(vec![slot(b"old")], 0);
-        pctx.mutate_slot(&Argument::Input(0), b"new".to_vec()).unwrap();
+        pctx.mutate_slot(&Argument::Input(0), b"new".to_vec())
+            .unwrap();
         assert_eq!(pctx.resolve(&Argument::Input(0)).unwrap().bytes, b"new");
     }
 
@@ -656,7 +735,8 @@ mod tests {
     fn u13_mutate_slot_updates_result() {
         let mut pctx = PtbContext::new(vec![], 1);
         pctx.record_result(0, vec![slot(b"a"), slot(b"b")]);
-        pctx.mutate_slot(&Argument::NestedResult(0, 1), b"BB".to_vec()).unwrap();
+        pctx.mutate_slot(&Argument::NestedResult(0, 1), b"BB".to_vec())
+            .unwrap();
         assert_eq!(
             pctx.resolve(&Argument::NestedResult(0, 1)).unwrap().bytes,
             b"BB"
@@ -692,6 +772,16 @@ mod tests {
         assert_eq!(s.type_tag.as_ref(), Some(&coin));
     }
 
+    // ── U16b ── mutate_slot preserves abilities (only payload changes) ─────
+    #[test]
+    fn u16b_mutate_slot_preserves_abilities() {
+        let mut pctx = PtbContext::new(vec![slot_with_abilities(&[1], AbilitySet::PRIMITIVES)], 0);
+        pctx.mutate_slot(&Argument::Input(0), vec![9, 9]).unwrap();
+        let s = pctx.resolve(&Argument::Input(0)).unwrap();
+        assert_eq!(s.bytes, vec![9, 9]);
+        assert!(s.abilities == Some(AbilitySet::PRIMITIVES));
+    }
+
     // ── U17 ── mutate_slot rejects writes to consumed slots ────────────────
     //
     // Linear-type symmetry: `consume()` rejects re-take, `mutate_slot()`
@@ -705,6 +795,18 @@ mod tests {
         let err = pctx
             .mutate_slot(&Argument::Input(0), b"new".to_vec())
             .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::PtbArgumentAlreadyConsumed(_)),
+            "expected PtbArgumentAlreadyConsumed, got {err:?}"
+        );
+    }
+
+    // ── U18 ── resolve rejects reads after move ────────────────────────────
+    #[test]
+    fn u18_resolve_after_consume_rejected() {
+        let mut pctx = PtbContext::new(vec![slot(b"x")], 0);
+        let _ = pctx.consume(&Argument::Input(0)).unwrap();
+        let err = pctx.resolve(&Argument::Input(0)).unwrap_err();
         assert!(
             matches!(err, RuntimeError::PtbArgumentAlreadyConsumed(_)),
             "expected PtbArgumentAlreadyConsumed, got {err:?}"

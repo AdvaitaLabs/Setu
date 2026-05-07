@@ -31,23 +31,27 @@
 //! ```
 
 use crate::{
-    stf::{ExecutionStats, FailedEvent, StateDiff, StfError, StfInput, StfOutput, StfResult, WriteSetEntry},
+    stf::{
+        ExecutionStats, FailedEvent, StateDiff, StfError, StfInput, StfOutput, StfResult,
+        WriteSetEntry,
+    },
     traits::{EnclaveConfig, EnclaveInfo, EnclavePlatform, EnclaveRuntime},
 };
 // Use types from setu-types (canonical source)
-use setu_types::task::{
-    Attestation, AttestationData,
-    ResolvedInputs, GasUsage,
-    ReadSetEntry,
-};
 use async_trait::async_trait;
-use setu_runtime::{RuntimeExecutor, ExecutionContext, InMemoryStateStore, InMemoryObjectStore, StateStore, ObjectStore, RawStore};
-use setu_types::{EventId, create_coin, Address, Object, CoinData, ObjectId, Balance, CoinType};
-use std::collections::HashMap;
+use setu_runtime::{
+    ExecutionContext, InMemoryObjectStore, InMemoryStateStore, ObjectStore, RawStore,
+    RuntimeExecutor, StateStore,
+};
+use setu_types::task::{Attestation, AttestationData, GasUsage, ReadSetEntry, ResolvedInputs};
+use setu_types::{create_coin, Address, Balance, CoinData, CoinType, EventId, Object, ObjectId};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "move-vm")]
+use setu_move_vm::engine::{MoveExecutionContext, SetuMoveEngine};
 #[cfg(feature = "move-vm")]
 use setu_move_vm::move_core_types::{
     account_address::AccountAddress,
@@ -55,14 +59,12 @@ use setu_move_vm::move_core_types::{
     language_storage::{ModuleId, TypeTag},
 };
 #[cfg(feature = "move-vm")]
-use setu_move_vm::engine::{MoveExecutionContext, SetuMoveEngine};
-#[cfg(feature = "move-vm")]
 use setu_move_vm::object_runtime::InputObject;
 #[cfg(feature = "move-vm")]
 use std::str::FromStr;
 
 /// CoinState from storage layer - matches storage/src/state_provider.rs
-/// 
+///
 /// TEE receives raw CoinState (BCS) from read_set so it can:
 /// 1. Verify Merkle proof (hash must match what's stored in tree)
 /// 2. Convert to Object<CoinData> for runtime execution
@@ -78,7 +80,7 @@ struct CoinState {
 
 #[allow(dead_code)]
 fn default_coin_type() -> String {
-    "ROOT".to_string()  // ROOT subnet's native token (consistent with storage)
+    "ROOT".to_string() // ROOT subnet's native token (consistent with storage)
 }
 
 /// Translate `setu_move_vm::engine::ModuleChange` entries into `WriteSetEntry`s
@@ -106,6 +108,15 @@ fn apply_module_changes_to_diff(
     diff: &mut StateDiff,
     module_changes: &[setu_move_vm::engine::ModuleChange],
 ) {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LinkageWrite {
+        latest_key: String,
+        hist_key: String,
+        latest: Vec<u8>,
+        old_latest: Option<Vec<u8>>,
+    }
+
+    let mut linkage_writes: BTreeMap<(String, u64), LinkageWrite> = BTreeMap::new();
     for mc in module_changes {
         match mc {
             setu_move_vm::engine::ModuleChange::Publish(id, bytes) => {
@@ -139,30 +150,37 @@ fn apply_module_changes_to_diff(
                     ),
                     bytecode.clone(),
                 ));
-                // linkage:latest:{family_id} → bcs(LinkageEntry { package_addr, version })
-                // linkage:hist:{family_id}:{version} → bcs({ package_addr })
-                // Both keys are content-addressed in the SMT via
-                // `update_indexes_for_value` ignoring linkage:* prefix.
-                let latest = bcs::to_bytes(&(*package_addr, *version))
-                    .expect("LinkageEntry serializes");
-                diff.add_write(WriteSetEntry::new(
-                    format!("linkage:latest:{}", hex::encode(family_id.as_bytes())),
-                    latest.clone(),
-                ));
-                diff.add_write(WriteSetEntry::new(
-                    format!(
-                        "linkage:hist:{}:{:020}",
-                        hex::encode(family_id.as_bytes()),
-                        version
-                    ),
+                // linkage is package-level, not module-level. Queue it and
+                // emit once after all module bytecode writes are recorded.
+                let latest =
+                    bcs::to_bytes(&(*package_addr, *version)).expect("LinkageEntry serializes");
+                let family_hex = hex::encode(family_id.as_bytes());
+                let write = LinkageWrite {
+                    latest_key: format!("linkage:latest:{family_hex}"),
+                    hist_key: format!("linkage:hist:{family_hex}:{version:020}"),
                     latest,
-                ));
+                    old_latest: None,
+                };
+                let key = (family_hex, *version);
+                match linkage_writes.get(&key) {
+                    Some(existing) if existing == &write => {}
+                    Some(existing) => warn!(
+                        family = %key.0,
+                        version = key.1,
+                        existing_latest = %hex::encode(&existing.latest),
+                        new_latest = %hex::encode(&write.latest),
+                        "conflicting package linkage write in one module bundle; keeping first"
+                    ),
+                    None => {
+                        linkage_writes.insert(key, write);
+                    }
+                }
             }
             setu_move_vm::engine::ModuleChange::Upgrade {
                 module_id,
                 bytecode,
                 family_id,
-                prev_package: _,
+                prev_package,
                 new_package_addr,
                 new_version,
             } => {
@@ -176,20 +194,52 @@ fn apply_module_changes_to_diff(
                 ));
                 let latest = bcs::to_bytes(&(*new_package_addr, *new_version))
                     .expect("LinkageEntry serializes");
-                diff.add_write(WriteSetEntry::new(
-                    format!("linkage:latest:{}", hex::encode(family_id.as_bytes())),
-                    latest.clone(),
-                ));
-                diff.add_write(WriteSetEntry::new(
-                    format!(
-                        "linkage:hist:{}:{:020}",
-                        hex::encode(family_id.as_bytes()),
-                        new_version
-                    ),
+                // iter-9 / fix-ptb-upgrade-cap-mutation: provide
+                // `old_value` so the storage layer treats this as an
+                // UPDATE (CAS-checked) rather than a CREATE. Without
+                // this, the CF-apply rejects the entire upgrade event
+                // ("Create conflict: key already exists") and silently
+                // drops every state change in it — including the
+                // UpgradeCap.version mutation. The previous linkage
+                // entry encodes (prev_package, prev_version) where
+                // prev_version = new_version - 1 by Command::Upgrade
+                // construction (engine.rs `new_version = prev_version + 1`).
+                let prev_version = new_version.saturating_sub(1);
+                let prev_addr = setu_types::object::Address::new(*prev_package.as_bytes());
+                let prev_latest =
+                    bcs::to_bytes(&(prev_addr, prev_version)).expect("LinkageEntry serializes");
+                let family_hex = hex::encode(family_id.as_bytes());
+                let write = LinkageWrite {
+                    latest_key: format!("linkage:latest:{family_hex}"),
+                    hist_key: format!("linkage:hist:{family_hex}:{new_version:020}"),
                     latest,
-                ));
+                    old_latest: Some(prev_latest),
+                };
+                let key = (family_hex, *new_version);
+                match linkage_writes.get(&key) {
+                    Some(existing) if existing == &write => {}
+                    Some(existing) => warn!(
+                        family = %key.0,
+                        version = key.1,
+                        existing_latest = %hex::encode(&existing.latest),
+                        new_latest = %hex::encode(&write.latest),
+                        "conflicting package linkage write in one module bundle; keeping first"
+                    ),
+                    None => {
+                        linkage_writes.insert(key, write);
+                    }
+                }
             }
         }
+    }
+
+    for write in linkage_writes.into_values() {
+        let mut latest_entry = WriteSetEntry::new(write.latest_key, write.latest.clone());
+        if let Some(old_latest) = write.old_latest {
+            latest_entry = latest_entry.with_old_value(old_latest);
+        }
+        diff.add_write(latest_entry);
+        diff.add_write(WriteSetEntry::new(write.hist_key, write.latest));
     }
 }
 
@@ -199,14 +249,11 @@ const MOCK_MEASUREMENT: [u8; 32] = [
     0x5f, 0x45, 0x4e, 0x43, // "_ENC"
     0x4c, 0x41, 0x56, 0x45, // "LAVE"
     0x5f, 0x56, 0x31, 0x00, // "_V1\0"
-    0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
 /// Mock enclave for development and testing
-/// 
+///
 /// This enclave simulates TEE execution by calling setu-runtime
 /// for actual state transition logic. In production, this would be
 /// replaced with a real TEE implementation (e.g., NitroEnclave).
@@ -229,7 +276,7 @@ impl MockEnclave {
     pub fn new(config: EnclaveConfig) -> Self {
         let store = InMemoryStateStore::new();
         let runtime = RuntimeExecutor::new(store);
-        
+
         Self {
             config,
             runtime: Arc::new(RwLock::new(runtime)),
@@ -241,69 +288,75 @@ impl MockEnclave {
                 .map(Arc::new),
         }
     }
-    
+
     /// Create a mock enclave with default configuration
     pub fn default_with_solver_id(solver_id: String) -> Self {
         let config = EnclaveConfig::default().with_solver_id(solver_id);
         Self::new(config)
     }
-    
+
     /// Initialize account with balance (for testing)
     /// Creates a Coin object owned by the address (must be hex format)
     pub async fn init_account(&self, address: &str, balance: u64) {
-        let addr = Address::from_hex(address)
-            .expect("init_account requires valid hex address");
+        let addr = Address::from_hex(address).expect("init_account requires valid hex address");
         let coin = create_coin(addr, balance);
         let coin_id = *coin.id();
-        
+
         let mut runtime = self.runtime.write().await;
-        runtime.state_mut().set_object(coin_id, coin).expect("Failed to init account");
-        
+        runtime
+            .state_mut()
+            .set_object(coin_id, coin)
+            .expect("Failed to init account");
+
         info!(address = %address, balance = balance, coin_id = %coin_id, "Initialized account");
     }
-    
+
     /// Get the current execution count
     pub async fn execution_count(&self) -> u64 {
         *self.execution_count.read().await
     }
-    
+
     /// Build temporary state from read_set (solver-tee3 architecture)
-    /// 
+    ///
     /// This is the key function that loads objects from read_set into
     /// a fresh InMemoryStateStore, making the TEE execution truly stateless.
-    /// 
+    ///
     /// ## Format
-    /// 
+    ///
     /// read_set entries use key format: "oid:{hex_object_id}"
     /// value is BCS-serialized CoinState (raw storage format)
-    /// 
+    ///
     /// ## Security
-    /// 
+    ///
     /// TEE receives raw CoinState so it can verify Merkle proof:
     /// - hash(CoinState) must match the leaf in Merkle tree
     /// - If TaskPreparer converted to Object<CoinData>, verification would fail
-    /// 
+    ///
     /// ## Conversion
-    /// 
+    ///
     /// After verification, TEE converts CoinState → Object<CoinData> for runtime
     /// Build temporary state from read_set (legacy, kept for backward compatibility)
     #[allow(dead_code)]
-    fn build_state_from_read_set(&self, read_set: &[ReadSetEntry]) -> StfResult<InMemoryStateStore> {
+    fn build_state_from_read_set(
+        &self,
+        read_set: &[ReadSetEntry],
+    ) -> StfResult<InMemoryStateStore> {
         let mut store = InMemoryStateStore::new();
         let mut loaded_count = 0;
-        
+
         for entry in read_set {
             // Parse object key: "oid:{hex_object_id}"
             let hex_id = entry.key.strip_prefix("oid:");
-            
+
             if let Some(hex_id) = hex_id {
                 // Parse ObjectId from hex string
-                let object_id = ObjectId::from_hex(hex_id)
-                    .map_err(|e| StfError::InvalidResolvedInputs(format!("Invalid object ID: {}", e)))?;
-                
+                let object_id = ObjectId::from_hex(hex_id).map_err(|e| {
+                    StfError::InvalidResolvedInputs(format!("Invalid object ID: {}", e))
+                })?;
+
                 // TODO: Verify Merkle proof here (for production)
                 // verify_proof(leaf_hash, entry.proof, pre_state_root)?;
-                
+
                 // Deserialize CoinState from BCS (raw storage format)
                 // Non-CoinState entries (e.g. FluxState/PowerState JSON) will fail BCS
                 // deserialization — skip them (they're read separately for Power/Flux).
@@ -314,18 +367,20 @@ impl MockEnclave {
                         continue;
                     }
                 };
-                
+
                 // Convert CoinState → Object<CoinData> for runtime
                 // CoinState.owner is stored in hex format ("0x..."), use from_hex.
-                let owner = Address::from_hex(&coin_state.owner)
-                    .map_err(|e| StfError::InvalidResolvedInputs(format!(
-                        "Invalid owner address in CoinState {}: {}", hex_id, e
-                    )))?;
+                let owner = Address::from_hex(&coin_state.owner).map_err(|e| {
+                    StfError::InvalidResolvedInputs(format!(
+                        "Invalid owner address in CoinState {}: {}",
+                        hex_id, e
+                    ))
+                })?;
                 let coin_data = CoinData {
                     coin_type: CoinType::new(&coin_state.coin_type),
                     balance: Balance::new(coin_state.balance),
                 };
-                
+
                 // Use deterministic timestamp (0) instead of SystemTime::now().
                 // created_at / updated_at are NOT included in CoinState (the consensus-
                 // critical BCS format), so they don't affect state hashes or conflict
@@ -343,11 +398,12 @@ impl MockEnclave {
                     },
                     data: coin_data,
                 };
-                
+
                 // Store in the temporary state
-                store.set_object(object_id, coin_object)
-                    .map_err(|e| StfError::InternalError(format!("Failed to store object: {}", e)))?;
-                
+                store.set_object(object_id, coin_object).map_err(|e| {
+                    StfError::InternalError(format!("Failed to store object: {}", e))
+                })?;
+
                 loaded_count += 1;
                 debug!(
                     object_id = %hex_id,
@@ -357,16 +413,16 @@ impl MockEnclave {
                 );
             }
         }
-        
+
         info!(
             loaded_count = loaded_count,
             total_entries = read_set.len(),
             "Built temporary state from read_set"
         );
-        
+
         Ok(store)
     }
-    
+
     /// Extract PowerState and FluxState from read_set entries by key matching (R8-ISSUE-2).
     ///
     /// Matches read_set entries by their `oid:{hex}` key against the deterministic
@@ -374,9 +430,18 @@ impl MockEnclave {
     fn extract_power_flux(
         read_set: &[ReadSetEntry],
         sender_address: &str,
-    ) -> (Option<setu_types::PowerState>, Option<setu_types::FluxState>) {
-        let power_key = format!("oid:{}", hex::encode(setu_types::power_state_object_id(sender_address)));
-        let flux_key = format!("oid:{}", hex::encode(setu_types::flux_state_object_id(sender_address)));
+    ) -> (
+        Option<setu_types::PowerState>,
+        Option<setu_types::FluxState>,
+    ) {
+        let power_key = format!(
+            "oid:{}",
+            hex::encode(setu_types::power_state_object_id(sender_address))
+        );
+        let flux_key = format!(
+            "oid:{}",
+            hex::encode(setu_types::flux_state_object_id(sender_address))
+        );
         let mut power_state = None;
         let mut flux_state = None;
         for entry in read_set {
@@ -398,7 +463,10 @@ impl MockEnclave {
     /// Returns `ResourceParams::default()` if not found (backward-compatible with
     /// tasks prepared before governance was initialized).
     fn extract_resource_params(read_set: &[ReadSetEntry]) -> setu_types::ResourceParams {
-        let rp_key = format!("oid:{}", hex::encode(setu_types::resource_params_object_id().as_bytes()));
+        let rp_key = format!(
+            "oid:{}",
+            hex::encode(setu_types::resource_params_object_id().as_bytes())
+        );
         for entry in read_set {
             if entry.key == rp_key {
                 if let Ok(rp) = serde_json::from_slice::<setu_types::ResourceParams>(&entry.value) {
@@ -408,7 +476,7 @@ impl MockEnclave {
         }
         setu_types::ResourceParams::default()
     }
-    
+
     /// Build temporary InMemoryObjectStore from read_set + module_read_set (solver-tee3, Phase 3+).
     ///
     /// Supports three key prefixes:
@@ -427,10 +495,9 @@ impl MockEnclave {
 
         for entry in read_set {
             if let Some(hex_id) = entry.key.strip_prefix("oid:") {
-                let object_id = ObjectId::from_hex(hex_id)
-                    .map_err(|e| StfError::InvalidResolvedInputs(format!(
-                        "Invalid object ID: {}", e
-                    )))?;
+                let object_id = ObjectId::from_hex(hex_id).map_err(|e| {
+                    StfError::InvalidResolvedInputs(format!("Invalid object ID: {}", e))
+                })?;
 
                 // DF FDP M5: Dynamic-field Create-mode entries carry an empty
                 // `value` — they exist in read_set purely as Merkle
@@ -451,14 +518,15 @@ impl MockEnclave {
                     let magic = u16::from_le_bytes([entry.value[0], entry.value[1]]);
                     if magic == ENVELOPE_MAGIC {
                         // BCS ObjectEnvelope
-                        let env: ObjectEnvelope = bcs::from_bytes(&entry.value)
-                            .map_err(|e| StfError::InvalidResolvedInputs(format!(
-                                "Failed to deserialize ObjectEnvelope {}: {}", hex_id, e
-                            )))?;
-                        store.set_envelope(object_id, env)
-                            .map_err(|e| StfError::InternalError(format!(
-                                "Failed to store envelope: {}", e
-                            )))?;
+                        let env: ObjectEnvelope = bcs::from_bytes(&entry.value).map_err(|e| {
+                            StfError::InvalidResolvedInputs(format!(
+                                "Failed to deserialize ObjectEnvelope {}: {}",
+                                hex_id, e
+                            ))
+                        })?;
+                        store.set_envelope(object_id, env).map_err(|e| {
+                            StfError::InternalError(format!("Failed to store envelope: {}", e))
+                        })?;
                         loaded_count += 1;
                         continue;
                     }
@@ -475,42 +543,52 @@ impl MockEnclave {
                     continue;
                 }
                 let coin_state: setu_types::coin::CoinState = bcs::from_bytes(&entry.value)
-                    .map_err(|e| StfError::InvalidResolvedInputs(format!(
-                        "Failed to deserialize CoinState {}: {}", hex_id, e
-                    )))?;
-                let env = ObjectEnvelope::from_legacy_coin_state(
-                    object_id, &coin_state,
-                ).map_err(|e| StfError::InternalError(format!(
-                    "Failed to convert CoinState {}: {}", hex_id, e
-                )))?;
-                store.set_envelope(object_id, env)
-                    .map_err(|e| StfError::InternalError(format!(
-                        "Failed to store envelope: {}", e
-                    )))?;
+                    .map_err(|e| {
+                        StfError::InvalidResolvedInputs(format!(
+                            "Failed to deserialize CoinState {}: {}",
+                            hex_id, e
+                        ))
+                    })?;
+                let env = ObjectEnvelope::from_legacy_coin_state(object_id, &coin_state).map_err(
+                    |e| {
+                        StfError::InternalError(format!(
+                            "Failed to convert CoinState {}: {}",
+                            hex_id, e
+                        ))
+                    },
+                )?;
+                store.set_envelope(object_id, env).map_err(|e| {
+                    StfError::InternalError(format!("Failed to store envelope: {}", e))
+                })?;
                 loaded_count += 1;
             } else if let Some(hex_id) = entry.key.strip_prefix("coin:") {
                 // Legacy "coin:" prefix → CoinState → ObjectEnvelope
-                let object_id = ObjectId::from_hex(hex_id)
-                    .map_err(|e| StfError::InvalidResolvedInputs(format!(
-                        "Invalid object ID: {}", e
-                    )))?;
+                let object_id = ObjectId::from_hex(hex_id).map_err(|e| {
+                    StfError::InvalidResolvedInputs(format!("Invalid object ID: {}", e))
+                })?;
                 let coin_state: setu_types::coin::CoinState = bcs::from_bytes(&entry.value)
-                    .map_err(|e| StfError::InvalidResolvedInputs(format!(
-                        "Failed to deserialize CoinState {}: {}", hex_id, e
-                    )))?;
-                let env = ObjectEnvelope::from_legacy_coin_state(
-                    object_id, &coin_state,
-                ).map_err(|e| StfError::InternalError(format!(
-                    "Failed to convert CoinState {}: {}", hex_id, e
-                )))?;
-                store.set_envelope(object_id, env)
-                    .map_err(|e| StfError::InternalError(format!(
-                        "Failed to store envelope: {}", e
-                    )))?;
+                    .map_err(|e| {
+                        StfError::InvalidResolvedInputs(format!(
+                            "Failed to deserialize CoinState {}: {}",
+                            hex_id, e
+                        ))
+                    })?;
+                let env = ObjectEnvelope::from_legacy_coin_state(object_id, &coin_state).map_err(
+                    |e| {
+                        StfError::InternalError(format!(
+                            "Failed to convert CoinState {}: {}",
+                            hex_id, e
+                        ))
+                    },
+                )?;
+                store.set_envelope(object_id, env).map_err(|e| {
+                    StfError::InternalError(format!("Failed to store envelope: {}", e))
+                })?;
                 loaded_count += 1;
             } else {
                 return Err(StfError::InvalidResolvedInputs(format!(
-                    "Unknown read_set key format: {}", entry.key
+                    "Unknown read_set key format: {}",
+                    entry.key
                 )));
             }
         }
@@ -527,10 +605,14 @@ impl MockEnclave {
                 || entry.key.starts_with("linkage:latest:")
                 || entry.key.starts_with("linkage:hist:");
             if accept {
-                store.set_raw(&entry.key, entry.value.clone())
-                    .map_err(|e| StfError::InternalError(format!(
-                        "Failed to store module/linkage entry: {}", e
-                    )))?;
+                store
+                    .set_raw(&entry.key, entry.value.clone())
+                    .map_err(|e| {
+                        StfError::InternalError(format!(
+                            "Failed to store module/linkage entry: {}",
+                            e
+                        ))
+                    })?;
             }
         }
 
@@ -544,13 +626,13 @@ impl MockEnclave {
     }
 
     /// Simulate applying events to state using self.runtime (LEGACY mode)
-    /// 
+    ///
     /// WARNING: This uses the shared self.runtime which can cause race conditions
     /// in concurrent execution. For solver-tee3 mode, use simulate_execution_isolated().
-    /// 
+    ///
     /// This method is kept for backward compatibility with non-read_set executions.
     async fn simulate_execution(
-        &self, 
+        &self,
         input: &StfInput,
         _local_runtime: Option<RuntimeExecutor<InMemoryStateStore>>,
     ) -> StfResult<(StateDiff, Vec<EventId>, Vec<FailedEvent>)> {
@@ -558,23 +640,28 @@ impl MockEnclave {
         let mut diff = StateDiff::new();
         let mut processed = Vec::new();
         let mut failed = Vec::new();
-        
+
         // Legacy mode: acquire write lock once for the entire execution.
         // This eliminates the TOCTOU gap from the previous read-then-write pattern
         // and unifies the code path with simulate_execution_isolated.
         let mut runtime_guard = self.runtime.write().await;
-        
+
         for event in &input.events {
             // Check timeout
             if start.elapsed().as_millis() as u64 > self.config.max_execution_time_ms {
                 return Err(StfError::ExecutionTimeout);
             }
-            
+
             // Execute event using shared runtime (acquired write lock above)
-            let result = self.execute_single_event_with_runtime(
-                event, &input.resolved_inputs, &mut diff, &mut *runtime_guard,
-            ).await;
-            
+            let result = self
+                .execute_single_event_with_runtime(
+                    event,
+                    &input.resolved_inputs,
+                    &mut diff,
+                    &mut *runtime_guard,
+                )
+                .await;
+
             match result {
                 Ok(()) => {
                     processed.push(event.id.clone());
@@ -587,15 +674,15 @@ impl MockEnclave {
                 }
             }
         }
-        
+
         // Increment execution counter
         *self.execution_count.write().await += 1;
-        
+
         Ok((diff, processed, failed))
     }
-    
+
     /// Execute events with an isolated local runtime (solver-tee3 mode)
-    /// 
+    ///
     /// This method takes ownership of a local RuntimeExecutor, ensuring complete
     /// isolation from concurrent tasks. Each task gets its own state snapshot.
     async fn simulate_execution_isolated(
@@ -607,10 +694,12 @@ impl MockEnclave {
         let mut diff = StateDiff::new();
         let mut processed = Vec::new();
         let mut failed = Vec::new();
-        
+
         // Pre-extract Power/Flux state from read_set (JSON entries)
         // Derive sender address from the first event (all events in a task share the same sender)
-        let sender_address = input.events.first()
+        let sender_address = input
+            .events
+            .first()
             .and_then(|e| e.transfer.as_ref())
             .map(|t| t.from.clone());
         let (mut power_state, mut flux_state) = match sender_address {
@@ -618,20 +707,21 @@ impl MockEnclave {
             None => (None, None),
         };
         let resource_params = Self::extract_resource_params(&input.read_set);
-        
+
         // Process each event with the isolated local runtime
         for event in &input.events {
             // Check timeout
             if start.elapsed().as_millis() as u64 > self.config.max_execution_time_ms {
                 return Err(StfError::ExecutionTimeout);
             }
-            
+
             let consumes_power = setu_runtime::should_consume_power(&event.event_type);
-            
+
             // 1. Power decrement BEFORE business logic
             if consumes_power {
                 if let Some(ref mut power) = power_state {
-                    match setu_runtime::decrement_power(power, resource_params.power_cost_per_event) {
+                    match setu_runtime::decrement_power(power, resource_params.power_cost_per_event)
+                    {
                         Ok(sc) => diff.add_state_changes(&[sc]),
                         Err(e) => {
                             failed.push(FailedEvent {
@@ -646,25 +736,33 @@ impl MockEnclave {
                     warn!(event_id = %event.id, "PowerState not found in read_set — skipping Power check");
                 }
             }
-            
+
             // 2. Execute business logic via object-store method
-            let result = self.execute_single_event_with_object_store(
-                event, 
-                &input.resolved_inputs, 
-                &mut diff,
-                &mut local_runtime,
-                input.gas_budget.max_gas_units,
-            ).await;
-            
+            let result = self
+                .execute_single_event_with_object_store(
+                    event,
+                    &input.resolved_inputs,
+                    &mut diff,
+                    &mut local_runtime,
+                    input.gas_budget.max_gas_units,
+                )
+                .await;
+
             match result {
                 Ok(()) => {
                     // 3. Flux increment AFTER successful business logic
                     if consumes_power {
                         if let Some(ref mut flux) = flux_state {
                             if resource_params.flux_reward_on_success > 0 {
-                                match setu_runtime::increment_flux(flux, event.timestamp, resource_params.flux_reward_on_success) {
+                                match setu_runtime::increment_flux(
+                                    flux,
+                                    event.timestamp,
+                                    resource_params.flux_reward_on_success,
+                                ) {
                                     Ok(sc) => diff.add_state_changes(&[sc]),
-                                    Err(e) => warn!(event_id = %event.id, "Flux increment failed: {}", e),
+                                    Err(e) => {
+                                        warn!(event_id = %event.id, "Flux increment failed: {}", e)
+                                    }
                                 }
                             }
                         }
@@ -677,7 +775,11 @@ impl MockEnclave {
                     // 3b. Flux penalty on failure (if configured)
                     if consumes_power && resource_params.flux_penalty_on_failure > 0 {
                         if let Some(ref mut flux) = flux_state {
-                            match setu_runtime::penalize_flux(flux, event.timestamp, resource_params.flux_penalty_on_failure) {
+                            match setu_runtime::penalize_flux(
+                                flux,
+                                event.timestamp,
+                                resource_params.flux_penalty_on_failure,
+                            ) {
                                 Ok(sc) => diff.add_state_changes(&[sc]),
                                 Err(e) => warn!(event_id = %event.id, "Flux penalty failed: {}", e),
                             }
@@ -690,15 +792,15 @@ impl MockEnclave {
                 }
             }
         }
-        
+
         // Increment execution counter
         *self.execution_count.write().await += 1;
-        
+
         Ok((diff, processed, failed))
     }
-    
+
     /// Execute a single event using the provided runtime
-    /// 
+    ///
     /// Core STF (State Transition Function) execution logic used by both
     /// legacy (shared runtime via write lock) and solver-tee3 (isolated runtime) modes.
     /// The caller provides the appropriate RuntimeExecutor reference.
@@ -715,29 +817,43 @@ impl MockEnclave {
         local_runtime: &mut RuntimeExecutor<InMemoryStateStore>,
     ) -> Result<(), String> {
         debug!(event_id = %event.id, event_type = ?event.event_type, "Executing event via isolated runtime");
-        
+
         // Check if this is a transfer event
         if let Some(transfer) = &event.transfer {
-            return self.execute_transfer_with_local_runtime(
-                event, transfer, resolved_inputs, diff, local_runtime
-            ).await;
+            return self
+                .execute_transfer_with_local_runtime(
+                    event,
+                    transfer,
+                    resolved_inputs,
+                    diff,
+                    local_runtime,
+                )
+                .await;
         }
-        
+
         // Infrastructure / root events should NEVER reach TEE.
         // They are executed directly by Validator via InfraExecutor.
         // If we receive such events here, it indicates a routing bug.
         match &event.payload {
             setu_types::event::EventPayload::SubnetRegister(_) => {
                 warn!(event_id = %event.id, "SubnetRegister event incorrectly routed to TEE - should use InfraExecutor");
-                return Err("SubnetRegister is a Validator-executed event, should not reach TEE".to_string());
+                return Err(
+                    "SubnetRegister is a Validator-executed event, should not reach TEE"
+                        .to_string(),
+                );
             }
             setu_types::event::EventPayload::UserRegister(_) => {
                 warn!(event_id = %event.id, "UserRegister event incorrectly routed to TEE - should use InfraExecutor");
-                return Err("UserRegister is a Validator-executed event, should not reach TEE".to_string());
+                return Err(
+                    "UserRegister is a Validator-executed event, should not reach TEE".to_string(),
+                );
             }
             setu_types::event::EventPayload::ContractPublish { .. } => {
                 warn!(event_id = %event.id, "ContractPublish event incorrectly routed to TEE - should use InfraExecutor");
-                return Err("ContractPublish is a Validator-executed event, should not reach TEE".to_string());
+                return Err(
+                    "ContractPublish is a Validator-executed event, should not reach TEE"
+                        .to_string(),
+                );
             }
             setu_types::event::EventPayload::CoinMerge { .. } => {
                 let ctx = ExecutionContext::new(
@@ -746,23 +862,30 @@ impl MockEnclave {
                     false,
                     Self::derive_tx_hash(&event.id),
                 );
-                if let setu_types::OperationType::MergeCoins { target_index, source_indices } = &resolved_inputs.operation {
-                    let target_coin_id = resolved_inputs.input_objects[*target_index].object_id.clone();
-                    let source_coin_ids: Vec<setu_types::object::ObjectId> = source_indices.iter()
+                if let setu_types::OperationType::MergeCoins {
+                    target_index,
+                    source_indices,
+                } = &resolved_inputs.operation
+                {
+                    let target_coin_id = resolved_inputs.input_objects[*target_index]
+                        .object_id
+                        .clone();
+                    let source_coin_ids: Vec<setu_types::object::ObjectId> = source_indices
+                        .iter()
                         .map(|&i| resolved_inputs.input_objects[i].object_id.clone())
                         .collect();
-                    let owner = local_runtime.state()
+                    let owner = local_runtime
+                        .state()
                         .get_object(&target_coin_id)
                         .map_err(|e| format!("Failed to read target coin: {}", e))?
                         .ok_or_else(|| format!("Target coin {} not found", target_coin_id))?
-                        .metadata.owner.clone()
+                        .metadata
+                        .owner
+                        .clone()
                         .ok_or_else(|| "Target coin has no owner".to_string())?;
-                    let output = local_runtime.execute_merge_coins(
-                        &owner,
-                        target_coin_id,
-                        &source_coin_ids,
-                        &ctx,
-                    ).map_err(|e| format!("Runtime merge error: {}", e))?;
+                    let output = local_runtime
+                        .execute_merge_coins(&owner, target_coin_id, &source_coin_ids, &ctx)
+                        .map_err(|e| format!("Runtime merge error: {}", e))?;
                     if !output.success {
                         return Err(output.message.unwrap_or_else(|| "Merge failed".to_string()));
                     }
@@ -781,20 +904,26 @@ impl MockEnclave {
                     false,
                     Self::derive_tx_hash(&event.id),
                 );
-                if let setu_types::OperationType::SplitCoin { source_index, amounts } = &resolved_inputs.operation {
-                    let source_coin_id = resolved_inputs.input_objects[*source_index].object_id.clone();
-                    let owner = local_runtime.state()
+                if let setu_types::OperationType::SplitCoin {
+                    source_index,
+                    amounts,
+                } = &resolved_inputs.operation
+                {
+                    let source_coin_id = resolved_inputs.input_objects[*source_index]
+                        .object_id
+                        .clone();
+                    let owner = local_runtime
+                        .state()
                         .get_object(&source_coin_id)
                         .map_err(|e| format!("Failed to read source coin: {}", e))?
                         .ok_or_else(|| format!("Source coin {} not found", source_coin_id))?
-                        .metadata.owner.clone()
+                        .metadata
+                        .owner
+                        .clone()
                         .ok_or_else(|| "Source coin has no owner".to_string())?;
-                    let output = local_runtime.execute_split_coin(
-                        &owner,
-                        source_coin_id,
-                        amounts,
-                        &ctx,
-                    ).map_err(|e| format!("Runtime split error: {}", e))?;
+                    let output = local_runtime
+                        .execute_split_coin(&owner, source_coin_id, amounts, &ctx)
+                        .map_err(|e| format!("Runtime split error: {}", e))?;
                     if !output.success {
                         return Err(output.message.unwrap_or_else(|| "Split failed".to_string()));
                     }
@@ -814,52 +943,74 @@ impl MockEnclave {
                     Self::derive_tx_hash(&event.id),
                 );
                 if let setu_types::OperationType::MergeThenTransfer {
-                    target_index, source_indices, recipient, amount
-                } = &resolved_inputs.operation {
-                    let target_coin_id = resolved_inputs.input_objects[*target_index].object_id.clone();
-                    let source_coin_ids: Vec<setu_types::object::ObjectId> = source_indices.iter()
+                    target_index,
+                    source_indices,
+                    recipient,
+                    amount,
+                } = &resolved_inputs.operation
+                {
+                    let target_coin_id = resolved_inputs.input_objects[*target_index]
+                        .object_id
+                        .clone();
+                    let source_coin_ids: Vec<setu_types::object::ObjectId> = source_indices
+                        .iter()
                         .map(|&i| resolved_inputs.input_objects[i].object_id.clone())
                         .collect();
-                    let owner = local_runtime.state()
+                    let owner = local_runtime
+                        .state()
                         .get_object(&target_coin_id)
                         .map_err(|e| format!("Failed to read target coin: {}", e))?
                         .ok_or_else(|| format!("Target coin {} not found", target_coin_id))?
-                        .metadata.owner.clone()
+                        .metadata
+                        .owner
+                        .clone()
                         .ok_or_else(|| "Target coin has no owner".to_string())?;
 
                     // Step 1: Merge — accumulate sources into target (same local_runtime)
-                    let mut merge_output = local_runtime.execute_merge_coins(
-                        &owner,
-                        target_coin_id.clone(),
-                        &source_coin_ids,
-                        &ctx,
-                    ).map_err(|e| format!("Runtime merge error: {}", e))?;
+                    let mut merge_output = local_runtime
+                        .execute_merge_coins(&owner, target_coin_id.clone(), &source_coin_ids, &ctx)
+                        .map_err(|e| format!("Runtime merge error: {}", e))?;
                     if !merge_output.success {
-                        return Err(merge_output.message.unwrap_or_else(|| "Merge failed".to_string()));
+                        return Err(merge_output
+                            .message
+                            .unwrap_or_else(|| "Merge failed".to_string()));
                     }
 
                     // Step 2: Transfer from merged coin to recipient
                     // ⚠️ Uses the SAME local_runtime — Step 2 reads Step 1's writes.
                     // If Step 2 fails, the entire function returns Err and local_runtime
                     // is discarded — no partial writes are committed.
-                    let transfer_output = local_runtime.execute_transfer_with_coin(
-                        target_coin_id,
-                        &owner.to_string(),
-                        &recipient.to_string(),
-                        Some(*amount),
-                        &ctx,
-                    ).map_err(|e| format!("Runtime transfer error: {}", e))?;
+                    let transfer_output = local_runtime
+                        .execute_transfer_with_coin(
+                            target_coin_id,
+                            &owner.to_string(),
+                            &recipient.to_string(),
+                            Some(*amount),
+                            &ctx,
+                        )
+                        .map_err(|e| format!("Runtime transfer error: {}", e))?;
                     if !transfer_output.success {
-                        return Err(transfer_output.message.unwrap_or_else(|| "Transfer failed".to_string()));
+                        return Err(transfer_output
+                            .message
+                            .unwrap_or_else(|| "Transfer failed".to_string()));
                     }
 
                     // Step 3: Combine state_changes (order matters! merge before transfer)
-                    merge_output.state_changes.extend(transfer_output.state_changes);
-                    merge_output.created_objects.extend(transfer_output.created_objects);
-                    merge_output.deleted_objects.extend(transfer_output.deleted_objects);
+                    merge_output
+                        .state_changes
+                        .extend(transfer_output.state_changes);
+                    merge_output
+                        .created_objects
+                        .extend(transfer_output.created_objects);
+                    merge_output
+                        .deleted_objects
+                        .extend(transfer_output.deleted_objects);
                     diff.add_state_changes(&merge_output.state_changes);
                 } else {
-                    return Err("CoinMergeThenTransfer payload but operation is not MergeThenTransfer".to_string());
+                    return Err(
+                        "CoinMergeThenTransfer payload but operation is not MergeThenTransfer"
+                            .to_string(),
+                    );
                 }
                 let mut legacy_state = self.legacy_state.write().await;
                 self.record_event_processed(&mut legacy_state, event, diff);
@@ -867,13 +1018,13 @@ impl MockEnclave {
             }
             _ => {}
         }
-        
+
         // For non-transfer events, record in legacy state
         let mut legacy_state = self.legacy_state.write().await;
         self.record_event_processed(&mut legacy_state, event, diff);
         Ok(())
     }
-    
+
     /// Execute a single event using InMemoryObjectStore-backed runtime (isolated path).
     ///
     /// Handles all event types that the legacy method handles, plus MoveCall.
@@ -892,27 +1043,41 @@ impl MockEnclave {
         gas_budget: u64,
     ) -> Result<(), String> {
         debug!(event_id = %event.id, event_type = ?event.event_type, "Executing event via object store runtime");
-        
+
         // Transfer
         if let Some(transfer) = &event.transfer {
-            return self.execute_transfer_with_local_runtime(
-                event, transfer, resolved_inputs, diff, local_runtime
-            ).await;
+            return self
+                .execute_transfer_with_local_runtime(
+                    event,
+                    transfer,
+                    resolved_inputs,
+                    diff,
+                    local_runtime,
+                )
+                .await;
         }
 
         match &event.payload {
             // Infrastructure events — should never reach TEE
             setu_types::event::EventPayload::SubnetRegister(_) => {
                 warn!(event_id = %event.id, "SubnetRegister event incorrectly routed to TEE");
-                return Err("SubnetRegister is a Validator-executed event, should not reach TEE".to_string());
+                return Err(
+                    "SubnetRegister is a Validator-executed event, should not reach TEE"
+                        .to_string(),
+                );
             }
             setu_types::event::EventPayload::UserRegister(_) => {
                 warn!(event_id = %event.id, "UserRegister event incorrectly routed to TEE");
-                return Err("UserRegister is a Validator-executed event, should not reach TEE".to_string());
+                return Err(
+                    "UserRegister is a Validator-executed event, should not reach TEE".to_string(),
+                );
             }
             setu_types::event::EventPayload::ContractPublish { .. } => {
                 warn!(event_id = %event.id, "ContractPublish event incorrectly routed to TEE");
-                return Err("ContractPublish is a Validator-executed event, should not reach TEE".to_string());
+                return Err(
+                    "ContractPublish is a Validator-executed event, should not reach TEE"
+                        .to_string(),
+                );
             }
             setu_types::event::EventPayload::MovePublish(_) => {
                 warn!(event_id = %event.id, "MovePublish event incorrectly routed to TEE");
@@ -931,20 +1096,27 @@ impl MockEnclave {
                     false,
                     Self::derive_tx_hash(&event.id),
                 );
-                if let setu_types::OperationType::MergeCoins { target_index, source_indices } = &resolved_inputs.operation {
+                if let setu_types::OperationType::MergeCoins {
+                    target_index,
+                    source_indices,
+                } = &resolved_inputs.operation
+                {
                     let target_coin_id = resolved_inputs.input_objects[*target_index].object_id;
-                    let source_coin_ids: Vec<ObjectId> = source_indices.iter()
+                    let source_coin_ids: Vec<ObjectId> = source_indices
+                        .iter()
                         .map(|&i| resolved_inputs.input_objects[i].object_id)
                         .collect();
-                    let owner = local_runtime.state()
+                    let owner = local_runtime
+                        .state()
                         .get_object(&target_coin_id)
                         .map_err(|e| format!("Failed to read target coin: {}", e))?
                         .ok_or_else(|| format!("Target coin {} not found", target_coin_id))?
-                        .metadata.owner
+                        .metadata
+                        .owner
                         .ok_or_else(|| "Target coin has no owner".to_string())?;
-                    let output = local_runtime.execute_merge_coins(
-                        &owner, target_coin_id, &source_coin_ids, &ctx,
-                    ).map_err(|e| format!("Runtime merge error: {}", e))?;
+                    let output = local_runtime
+                        .execute_merge_coins(&owner, target_coin_id, &source_coin_ids, &ctx)
+                        .map_err(|e| format!("Runtime merge error: {}", e))?;
                     if !output.success {
                         return Err(output.message.unwrap_or_else(|| "Merge failed".to_string()));
                     }
@@ -965,17 +1137,23 @@ impl MockEnclave {
                     false,
                     Self::derive_tx_hash(&event.id),
                 );
-                if let setu_types::OperationType::SplitCoin { source_index, amounts } = &resolved_inputs.operation {
+                if let setu_types::OperationType::SplitCoin {
+                    source_index,
+                    amounts,
+                } = &resolved_inputs.operation
+                {
                     let source_coin_id = resolved_inputs.input_objects[*source_index].object_id;
-                    let owner = local_runtime.state()
+                    let owner = local_runtime
+                        .state()
                         .get_object(&source_coin_id)
                         .map_err(|e| format!("Failed to read source coin: {}", e))?
                         .ok_or_else(|| format!("Source coin {} not found", source_coin_id))?
-                        .metadata.owner
+                        .metadata
+                        .owner
                         .ok_or_else(|| "Source coin has no owner".to_string())?;
-                    let output = local_runtime.execute_split_coin(
-                        &owner, source_coin_id, amounts, &ctx,
-                    ).map_err(|e| format!("Runtime split error: {}", e))?;
+                    let output = local_runtime
+                        .execute_split_coin(&owner, source_coin_id, amounts, &ctx)
+                        .map_err(|e| format!("Runtime split error: {}", e))?;
                     if !output.success {
                         return Err(output.message.unwrap_or_else(|| "Split failed".to_string()));
                     }
@@ -997,43 +1175,65 @@ impl MockEnclave {
                     Self::derive_tx_hash(&event.id),
                 );
                 if let setu_types::OperationType::MergeThenTransfer {
-                    target_index, source_indices, recipient, amount
-                } = &resolved_inputs.operation {
+                    target_index,
+                    source_indices,
+                    recipient,
+                    amount,
+                } = &resolved_inputs.operation
+                {
                     let target_coin_id = resolved_inputs.input_objects[*target_index].object_id;
-                    let source_coin_ids: Vec<ObjectId> = source_indices.iter()
+                    let source_coin_ids: Vec<ObjectId> = source_indices
+                        .iter()
                         .map(|&i| resolved_inputs.input_objects[i].object_id)
                         .collect();
-                    let owner = local_runtime.state()
+                    let owner = local_runtime
+                        .state()
                         .get_object(&target_coin_id)
                         .map_err(|e| format!("Failed to read target coin: {}", e))?
                         .ok_or_else(|| format!("Target coin {} not found", target_coin_id))?
-                        .metadata.owner
+                        .metadata
+                        .owner
                         .ok_or_else(|| "Target coin has no owner".to_string())?;
 
-                    let mut merge_output = local_runtime.execute_merge_coins(
-                        &owner, target_coin_id, &source_coin_ids, &ctx,
-                    ).map_err(|e| format!("Runtime merge error: {}", e))?;
+                    let mut merge_output = local_runtime
+                        .execute_merge_coins(&owner, target_coin_id, &source_coin_ids, &ctx)
+                        .map_err(|e| format!("Runtime merge error: {}", e))?;
                     if !merge_output.success {
-                        return Err(merge_output.message.unwrap_or_else(|| "Merge failed".to_string()));
+                        return Err(merge_output
+                            .message
+                            .unwrap_or_else(|| "Merge failed".to_string()));
                     }
 
-                    let transfer_output = local_runtime.execute_transfer_with_coin(
-                        target_coin_id,
-                        &owner.to_string(),
-                        &recipient.to_string(),
-                        Some(*amount),
-                        &ctx,
-                    ).map_err(|e| format!("Runtime transfer error: {}", e))?;
+                    let transfer_output = local_runtime
+                        .execute_transfer_with_coin(
+                            target_coin_id,
+                            &owner.to_string(),
+                            &recipient.to_string(),
+                            Some(*amount),
+                            &ctx,
+                        )
+                        .map_err(|e| format!("Runtime transfer error: {}", e))?;
                     if !transfer_output.success {
-                        return Err(transfer_output.message.unwrap_or_else(|| "Transfer failed".to_string()));
+                        return Err(transfer_output
+                            .message
+                            .unwrap_or_else(|| "Transfer failed".to_string()));
                     }
 
-                    merge_output.state_changes.extend(transfer_output.state_changes);
-                    merge_output.created_objects.extend(transfer_output.created_objects);
-                    merge_output.deleted_objects.extend(transfer_output.deleted_objects);
+                    merge_output
+                        .state_changes
+                        .extend(transfer_output.state_changes);
+                    merge_output
+                        .created_objects
+                        .extend(transfer_output.created_objects);
+                    merge_output
+                        .deleted_objects
+                        .extend(transfer_output.deleted_objects);
                     diff.add_state_changes(&merge_output.state_changes);
                 } else {
-                    return Err("CoinMergeThenTransfer payload but operation is not MergeThenTransfer".to_string());
+                    return Err(
+                        "CoinMergeThenTransfer payload but operation is not MergeThenTransfer"
+                            .to_string(),
+                    );
                 }
                 let mut legacy_state = self.legacy_state.write().await;
                 self.record_event_processed(&mut legacy_state, event, diff);
@@ -1043,7 +1243,9 @@ impl MockEnclave {
             // MoveCall — only when move-vm feature is enabled
             #[cfg(feature = "move-vm")]
             setu_types::event::EventPayload::MoveCall(payload) => {
-                let engine = self.move_engine.as_ref()
+                let engine = self
+                    .move_engine
+                    .as_ref()
                     .ok_or("Move VM not enabled".to_string())?;
 
                 // 0. Parse sender address (for ownership checks)
@@ -1128,13 +1330,18 @@ impl MockEnclave {
                 // 2. Parse ModuleId + function name
                 let addr = AccountAddress::from_hex_literal(&payload.package)
                     .map_err(|e| format!("Invalid package address: {}", e))?;
-                let module_id = ModuleId::new(addr, Identifier::new(payload.module.as_str())
-                    .map_err(|e| format!("Invalid module name: {}", e))?);
+                let module_id = ModuleId::new(
+                    addr,
+                    Identifier::new(payload.module.as_str())
+                        .map_err(|e| format!("Invalid module name: {}", e))?,
+                );
                 let func_name = IdentStr::new(payload.function.as_str())
                     .map_err(|e| format!("Invalid function name: {}", e))?;
 
                 // 3. Parse type_args
-                let type_args: Vec<TypeTag> = payload.type_args.iter()
+                let type_args: Vec<TypeTag> = payload
+                    .type_args
+                    .iter()
                     .map(|s| TypeTag::from_str(s))
                     .collect::<Result<_, _>>()
                     .map_err(|e| format!("Invalid type arg: {}", e))?;
@@ -1172,17 +1379,19 @@ impl MockEnclave {
                 );
 
                 // 6. Execute
-                let output = engine.execute(
-                    local_runtime.state(),
-                    input_objects,
-                    resolved_inputs.dynamic_fields.clone(),
-                    &module_id,
-                    func_name,
-                    type_args,
-                    combined_args,
-                    &move_ctx,
-                    &mutable_arg_map,
-                ).map_err(|e| format!("Move VM error: {}", e))?;
+                let output = engine
+                    .execute(
+                        local_runtime.state(),
+                        input_objects,
+                        resolved_inputs.dynamic_fields.clone(),
+                        &module_id,
+                        func_name,
+                        type_args,
+                        combined_args,
+                        &move_ctx,
+                        &mutable_arg_map,
+                    )
+                    .map_err(|e| format!("Move VM error: {}", e))?;
 
                 if !output.success {
                     return Err(output.error.unwrap_or("MoveCall failed".into()));
@@ -1236,7 +1445,9 @@ impl MockEnclave {
             // hard-rejected at TaskPreparer and re-rejected here).
             #[cfg(feature = "move-vm")]
             setu_types::event::EventPayload::MovePtb(payload) => {
-                let engine = self.move_engine.as_ref()
+                let engine = self
+                    .move_engine
+                    .as_ref()
                     .ok_or("Move VM not enabled".to_string())?;
 
                 let sender_addr = Address::from_hex(&payload.sender)
@@ -1250,8 +1461,12 @@ impl MockEnclave {
                     .input_objects
                     .iter()
                     .map(|ro| {
-                        let env = local_runtime.state().get_envelope(&ro.object_id)
-                            .map_err(|e| format!("Failed to get envelope for {}: {}", ro.object_id, e))?
+                        let env = local_runtime
+                            .state()
+                            .get_envelope(&ro.object_id)
+                            .map_err(|e| {
+                                format!("Failed to get envelope for {}: {}", ro.object_id, e)
+                            })?
                             .ok_or_else(|| format!("Object {} not found in store", ro.object_id))?;
 
                         match env.metadata.ownership {
@@ -1282,8 +1497,9 @@ impl MockEnclave {
                             }
                         }
 
-                        InputObject::from_envelope(&ro.object_id, &env)
-                            .map_err(|e| format!("Failed to convert object {}: {}", ro.object_id, e))
+                        InputObject::from_envelope(&ro.object_id, &env).map_err(|e| {
+                            format!("Failed to convert object {}: {}", ro.object_id, e)
+                        })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
 
@@ -1305,13 +1521,15 @@ impl MockEnclave {
                     epoch_timestamp_ms: event.timestamp,
                 };
 
-                let output = engine.execute_ptb(
-                    local_runtime.state(),
-                    &payload.ptb,
-                    input_objects,
-                    resolved_inputs.dynamic_fields.clone(),
-                    &move_ctx,
-                ).map_err(|e| format!("PTB Move VM error: {}", e))?;
+                let output = engine
+                    .execute_ptb(
+                        local_runtime.state(),
+                        &payload.ptb,
+                        input_objects,
+                        resolved_inputs.dynamic_fields.clone(),
+                        &move_ctx,
+                    )
+                    .map_err(|e| format!("PTB Move VM error: {}", e))?;
 
                 if !output.success {
                     return Err(output.error.unwrap_or("PTB execution failed".into()));
@@ -1365,7 +1583,7 @@ impl MockEnclave {
     }
 
     /// Execute a transfer event using the provided runtime
-    /// 
+    ///
     /// Uses resolved_inputs.primary_coin() to get the coin_id that Validator
     /// has already selected. This follows the solver-tee3 design where
     /// Validator prepares everything - if coin_id is missing, it's an error.
@@ -1386,11 +1604,12 @@ impl MockEnclave {
             false, // Mock enclave
             Self::derive_tx_hash(&event.id),
         );
-        
+
         // solver-tee3: resolved_inputs MUST have primary_coin
-        let resolved_coin = resolved_inputs.primary_coin()
-            .ok_or_else(|| "Missing resolved_inputs.primary_coin - TaskPreparer error".to_string())?;
-        
+        let resolved_coin = resolved_inputs.primary_coin().ok_or_else(|| {
+            "Missing resolved_inputs.primary_coin - TaskPreparer error".to_string()
+        })?;
+
         debug!(
             event_id = %event.id,
             coin_id = %resolved_coin.object_id,
@@ -1399,27 +1618,31 @@ impl MockEnclave {
             amount = transfer.amount,
             "Executing transfer with isolated runtime (solver-tee3)"
         );
-        
+
         // Use the LOCAL runtime (not self.runtime!)
-        let output = local_runtime.execute_transfer_with_coin(
-            resolved_coin.object_id.clone(),
-            &transfer.from,
-            &transfer.to,
-            Some(transfer.amount),
-            &ctx,
-        ).map_err(|e| format!("Runtime error: {}", e))?;
-        
+        let output = local_runtime
+            .execute_transfer_with_coin(
+                resolved_coin.object_id.clone(),
+                &transfer.from,
+                &transfer.to,
+                Some(transfer.amount),
+                &ctx,
+            )
+            .map_err(|e| format!("Runtime error: {}", e))?;
+
         if !output.success {
-            return Err(output.message.unwrap_or_else(|| "Transfer failed".to_string()));
+            return Err(output
+                .message
+                .unwrap_or_else(|| "Transfer failed".to_string()));
         }
-        
+
         // Convert setu-runtime StateChanges to enclave StateDiff
         diff.add_state_changes(&output.state_changes);
-        
+
         // Record event as processed
         let mut legacy_state = self.legacy_state.write().await;
         self.record_event_processed(&mut legacy_state, event, diff);
-        
+
         info!(
             event_id = %event.id,
             from = %transfer.from,
@@ -1428,15 +1651,15 @@ impl MockEnclave {
             state_changes = output.state_changes.len(),
             "Transfer executed successfully via isolated runtime"
         );
-        
+
         Ok(())
     }
-    
+
     // NOTE: Subnet & User Registration handlers have been removed.
     // These are infrastructure events that should NEVER reach TEE.
     // They are executed directly by Validator via InfraExecutor.
     // See: setu_validator::InfraExecutor
-    
+
     /// Derive a deterministic tx_hash from an event ID.
     fn derive_tx_hash(event_id: &str) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
@@ -1444,7 +1667,7 @@ impl MockEnclave {
         hasher.update(event_id.as_bytes());
         *hasher.finalize().as_bytes()
     }
-    
+
     /// Record that an event was processed (for non-transfer events)
     fn record_event_processed(
         &self,
@@ -1455,42 +1678,45 @@ impl MockEnclave {
         let key = format!("event:{}", event.id);
         let old_value = state.get(&key).cloned();
         let new_value = format!("processed:{}", event.id).into_bytes();
-        
+
         state.insert(key.clone(), new_value.clone());
-        
+
         let mut write_entry = WriteSetEntry::new(key, new_value);
         if let Some(old) = old_value {
             write_entry = write_entry.with_old_value(old);
         }
         diff.add_write(write_entry);
     }
-    
+
     /// Compute post-state root from state
     ///
     /// WARNING: This uses a simple hash over sorted key-value pairs, which does NOT match
     /// the real SMT state root computation. This mock should be replaced
     /// with an actual SMT instance for accurate testing.
-    #[deprecated(since = "0.3.0", note = "Mock state root uses simple hash, not SMT. Replace with real SMT for accurate testing.")]
+    #[deprecated(
+        since = "0.3.0",
+        note = "Mock state root uses simple hash, not SMT. Replace with real SMT for accurate testing."
+    )]
     fn compute_state_root(state: &HashMap<String, Vec<u8>>) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"SETU_MOCK_STATE:");
-        
+
         // Sort keys for determinism
         let mut keys: Vec<_> = state.keys().collect();
         keys.sort();
-        
+
         for key in keys {
             if let Some(value) = state.get(key) {
                 hasher.update(key.as_bytes());
                 hasher.update(value);
             }
         }
-        
+
         *hasher.finalize().as_bytes()
     }
-    
+
     /// Compute hash of output for attestation user_data
-    /// 
+    ///
     /// Reserved for future use: binding attestation to output commitment
     #[allow(dead_code)]
     fn compute_output_hash(
@@ -1513,15 +1739,15 @@ impl MockEnclave {
 impl EnclaveRuntime for MockEnclave {
     async fn execute_stf(&self, input: StfInput) -> StfResult<StfOutput> {
         let start = std::time::Instant::now();
-        
+
         // TODO (solver-tee3): Verify read_set Merkle proofs against pre_state_root
         // For now, skip verification in mock mode
         // self.verify_read_set(&input.read_set, &input.pre_state_root)?;
-        
+
         // ========== solver-tee3: Build ISOLATED state from read_set ==========
         // CRITICAL FIX: Each task gets its own local RuntimeExecutor.
         // This prevents concurrent tasks from overwriting each other's state.
-        // 
+        //
         // Previous bug: We replaced self.runtime with a new temp_store, causing
         // race conditions where concurrent tasks would see each other's (or empty) state.
         let use_read_set_state = !input.read_set.is_empty() || !input.module_read_set.is_empty();
@@ -1538,38 +1764,38 @@ impl EnclaveRuntime for MockEnclave {
             .iter()
             .any(|e| matches!(e.payload, setu_types::event::EventPayload::MovePtb(_)));
         let use_read_set_state = use_read_set_state || has_move_ptb;
-        
+
         let (diff, events_processed, events_failed) = if use_read_set_state {
             // Build temporary state from read_set into a LOCAL ObjectStore
-            let local_store = self.build_object_store_from_read_set(
-                &input.read_set,
-                &input.module_read_set,
-            )?;
+            let local_store =
+                self.build_object_store_from_read_set(&input.read_set, &input.module_read_set)?;
             let local_runtime = RuntimeExecutor::new(local_store);
-            
+
             info!(
                 read_set_entries = input.read_set.len(),
                 module_entries = input.module_read_set.len(),
                 "Using isolated read_set state for execution (solver-tee3 mode)"
             );
-            
+
             // Execute using the ISOLATED local runtime (not self.runtime!)
-            self.simulate_execution_isolated(&input, local_runtime).await?
+            self.simulate_execution_isolated(&input, local_runtime)
+                .await?
         } else {
             // Legacy mode: use shared self.runtime (only for backward compatibility)
             self.simulate_execution(&input, None).await?
         };
-        
+
         // Compute post-state root from legacy state
         // Note: For full object model, should compute from RuntimeExecutor state
+        #[allow(deprecated)]
         let post_state_root = {
             let state = self.legacy_state.read().await;
             Self::compute_state_root(&state)
         };
-        
+
         // Compute input hash for attestation binding
         let input_hash = input.input_hash();
-        
+
         // Create AttestationData binding task_id, input_hash, and state roots
         let attestation_data = AttestationData::new(
             input.task_id,
@@ -1577,14 +1803,14 @@ impl EnclaveRuntime for MockEnclave {
             input.pre_state_root,
             post_state_root,
         );
-        
+
         // Generate mock attestation with proper data binding
         let attestation = Attestation::mock_with_data(attestation_data)
             .with_solver_id(self.config.solver_id.clone());
-        
+
         let execution_time = start.elapsed();
         let writes_count = diff.writes.len() as u64;
-        
+
         // B6c follow-up fix: gas_used must be **deterministic** across
         // solvers (design §4.3, G1). The previous formula folded in
         // `execution_time.as_micros() / 10`, making `gas_used` depend on
@@ -1598,7 +1824,7 @@ impl EnclaveRuntime for MockEnclave {
         // is tracked in docs/bugs/20260506-mock-gas-used-not-plumbed.md).
         let gas_used = writes_count * 100 + input.read_set.len() as u64 * 10;
         let gas_usage = GasUsage::new(gas_used, Some(1)); // mock gas_price = 1
-        
+
         Ok(StfOutput {
             task_id: input.task_id,
             subnet_id: input.subnet_id,
@@ -1616,16 +1842,16 @@ impl EnclaveRuntime for MockEnclave {
             },
         })
     }
-    
+
     async fn generate_attestation(&self, user_data: [u8; 32]) -> StfResult<Attestation> {
         Ok(Attestation::mock(user_data).with_solver_id(self.config.solver_id.clone()))
     }
-    
+
     async fn verify_attestation(&self, attestation: &Attestation) -> StfResult<bool> {
         // Mock verification: accept all mock attestations
         Ok(attestation.is_mock())
     }
-    
+
     fn info(&self) -> EnclaveInfo {
         EnclaveInfo {
             enclave_id: self.config.enclave_id.clone(),
@@ -1635,11 +1861,11 @@ impl EnclaveRuntime for MockEnclave {
             is_simulated: true,
         }
     }
-    
+
     fn measurement(&self) -> [u8; 32] {
         MOCK_MEASUREMENT
     }
-    
+
     fn is_simulated(&self) -> bool {
         true
     }
@@ -1664,27 +1890,27 @@ impl MockEnclaveBuilder {
             initial_state: HashMap::new(),
         }
     }
-    
+
     pub fn max_execution_time(mut self, ms: u64) -> Self {
         self.max_execution_time_ms = ms;
         self
     }
-    
+
     pub fn max_memory(mut self, bytes: u64) -> Self {
         self.max_memory_bytes = bytes;
         self
     }
-    
+
     pub fn debug_logging(mut self, enabled: bool) -> Self {
         self.debug_logging = enabled;
         self
     }
-    
+
     pub fn with_initial_state(mut self, key: String, value: Vec<u8>) -> Self {
         self.initial_state.insert(key, value);
         self
     }
-    
+
     pub fn build(self) -> MockEnclave {
         let config = EnclaveConfig {
             enclave_id: format!("mock-{}", uuid::Uuid::new_v4()),
@@ -1693,10 +1919,10 @@ impl MockEnclaveBuilder {
             max_memory_bytes: self.max_memory_bytes,
             enable_debug_logging: self.debug_logging,
         };
-        
+
         let store = InMemoryStateStore::new();
         let runtime = RuntimeExecutor::new(store);
-        
+
         let enclave = MockEnclave {
             config,
             runtime: Arc::new(RwLock::new(runtime)),
@@ -1707,7 +1933,7 @@ impl MockEnclaveBuilder {
                 .ok()
                 .map(Arc::new),
         };
-        
+
         enclave
     }
 }
@@ -1715,8 +1941,21 @@ impl MockEnclaveBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_types::{Event, SubnetId, EventType, VLCSnapshot};
-    
+    use setu_types::{Event, EventType, SubnetId, VLCSnapshot};
+
+    #[cfg(feature = "move-vm")]
+    fn module_id(
+        byte: u8,
+        name: &str,
+    ) -> setu_move_vm::move_core_types::language_storage::ModuleId {
+        let mut addr = [0u8; 32];
+        addr[31] = byte;
+        setu_move_vm::move_core_types::language_storage::ModuleId::new(
+            setu_move_vm::move_core_types::account_address::AccountAddress::new(addr),
+            setu_move_vm::move_core_types::identifier::Identifier::new(name).unwrap(),
+        )
+    }
+
     fn create_test_event(id: &str) -> Event {
         Event::new(
             EventType::Transfer,
@@ -1725,62 +1964,162 @@ mod tests {
             format!("creator_{}", id),
         )
     }
-    
+
     #[tokio::test]
     async fn test_mock_enclave_creation() {
         let enclave = MockEnclave::default_with_solver_id("solver1".to_string());
         let info = enclave.info();
-        
+
         assert_eq!(info.platform, EnclavePlatform::Mock);
         assert!(info.is_simulated);
     }
-    
+
     #[tokio::test]
     async fn test_mock_enclave_stf_execution() {
-        use crate::solver_task::{ResolvedInputs, GasBudget};
-        
+        use crate::solver_task::{GasBudget, ResolvedInputs};
+
         let enclave = MockEnclave::default_with_solver_id("solver1".to_string());
-        
+
         let task_id = [1u8; 32];
         let resolved_inputs = ResolvedInputs::new();
         let gas_budget = GasBudget::default();
-        
+
         let input = StfInput::new(
             task_id,
             SubnetId::ROOT,
             [0u8; 32],
             resolved_inputs,
             gas_budget,
-        ).with_events(vec![create_test_event("evt1")]);
-        
+        )
+        .with_events(vec![create_test_event("evt1")]);
+
         let output = enclave.execute_stf(input).await.unwrap();
-        
+
         assert_eq!(output.subnet_id, SubnetId::ROOT);
         assert_eq!(output.task_id, task_id);
         assert_eq!(output.events_processed.len(), 1);
         assert!(output.events_failed.is_empty());
         assert!(output.attestation.is_mock());
     }
-    
+
     #[tokio::test]
     async fn test_mock_enclave_generates_attestation() {
         let enclave = MockEnclave::default_with_solver_id("solver1".to_string());
-        
+
         let user_data = [42u8; 32];
         let attestation = enclave.generate_attestation(user_data).await.unwrap();
-        
+
         assert!(attestation.is_mock());
         assert_eq!(attestation.user_data, user_data);
     }
-    
+
     #[tokio::test]
     async fn test_mock_enclave_builder() {
         let enclave = MockEnclaveBuilder::new("test_solver")
             .max_execution_time(5000)
             .debug_logging(true)
             .build();
-        
+
         assert!(enclave.is_simulated());
         assert_eq!(enclave.measurement(), MOCK_MEASUREMENT);
+    }
+
+    #[cfg(feature = "move-vm")]
+    #[test]
+    fn module_changes_coalesce_publish_linkage_per_package() {
+        let family_id = ObjectId::new([7u8; 32]);
+        let package_addr = Address::new([8u8; 32]);
+        let module_changes = vec![
+            setu_move_vm::engine::ModuleChange::PublishWithLinkage {
+                module_id: module_id(8, "a"),
+                bytecode: vec![1],
+                family_id,
+                package_addr,
+                version: 1,
+            },
+            setu_move_vm::engine::ModuleChange::PublishWithLinkage {
+                module_id: module_id(8, "b"),
+                bytecode: vec![2],
+                family_id,
+                package_addr,
+                version: 1,
+            },
+        ];
+
+        let mut diff = StateDiff::new();
+        apply_module_changes_to_diff(&mut diff, &module_changes);
+
+        assert_eq!(
+            diff.writes
+                .iter()
+                .filter(|w| w.key.starts_with("mod:"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            diff.writes
+                .iter()
+                .filter(|w| w.key.starts_with("linkage:latest:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            diff.writes
+                .iter()
+                .filter(|w| w.key.starts_with("linkage:hist:"))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(feature = "move-vm")]
+    #[test]
+    fn module_changes_coalesce_upgrade_linkage_with_old_value() {
+        let family_id = ObjectId::new([9u8; 32]);
+        let prev_package = ObjectId::new([8u8; 32]);
+        let new_package_addr = Address::new([10u8; 32]);
+        let module_changes = vec![
+            setu_move_vm::engine::ModuleChange::Upgrade {
+                module_id: module_id(10, "a"),
+                bytecode: vec![1],
+                family_id,
+                prev_package,
+                new_package_addr,
+                new_version: 2,
+            },
+            setu_move_vm::engine::ModuleChange::Upgrade {
+                module_id: module_id(10, "b"),
+                bytecode: vec![2],
+                family_id,
+                prev_package,
+                new_package_addr,
+                new_version: 2,
+            },
+        ];
+
+        let mut diff = StateDiff::new();
+        apply_module_changes_to_diff(&mut diff, &module_changes);
+
+        let latest_writes: Vec<_> = diff
+            .writes
+            .iter()
+            .filter(|w| w.key.starts_with("linkage:latest:"))
+            .collect();
+        assert_eq!(latest_writes.len(), 1);
+        assert!(latest_writes[0].old_value.is_some());
+        assert_eq!(
+            diff.writes
+                .iter()
+                .filter(|w| w.key.starts_with("mod:"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            diff.writes
+                .iter()
+                .filter(|w| w.key.starts_with("linkage:hist:"))
+                .count(),
+            1
+        );
     }
 }

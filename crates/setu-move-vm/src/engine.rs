@@ -12,23 +12,27 @@ use move_core_types::{
     identifier::{IdentStr, Identifier},
     language_storage::{ModuleId, TypeTag},
 };
-use move_vm_runtime::{
-    move_vm::MoveVM,
-    native_extensions::NativeContextExtensions,
-};
+use move_vm_runtime::{move_vm::MoveVM, native_extensions::NativeContextExtensions};
 
 use setu_runtime::{error::RuntimeError, state::RawStore};
 use setu_types::dynamic_field::DfFieldValue;
-use setu_types::object::{Address, ObjectId, Ownership};
 use setu_types::envelope::ObjectEnvelope;
+use setu_types::object::{Address, ObjectId, Ownership};
 
 use crate::address_compat::move_addr_to_setu;
 use crate::gas::InstructionCountGasMeter;
 use crate::natives::setu_native_functions;
-use crate::object_runtime::{
-    InputObject, ObjectRuntimeResults, SetuObjectRuntime,
-};
+use crate::object_runtime::{InputObject, ObjectRuntimeResults, SetuObjectRuntime};
 use crate::resolver::SetuModuleResolver;
+
+fn is_forbidden_package_engine_hook(module_id: &ModuleId, func_ident: &IdentStr) -> bool {
+    module_id.address() == &crate::ptb_executor::SETU_FRAMEWORK_ADDR
+        && module_id.name().as_str() == crate::ptb_executor::PACKAGE_MODULE
+        && matches!(
+            func_ident.as_str(),
+            "make_upgrade_cap" | "consume_ticket" | "make_receipt"
+        )
+}
 
 // Embed build-time generated stdlib bytecodes constant.
 // When .mv files exist in setu-framework/compiled/, STDLIB_MODULES is populated.
@@ -197,8 +201,7 @@ impl SetuMoveEngine {
     /// Create engine with no stdlib (Phase 1).
     pub fn new() -> Result<Self, RuntimeError> {
         let natives = setu_native_functions();
-        let vm = MoveVM::new(natives)
-            .map_err(|e| RuntimeError::VMInitError(e.to_string()))?;
+        let vm = MoveVM::new(natives).map_err(|e| RuntimeError::VMInitError(e.to_string()))?;
 
         Ok(Self {
             vm,
@@ -212,8 +215,7 @@ impl SetuMoveEngine {
         stdlib_modules: HashMap<ModuleId, Vec<u8>>,
     ) -> Result<Self, RuntimeError> {
         let natives = setu_native_functions();
-        let vm = MoveVM::new(natives)
-            .map_err(|e| RuntimeError::VMInitError(e.to_string()))?;
+        let vm = MoveVM::new(natives).map_err(|e| RuntimeError::VMInitError(e.to_string()))?;
 
         Ok(Self {
             vm,
@@ -235,23 +237,22 @@ impl SetuMoveEngine {
         let mut stdlib = HashMap::new();
 
         for &(name, bytes) in STDLIB_MODULES {
-            let compiled_module =
-                move_binary_format::CompiledModule::deserialize_with_defaults(bytes)
-                    .map_err(|e| {
-                        RuntimeError::VMInitError(format!(
-                            "Failed to deserialize stdlib module '{}': {}",
-                            name, e
-                        ))
-                    })?;
+            let compiled_module = move_binary_format::CompiledModule::deserialize_with_defaults(
+                bytes,
+            )
+            .map_err(|e| {
+                RuntimeError::VMInitError(format!(
+                    "Failed to deserialize stdlib module '{}': {}",
+                    name, e
+                ))
+            })?;
 
-            move_bytecode_verifier::verify_module_unmetered(&compiled_module).map_err(
-                |e| {
-                    RuntimeError::VMInitError(format!(
-                        "Stdlib module '{}' failed verification: {}",
-                        name, e
-                    ))
-                },
-            )?;
+            move_bytecode_verifier::verify_module_unmetered(&compiled_module).map_err(|e| {
+                RuntimeError::VMInitError(format!(
+                    "Stdlib module '{}' failed verification: {}",
+                    name, e
+                ))
+            })?;
 
             let module_id = compiled_module.self_id();
             stdlib.insert(module_id, bytes.to_vec());
@@ -330,19 +331,26 @@ impl SetuMoveEngine {
 
         // 7. Execute (6 args: module, func, ty_args, args, gas_meter, tracer)
         let exec_result = session.execute_function_bypass_visibility(
-            module_id, function, ty_args, final_args, &mut gas_meter, None,
+            module_id,
+            function,
+            ty_args,
+            final_args,
+            &mut gas_meter,
+            None,
         );
 
         match exec_result {
             Ok(return_values) => {
                 // 8. Finish session — v3.8 R8-1: two-step destructure
                 let (finish_result, _resolver_back) = session.finish_with_extensions();
-                let (_change_set, mut native_ext) = finish_result
-                    .map_err(|e| RuntimeError::VMExecutionError(e.to_string()))?;
+                let (_change_set, mut native_ext) =
+                    finish_result.map_err(|e| RuntimeError::VMExecutionError(e.to_string()))?;
 
                 // 9. Extract object runtime
-                let mut obj_runtime: SetuObjectRuntime = native_ext.remove::<SetuObjectRuntime>()
-                    .map_err(|e| RuntimeError::VMExecutionError(e.to_string()))?;
+                let mut obj_runtime: SetuObjectRuntime =
+                    native_ext
+                        .remove::<SetuObjectRuntime>()
+                        .map_err(|e| RuntimeError::VMExecutionError(e.to_string()))?;
 
                 // 9.5. Process mutable_reference_outputs — capture &mut arg mutations
                 // The Move VM serializes mutated &mut arguments back in
@@ -350,8 +358,8 @@ impl SetuMoveEngine {
                 // Each entry: (LocalIndex = arg position, bcs_bytes, layout).
                 for (local_idx, bcs_bytes, _layout) in &return_values.mutable_reference_outputs {
                     let arg_idx = *local_idx as usize;
-                    if let Some(&(_, object_id)) = mutable_arg_map.iter()
-                        .find(|(pos, _)| *pos == arg_idx)
+                    if let Some(&(_, object_id)) =
+                        mutable_arg_map.iter().find(|(pos, _)| *pos == arg_idx)
                     {
                         // Look up the original input object to get its StructTag
                         if let Some(input_obj) = obj_runtime.get_input_object(&object_id) {
@@ -373,10 +381,8 @@ impl SetuMoveEngine {
                 let module_changes = self.extract_module_changes(&_change_set)?;
 
                 // 11. Convert object results → state changes
-                let state_changes = self.convert_results_to_state_changes(
-                    &obj_results,
-                    ctx.current_version,
-                )?;
+                let state_changes =
+                    self.convert_results_to_state_changes(&obj_results, ctx.current_version)?;
 
                 // 12. Serialize return values
                 let ret = return_values
@@ -385,7 +391,8 @@ impl SetuMoveEngine {
                     .map(|(bytes, _layout)| bytes.clone())
                     .collect();
 
-                let events = obj_results.emitted_events
+                let events = obj_results
+                    .emitted_events
                     .iter()
                     .map(|(tag, bytes)| (tag.to_string(), bytes.clone()))
                     .collect();
@@ -536,9 +543,7 @@ impl SetuMoveEngine {
                 }
             }
 
-            let owner = input
-                .map(|i| i.owner)
-                .unwrap_or(Address::ZERO);
+            let owner = input.map(|i| i.owner).unwrap_or(Address::ZERO);
             // R4-ISSUE-2: preserve the original ownership enum.
             // InputObject carries `ownership` so &mut mutations of Shared /
             // Immutable / ObjectOwner inputs persist back with the correct
@@ -569,9 +574,7 @@ impl SetuMoveEngine {
         // Frozen objects
         for (id, effect) in &results.frozen {
             let input = results.input_objects.get(id);
-            let owner = input
-                .map(|i| i.owner)
-                .unwrap_or(Address::ZERO);
+            let owner = input.map(|i| i.owner).unwrap_or(Address::ZERO);
 
             let new_version = next_version_for(id);
             let envelope = ObjectEnvelope::from_move_result(
@@ -824,9 +827,7 @@ impl SetuMoveEngine {
         // submission-side `move_handler` rejects earlier). Out-of-bounds
         // is surfaced as a normal `success=false` output rather than `Err`
         // so callers see a uniform PTB shape.
-        if ctx.gas_budget < crate::gas::MIN_GAS_PTB
-            || ctx.gas_budget > crate::gas::MAX_GAS_BUDGET
-        {
+        if ctx.gas_budget < crate::gas::MIN_GAS_PTB || ctx.gas_budget > crate::gas::MAX_GAS_BUDGET {
             return Ok(MoveExecutionOutput {
                 success: false,
                 state_changes: vec![],
@@ -921,8 +922,7 @@ impl SetuMoveEngine {
         // B6c · per-key read surcharge for declared inputs + dynamic-field
         // preload entries. Charged once up front so a malicious PTB cannot
         // burn budget elsewhere before paying for what it loaded.
-        let read_keys = (input_objects.len() as u64)
-            .saturating_add(df_preload.len() as u64);
+        let read_keys = (input_objects.len() as u64).saturating_add(df_preload.len() as u64);
         let read_cost = crate::gas::PTB_OVERHEAD_TABLE
             .storage_read_per_key
             .saturating_mul(read_keys);
@@ -949,6 +949,7 @@ impl SetuMoveEngine {
                         bytes: bytes.clone(),
                         layout: None,
                         type_tag: None,
+                        abilities: None,
                     });
                 }
                 setu_types::ptb::CallArg::Object(obj_arg) => {
@@ -956,20 +957,23 @@ impl SetuMoveEngine {
                         setu_types::ptb::ObjectArg::ImmOrOwnedObject(id, _, _) => *id,
                         setu_types::ptb::ObjectArg::SharedObject { id, .. } => *id,
                     };
-                    let input_obj = input_objects.iter().find(|io| io.id == oid).ok_or_else(
-                        || {
-                            RuntimeError::InvalidTransaction(format!(
-                                "PTB Object input[{i}] (oid={oid}) not present in \
+                    let input_obj =
+                        input_objects
+                            .iter()
+                            .find(|io| io.id == oid)
+                            .ok_or_else(|| {
+                                RuntimeError::InvalidTransaction(format!(
+                                    "PTB Object input[{i}] (oid={oid}) not present in \
                                  input_objects — TaskPreparer must resolve all \
                                  declared objects before calling execute_ptb"
-                            ))
-                        },
-                    )?;
+                                ))
+                            })?;
                     let type_tag = TypeTag::Struct(Box::new(input_obj.type_tag.clone()));
                     initial_inputs.push(Slot {
                         bytes: input_obj.move_data.clone(),
                         layout: None,
                         type_tag: Some(type_tag),
+                        abilities: None,
                     });
                 }
             }
@@ -1010,6 +1014,18 @@ impl SetuMoveEngine {
         // legacy ChangeSet-derived list at finalize time, with the IDs we
         // pushed explicitly skipped (so each module surfaces exactly once).
         let mut explicit_module_changes: Vec<ModuleChange> = Vec::new();
+        // iter-9 / fix-ptb-upgrade-cap-mutation: pending writebacks for
+        // `&mut` Object inputs mutated by user MoveCalls (e.g.
+        // `commit_upgrade(cap, receipt)` bumps `cap.version`). Accumulated
+        // by `lower_move_call_inline` and drained AFTER
+        // `session.finish_with_extensions()`, then applied via
+        // `obj_runtime.mutate_object`. Mirrors the post-finish writeback in
+        // `execute()` line 351-369.
+        let mut pending_input_mutations: Vec<(
+            ObjectId,
+            move_core_types::language_storage::StructTag,
+            Vec<u8>,
+        )> = Vec::new();
         for (idx, cmd) in ptb.commands.iter().enumerate() {
             // B6c · outer-tier per-Command surcharge BEFORE dispatch
             //       (charge-on-abort determinism, design §4.3).
@@ -1025,7 +1041,9 @@ impl SetuMoveEngine {
                     let (result_slots, raw_returns) = self.lower_move_call_inline(
                         &mut session,
                         mc,
+                        &ptb.inputs,
                         &mut pctx,
+                        &mut pending_input_mutations,
                         gas_meter,
                     )?;
                     last_return_values = raw_returns;
@@ -1067,11 +1085,8 @@ impl SetuMoveEngine {
                     pctx.record_result(idx, vec![]);
                 }
                 setu_types::ptb::Command::MakeMoveVec { type_tag, args } => {
-                    let result_slot = self.lower_make_move_vec_inline(
-                        type_tag.as_deref(),
-                        args,
-                        &mut pctx,
-                    )?;
+                    let result_slot =
+                        self.lower_make_move_vec_inline(type_tag.as_deref(), args, &mut pctx)?;
                     last_return_values = vec![];
                     pctx.record_result(idx, vec![result_slot]);
                 }
@@ -1113,15 +1128,87 @@ impl SetuMoveEngine {
             }
         }
 
+        // iter-9 / fix-ptb-upgrade-hot-potato: sweep `pctx` for unconsumed
+        // result slots whose Move type is a strict hot-potato (no `drop`
+        // AND no `key`). Without this check, a PTB that mints a non-
+        // droppable value (e.g. `Command::Upgrade` produces an
+        // `UpgradeReceipt` with zero abilities) and forgets the trailing
+        // consumer (`commit_upgrade`) would silently succeed — the
+        // receipt bytes leave the Move VM as soon as `make_receipt`
+        // returns, so `session.finish_with_extensions()` cannot detect
+        // the leak. Sui's `programmable_transactions` does the
+        // equivalent sweep at PTB end.
+        //
+        // Why `!drop && !key` rather than `!drop` alone: leftover
+        // `key`-having objects (e.g. `Coin<T>`) are storage-bearing and
+        // are tolerated today (Sui auto-transfers them to sender; Setu
+        // currently silently drops them — tracked separately). Strict
+        // hot-potato types in Move are those declared with no
+        // abilities, exactly the set caught here.
+        //
+        // Inputs are intentionally skipped: they represent externally-
+        // provided values whose lifetime is governed by storage rules,
+        // not PTB linear-typing.
+        for (cmd_idx, row) in pctx.results_for_sweep().iter().enumerate() {
+            for (slot_idx, slot) in row.iter().enumerate() {
+                let canonical = crate::ptb_executor::ArgumentSlot::CmdResult {
+                    cmd: cmd_idx as u16,
+                    idx: slot_idx as u16,
+                };
+                if pctx.is_consumed(canonical) {
+                    continue;
+                }
+                let (abilities, type_desc) = if let Some(abilities) = slot.abilities {
+                    let type_desc = slot
+                        .type_tag
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "<generic MoveCall return>".to_string());
+                    (abilities, type_desc)
+                } else if let Some(tag) = &slot.type_tag {
+                    let ty = session.load_type(tag).map_err(|e| {
+                        RuntimeError::VMExecutionError(format!(
+                            "hot-potato sweep: load_type({tag}) failed: {e}"
+                        ))
+                    })?;
+                    let abilities = session.get_type_abilities(&ty).map_err(|e| {
+                        RuntimeError::VMExecutionError(format!(
+                            "hot-potato sweep: get_type_abilities({tag}) failed: {e}"
+                        ))
+                    })?;
+                    (abilities, tag.to_string())
+                } else {
+                    continue;
+                };
+                if !abilities.has_drop() && !abilities.has_key() {
+                    return Err(RuntimeError::InvalidTransaction(format!(
+                        "PTB ended with unconsumed value at Result({cmd_idx},{slot_idx}) \
+                         of type {type_desc} which has neither `drop` nor `key` ability \
+                         (hot-potato leak — did you forget the trailing \
+                         `commit_upgrade(cap, receipt)`?)"
+                    )));
+                }
+            }
+        }
+
         // 8. Finalize — collect ALL effects from the shared SetuObjectRuntime.
         //    For an empty PTB this yields zero state changes / zero module
         //    changes; mirrors the success branch of `execute()` lines 309-345.
         let (finish_result, _resolver_back) = session.finish_with_extensions();
-        let (_change_set, mut native_ext) = finish_result
-            .map_err(|e| RuntimeError::VMExecutionError(e.to_string()))?;
-        let obj_runtime: SetuObjectRuntime = native_ext
+        let (_change_set, mut native_ext) =
+            finish_result.map_err(|e| RuntimeError::VMExecutionError(e.to_string()))?;
+        let mut obj_runtime: SetuObjectRuntime = native_ext
             .remove::<SetuObjectRuntime>()
             .map_err(|e| RuntimeError::VMExecutionError(e.to_string()))?;
+
+        // iter-9 / fix-ptb-upgrade-cap-mutation: flush pending Object-Input
+        // `&mut` writebacks accumulated during the command loop. Mirrors
+        // `execute()` lines 351-369. Without this step, the
+        // `commit_upgrade` MoveCall mutates `cap.version` inside the VM
+        // but the new bytes never reach storage.
+        for (oid, type_tag, bcs_bytes) in pending_input_mutations.drain(..) {
+            obj_runtime.mutate_object(oid, type_tag, bcs_bytes);
+        }
         let obj_results = obj_runtime.into_results();
 
         // Build skip-set from explicit-changes module IDs so they aren't
@@ -1145,8 +1232,7 @@ impl SetuMoveEngine {
         // exceeds budget the body returns Err and the wrapper builds an
         // `(success=false, state_changes=[])` output, so the writes never
         // reach storage.
-        let write_keys = (state_changes.len() as u64)
-            .saturating_add(module_changes.len() as u64);
+        let write_keys = (state_changes.len() as u64).saturating_add(module_changes.len() as u64);
         let write_cost = crate::gas::PTB_OVERHEAD_TABLE
             .storage_write_per_key
             .saturating_mul(write_keys);
@@ -1173,13 +1259,11 @@ impl SetuMoveEngine {
     /// `MoveExecutionOutput.return_values` so callers can verify pure
     /// function calls without reading state.
     ///
-    /// **TypeTag tracking limitation (Phase 3c)**: result Slots are recorded
-    /// with `type_tag = None`. Phase 3d will need to derive return-value
-    /// TypeTags from the Move VM's `LoadedFunctionInstantiation.return_`
-    /// (currently not exposed by the Sui-fork session API) before
-    /// `SplitCoins`/`MergeCoins` can consume a `MoveCall` result as a coin
-    /// source. Until then, attempting to chain such a result into a Coin
-    /// command will deterministically fail with `PtbInvalidCoinLayout`.
+    /// Generic MoveCall result Slots are recorded with `type_tag = None` but
+    /// carry instantiated return abilities from `LoadedFunctionInstantiation`
+    /// so the PTB hot-potato sweep can reject no-drop/no-key leaks. Coin
+    /// commands still require a concrete TypeTag and will reject generic
+    /// MoveCall result slots with `PtbInvalidCoinLayout`.
     #[allow(clippy::too_many_arguments)]
     fn lower_move_call_inline<S: RawStore>(
         &self,
@@ -1189,7 +1273,13 @@ impl SetuMoveEngine {
             crate::resolver::SetuModuleResolver<'_, S>,
         >,
         mc: &setu_types::ptb::MoveCall,
+        ptb_inputs: &[setu_types::ptb::CallArg],
         pctx: &mut crate::ptb_executor::PtbContext,
+        pending_input_mutations: &mut Vec<(
+            ObjectId,
+            move_core_types::language_storage::StructTag,
+            Vec<u8>,
+        )>,
         gas_meter: &mut InstructionCountGasMeter,
     ) -> Result<(Vec<crate::ptb_executor::Slot>, Vec<Vec<u8>>), RuntimeError> {
         use crate::address_compat::object_id_to_move;
@@ -1199,7 +1289,10 @@ impl SetuMoveEngine {
         // 1. Resolve module + function identifiers.
         let addr = object_id_to_move(&mc.package);
         let module_ident = Identifier::new(mc.module.as_str()).map_err(|e| {
-            RuntimeError::InvalidTransaction(format!("Invalid PTB module name '{}': {e}", mc.module))
+            RuntimeError::InvalidTransaction(format!(
+                "Invalid PTB module name '{}': {e}",
+                mc.module
+            ))
         })?;
         let module_id = ModuleId::new(addr, module_ident);
         let func_ident = IdentStr::new(mc.function.as_str()).map_err(|e| {
@@ -1208,6 +1301,13 @@ impl SetuMoveEngine {
                 mc.function
             ))
         })?;
+
+        if is_forbidden_package_engine_hook(&module_id, func_ident) {
+            return Err(RuntimeError::InvalidTransaction(format!(
+                "MoveCall to engine-only package hook 0x1::package::{} is not allowed",
+                mc.function
+            )));
+        }
 
         // 2. Parse type-arg strings → TypeTags → loaded VM Types.
         let ty_tags: Vec<TypeTag> = mc
@@ -1232,33 +1332,65 @@ impl SetuMoveEngine {
                 ))
             })?;
 
-        // 3. Resolve PTB Arguments → raw bcs byte arrays.
-        //    Phase 3c: borrow each arg's bytes via PtbContext::resolve (no
-        //    consume — the upstream wire-validation already prevents forward
-        //    refs and the borrow-stack check fires only for Coin-by-value
-        //    commands in 3d). GasCoin is rejected explicitly.
+        // 3. Load the function signature before assembling args so by-value
+        //    PTB arguments can be consumed BEFORE VM execution. Post-exec
+        //    consumption lets already-moved slots be replayed by generic
+        //    MoveCalls and can leak VM effects before the PTB layer notices.
+        let func_inst = session
+            .load_function(&module_id, func_ident, &ty_args)
+            .map_err(|e| {
+                RuntimeError::VMExecutionError(format!(
+                    "MoveCall {}::{}: load_function failed: {e}",
+                    mc.module, mc.function
+                ))
+            })?;
+        let func_params: Vec<move_vm_types::loaded_data::runtime_types::Type> =
+            func_inst.parameters;
+        let func_returns: Vec<move_vm_types::loaded_data::runtime_types::Type> = func_inst.return_;
+        if func_params.len() != mc.arguments.len() {
+            return Err(RuntimeError::InvalidTransaction(format!(
+                "MoveCall {}::{} argument count mismatch: function expects {}, PTB supplied {}",
+                mc.module,
+                mc.function,
+                func_params.len(),
+                mc.arguments.len()
+            )));
+        }
+
+        use move_vm_types::loaded_data::runtime_types::Type as VmType;
         let mut args_bytes: Vec<Vec<u8>> = Vec::with_capacity(mc.arguments.len());
-        for (i, arg) in mc.arguments.iter().enumerate() {
+        for (i, (arg, param)) in mc.arguments.iter().zip(func_params.iter()).enumerate() {
             if matches!(arg, setu_types::ptb::Argument::GasCoin) {
                 return Err(RuntimeError::InvalidTransaction(format!(
                     "MoveCall arg[{i}]: GasCoin not yet supported in Phase 3c"
                 )));
             }
-            let slot = pctx.resolve(arg)?;
-            args_bytes.push(slot.bytes.clone());
+            let slot = if matches!(param, VmType::Reference(_) | VmType::MutableReference(_)) {
+                pctx.resolve(arg)?.clone()
+            } else {
+                pctx.consume(arg)?
+            };
+            args_bytes.push(slot.bytes);
         }
+
+        let return_abilities = func_returns
+            .iter()
+            .map(|ty| {
+                session.get_type_abilities(ty).map_err(|e| {
+                    RuntimeError::VMExecutionError(format!(
+                        "MoveCall {}::{} return ability lookup failed: {e}",
+                        mc.module, mc.function
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         // 4. Execute the function. Errors propagate as VMExecutionError; the
         //    caller drops the session without `into_results()`, so partial
         //    state changes are discarded (§4.4).
         let serialized = session
             .execute_function_bypass_visibility(
-                &module_id,
-                func_ident,
-                ty_args,
-                args_bytes,
-                gas_meter,
-                None,
+                &module_id, func_ident, ty_args, args_bytes, gas_meter, None,
             )
             .map_err(|e| {
                 RuntimeError::VMExecutionError(format!(
@@ -1267,7 +1399,18 @@ impl SetuMoveEngine {
                 ))
             })?;
 
-        // 5. Pack results. type_tag = None for now (see method-level note).
+        if serialized.return_values.len() != return_abilities.len() {
+            return Err(RuntimeError::VMExecutionError(format!(
+                "MoveCall {}::{} return arity mismatch: VM returned {}, signature has {}",
+                mc.module,
+                mc.function,
+                serialized.return_values.len(),
+                return_abilities.len()
+            )));
+        }
+
+        // 5. Pack results. Generic MoveCall results still have no TypeTag,
+        //    but carry instantiated abilities for the PTB hot-potato sweep.
         let raw_returns: Vec<Vec<u8>> = serialized
             .return_values
             .iter()
@@ -1276,12 +1419,104 @@ impl SetuMoveEngine {
         let result_slots: Vec<Slot> = serialized
             .return_values
             .into_iter()
-            .map(|(bytes, layout)| Slot {
+            .zip(return_abilities)
+            .map(|((bytes, layout), abilities)| Slot {
                 bytes,
                 layout: Some(layout),
                 type_tag: None,
+                abilities: Some(abilities),
             })
             .collect();
+
+        // 6. iter-9 / fix-ptb-upgrade-cap-mutation: process
+        //    `mutable_reference_outputs` so user MoveCalls that take
+        //    `&mut T` (most importantly `commit_upgrade(cap, receipt)`)
+        //    actually persist their mutations. Mirrors the post-finish
+        //    writeback in `execute()` line 351-369. Each entry's
+        //    `LocalIndex` selects which `mc.arguments[i]` was mutated:
+        //
+        //    - `Argument::Input(i)` referring to a `CallArg::Object` →
+        //      pushed into `pending_input_mutations`; the body loop
+        //      drains and feeds them to `obj_runtime.mutate_object` after
+        //      `session.finish_with_extensions()`. Pure inputs are not
+        //      possible here (Move VM forbids `&mut` to non-aliasable
+        //      pure values) — we fail-fast if observed.
+        //    - `Argument::Result` / `NestedResult` → applied immediately
+        //      via `pctx.mutate_slot` so subsequent commands see the
+        //      mutation.
+        //    - `Argument::GasCoin` → already rejected upstream; cannot
+        //      reach this point.
+        for (local_idx, new_bytes, _layout) in &serialized.mutable_reference_outputs {
+            let arg_idx = *local_idx as usize;
+            let arg = mc.arguments.get(arg_idx).ok_or_else(|| {
+                RuntimeError::VMExecutionError(format!(
+                    "MoveCall {}::{}: mutable_reference_output LocalIndex={arg_idx} \
+                     out of range (mc.arguments.len()={})",
+                    mc.module,
+                    mc.function,
+                    mc.arguments.len()
+                ))
+            })?;
+            match arg {
+                setu_types::ptb::Argument::GasCoin => {
+                    return Err(RuntimeError::VMExecutionError(format!(
+                        "MoveCall {}::{}: mutable_reference_output points at \
+                         GasCoin (unreachable — should have been rejected upstream)",
+                        mc.module, mc.function
+                    )));
+                }
+                setu_types::ptb::Argument::Input(i) => {
+                    let i_us = *i as usize;
+                    let call_arg = ptb_inputs.get(i_us).ok_or_else(|| {
+                        RuntimeError::PtbArgumentOutOfBounds(format!(
+                            "MoveCall {}::{}: Input({i}) referenced by \
+                             mutable_reference_output but ptb.inputs.len()={}",
+                            mc.module,
+                            mc.function,
+                            ptb_inputs.len()
+                        ))
+                    })?;
+                    match call_arg {
+                        setu_types::ptb::CallArg::Object(obj_arg) => {
+                            let oid = match obj_arg {
+                                setu_types::ptb::ObjectArg::ImmOrOwnedObject(id, _, _) => *id,
+                                setu_types::ptb::ObjectArg::SharedObject { id, .. } => *id,
+                            };
+                            // Recover the StructTag from the slot's tracked
+                            // TypeTag. The slot was built in
+                            // `execute_ptb_body` step 1 from the input
+                            // object's envelope and carries
+                            // `Some(TypeTag::Struct(Box<StructTag>))`.
+                            let slot = pctx.resolve(arg)?;
+                            let struct_tag = match slot.type_tag.as_ref() {
+                                Some(TypeTag::Struct(st)) => (**st).clone(),
+                                _ => {
+                                    return Err(RuntimeError::VMExecutionError(format!(
+                                        "MoveCall {}::{}: Input({i}) is an Object \
+                                         but its tracked TypeTag is not a Struct \
+                                         (cannot recover StructTag for mutate_object)",
+                                        mc.module, mc.function
+                                    )));
+                                }
+                            };
+                            pending_input_mutations.push((oid, struct_tag, new_bytes.clone()));
+                        }
+                        setu_types::ptb::CallArg::Pure(_) => {
+                            return Err(RuntimeError::VMExecutionError(format!(
+                                "MoveCall {}::{}: mutable_reference_output points at \
+                                 Pure Input({i}) — Move VM should never emit this",
+                                mc.module, mc.function
+                            )));
+                        }
+                    }
+                }
+                setu_types::ptb::Argument::Result(_)
+                | setu_types::ptb::Argument::NestedResult(_, _) => {
+                    pctx.mutate_slot(arg, new_bytes.clone())?;
+                }
+            }
+        }
+
         Ok((result_slots, raw_returns))
     }
 
@@ -1312,7 +1547,9 @@ impl SetuMoveEngine {
         gas_meter: &mut InstructionCountGasMeter,
         tx_ctx_bytes: &mut Vec<u8>,
     ) -> Result<Vec<crate::ptb_executor::Slot>, RuntimeError> {
-        use crate::ptb_executor::{coin_inner_type_from_tag, Slot, COIN_MODULE, SETU_FRAMEWORK_ADDR};
+        use crate::ptb_executor::{
+            coin_inner_type_from_tag, Slot, COIN_MODULE, SETU_FRAMEWORK_ADDR,
+        };
 
         // 1. Resolve the coin source slot, infer `T`.
         let (coin_full_tag, inner_t, coin_bytes_initial) = {
@@ -1365,9 +1602,7 @@ impl SetuMoveEngine {
                     None,
                 )
                 .map_err(|e| {
-                    RuntimeError::VMExecutionError(format!(
-                        "coin::split iteration {i} failed: {e}"
-                    ))
+                    RuntimeError::VMExecutionError(format!("coin::split iteration {i} failed: {e}"))
                 })?;
 
             // Apply mutable_reference_outputs: idx 0 = self (Coin), idx 2 = ctx.
@@ -1396,6 +1631,7 @@ impl SetuMoveEngine {
                 bytes: new_coin_bytes,
                 layout: Some(new_coin_layout),
                 type_tag: Some(coin_full_tag.clone()),
+                abilities: None,
             });
         }
 
@@ -1524,9 +1760,7 @@ impl SetuMoveEngine {
                     None,
                 )
                 .map_err(|e| {
-                    RuntimeError::VMExecutionError(format!(
-                        "coin::join iteration {i} failed: {e}"
-                    ))
+                    RuntimeError::VMExecutionError(format!("coin::join iteration {i} failed: {e}"))
                 })?;
 
             // Only `&mut Coin<T>` (idx 0) appears in mutable_reference_outputs.
@@ -1636,6 +1870,7 @@ impl SetuMoveEngine {
             bytes: buf,
             layout: None,
             type_tag: t_tag.map(|t| TypeTag::Vector(Box::new(t))),
+            abilities: None,
         })
     }
 
@@ -1661,9 +1896,9 @@ impl SetuMoveEngine {
     /// 2. `setu::transfer::transfer<UpgradeCap>(cap, sender)` — transfers
     ///    the cap to the publisher. `SetuObjectRuntime` captures it in
     ///    `transfers`, surfacing as a `Create` state-change at finalize.
-    /// The cap UID is then visible via `MovePtbResponse.cap_ids` after the
-    /// validator handler filters state_changes by `type_tag` suffix
-    /// (see `network::move_handler::submit_move_ptb`).
+    ///    The cap UID is then visible via `MovePtbResponse.cap_ids` after the
+    ///    validator handler filters state_changes by `type_tag` suffix
+    ///    (see `network::move_handler::submit_move_ptb`).
     #[allow(clippy::too_many_arguments)]
     fn lower_publish_inline<S: RawStore>(
         &self,
@@ -1746,12 +1981,11 @@ impl SetuMoveEngine {
             SETU_FRAMEWORK_ADDR,
             Identifier::new(PACKAGE_MODULE).expect("PACKAGE_MODULE is valid"),
         );
-        let make_cap_fn = IdentStr::new("make_upgrade_cap")
-            .expect("\"make_upgrade_cap\" is valid");
+        let make_cap_fn = IdentStr::new("make_upgrade_cap").expect("\"make_upgrade_cap\" is valid");
         // family_id: ID is BCS-encoded as a 32-byte address. `ObjectId::as_bytes`
         // returns &[u8; 32] which is the canonical wire form.
-        let family_id_bcs = bcs::to_bytes(family_id.as_bytes())
-            .expect("BCS serialize family_id (fixed [u8; 32])");
+        let family_id_bcs =
+            bcs::to_bytes(family_id.as_bytes()).expect("BCS serialize family_id (fixed [u8; 32])");
         let make_cap_args = vec![family_id_bcs, tx_ctx_bytes.clone()];
         let cap_returns = session
             .execute_function_bypass_visibility(
@@ -1763,9 +1997,7 @@ impl SetuMoveEngine {
                 None,
             )
             .map_err(|e| {
-                RuntimeError::VMExecutionError(format!(
-                    "synth make_upgrade_cap failed: {e}"
-                ))
+                RuntimeError::VMExecutionError(format!("synth make_upgrade_cap failed: {e}"))
             })?;
         // Capture mutated TxContext (ids_created bumped by object::new).
         for (local_idx, bytes, _layout) in &cap_returns.mutable_reference_outputs {
@@ -1804,8 +2036,8 @@ impl SetuMoveEngine {
             Identifier::new("transfer").expect("\"transfer\" is valid"),
         );
         let xfer_fn = IdentStr::new("transfer").expect("\"transfer\" is valid");
-        let recipient_bytes = bcs::to_bytes(ctx.sender.as_bytes())
-            .expect("BCS serialize sender (fixed [u8; 32])");
+        let recipient_bytes =
+            bcs::to_bytes(ctx.sender.as_bytes()).expect("BCS serialize sender (fixed [u8; 32])");
         let xfer_args = vec![cap_bytes, recipient_bytes];
         let _xfer_ret = session
             .execute_function_bypass_visibility(
@@ -1817,9 +2049,7 @@ impl SetuMoveEngine {
                 None,
             )
             .map_err(|e| {
-                RuntimeError::VMExecutionError(format!(
-                    "synth transfer<UpgradeCap> failed: {e}"
-                ))
+                RuntimeError::VMExecutionError(format!("synth transfer<UpgradeCap> failed: {e}"))
             })?;
         Ok(())
     }
@@ -1899,9 +2129,7 @@ impl SetuMoveEngine {
                 None,
             )
             .map_err(|e| {
-                RuntimeError::VMExecutionError(format!(
-                    "synth consume_ticket failed: {e}"
-                ))
+                RuntimeError::VMExecutionError(format!("synth consume_ticket failed: {e}"))
             })?;
         if consume_ret.return_values.len() != 4 {
             return Err(RuntimeError::VMExecutionError(format!(
@@ -1910,18 +2138,21 @@ impl SetuMoveEngine {
             )));
         }
         // (cap_id: ID, family_id: ID, policy: u8, digest: vector<u8>)
-        let cap_id_bytes: [u8; 32] = bcs::from_bytes(&consume_ret.return_values[0].0)
-            .map_err(|e| RuntimeError::VMExecutionError(format!(
-                "consume_ticket cap_id BCS decode failed: {e}"
-            )))?;
+        let cap_id_bytes: [u8; 32] =
+            bcs::from_bytes(&consume_ret.return_values[0].0).map_err(|e| {
+                RuntimeError::VMExecutionError(format!(
+                    "consume_ticket cap_id BCS decode failed: {e}"
+                ))
+            })?;
         let family_id_decoded: [u8; 32] = bcs::from_bytes(&consume_ret.return_values[1].0)
-            .map_err(|e| RuntimeError::VMExecutionError(format!(
-                "consume_ticket family_id BCS decode failed: {e}"
-            )))?;
-        let policy_u8: u8 = bcs::from_bytes(&consume_ret.return_values[2].0)
-            .map_err(|e| RuntimeError::VMExecutionError(format!(
-                "consume_ticket policy BCS decode failed: {e}"
-            )))?;
+            .map_err(|e| {
+                RuntimeError::VMExecutionError(format!(
+                    "consume_ticket family_id BCS decode failed: {e}"
+                ))
+            })?;
+        let policy_u8: u8 = bcs::from_bytes(&consume_ret.return_values[2].0).map_err(|e| {
+            RuntimeError::VMExecutionError(format!("consume_ticket policy BCS decode failed: {e}"))
+        })?;
         // iter-8β: decode policy now so the compat-check stage below can
         // dispatch on it. Unknown values reject — Sui upstream semantics.
         let policy = crate::compat::UpgradePolicy::from_u8(policy_u8).ok_or_else(|| {
@@ -1930,10 +2161,12 @@ impl SetuMoveEngine {
                  (0=Compatible, 1=AdditiveOnly, 2=DepOnly)"
             ))
         })?;
-        let digest_vec: Vec<u8> = bcs::from_bytes(&consume_ret.return_values[3].0)
-            .map_err(|e| RuntimeError::VMExecutionError(format!(
-                "consume_ticket digest BCS decode failed: {e}"
-            )))?;
+        let digest_vec: Vec<u8> =
+            bcs::from_bytes(&consume_ret.return_values[3].0).map_err(|e| {
+                RuntimeError::VMExecutionError(format!(
+                    "consume_ticket digest BCS decode failed: {e}"
+                ))
+            })?;
 
         // 1.5. Cross-layer assertions (G12) — ticket must bind to this family
         //      and to a digest matching the supplied module bytes.
@@ -1964,10 +2197,7 @@ impl SetuMoveEngine {
         }
         // 2. Read prev linkage entry. Key format mirrors mock TEE writer
         //    (`crates/setu-enclave/src/mock/mod.rs:~1100`).
-        let linkage_key = format!(
-            "linkage:latest:{}",
-            hex::encode(current_package.as_bytes())
-        );
+        let linkage_key = format!("linkage:latest:{}", hex::encode(current_package.as_bytes()));
         let linkage_bytes = store.get_raw(&linkage_key).map_err(|e| {
             RuntimeError::VMExecutionError(format!(
                 "Command::Upgrade: storage read failed for {linkage_key}: {e}"
@@ -1988,11 +2218,9 @@ impl SetuMoveEngine {
             })?;
 
         // 3. Derive new_version and new_package_addr deterministically.
-        let new_version = prev_version
-            .checked_add(1)
-            .ok_or_else(|| RuntimeError::InvalidTransaction(
-                "Command::Upgrade: version overflow".to_string(),
-            ))?;
+        let new_version = prev_version.checked_add(1).ok_or_else(|| {
+            RuntimeError::InvalidTransaction("Command::Upgrade: version overflow".to_string())
+        })?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"SETU_PKG_VER:");
         hasher.update(&ctx.tx_hash);
@@ -2009,16 +2237,12 @@ impl SetuMoveEngine {
         let mut module_names: Vec<move_core_types::identifier::Identifier> =
             Vec::with_capacity(modules.len());
         for (i, bytecode) in modules.iter().enumerate() {
-            let (relinked, _stats) = crate::relink::relink_module(
-                bytecode,
-                prev_account,
-                new_account,
-            )
-            .map_err(|e| {
-                RuntimeError::VMExecutionError(format!(
-                    "Command::Upgrade: relink module[{i}] failed: {e}"
-                ))
-            })?;
+            let (relinked, _stats) =
+                crate::relink::relink_module(bytecode, prev_account, new_account).map_err(|e| {
+                    RuntimeError::VMExecutionError(format!(
+                        "Command::Upgrade: relink module[{i}] failed: {e}"
+                    ))
+                })?;
             // Re-read self_id from the relinked bytecode to get the module name.
             use move_binary_format::CompiledModule;
             let cm = CompiledModule::deserialize_with_defaults(&relinked).map_err(|e| {
@@ -2045,17 +2269,9 @@ impl SetuMoveEngine {
         //      at their original publish time and the storage layer is
         //      treated as a trusted producer (G3 deferred-commit ensures
         //      no half-applied bundle is observable).
-        for (i, (_relinked, name)) in relinked_bytes
-            .iter()
-            .zip(module_names.iter())
-            .enumerate()
-        {
+        for (i, (_relinked, name)) in relinked_bytes.iter().zip(module_names.iter()).enumerate() {
             use move_binary_format::CompiledModule;
-            let old_key = format!(
-                "mod:{}::{}",
-                prev_account.to_hex_literal(),
-                name.as_str()
-            );
+            let old_key = format!("mod:{}::{}", prev_account.to_hex_literal(), name.as_str());
             let old_bytes = store.get_raw(&old_key).map_err(|e| {
                 RuntimeError::VMExecutionError(format!(
                     "Command::Upgrade: storage read failed for {old_key}: {e}"
@@ -2077,12 +2293,13 @@ impl SetuMoveEngine {
                     prev_account.to_hex_literal(),
                 ))
             })?;
-            let old_module = CompiledModule::deserialize_with_defaults(&old_bytes).map_err(|e| {
-                RuntimeError::VMExecutionError(format!(
-                    "Command::Upgrade: prev module[{i}] '{}' deserialization failed: {e}",
-                    name.as_str(),
-                ))
-            })?;
+            let old_module =
+                CompiledModule::deserialize_with_defaults(&old_bytes).map_err(|e| {
+                    RuntimeError::VMExecutionError(format!(
+                        "Command::Upgrade: prev module[{i}] '{}' deserialization failed: {e}",
+                        name.as_str(),
+                    ))
+                })?;
             // CRITICAL: feed compat the PRE-relink bytecode (self-addr ==
             // prev_addr) NOT the post-relink `relinked` (self-addr ==
             // new_addr). Upstream `Compatibility::check` rejects on address
@@ -2093,12 +2310,13 @@ impl SetuMoveEngine {
             // compat. Mirrors the infra-path fix at
             // `setu-validator/src/infra_executor.rs::execute_move_upgrade`
             // (docs/feat/fix-infra-executor-skips-compat-check/).
-            let new_module = CompiledModule::deserialize_with_defaults(&modules[i]).map_err(|e| {
-                RuntimeError::VMExecutionError(format!(
-                    "Command::Upgrade: pre-relink module[{i}] '{}' deserialization failed: {e}",
-                    name.as_str(),
-                ))
-            })?;
+            let new_module =
+                CompiledModule::deserialize_with_defaults(&modules[i]).map_err(|e| {
+                    RuntimeError::VMExecutionError(format!(
+                        "Command::Upgrade: pre-relink module[{i}] '{}' deserialization failed: {e}",
+                        name.as_str(),
+                    ))
+                })?;
 
             // Charge gas based on the OLD module's handle counts (the
             // amount of work upstream `Compatibility::check` must do is
@@ -2117,14 +2335,14 @@ impl SetuMoveEngine {
                         .compat_check_per_function
                         .saturating_mul(old_function_count),
                 );
-            gas_meter.charge_outer(compat_gas).map_err(|_e| {
-                RuntimeError::OutOfGas {
+            gas_meter
+                .charge_outer(compat_gas)
+                .map_err(|_e| RuntimeError::OutOfGas {
                     used: gas_meter.instructions_executed(),
-                }
-            })?;
+                })?;
 
-            crate::compat::check_upgrade_compat(&old_module, &new_module, policy).map_err(
-                |e| match e {
+            crate::compat::check_upgrade_compat(&old_module, &new_module, policy).map_err(|e| {
+                match e {
                     crate::compat::CompatError::Incompatible { status, msg } => {
                         RuntimeError::InvalidTransaction(format!(
                             "Command::Upgrade: module[{i}] '{}' compat check failed \
@@ -2135,8 +2353,8 @@ impl SetuMoveEngine {
                             msg,
                         ))
                     }
-                },
-            )?;
+                }
+            })?;
         }
 
         // 5. Publish relinked bundle at new_account.
@@ -2153,14 +2371,17 @@ impl SetuMoveEngine {
 
         // 6. Emit per-module Upgrade entries. The storage layer keys
         //    linkage:latest by family_id (== current_package); prev_package
-        //    is informational only (unused by mock TEE writer today).
+        //    carries the **actual previous package address** (read from
+        //    `linkage:latest` above, NOT family_id) so the mock TEE writer
+        //    can reconstruct the prior linkage entry as `old_value` for
+        //    CAS-based stale-read protection.
         for (bytecode, name) in relinked_bytes.into_iter().zip(module_names.into_iter()) {
             let module_id = ModuleId::new(new_account, name);
             out_changes.push(ModuleChange::Upgrade {
                 module_id,
                 bytecode,
                 family_id: *current_package,
-                prev_package: *current_package,
+                prev_package: setu_types::object::ObjectId::new(*prev_addr.as_bytes()),
                 new_package_addr,
                 new_version,
             });
@@ -2169,15 +2390,17 @@ impl SetuMoveEngine {
         // 7. iter-8α: mint UpgradeReceipt via synth MoveCall and return as
         //    Result(idx, 0) slot. The receipt has NO abilities, so a
         //    well-formed PTB MUST consume it via `commit_upgrade(cap, receipt)`
-        //    in a same-PTB tail call, otherwise session finalize fails the
-        //    type-check (forge resistance per package.move docs).
+        //    in a same-PTB tail call. Hot-potato enforcement happens at PTB
+        //    end (see `execute_ptb_body`'s sweep over `pctx.results_for_sweep`):
+        //    once the receipt bytes leave the Move VM here, only that explicit
+        //    sweep can detect a missing trailing consumer (engine.rs
+        //    iter-9 / fix-ptb-upgrade-cap-mutation-and-hot-potato-not-enforced).
         let make_receipt_fn = IdentStr::new("make_receipt").expect("\"make_receipt\" is valid");
-        let cap_id_bcs = bcs::to_bytes(&cap_id_bytes)
-            .expect("BCS serialize cap_id (fixed [u8; 32])");
+        let cap_id_bcs =
+            bcs::to_bytes(&cap_id_bytes).expect("BCS serialize cap_id (fixed [u8; 32])");
         let new_pkg_bcs = bcs::to_bytes(new_package_addr.as_bytes())
             .expect("BCS serialize new_package_addr (fixed [u8; 32])");
-        let new_ver_bcs = bcs::to_bytes(&new_version)
-            .expect("BCS serialize new_version (u64)");
+        let new_ver_bcs = bcs::to_bytes(&new_version).expect("BCS serialize new_version (u64)");
         let receipt_args = vec![cap_id_bcs, new_pkg_bcs, new_ver_bcs];
         let receipt_ret = session
             .execute_function_bypass_visibility(
@@ -2189,18 +2412,14 @@ impl SetuMoveEngine {
                 None,
             )
             .map_err(|e| {
-                RuntimeError::VMExecutionError(format!(
-                    "synth make_receipt failed: {e}"
-                ))
+                RuntimeError::VMExecutionError(format!("synth make_receipt failed: {e}"))
             })?;
         let receipt_bytes: Vec<u8> = receipt_ret
             .return_values
             .first()
             .map(|(b, _l)| b.clone())
             .ok_or_else(|| {
-                RuntimeError::VMExecutionError(
-                    "synth make_receipt returned no value".to_string(),
-                )
+                RuntimeError::VMExecutionError("synth make_receipt returned no value".to_string())
             })?;
         // Suppress unused-binding lints for fields stashed for future iter-8β.
         let _ = (cmd_idx, tx_ctx_bytes);
@@ -2218,6 +2437,7 @@ impl SetuMoveEngine {
             bytes: receipt_bytes,
             layout: None,
             type_tag: Some(receipt_tag),
+            abilities: None,
         })
     }
 
@@ -2318,8 +2538,7 @@ impl SetuMoveEngine {
         let move_addr = setu_addr_to_move(&ctx.sender);
         buf.extend_from_slice(move_addr.as_ref());
         // tx_hash: vector<u8> (BCS: ULEB128 length + bytes)
-        let tx_hash_bcs = bcs::to_bytes(&ctx.tx_hash.to_vec())
-            .expect("BCS serialize tx_hash");
+        let tx_hash_bcs = bcs::to_bytes(&ctx.tx_hash.to_vec()).expect("BCS serialize tx_hash");
         buf.extend_from_slice(&tx_hash_bcs);
         // epoch: u64
         buf.extend_from_slice(&ctx.epoch.to_le_bytes());
@@ -2345,8 +2564,8 @@ impl SetuMoveEngine {
 ///
 /// Returns `None` if the module cannot be parsed or the function is not found.
 pub fn detect_needs_tx_context(module_bytes: &[u8], function_name: &str) -> Option<bool> {
-    use move_binary_format::CompiledModule;
     use move_binary_format::file_format::SignatureToken;
+    use move_binary_format::CompiledModule;
 
     let module = CompiledModule::deserialize_with_defaults(module_bytes).ok()?;
 
@@ -2394,7 +2613,10 @@ mod tests {
     #[test]
     fn test_engine_creation() {
         let engine = SetuMoveEngine::new();
-        assert!(engine.is_ok(), "Engine should initialize with empty natives");
+        assert!(
+            engine.is_ok(),
+            "Engine should initialize with empty natives"
+        );
     }
 
     #[test]
@@ -2423,7 +2645,10 @@ mod tests {
     fn test_embedded_stdlib_empty_ok() {
         // new_with_embedded_stdlib should succeed even when STDLIB_MODULES is empty
         let engine = SetuMoveEngine::new_with_embedded_stdlib();
-        assert!(engine.is_ok(), "Engine should init with empty or populated stdlib");
+        assert!(
+            engine.is_ok(),
+            "Engine should init with empty or populated stdlib"
+        );
     }
 
     #[test]
@@ -2449,9 +2674,8 @@ mod tests {
         use move_core_types::account_address::AccountAddress;
 
         for &(name, bytes) in STDLIB_MODULES {
-            let cm =
-                move_binary_format::CompiledModule::deserialize_with_defaults(bytes)
-                    .unwrap_or_else(|e| panic!("Failed to deserialize {}: {}", name, e));
+            let cm = move_binary_format::CompiledModule::deserialize_with_defaults(bytes)
+                .unwrap_or_else(|e| panic!("Failed to deserialize {}: {}", name, e));
             assert_eq!(
                 *cm.self_id().address(),
                 AccountAddress::ONE,
@@ -2467,8 +2691,21 @@ mod tests {
             eprintln!("SKIP: stdlib .mv files not found");
             return;
         }
-        let expected = ["object", "transfer", "tx_context", "balance", "coin", "setu",
-                       "vector", "option", "string", "vec_map", "vec_set", "event", "clock"];
+        let expected = [
+            "object",
+            "transfer",
+            "tx_context",
+            "balance",
+            "coin",
+            "setu",
+            "vector",
+            "option",
+            "string",
+            "vec_map",
+            "vec_set",
+            "event",
+            "clock",
+        ];
         let names: Vec<&str> = STDLIB_MODULES.iter().map(|(n, _)| *n).collect();
         for exp in &expected {
             assert!(
@@ -2486,24 +2723,19 @@ mod tests {
             eprintln!("SKIP: stdlib .mv files not found");
             return;
         }
-        use setu_runtime::state::InMemoryObjectStore;
-        use move_core_types::resolver::ModuleResolver;
         use crate::resolver::SetuModuleResolver;
+        use move_core_types::resolver::ModuleResolver;
+        use setu_runtime::state::InMemoryObjectStore;
 
         let engine = SetuMoveEngine::new_with_embedded_stdlib().unwrap();
         let store = InMemoryObjectStore::new();
         let resolver = SetuModuleResolver::new(&store, &engine.stdlib_modules);
 
         for &(name, _) in STDLIB_MODULES {
-            let cm =
-                move_binary_format::CompiledModule::deserialize_with_defaults(
-                    STDLIB_MODULES
-                        .iter()
-                        .find(|(n, _)| *n == name)
-                        .unwrap()
-                        .1,
-                )
-                .unwrap();
+            let cm = move_binary_format::CompiledModule::deserialize_with_defaults(
+                STDLIB_MODULES.iter().find(|(n, _)| *n == name).unwrap().1,
+            )
+            .unwrap();
             let mid = cm.self_id();
             let result = resolver.get_module(&mid);
             assert!(
@@ -2521,9 +2753,8 @@ mod tests {
             return;
         }
         for &(name, bytes) in STDLIB_MODULES {
-            let cm =
-                move_binary_format::CompiledModule::deserialize_with_defaults(bytes)
-                    .unwrap_or_else(|e| panic!("Failed to deserialize {}: {}", name, e));
+            let cm = move_binary_format::CompiledModule::deserialize_with_defaults(bytes)
+                .unwrap_or_else(|e| panic!("Failed to deserialize {}: {}", name, e));
             move_bytecode_verifier::verify_module_unmetered(&cm)
                 .unwrap_or_else(|e| panic!("Module '{}' failed verification: {}", name, e));
         }
@@ -2547,7 +2778,11 @@ mod tests {
             return;
         }
         let result = detect_needs_tx_context(stdlib_bytes("coin"), "from_balance");
-        assert_eq!(result, Some(true), "from_balance has &mut TxContext as last param");
+        assert_eq!(
+            result,
+            Some(true),
+            "from_balance has &mut TxContext as last param"
+        );
     }
 
     #[test]
@@ -2558,7 +2793,11 @@ mod tests {
             return;
         }
         let result = detect_needs_tx_context(stdlib_bytes("tx_context"), "sender");
-        assert_eq!(result, Some(false), "sender takes &TxContext (immutable), not &mut");
+        assert_eq!(
+            result,
+            Some(false),
+            "sender takes &TxContext (immutable), not &mut"
+        );
     }
 
     #[test]
@@ -2585,20 +2824,20 @@ mod tests {
     #[test]
     fn test_detect_needs_tx_context_invalid_bytecode() {
         let result = detect_needs_tx_context(b"not valid bytecode", "anything");
-        assert_eq!(result, None, "invalid bytecode should return None (deserialization fails)");
+        assert_eq!(
+            result, None,
+            "invalid bytecode should return None (deserialization fails)"
+        );
     }
 
     // R4-ISSUE-2 regression: mutating a Shared input via `&mut` must NOT
     // silently demote the persisted envelope to AddressOwner.
     #[test]
     fn test_mutated_shared_input_preserves_shared_ownership() {
-        use crate::object_runtime::{
-            InputObject, ObjectMutationEffect, ObjectRuntimeResults,
-        };
+        use crate::object_runtime::{InputObject, ObjectMutationEffect, ObjectRuntimeResults};
         use indexmap::{IndexMap, IndexSet};
         use move_core_types::{
-            account_address::AccountAddress, identifier::Identifier,
-            language_storage::StructTag,
+            account_address::AccountAddress, identifier::Identifier, language_storage::StructTag,
         };
         use setu_types::{
             object::{Address, ObjectId},
@@ -2624,14 +2863,18 @@ mod tests {
             id,
             owner,
             7, // pre-mutation version
-            Ownership::Shared { initial_shared_version: isv },
+            Ownership::Shared {
+                initial_shared_version: isv,
+            },
             tag.to_string(),
             vec![],
         );
         let input = InputObject {
             id,
             owner,
-            ownership: Ownership::Shared { initial_shared_version: isv },
+            ownership: Ownership::Shared {
+                initial_shared_version: isv,
+            },
             version: 7,
             envelope_bytes: pre_envelope.to_bytes(),
             move_data: vec![],
@@ -2643,7 +2886,10 @@ mod tests {
         let mut mutated = IndexMap::new();
         mutated.insert(
             id,
-            ObjectMutationEffect { type_tag: tag, bcs_bytes: vec![0xDE, 0xAD] },
+            ObjectMutationEffect {
+                type_tag: tag,
+                bcs_bytes: vec![0xDE, 0xAD],
+            },
         );
         let results = ObjectRuntimeResults {
             input_objects,
@@ -2667,11 +2913,13 @@ mod tests {
             .new_state
             .as_ref()
             .expect("mutated emits new_state");
-        let new_env = setu_types::ObjectEnvelope::from_bytes(new_bytes)
-            .expect("envelope roundtrips");
+        let new_env =
+            setu_types::ObjectEnvelope::from_bytes(new_bytes).expect("envelope roundtrips");
 
         match new_env.metadata.ownership {
-            Ownership::Shared { initial_shared_version } => {
+            Ownership::Shared {
+                initial_shared_version,
+            } => {
                 assert_eq!(
                     initial_shared_version, isv,
                     "R4-ISSUE-2: initial_shared_version preserved across &mut"
@@ -2707,10 +2955,8 @@ mod tests {
         let engine = SetuMoveEngine::new().expect("engine init");
         let id = ObjectId::new([0xAB; 32]);
         let owner = Address::new([0x33; 32]);
-        let tag = move_core_types::language_storage::StructTag::from_str(
-            "0x1::widget::Widget",
-        )
-        .unwrap();
+        let tag =
+            move_core_types::language_storage::StructTag::from_str("0x1::widget::Widget").unwrap();
 
         let pre_envelope = ObjectEnvelope::from_move_result(
             id,
@@ -2759,10 +3005,7 @@ mod tests {
             .convert_results_to_state_changes(&results, 0)
             .expect("convert ok");
         assert_eq!(changes.len(), 1);
-        let new_env = ObjectEnvelope::from_bytes(
-            changes[0].new_state.as_ref().unwrap(),
-        )
-        .unwrap();
+        let new_env = ObjectEnvelope::from_bytes(changes[0].new_state.as_ref().unwrap()).unwrap();
         assert_eq!(
             new_env.metadata.version, 43,
             "per-object version: 42 + 1 = 43"
@@ -2781,10 +3024,8 @@ mod tests {
 
         let engine = SetuMoveEngine::new().expect("engine init");
         let id = ObjectId::new([0xCD; 32]);
-        let tag = move_core_types::language_storage::StructTag::from_str(
-            "0x1::widget::Widget",
-        )
-        .unwrap();
+        let tag =
+            move_core_types::language_storage::StructTag::from_str("0x1::widget::Widget").unwrap();
 
         let mut mutated = IndexMap::new();
         mutated.insert(
@@ -2812,10 +3053,7 @@ mod tests {
             .convert_results_to_state_changes(&results, 17)
             .expect("convert ok");
         assert_eq!(changes.len(), 1);
-        let new_env = ObjectEnvelope::from_bytes(
-            changes[0].new_state.as_ref().unwrap(),
-        )
-        .unwrap();
+        let new_env = ObjectEnvelope::from_bytes(changes[0].new_state.as_ref().unwrap()).unwrap();
         assert_eq!(
             new_env.metadata.version, 18,
             "fallback when no input: base_version + 1 = 17 + 1"
@@ -2837,15 +3075,7 @@ mod tests {
         let df_oid = ObjectId::new([0xBB; 32]);
 
         // Build the on-disk envelope with version=10.
-        let prior_env = build_df_envelope(
-            df_oid,
-            parent,
-            "u64",
-            &[1u8; 8],
-            "u64",
-            &[0xAA; 8],
-            10,
-        );
+        let prior_env = build_df_envelope(df_oid, parent, "u64", &[1u8; 8], "u64", &[0xAA; 8], 10);
         let mut df_mutated = IndexMap::new();
         df_mutated.insert(
             df_oid,
@@ -2878,10 +3108,7 @@ mod tests {
             .convert_results_to_state_changes(&results, 0)
             .expect("convert ok");
         assert_eq!(changes.len(), 1);
-        let new_env = ObjectEnvelope::from_bytes(
-            changes[0].new_state.as_ref().unwrap(),
-        )
-        .unwrap();
+        let new_env = ObjectEnvelope::from_bytes(changes[0].new_state.as_ref().unwrap()).unwrap();
         assert_eq!(
             new_env.metadata.version, 11,
             "DF mutate version: prior(10) + 1 = 11"
@@ -2899,9 +3126,7 @@ mod tests {
 
     mod m3_df_convert {
         use super::*;
-        use crate::object_runtime::{
-            DfDeleteEffect, DfMutateEffect, ObjectMutationEffect,
-        };
+        use crate::object_runtime::{DfDeleteEffect, DfMutateEffect, ObjectMutationEffect};
         use indexmap::{IndexMap, IndexSet};
         use setu_types::{
             dynamic_field::DfFieldValue,
@@ -3002,14 +3227,10 @@ mod tests {
             let c = &changes[0];
             assert_eq!(c.change_type, MoveStateChangeType::Update);
             assert_eq!(c.object_id, df_oid);
-            let old = setu_types::ObjectEnvelope::from_bytes(
-                c.old_state.as_ref().unwrap(),
-            )
-            .unwrap();
-            let new = setu_types::ObjectEnvelope::from_bytes(
-                c.new_state.as_ref().unwrap(),
-            )
-            .unwrap();
+            let old =
+                setu_types::ObjectEnvelope::from_bytes(c.old_state.as_ref().unwrap()).unwrap();
+            let new =
+                setu_types::ObjectEnvelope::from_bytes(c.new_state.as_ref().unwrap()).unwrap();
             assert_eq!(old.metadata.version, base);
             assert_eq!(new.metadata.version, base + 1);
             let old_pl: DfFieldValue = bcs::from_bytes(&old.data).unwrap();
@@ -3047,10 +3268,8 @@ mod tests {
             assert_eq!(c.change_type, MoveStateChangeType::Delete);
             assert_eq!(c.object_id, df_oid);
             assert!(c.new_state.is_none());
-            let old = setu_types::ObjectEnvelope::from_bytes(
-                c.old_state.as_ref().unwrap(),
-            )
-            .unwrap();
+            let old =
+                setu_types::ObjectEnvelope::from_bytes(c.old_state.as_ref().unwrap()).unwrap();
             assert_eq!(old.metadata.version, base);
             let pl: DfFieldValue = bcs::from_bytes(&old.data).unwrap();
             assert_eq!(pl.value_bcs, vec![0x99; 8]);
@@ -3186,7 +3405,10 @@ mod tests {
             results.input_objects.insert(parent, input);
             results.mutated.insert(
                 parent,
-                ObjectMutationEffect { type_tag: tag, bcs_bytes: data },
+                ObjectMutationEffect {
+                    type_tag: tag,
+                    bcs_bytes: data,
+                },
             );
 
             let changes = engine()
@@ -3221,10 +3443,9 @@ mod tests {
             let changes = engine()
                 .convert_results_to_state_changes(&results, base)
                 .expect("convert ok");
-            let env = setu_types::ObjectEnvelope::from_bytes(
-                changes[0].new_state.as_ref().unwrap(),
-            )
-            .unwrap();
+            let env =
+                setu_types::ObjectEnvelope::from_bytes(changes[0].new_state.as_ref().unwrap())
+                    .unwrap();
             assert_eq!(env.metadata.version, base + 1);
         }
 
@@ -3252,10 +3473,9 @@ mod tests {
             let changes = engine()
                 .convert_results_to_state_changes(&results, 1)
                 .expect("convert ok");
-            let env = setu_types::ObjectEnvelope::from_bytes(
-                changes[0].new_state.as_ref().unwrap(),
-            )
-            .unwrap();
+            let env =
+                setu_types::ObjectEnvelope::from_bytes(changes[0].new_state.as_ref().unwrap())
+                    .unwrap();
             let pl: DfFieldValue = bcs::from_bytes(&env.data).unwrap();
             assert_eq!(pl.name_bcs, raw_key);
             assert_eq!(pl.value_bcs, raw_val);
@@ -3304,7 +3524,11 @@ mod tests {
                 .execute_ptb(&store, &ptb, vec![], vec![], &make_ctx())
                 .expect("empty PTB executes");
             assert!(out.success);
-            assert!(out.state_changes.is_empty(), "state_changes={:?}", out.state_changes);
+            assert!(
+                out.state_changes.is_empty(),
+                "state_changes={:?}",
+                out.state_changes
+            );
             assert!(out.module_changes.is_empty());
             assert!(out.events.is_empty());
             assert!(out.error.is_none());
@@ -3466,7 +3690,11 @@ mod tests {
 
         /// Construct a synthetic `0x1::coin::Coin<0x1::setu::SETU>` InputObject
         /// for tests. BCS layout: 32-byte UID address ++ 8-byte LE u64 balance.
-        fn make_coin_input(oid: ObjectId, value: u64, owner: Address) -> crate::object_runtime::InputObject {
+        fn make_coin_input(
+            oid: ObjectId,
+            value: u64,
+            owner: Address,
+        ) -> crate::object_runtime::InputObject {
             use move_core_types::account_address::AccountAddress;
             use move_core_types::identifier::Identifier;
             use move_core_types::language_storage::StructTag;
@@ -3549,9 +3777,9 @@ mod tests {
             let amount_bcs = bcs::to_bytes(&10u64).unwrap();
             let ptb = ProgrammableTransaction {
                 inputs: vec![
-                    setu_types::ptb::CallArg::Object(
-                        setu_types::ptb::ObjectArg::ImmOrOwnedObject(coin_id, 0, [0u8; 32]),
-                    ),
+                    setu_types::ptb::CallArg::Object(setu_types::ptb::ObjectArg::ImmOrOwnedObject(
+                        coin_id, 0, [0u8; 32],
+                    )),
                     setu_types::ptb::CallArg::Pure(amount_bcs),
                 ],
                 commands: vec![
@@ -3596,9 +3824,8 @@ mod tests {
                 bcs::from_bytes(src_change.new_state.as_ref().expect("new_state"))
                     .expect("envelope decode");
             // Coin<T> BCS = 32-byte UID || 8-byte LE u64 balance
-            let post_balance = u64::from_le_bytes(
-                new_env.data[32..40].try_into().expect("balance slice"),
-            );
+            let post_balance =
+                u64::from_le_bytes(new_env.data[32..40].try_into().expect("balance slice"));
             assert_eq!(
                 post_balance, 90,
                 "on-chain source balance must be 90 — total-supply invariant"
@@ -3686,12 +3913,12 @@ mod tests {
 
             let ptb = ProgrammableTransaction {
                 inputs: vec![
-                    setu_types::ptb::CallArg::Object(
-                        setu_types::ptb::ObjectArg::ImmOrOwnedObject(coin_a.id, 0, [0u8; 32]),
-                    ),
-                    setu_types::ptb::CallArg::Object(
-                        setu_types::ptb::ObjectArg::ImmOrOwnedObject(coin_b.id, 0, [0u8; 32]),
-                    ),
+                    setu_types::ptb::CallArg::Object(setu_types::ptb::ObjectArg::ImmOrOwnedObject(
+                        coin_a.id, 0, [0u8; 32],
+                    )),
+                    setu_types::ptb::CallArg::Object(setu_types::ptb::ObjectArg::ImmOrOwnedObject(
+                        coin_b.id, 0, [0u8; 32],
+                    )),
                 ],
                 commands: vec![
                     setu_types::ptb::Command::MergeCoins(
@@ -3727,9 +3954,8 @@ mod tests {
             let new_env: setu_types::ObjectEnvelope =
                 bcs::from_bytes(tgt_change.new_state.as_ref().expect("new_state"))
                     .expect("envelope decode");
-            let post_balance = u64::from_le_bytes(
-                new_env.data[32..40].try_into().expect("balance slice"),
-            );
+            let post_balance =
+                u64::from_le_bytes(new_env.data[32..40].try_into().expect("balance slice"));
             assert_eq!(
                 post_balance, 80,
                 "on-chain target balance must be 80 — total-supply invariant"
@@ -3756,12 +3982,12 @@ mod tests {
 
             let ptb = ProgrammableTransaction {
                 inputs: vec![
-                    setu_types::ptb::CallArg::Object(
-                        setu_types::ptb::ObjectArg::ImmOrOwnedObject(coin_a.id, 0, [0u8; 32]),
-                    ),
-                    setu_types::ptb::CallArg::Object(
-                        setu_types::ptb::ObjectArg::ImmOrOwnedObject(coin_b.id, 0, [0u8; 32]),
-                    ),
+                    setu_types::ptb::CallArg::Object(setu_types::ptb::ObjectArg::ImmOrOwnedObject(
+                        coin_a.id, 0, [0u8; 32],
+                    )),
+                    setu_types::ptb::CallArg::Object(setu_types::ptb::ObjectArg::ImmOrOwnedObject(
+                        coin_b.id, 0, [0u8; 32],
+                    )),
                 ],
                 commands: vec![setu_types::ptb::Command::MergeCoins(
                     setu_types::ptb::Argument::Input(0),
@@ -3809,12 +4035,12 @@ mod tests {
 
             let ptb = ProgrammableTransaction {
                 inputs: vec![
-                    setu_types::ptb::CallArg::Object(
-                        setu_types::ptb::ObjectArg::ImmOrOwnedObject(coin_a.id, 0, [0u8; 32]),
-                    ),
-                    setu_types::ptb::CallArg::Object(
-                        setu_types::ptb::ObjectArg::ImmOrOwnedObject(coin_b.id, 0, [0u8; 32]),
-                    ),
+                    setu_types::ptb::CallArg::Object(setu_types::ptb::ObjectArg::ImmOrOwnedObject(
+                        coin_a.id, 0, [0u8; 32],
+                    )),
+                    setu_types::ptb::CallArg::Object(setu_types::ptb::ObjectArg::ImmOrOwnedObject(
+                        coin_b.id, 0, [0u8; 32],
+                    )),
                     setu_types::ptb::CallArg::Pure(recipient_bcs),
                 ],
                 commands: vec![setu_types::ptb::Command::TransferObjects(
@@ -3887,9 +4113,9 @@ mod tests {
             let recipient_bcs = bcs::to_bytes(&[2u8; 32]).unwrap();
             let ptb = ProgrammableTransaction {
                 inputs: vec![
-                    setu_types::ptb::CallArg::Object(
-                        setu_types::ptb::ObjectArg::ImmOrOwnedObject(oid, 0, [0u8; 32]),
-                    ),
+                    setu_types::ptb::CallArg::Object(setu_types::ptb::ObjectArg::ImmOrOwnedObject(
+                        oid, 0, [0u8; 32],
+                    )),
                     setu_types::ptb::CallArg::Pure(recipient_bcs),
                 ],
                 commands: vec![setu_types::ptb::Command::TransferObjects(
@@ -4023,8 +4249,7 @@ mod tests {
                 }],
                 dynamic_field_accesses: vec![],
             };
-            let out = engine
-                .execute_ptb(&store, &ptb, vec![], vec![], &make_ctx());
+            let out = engine.execute_ptb(&store, &ptb, vec![], vec![], &make_ctx());
             // execute_ptb wraps body errors into success=false outputs for
             // most paths, but pre-execution `InvalidTransaction` (linkage
             // miss is a wire-level precondition violation) bubbles up as
@@ -4044,8 +4269,7 @@ mod tests {
             // "no linkage entry" path is now unreachable without a
             // forge-valid ticket; full coverage moves to mo_pkg_*.sh.
             assert!(
-                err_text.contains("no linkage entry")
-                    || err_text.contains("consume_ticket"),
+                err_text.contains("no linkage entry") || err_text.contains("consume_ticket"),
                 "wrong error: {err_text}"
             );
         }
@@ -4065,10 +4289,7 @@ mod tests {
             let prev_addr = setu_types::object::Address::new([0x42; 32]);
             // BCS-encode (Address, u64) — same shape mock TEE writes.
             let linkage_payload = bcs::to_bytes(&(prev_addr, 1u64)).unwrap();
-            let key = format!(
-                "linkage:latest:{}",
-                hex::encode(family.as_bytes())
-            );
+            let key = format!("linkage:latest:{}", hex::encode(family.as_bytes()));
             store.set_raw(&key, linkage_payload).unwrap();
 
             let ptb = ProgrammableTransaction {
@@ -4316,15 +4537,13 @@ mod tests {
         #[test]
         fn b6c_overhead_cost_shape() {
             use crate::gas::{ptb_overhead_cost, PTB_OVERHEAD_TABLE};
-            let move_call = setu_types::ptb::Command::MoveCall(
-                setu_types::ptb::MoveCall {
-                    package: ObjectId::new([0u8; 32]),
-                    module: "m".into(),
-                    function: "f".into(),
-                    type_arguments: vec![],
-                    arguments: vec![],
-                },
-            );
+            let move_call = setu_types::ptb::Command::MoveCall(setu_types::ptb::MoveCall {
+                package: ObjectId::new([0u8; 32]),
+                module: "m".into(),
+                function: "f".into(),
+                type_arguments: vec![],
+                arguments: vec![],
+            });
             assert_eq!(ptb_overhead_cost(&move_call), PTB_OVERHEAD_TABLE.move_call);
 
             let publish_2 = setu_types::ptb::Command::Publish {
@@ -4370,13 +4589,9 @@ mod tests {
             let family_id_bytes: [u8; 32] = [0xBB; 32];
             let policy_u8: u8 = 0;
             let digest_vec: Vec<u8> = vec![0xCC; 32];
-            let ticket_bcs = bcs::to_bytes(&(
-                cap_id_bytes,
-                family_id_bytes,
-                policy_u8,
-                digest_vec.clone(),
-            ))
-            .expect("bcs serialize ticket");
+            let ticket_bcs =
+                bcs::to_bytes(&(cap_id_bytes, family_id_bytes, policy_u8, digest_vec.clone()))
+                    .expect("bcs serialize ticket");
 
             let module_id = ModuleId::new(
                 AccountAddress::ONE,
@@ -4408,14 +4623,11 @@ mod tests {
 
             // Cross-check field ordering. BCS for ID = raw 32 bytes; u8 = 1
             // byte; vector<u8> = ULEB length-prefix + bytes.
-            let cap_out: [u8; 32] =
-                bcs::from_bytes(&out.return_values[0]).expect("decode cap_id");
+            let cap_out: [u8; 32] = bcs::from_bytes(&out.return_values[0]).expect("decode cap_id");
             let fam_out: [u8; 32] =
                 bcs::from_bytes(&out.return_values[1]).expect("decode family_id");
-            let pol_out: u8 =
-                bcs::from_bytes(&out.return_values[2]).expect("decode policy");
-            let dig_out: Vec<u8> =
-                bcs::from_bytes(&out.return_values[3]).expect("decode digest");
+            let pol_out: u8 = bcs::from_bytes(&out.return_values[2]).expect("decode policy");
+            let dig_out: Vec<u8> = bcs::from_bytes(&out.return_values[3]).expect("decode digest");
             assert_eq!(cap_out, cap_id_bytes, "cap_id field 0 ordering drift");
             assert_eq!(fam_out, family_id_bytes, "family_id field 1 ordering drift");
             assert_eq!(pol_out, policy_u8, "policy field 2 ordering drift");
