@@ -301,10 +301,7 @@ impl MoveCallHandler {
             mutable_indices: if request.mutable_indices.is_empty() { None } else { Some(request.mutable_indices.clone()) },
             consumed_indices: if request.consumed_indices.is_empty() { None } else { Some(request.consumed_indices.clone()) },
             needs_tx_context: request.needs_tx_context,
-            // DF FDP M4: network path does not surface DF declarations yet.
-            // Clients speaking the RPC layer get empty DF accesses; HTTP /
-            // JSON clients can still populate via serde default.
-            dynamic_field_accesses: Vec::new(),
+            dynamic_field_accesses: request.dynamic_field_accesses.clone(),
         })
     }
 
@@ -630,7 +627,10 @@ pub(crate) fn canonical_addr_hex(input: &str) -> String {
 
 #[cfg(test)]
 mod hex_canonical_tests {
-    use super::canonical_addr_hex;
+    use super::{canonical_addr_hex, MoveCallHandler};
+    use setu_api::MoveCallRequest;
+    use setu_types::dynamic_field::DfAccessMode;
+    use setu_types::event::DynamicFieldAccess;
 
     #[test]
     fn padded_and_stripped_collapse_to_same_form() {
@@ -670,6 +670,41 @@ mod hex_canonical_tests {
         let padded = "0x0000000000000000000000000000000000000000000000000000000000000001";
         assert_eq!(canonical_addr_hex(padded), "0x1");
         assert_eq!(canonical_addr_hex("0x1"), "0x1");
+    }
+
+    #[test]
+    fn move_call_convert_preserves_dynamic_field_accesses() {
+        let parent = "11".repeat(32);
+        let request = MoveCallRequest {
+            sender: "alice".to_string(),
+            package: "0xcafe".to_string(),
+            module: "df_registry".to_string(),
+            function: "put_u64".to_string(),
+            type_args: vec![],
+            args: vec!["0100000000000000".to_string(), "2a00000000000000".to_string()],
+            input_object_ids: vec![parent.clone()],
+            shared_object_ids: vec![],
+            mutable_indices: vec![0],
+            consumed_indices: vec![],
+            needs_tx_context: false,
+            subnet_id: None,
+            dynamic_field_accesses: vec![DynamicFieldAccess {
+                parent_object_id: parent,
+                key_type: "u64".to_string(),
+                key_bcs_hex: "0100000000000000".to_string(),
+                mode: DfAccessMode::Create,
+                value_type: Some("u64".to_string()),
+            }],
+        };
+
+        let payload = MoveCallHandler::convert_request(&request).expect("convert request");
+        assert_eq!(payload.dynamic_field_accesses.len(), 1);
+        assert_eq!(payload.dynamic_field_accesses[0].key_type, "u64");
+        assert_eq!(payload.dynamic_field_accesses[0].mode, DfAccessMode::Create);
+        assert_eq!(
+            payload.dynamic_field_accesses[0].value_type.as_deref(),
+            Some("u64")
+        );
     }
 }
 
