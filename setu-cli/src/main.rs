@@ -80,6 +80,35 @@ enum Commands {
         #[command(subcommand)]
         action: UserAction,
     },
+
+    /// Encode a Programmable Transaction Block (PTB) from a JSON spec to BCS hex.
+    ///
+    /// Used by the `tests/move_overlay/mo_pkg_upgrade_*` shell tests to drive
+    /// `/api/v1/move/ptb` end-to-end. The spec format is internal-only and
+    /// documented in `setu-cli/src/commands/ptb_encode.rs`.
+    #[command(name = "ptb-encode")]
+    PtbEncode {
+        /// Path to the JSON spec file.
+        #[arg(long)]
+        spec: String,
+        /// Output path. Writes lowercase hex of the BCS-encoded
+        /// `ProgrammableTransaction`. When omitted, prints to stdout.
+        #[arg(long)]
+        out: Option<String>,
+    },
+
+    /// Compute `blake3(bcs::to_bytes(Vec<Vec<u8>>))` for a Move upgrade
+    /// module bundle. The result is the value that goes into
+    /// `authorize_upgrade(cap, policy, digest).digest`. Used by the
+    /// `mo_pkg_upgrade_*.sh` shell tests; matches the recomputation at
+    /// `crates/setu-move-vm/src/engine.rs` (UpgradeTicket digest gate).
+    #[command(name = "bundle-digest")]
+    BundleDigest {
+        /// One or more module bytecodes as hex strings (with or without
+        /// `0x` prefix). Order MUST match `Command::Upgrade.modules` order.
+        #[arg(long = "module", required = true)]
+        module: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -636,6 +665,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::User { action } => {
             commands::user::handle(action, &config).await?;
+        }
+        Commands::PtbEncode { spec, out } => {
+            commands::ptb_encode::handle(&spec, out.as_deref())?;
+        }
+        Commands::BundleDigest { module } => {
+            commands::ptb_encode::handle_bundle_digest(&module)?;
         }
     }
     

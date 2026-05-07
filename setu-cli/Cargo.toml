@@ -50,3 +50,8 @@ uuid = { version = "1.0", features = ["v4"] }
 hex = "0.4"
 base64 = "0.21"
 
+# BCS encoding (for ptb-encode subcommand; B5 Phase B)
+bcs = { workspace = true }
+# BLAKE3 (for bundle-digest subcommand; B5 Phase B)
+blake3 = "1.5"
+

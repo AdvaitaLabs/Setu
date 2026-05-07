@@ -141,7 +141,7 @@ impl MoveCallHandler {
         match tee_executor.execute_solver_inline_batch(
             &call_id, &solver_id, solver_task, vec![],
         ).await {
-            Ok((result_event, execution_time_us, events_processed)) => {
+            Ok((result_event, execution_time_us, events_processed, _gas_used)) => {
                 let event_id = result_event.id.clone();
                 let exec_result = result_event.execution_result.as_ref();
                 let state_changes = exec_result
@@ -725,6 +725,7 @@ impl MovePtbHandler {
                 )),
                 code: None,
                 cap_ids: vec![],
+                gas_used: None,
             };
         }
 
@@ -788,6 +789,7 @@ impl MovePtbHandler {
                     error: Some(format!("Task preparation failed: {}", e)),
                     code: None,
                     cap_ids: vec![],
+                    gas_used: None,
                 };
             }
         };
@@ -803,6 +805,7 @@ impl MovePtbHandler {
                     error: Some(format!("No solver available: {}", e)),
                     code: None,
                     cap_ids: vec![],
+                    gas_used: None,
                 };
             }
         };
@@ -812,7 +815,7 @@ impl MovePtbHandler {
         match tee_executor.execute_solver_inline_batch(
             &call_id, &solver_id, solver_task, vec![],
         ).await {
-            Ok((result_event, execution_time_us, events_processed)) => {
+            Ok((result_event, execution_time_us, events_processed, gas_used)) => {
                 let event_id = result_event.id.clone();
                 let exec_result = result_event.execution_result.as_ref();
                 let success = exec_result.map(|r| r.success).unwrap_or(false);
@@ -912,6 +915,7 @@ impl MovePtbHandler {
                     error,
                     code: None,
                     cap_ids,
+                    gas_used: Some(gas_used),
                 }
             }
             Err(e) => {
@@ -922,6 +926,7 @@ impl MovePtbHandler {
                     error: Some(format!("Execution failed: {}", e)),
                     code: None,
                     cap_ids: vec![],
+                    gas_used: None,
                 }
             }
         }

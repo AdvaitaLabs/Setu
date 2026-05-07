@@ -803,6 +803,7 @@ impl ValidatorNetworkService {
                     error: Some(format!("Invalid hex in `ptb` field: {}", e)),
                     code: None,
                     cap_ids: vec![],
+                    gas_used: None,
                 });
             }
         };
@@ -817,6 +818,7 @@ impl ValidatorNetworkService {
                     error: Some(format!("BCS deserialize failed: {}", e)),
                     code: None,
                     cap_ids: vec![],
+                    gas_used: None,
                 });
             }
         };
@@ -829,6 +831,7 @@ impl ValidatorNetworkService {
                 error: Some(format!("PTB validation failed: {}", e)),
                 code: None,
                 cap_ids: vec![],
+                gas_used: None,
             });
         }
 
@@ -877,6 +880,7 @@ impl ValidatorNetworkService {
                     owner: String::new(), ownership: String::new(),
                     type_tag: String::new(), version: 0,
                     data_hex: String::new(), exists: false,
+                    digest_hex: String::new(),
                     error: Some(format!("Invalid object ID hex: {}", stripped)),
                 };
             }
@@ -893,13 +897,17 @@ impl ValidatorNetworkService {
                     key, object_id: stripped.to_string(),
                     owner: String::new(), ownership: String::new(),
                     type_tag: String::new(), version: 0,
-                    data_hex: String::new(), exists: false, error: None,
+                    data_hex: String::new(), exists: false,
+                    digest_hex: String::new(),
+                    error: None,
                 };
             }
         };
 
         match setu_types::envelope::detect_and_parse(&data) {
             setu_types::envelope::StorageFormat::Envelope(env) => {
+                let envelope_bytes = env.to_bytes();
+                let digest_hex = hex::encode(blake3::hash(&envelope_bytes).as_bytes());
                 setu_api::GetMoveObjectResponse {
                     key,
                     object_id: hex::encode(env.metadata.id.as_bytes()),
@@ -909,6 +917,7 @@ impl ValidatorNetworkService {
                     version: env.metadata.version,
                     data_hex: hex::encode(&env.data),
                     exists: true,
+                    digest_hex,
                     error: None,
                 }
             }
@@ -920,7 +929,9 @@ impl ValidatorNetworkService {
                     type_tag: format!("LegacyCoinState({})", cs.coin_type),
                     version: cs.version,
                     data_hex: hex::encode(&data),
-                    exists: true, error: None,
+                    exists: true,
+                    digest_hex: String::new(),
+                    error: None,
                 }
             }
             setu_types::envelope::StorageFormat::Unknown => {
@@ -930,6 +941,7 @@ impl ValidatorNetworkService {
                     type_tag: String::new(), version: 0,
                     data_hex: hex::encode(&data),
                     exists: true,
+                    digest_hex: String::new(),
                     error: Some("Unknown storage format".into()),
                 }
             }

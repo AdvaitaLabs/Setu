@@ -124,7 +124,7 @@ struct BatchEntry {
     /// RAII-guarded reservation handles — auto-release on drop
     reservations: ReservationGuard,
     /// Channel to send result back to caller
-    result_tx: oneshot::Sender<Result<(Event, u64, usize), String>>,
+    result_tx: oneshot::Sender<Result<(Event, u64, usize, u64), String>>,
 }
 
 /// Configuration for batch collection
@@ -288,7 +288,7 @@ impl TeeExecutor {
     /// 2. No tokio runtime starvation (no background tasks competing for CPU)
     /// 3. Natural backpressure: each HTTP connection handles one transfer at a time
     ///
-    /// Returns `(Event, execution_time_us, events_processed)` on success.
+    /// Returns `(Event, execution_time_us, events_processed, gas_used)` on success.
     /// The coin reservation is released before returning on success.
     /// On error, the RAII guard releases the reservation on drop.
     pub async fn execute_solver_inline(
@@ -297,7 +297,7 @@ impl TeeExecutor {
         solver_id: &str,
         task: SolverTask,
         reservation: Option<ReservationHandle>,
-    ) -> Result<(Event, u64, usize), String> {
+    ) -> Result<(Event, u64, usize, u64), String> {
         self.execute_solver_inline_batch(
             transfer_id,
             solver_id,
@@ -319,7 +319,7 @@ impl TeeExecutor {
         solver_id: &str,
         task: SolverTask,
         reservations: Vec<ReservationHandle>,
-    ) -> Result<(Event, u64, usize), String> {
+    ) -> Result<(Event, u64, usize, u64), String> {
         // Check if batch path is available
         let use_batch = self.batch_tx.is_some()
             && self.batch_collector_alive.load(Ordering::Acquire);
@@ -393,7 +393,7 @@ impl TeeExecutor {
         solver_id: &str,
         task: SolverTask,
         reservations: Vec<ReservationHandle>,
-    ) -> Result<(Event, u64, usize), String> {
+    ) -> Result<(Event, u64, usize, u64), String> {
         let task_id_hex = hex::encode(&task.task_id[..8]);
 
         // RAII guard for panic-safe reservation release
@@ -477,8 +477,9 @@ impl TeeExecutor {
 
                             let exec_time = result_dto.execution_time_us;
                             let events_proc = result_dto.events_processed;
+                            let gas_used = result_dto.gas_used;
 
-                            Ok((event, exec_time, events_proc))
+                            Ok((event, exec_time, events_proc, gas_used))
                         } else {
                             Err("No result in response".to_string())
                         }
@@ -1302,6 +1303,7 @@ impl TeeExecutor {
                             event,
                             result_dto.execution_time_us,
                             result_dto.events_processed,
+                            result_dto.gas_used,
                         ))
                     } else {
                         Err("No result in batch response".to_string())
@@ -1368,7 +1370,7 @@ impl TeeExecutor {
                             event.status = setu_types::event::EventStatus::Executed;
                             entry.reservations.release();
                             let _ = entry.result_tx.send(
-                                Ok((event, result_dto.execution_time_us, result_dto.events_processed))
+                                Ok((event, result_dto.execution_time_us, result_dto.events_processed, result_dto.gas_used))
                             );
                         } else {
                             let _ = entry.result_tx.send(Err("No result in response".to_string()));

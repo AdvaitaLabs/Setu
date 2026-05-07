@@ -225,7 +225,7 @@ impl TransferHandler {
             match tee_executor.execute_solver_inline_batch(
                 &transfer_id, sid, solver_task, reservation_handles,
             ).await {
-                Ok((event, execution_time_us, events_processed)) => {
+                Ok((event, execution_time_us, events_processed, _gas_used)) => {
                     // Fire-and-forget: consensus + storage (no coin held)
                     tee_executor.spawn_post_execution(
                         transfer_id.clone(), event, execution_time_us, events_processed,

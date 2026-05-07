@@ -260,6 +260,11 @@ pub struct MovePtbResponse {
     /// Empty / omitted for PTBs without any `Command::Publish`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cap_ids: Vec<String>,
+    /// B5 Phase B — gas units consumed by the PTB on the solver. `None` for
+    /// failure paths that never reached execution (wire-validation rejects,
+    /// no solver available, etc.). Tail-only addition; JSON shape only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas_used: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -289,6 +294,14 @@ pub struct GetMoveObjectResponse {
     pub data_hex: String,
     /// Whether the object exists
     pub exists: bool,
+    /// B5 Phase B — `blake3(envelope.to_bytes())` of the canonical
+    /// envelope, hex-encoded. Matches the digest a PTB submitter must
+    /// supply in `ObjectArg::ImmOrOwnedObject(id, version, digest)` for
+    /// the stale-read defense at
+    /// `setu-validator/src/task_preparer/single.rs`. Empty when the object
+    /// does not exist or is in a non-envelope storage format.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub digest_hex: String,
     /// Error message (if any)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -500,6 +513,7 @@ mod b6a_ptb_tests {
             error: Some(format!("Invalid hex in `ptb` field: {}", e)),
             code: None,
             cap_ids: vec![],
+            gas_used: None,
         })?;
         let ptb: ProgrammableTransaction =
             bcs::from_bytes(&bcs_bytes).map_err(|e| MovePtbResponse {
@@ -508,6 +522,7 @@ mod b6a_ptb_tests {
                 error: Some(format!("BCS deserialize failed: {}", e)),
                 code: None,
                 cap_ids: vec![],
+                gas_used: None,
             })?;
         ptb.validate_wire().map_err(|e| MovePtbResponse {
             event_id: String::new(),
@@ -515,6 +530,7 @@ mod b6a_ptb_tests {
             error: Some(format!("PTB validation failed: {}", e)),
             code: None,
             cap_ids: vec![],
+            gas_used: None,
         })?;
         Ok(())
     }
