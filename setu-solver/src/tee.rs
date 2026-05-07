@@ -214,6 +214,9 @@ pub struct TeeExecutionResult {
     
     /// Number of events that failed
     pub events_failed: usize,
+
+    /// Human-readable per-event failure reasons, kept out of consensus state.
+    pub failure_reasons: Vec<String>,
     
     /// Gas usage for this execution
     pub gas_usage: GasUsage,
@@ -224,6 +227,32 @@ pub struct TeeExecutionResult {
     
     /// Execution time in microseconds
     pub execution_time_us: u64,
+}
+
+fn annotate_dynamic_field_abort(reason: &str) -> String {
+    let lower = reason.to_ascii_lowercase();
+    if !lower.contains("dynamic_field") {
+        return reason.to_string();
+    }
+
+    let hint = if lower.contains("sub status 0") {
+        Some("dynamicfield not preloaded")
+    } else if lower.contains("sub status 1") {
+        Some("dynamicfield already exists")
+    } else if lower.contains("sub status 2") {
+        Some("dynamicfield not found")
+    } else if lower.contains("sub status 3") {
+        Some("dynamicfield type mismatch")
+    } else if lower.contains("sub status 4") {
+        Some("dynamicfield value has key ability")
+    } else {
+        Some("dynamicfield error")
+    };
+
+    match hint {
+        Some(hint) if !lower.contains(hint) => format!("{} ({})", reason, hint),
+        _ => reason.to_string(),
+    }
 }
 
 impl TeeExecutionResult {
@@ -248,13 +277,20 @@ impl TeeExecutionResult {
             )
             .collect();
         
+        let failure_reasons: Vec<String> = output
+            .events_failed
+            .iter()
+            .map(|failed| format!("{}: {}", failed.event_id, annotate_dynamic_field_abort(&failed.reason)))
+            .collect();
+
         Self {
             task_id: output.task_id,
             subnet_id: output.subnet_id,
             post_state_root: output.post_state_root,
             state_changes,
             events_processed: output.events_processed.len(),
-            events_failed: output.events_failed.len(),
+            events_failed: failure_reasons.len(),
+            failure_reasons,
             gas_usage: output.gas_usage,
             attestation: output.attestation,
             execution_time_us: output.stats.execution_time_us,
@@ -267,8 +303,15 @@ impl TeeExecutionResult {
             success: self.events_failed == 0,
             message: if self.events_failed == 0 {
                 Some(format!("Processed {} events in {}μs", self.events_processed, self.execution_time_us))
-            } else {
+            } else if self.failure_reasons.is_empty() {
                 Some(format!("{} events failed out of {}", self.events_failed, self.events_processed + self.events_failed))
+            } else {
+                Some(format!(
+                    "{} events failed out of {}: {}",
+                    self.events_failed,
+                    self.events_processed + self.events_failed,
+                    self.failure_reasons.join("; ")
+                ))
             },
             state_changes: self.state_changes.clone(),
         }
@@ -363,11 +406,45 @@ mod tests {
             state_changes: vec![],
             events_processed: 1,
             events_failed: 0,
+            failure_reasons: vec![],
             gas_usage: GasUsage::default(),
             attestation: Attestation::mock([0u8; 32]),
             execution_time_us: 100,
         };
         
         assert_eq!(result.task_id_hex(), "ab".repeat(32));
+    }
+
+    #[test]
+    fn test_execution_result_failure_preserves_reason() {
+        let result = TeeExecutionResult {
+            task_id: [0xcd; 32],
+            subnet_id: SubnetId::ROOT,
+            post_state_root: [0u8; 32],
+            state_changes: vec![],
+            events_processed: 0,
+            events_failed: 1,
+            failure_reasons: vec!["event-1: DynamicFieldNotFound: not found".to_string()],
+            gas_usage: GasUsage::default(),
+            attestation: Attestation::mock([0u8; 32]),
+            execution_time_us: 100,
+        };
+
+        let exec_result = result.to_execution_result();
+        assert!(!exec_result.success);
+        assert!(exec_result
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("DynamicFieldNotFound"));
+    }
+
+    #[test]
+    fn test_dynamic_field_abort_annotation() {
+        let reason = "VMError with status ABORTED with sub status 2 at location Module ModuleId { address: 0x1, name: Identifier(\"dynamic_field\") }";
+
+        let annotated = annotate_dynamic_field_abort(reason);
+
+        assert!(annotated.contains("dynamicfield not found"));
     }
 }

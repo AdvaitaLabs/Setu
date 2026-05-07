@@ -105,6 +105,28 @@ impl Drop for ReservationGuard {
     }
 }
 
+fn solver_execution_message(
+    events_processed: usize,
+    events_failed: usize,
+    execution_time_us: u64,
+    solver_message: &str,
+    suffix: &str,
+) -> String {
+    if events_failed == 0 {
+        format!(
+            "TEE executed: {} events in {}μs{}",
+            events_processed, execution_time_us, suffix
+        )
+    } else if !solver_message.trim().is_empty() {
+        solver_message.to_string()
+    } else {
+        format!(
+            "TEE executed: {} events in {}μs{} ({} failed)",
+            events_processed, execution_time_us, suffix, events_failed
+        )
+    }
+}
+
 // ============================================
 // Batch Collection Types
 // ============================================
@@ -453,9 +475,12 @@ impl TeeExecutor {
                             // 5. Build ExecutionResult
                             let execution_result = setu_types::event::ExecutionResult {
                                 success: result_dto.events_failed == 0,
-                                message: Some(format!(
-                                    "TEE executed: {} events in {}μs",
-                                    result_dto.events_processed, result_dto.execution_time_us
+                                message: Some(solver_execution_message(
+                                    result_dto.events_processed,
+                                    result_dto.events_failed,
+                                    result_dto.execution_time_us,
+                                    &exec_resp.message,
+                                    "",
                                 )),
                                 state_changes: result_dto
                                     .state_changes
@@ -761,9 +786,12 @@ impl TeeExecutor {
                             // 5a. Success: Build ExecutionResult and set on Event
                             let execution_result = setu_types::event::ExecutionResult {
                                 success: result_dto.events_failed == 0,
-                                message: Some(format!(
-                                    "TEE executed: {} events in {}μs",
-                                    result_dto.events_processed, result_dto.execution_time_us
+                                message: Some(solver_execution_message(
+                                    result_dto.events_processed,
+                                    result_dto.events_failed,
+                                    result_dto.execution_time_us,
+                                    &exec_resp.message,
+                                    "",
                                 )),
                                 state_changes: result_dto
                                     .state_changes
@@ -1277,10 +1305,12 @@ impl TeeExecutor {
                         let mut event = entry.event;
                         let execution_result = setu_types::event::ExecutionResult {
                             success: result_dto.events_failed == 0,
-                            message: Some(format!(
-                                "TEE executed: {} events in {}μs (batch)",
+                            message: Some(solver_execution_message(
                                 result_dto.events_processed,
+                                result_dto.events_failed,
                                 result_dto.execution_time_us,
+                                &resp.message,
+                                " (batch)",
                             )),
                             state_changes: result_dto
                                 .state_changes
@@ -1353,9 +1383,12 @@ impl TeeExecutor {
                             let mut event = entry.event;
                             let execution_result = setu_types::event::ExecutionResult {
                                 success: result_dto.events_failed == 0,
-                                message: Some(format!(
-                                    "TEE executed: {} events in {}μs (fallback-single)",
-                                    result_dto.events_processed, result_dto.execution_time_us,
+                                message: Some(solver_execution_message(
+                                    result_dto.events_processed,
+                                    result_dto.events_failed,
+                                    result_dto.execution_time_us,
+                                    &exec_resp.message,
+                                    " (fallback-single)",
                                 )),
                                 state_changes: result_dto.state_changes.iter()
                                     .map(|sc| setu_types::event::StateChange {
@@ -1530,9 +1563,12 @@ pub async fn send_solver_task_sync(
     // Convert DTO to ExecutionResult and set on Event
     let execution_result = setu_types::event::ExecutionResult {
         success: result_dto.events_failed == 0,
-        message: Some(format!(
-            "TEE executed: {} events in {}μs",
-            result_dto.events_processed, result_dto.execution_time_us
+        message: Some(solver_execution_message(
+            result_dto.events_processed,
+            result_dto.events_failed,
+            result_dto.execution_time_us,
+            &exec_response.message,
+            "",
         )),
         state_changes: result_dto
             .state_changes

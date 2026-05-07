@@ -756,15 +756,15 @@ fn native_df_remove_internal(
         if !matches!(entry.mode, DfAccessMode::Delete | DfAccessMode::Mutate) {
             return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
         }
-        if entry.value_type_tag != v_tag {
-            return Ok(NativeResult::err(InternalGas::zero(), E_DF_TYPE_MISMATCH));
-        }
         let bytes = match &entry.value_bytes {
             Some(b) => b.clone(),
             None => {
                 return Ok(NativeResult::err(InternalGas::zero(), E_DF_DOES_NOT_EXIST));
             }
         };
+        if entry.value_type_tag != v_tag {
+            return Ok(NativeResult::err(InternalGas::zero(), E_DF_TYPE_MISMATCH));
+        }
         let df_oid = entry.df_oid;
         let on_disk_envelope = entry.envelope_bytes.clone();
         runtime.record_df_delete(
@@ -828,15 +828,16 @@ fn native_df_borrow_internal(
                 return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
             }
         };
-        if entry.value_type_tag != v_tag {
-            return Ok(NativeResult::err(InternalGas::zero(), E_DF_TYPE_MISMATCH));
-        }
-        match &entry.value_bytes {
+        let bytes = match &entry.value_bytes {
             Some(b) => b.clone(),
             None => {
                 return Ok(NativeResult::err(InternalGas::zero(), E_DF_DOES_NOT_EXIST));
             }
+        };
+        if entry.value_type_tag != v_tag {
+            return Ok(NativeResult::err(InternalGas::zero(), E_DF_TYPE_MISMATCH));
         }
+        bytes
     };
     let value = deserialize_value_bytes(context, &v_ty, &bytes)?;
 
@@ -892,15 +893,15 @@ fn native_df_borrow_mut_internal(
         if !matches!(entry.mode, DfAccessMode::Mutate) {
             return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
         }
-        if entry.value_type_tag != v_tag {
-            return Ok(NativeResult::err(InternalGas::zero(), E_DF_TYPE_MISMATCH));
-        }
         let bytes = match &entry.value_bytes {
             Some(b) => b.clone(),
             None => {
                 return Ok(NativeResult::err(InternalGas::zero(), E_DF_DOES_NOT_EXIST));
             }
         };
+        if entry.value_type_tag != v_tag {
+            return Ok(NativeResult::err(InternalGas::zero(), E_DF_TYPE_MISMATCH));
+        }
         let df_oid = entry.df_oid;
         let on_disk_envelope = entry.envelope_bytes.clone();
         runtime.record_df_mutate(

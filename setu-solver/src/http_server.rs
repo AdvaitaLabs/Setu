@@ -39,6 +39,22 @@ impl SolverHandler {
     }
 }
 
+fn execution_message(result: &TeeExecutionResult) -> String {
+    if result.events_failed == 0 || result.failure_reasons.is_empty() {
+        format!(
+            "Task executed: {} events processed, {} failed",
+            result.events_processed, result.events_failed
+        )
+    } else {
+        format!(
+            "Task executed: {} events processed, {} failed: {}",
+            result.events_processed,
+            result.events_failed,
+            result.failure_reasons.join("; ")
+        )
+    }
+}
+
 #[async_trait]
 impl SolverHttpHandler for SolverHandler {
     async fn execute_task(&self, request: ExecuteTaskRequest) -> ExecuteTaskResponse {
@@ -72,10 +88,7 @@ impl SolverHttpHandler for SolverHandler {
 
                 ExecuteTaskResponse::success(
                     result_dto,
-                    format!(
-                        "Task executed: {} events processed, {} failed",
-                        result.events_processed, result.events_failed
-                    ),
+                    execution_message(&result),
                     execution_time_us,
                 )
             }
@@ -127,7 +140,7 @@ impl SolverHttpHandler for SolverHandler {
                     let result_dto = convert_to_dto(&result);
                     indexed_results.push((idx, ExecuteTaskResponse::success(
                         result_dto,
-                        format!("Task {}: {} events processed", task_id_hex, result.events_processed),
+                        format!("Task {}: {}", task_id_hex, execution_message(&result)),
                         execution_time_us,
                     )));
                 }
