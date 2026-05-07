@@ -68,7 +68,8 @@ impl InstructionCountGasMeter {
     /// `MoveExecutionOutput.gas_used` reflects work done up to the failure
     /// point (G1 cross-solver determinism).
     pub fn instructions_remaining(&self) -> u64 {
-        self.max_instructions.saturating_sub(self.instructions_executed)
+        self.max_instructions
+            .saturating_sub(self.instructions_executed)
     }
 }
 
@@ -162,16 +163,16 @@ pub fn ptb_overhead_cost(cmd: &setu_types::ptb::Command) -> u64 {
         Command::SplitCoins(_, amounts) => {
             // One outer charge per resulting coin so a 1×1024 SplitCoins
             // cannot dodge per-element overhead.
-            PTB_OVERHEAD_TABLE.split_coins.saturating_mul(amounts.len() as u64)
-        }
-        Command::MergeCoins(_, sources) => {
-            PTB_OVERHEAD_TABLE.merge_coins.saturating_mul(sources.len() as u64)
-        }
-        Command::TransferObjects(objs, _) => {
             PTB_OVERHEAD_TABLE
-                .transfer_objects
-                .saturating_mul(objs.len() as u64)
+                .split_coins
+                .saturating_mul(amounts.len() as u64)
         }
+        Command::MergeCoins(_, sources) => PTB_OVERHEAD_TABLE
+            .merge_coins
+            .saturating_mul(sources.len() as u64),
+        Command::TransferObjects(objs, _) => PTB_OVERHEAD_TABLE
+            .transfer_objects
+            .saturating_mul(objs.len() as u64),
         Command::Publish { modules, .. } => {
             // Charge the per-bundle baseline plus 5 000 per module
             // bytecode-verify; clamping `len().max(1)` so that an empty
@@ -180,11 +181,9 @@ pub fn ptb_overhead_cost(cmd: &setu_types::ptb::Command) -> u64 {
                 .publish
                 .saturating_mul((modules.len() as u64).max(1))
         }
-        Command::MakeMoveVec { args, .. } => {
-            PTB_OVERHEAD_TABLE
-                .make_move_vec
-                .saturating_mul(args.len() as u64)
-        }
+        Command::MakeMoveVec { args, .. } => PTB_OVERHEAD_TABLE
+            .make_move_vec
+            .saturating_mul(args.len() as u64),
         Command::Upgrade { modules, .. } => {
             // Upgrade pays the publish baseline plus per-module relink and
             // per-byte bundle charges. Compat-check tier charges happen
@@ -304,20 +303,12 @@ impl GasMeter for InstructionCountGasMeter {
     }
 
     // (15) Equality: 1 unit (Phase 1 flat; legacy_abstract_memory_size not available)
-    fn charge_eq(
-        &mut self,
-        _lhs: impl ValueView,
-        _rhs: impl ValueView,
-    ) -> PartialVMResult<()> {
+    fn charge_eq(&mut self, _lhs: impl ValueView, _rhs: impl ValueView) -> PartialVMResult<()> {
         self.charge(1)
     }
 
     // (16) Inequality: 1 unit
-    fn charge_neq(
-        &mut self,
-        _lhs: impl ValueView,
-        _rhs: impl ValueView,
-    ) -> PartialVMResult<()> {
+    fn charge_neq(&mut self, _lhs: impl ValueView, _rhs: impl ValueView) -> PartialVMResult<()> {
         self.charge(1)
     }
 
@@ -407,7 +398,10 @@ impl GasMeter for InstructionCountGasMeter {
 
     // (27) Remaining gas
     fn remaining_gas(&self) -> InternalGas {
-        InternalGas::new(self.max_instructions.saturating_sub(self.instructions_executed))
+        InternalGas::new(
+            self.max_instructions
+                .saturating_sub(self.instructions_executed),
+        )
     }
 }
 

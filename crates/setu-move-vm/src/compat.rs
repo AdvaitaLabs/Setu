@@ -95,15 +95,16 @@ pub fn check_upgrade_compat(
     }
 
     let mut pool = RcPool::new();
-    let old_norm: NormalizedModule = NormalizedModule::new(&mut pool, old_module, /* include_code */ false);
+    let old_norm: NormalizedModule =
+        NormalizedModule::new(&mut pool, old_module, /* include_code */ false);
     let new_norm: NormalizedModule = NormalizedModule::new(&mut pool, new_module, false);
 
-    compat.check(&old_norm, &new_norm).map_err(|e: PartialVMError| {
-        CompatError::Incompatible {
+    compat
+        .check(&old_norm, &new_norm)
+        .map_err(|e: PartialVMError| CompatError::Incompatible {
             status: e.major_status(),
             msg: e.to_string(),
-        }
-    })
+        })
 }
 
 #[cfg(test)]
@@ -111,7 +112,11 @@ mod tests {
     use super::*;
 
     fn first_stdlib() -> Option<&'static [u8]> {
-        crate::engine::STDLIB_MODULES.iter().copied().next().map(|(_, b)| b)
+        crate::engine::STDLIB_MODULES
+            .iter()
+            .copied()
+            .next()
+            .map(|(_, b)| b)
     }
 
     #[test]
@@ -140,7 +145,11 @@ mod tests {
 
     #[test]
     fn u_co3_policy_round_trip() {
-        for p in [UpgradePolicy::Compatible, UpgradePolicy::AdditiveOnly, UpgradePolicy::DepOnly] {
+        for p in [
+            UpgradePolicy::Compatible,
+            UpgradePolicy::AdditiveOnly,
+            UpgradePolicy::DepOnly,
+        ] {
             assert_eq!(UpgradePolicy::from_u8(p.as_u8()), Some(p));
         }
         assert!(UpgradePolicy::from_u8(99).is_none());

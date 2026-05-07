@@ -6,21 +6,19 @@
 use std::str::FromStr;
 
 use move_core_types::{
+    account_address::AccountAddress,
     identifier::{IdentStr, Identifier},
     language_storage::{ModuleId, TypeTag},
-    account_address::AccountAddress,
 };
 
 use setu_runtime::{
-    ExecutionContext, ExecutionOutput, RuntimeExecutor, StateChange, StateChangeType,
-    state::{ObjectStore, StateStore},
     error::RuntimeError,
+    state::{ObjectStore, StateStore},
+    ExecutionContext, ExecutionOutput, RuntimeExecutor, StateChange, StateChangeType,
 };
 use setu_types::OperationType;
 
-use crate::engine::{
-    MoveExecutionContext, MoveStateChange, MoveStateChangeType, SetuMoveEngine,
-};
+use crate::engine::{MoveExecutionContext, MoveStateChange, MoveStateChangeType, SetuMoveEngine};
 use crate::object_runtime::InputObject;
 
 // ═══════════════════════════════════════════════════════════════
@@ -91,7 +89,10 @@ impl<S: StateStore + ObjectStore> HybridExecutor<S> {
                 query_result: None,
             }),
 
-            OperationType::Transfer { from_coin_index, amount } => {
+            OperationType::Transfer {
+                from_coin_index,
+                amount,
+            } => {
                 let coin_id = resolved_inputs.input_objects[*from_coin_index].object_id;
                 let transfer = event.transfer.as_ref().ok_or_else(|| {
                     RuntimeError::InvalidTransaction("Transfer op but no transfer payload".into())
@@ -105,50 +106,79 @@ impl<S: StateStore + ObjectStore> HybridExecutor<S> {
                 )
             }
 
-            OperationType::MergeCoins { target_index, source_indices } => {
-                let target_coin_id = resolved_inputs.input_objects[*target_index].object_id;
-                let source_coin_ids: Vec<_> = source_indices
-                    .iter()
-                    .map(|&i| resolved_inputs.input_objects[i].object_id)
-                    .collect();
-                let owner = self.native.state()
-                    .get_object(&target_coin_id)
-                    .map_err(|e| RuntimeError::StateError(e.to_string()))?
-                    .ok_or(RuntimeError::ObjectNotFound(target_coin_id))?
-                    .metadata.owner
-                    .ok_or_else(|| RuntimeError::InvalidTransaction("Target coin has no owner".into()))?;
-                self.native.execute_merge_coins(&owner, target_coin_id, &source_coin_ids, ctx)
-            }
-
-            OperationType::SplitCoin { source_index, amounts } => {
-                let source_coin_id = resolved_inputs.input_objects[*source_index].object_id;
-                let owner = self.native.state()
-                    .get_object(&source_coin_id)
-                    .map_err(|e| RuntimeError::StateError(e.to_string()))?
-                    .ok_or(RuntimeError::ObjectNotFound(source_coin_id))?
-                    .metadata.owner
-                    .ok_or_else(|| RuntimeError::InvalidTransaction("Source coin has no owner".into()))?;
-                self.native.execute_split_coin(&owner, source_coin_id, amounts, ctx)
-            }
-
-            OperationType::MergeThenTransfer {
-                target_index, source_indices, recipient, amount,
+            OperationType::MergeCoins {
+                target_index,
+                source_indices,
             } => {
                 let target_coin_id = resolved_inputs.input_objects[*target_index].object_id;
                 let source_coin_ids: Vec<_> = source_indices
                     .iter()
                     .map(|&i| resolved_inputs.input_objects[i].object_id)
                     .collect();
-                let owner = self.native.state()
+                let owner = self
+                    .native
+                    .state()
                     .get_object(&target_coin_id)
                     .map_err(|e| RuntimeError::StateError(e.to_string()))?
                     .ok_or(RuntimeError::ObjectNotFound(target_coin_id))?
-                    .metadata.owner
-                    .ok_or_else(|| RuntimeError::InvalidTransaction("Target coin has no owner".into()))?;
+                    .metadata
+                    .owner
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidTransaction("Target coin has no owner".into())
+                    })?;
+                self.native
+                    .execute_merge_coins(&owner, target_coin_id, &source_coin_ids, ctx)
+            }
+
+            OperationType::SplitCoin {
+                source_index,
+                amounts,
+            } => {
+                let source_coin_id = resolved_inputs.input_objects[*source_index].object_id;
+                let owner = self
+                    .native
+                    .state()
+                    .get_object(&source_coin_id)
+                    .map_err(|e| RuntimeError::StateError(e.to_string()))?
+                    .ok_or(RuntimeError::ObjectNotFound(source_coin_id))?
+                    .metadata
+                    .owner
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidTransaction("Source coin has no owner".into())
+                    })?;
+                self.native
+                    .execute_split_coin(&owner, source_coin_id, amounts, ctx)
+            }
+
+            OperationType::MergeThenTransfer {
+                target_index,
+                source_indices,
+                recipient,
+                amount,
+            } => {
+                let target_coin_id = resolved_inputs.input_objects[*target_index].object_id;
+                let source_coin_ids: Vec<_> = source_indices
+                    .iter()
+                    .map(|&i| resolved_inputs.input_objects[i].object_id)
+                    .collect();
+                let owner = self
+                    .native
+                    .state()
+                    .get_object(&target_coin_id)
+                    .map_err(|e| RuntimeError::StateError(e.to_string()))?
+                    .ok_or(RuntimeError::ObjectNotFound(target_coin_id))?
+                    .metadata
+                    .owner
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidTransaction("Target coin has no owner".into())
+                    })?;
 
                 // Step 1: Merge
                 let mut merge_out = self.native.execute_merge_coins(
-                    &owner, target_coin_id, &source_coin_ids, ctx,
+                    &owner,
+                    target_coin_id,
+                    &source_coin_ids,
+                    ctx,
                 )?;
                 if !merge_out.success {
                     return Ok(merge_out);
@@ -168,65 +198,76 @@ impl<S: StateStore + ObjectStore> HybridExecutor<S> {
 
                 // Combine
                 merge_out.state_changes.extend(transfer_out.state_changes);
-                merge_out.created_objects.extend(transfer_out.created_objects);
-                merge_out.deleted_objects.extend(transfer_out.deleted_objects);
+                merge_out
+                    .created_objects
+                    .extend(transfer_out.created_objects);
+                merge_out
+                    .deleted_objects
+                    .extend(transfer_out.deleted_objects);
                 Ok(merge_out)
             }
 
             OperationType::MoveCall {
-                package, module_name, function_name,
-                type_args, pure_args,
-                mutable_indices, consumed_indices,
+                package,
+                module_name,
+                function_name,
+                type_args,
+                pure_args,
+                mutable_indices,
+                consumed_indices,
             } => {
                 let engine = self.move_engine.as_ref().ok_or_else(|| {
                     RuntimeError::InvalidTransaction("Move VM not enabled".into())
                 })?;
 
                 // Build InputObjects from store
-                let input_objects: Vec<InputObject> = resolved_inputs.input_objects
+                let input_objects: Vec<InputObject> = resolved_inputs
+                    .input_objects
                     .iter()
                     .map(|ro| {
-                        let env = self.native.state().get_envelope(&ro.object_id)
-                            .map_err(|e| RuntimeError::StateError(
-                                format!("Failed to get envelope for {}: {}", ro.object_id, e)
-                            ))?
+                        let env = self
+                            .native
+                            .state()
+                            .get_envelope(&ro.object_id)
+                            .map_err(|e| {
+                                RuntimeError::StateError(format!(
+                                    "Failed to get envelope for {}: {}",
+                                    ro.object_id, e
+                                ))
+                            })?
                             .ok_or(RuntimeError::ObjectNotFound(ro.object_id))?;
                         InputObject::from_envelope(&ro.object_id, &env)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
                 // Parse ModuleId
-                let addr = AccountAddress::from_hex_literal(package)
-                    .map_err(|e| RuntimeError::InvalidTransaction(
-                        format!("Invalid package address: {}", e),
-                    ))?;
+                let addr = AccountAddress::from_hex_literal(package).map_err(|e| {
+                    RuntimeError::InvalidTransaction(format!("Invalid package address: {}", e))
+                })?;
                 let module_id = ModuleId::new(
                     addr,
-                    Identifier::new(module_name.as_str())
-                        .map_err(|e| RuntimeError::InvalidTransaction(
-                            format!("Invalid module name: {}", e),
-                        ))?,
+                    Identifier::new(module_name.as_str()).map_err(|e| {
+                        RuntimeError::InvalidTransaction(format!("Invalid module name: {}", e))
+                    })?,
                 );
-                let func_name = IdentStr::new(function_name.as_str())
-                    .map_err(|e| RuntimeError::InvalidTransaction(
-                        format!("Invalid function name: {}", e),
-                    ))?;
+                let func_name = IdentStr::new(function_name.as_str()).map_err(|e| {
+                    RuntimeError::InvalidTransaction(format!("Invalid function name: {}", e))
+                })?;
 
                 // Parse type args
                 let ty_args: Vec<TypeTag> = type_args
                     .iter()
                     .map(|s| TypeTag::from_str(s))
                     .collect::<Result<_, _>>()
-                    .map_err(|e| RuntimeError::InvalidTransaction(
-                        format!("Invalid type arg: {}", e),
-                    ))?;
+                    .map_err(|e| {
+                        RuntimeError::InvalidTransaction(format!("Invalid type arg: {}", e))
+                    })?;
 
                 // MoveExecutionContext
                 let move_ctx = MoveExecutionContext {
                     tx_hash: ctx.tx_hash,
-                    sender: setu_types::Address::from_hex(
-                        &event.creator.clone()
-                    ).unwrap_or(setu_types::Address::ZERO),
+                    sender: setu_types::Address::from_hex(&event.creator.clone())
+                        .unwrap_or(setu_types::Address::ZERO),
                     gas_budget: ctx.gas_budget.unwrap_or(10_000_000),
                     current_version: 0,
                     epoch: 0,
@@ -236,7 +277,10 @@ impl<S: StateStore + ObjectStore> HybridExecutor<S> {
 
                 // Assemble args
                 let (combined_args, mutable_arg_map) = build_move_call_args(
-                    &input_objects, pure_args, consumed_indices, mutable_indices,
+                    &input_objects,
+                    pure_args,
+                    consumed_indices,
+                    mutable_indices,
                 );
 
                 // Execute
@@ -264,15 +308,18 @@ impl<S: StateStore + ObjectStore> HybridExecutor<S> {
                 }
 
                 // Bridge state changes
-                let state_changes: Vec<StateChange> = move_output.state_changes
+                let state_changes: Vec<StateChange> = move_output
+                    .state_changes
                     .into_iter()
                     .map(StateChange::from)
                     .collect();
-                let created: Vec<_> = state_changes.iter()
+                let created: Vec<_> = state_changes
+                    .iter()
                     .filter(|sc| sc.change_type == StateChangeType::Create)
                     .map(|sc| sc.object_id)
                     .collect();
-                let deleted: Vec<_> = state_changes.iter()
+                let deleted: Vec<_> = state_changes
+                    .iter()
                     .filter(|sc| sc.change_type == StateChangeType::Delete)
                     .map(|sc| sc.object_id)
                     .collect();
@@ -287,11 +334,9 @@ impl<S: StateStore + ObjectStore> HybridExecutor<S> {
                 })
             }
 
-            OperationType::MovePublish { .. } => {
-                Err(RuntimeError::InvalidTransaction(
-                    "MovePublish is a ROOT event, not routed through HybridExecutor".into(),
-                ))
-            }
+            OperationType::MovePublish { .. } => Err(RuntimeError::InvalidTransaction(
+                "MovePublish is a ROOT event, not routed through HybridExecutor".into(),
+            )),
 
             // B6b Phase 3g: PTB execution dispatched to engine.execute_ptb.
             //   - input_objects materialization mirrors the MoveCall path
@@ -498,15 +543,17 @@ mod tests {
         let consumed = &[0usize]; // obj_a consumed
         let mutable = &[1usize]; // obj_b mutable
 
-        let (args, mutable_arg_map) = build_move_call_args(&[obj_a, obj_b], &pure, consumed, mutable);
+        let (args, mutable_arg_map) =
+            build_move_call_args(&[obj_a, obj_b], &pure, consumed, mutable);
         assert_eq!(args.len(), 3);
         assert_eq!(args[0], vec![0xA0]); // consumed first
         assert_eq!(args[1], vec![0xB0]); // mutable second
         assert_eq!(args[2], vec![0xCC]); // pure last
-        // mutable_arg_map: obj_b (index 1) is mutable, at arg position 1
+                                         // mutable_arg_map: obj_b (index 1) is mutable, at arg position 1
         assert_eq!(mutable_arg_map.len(), 1);
         assert_eq!(mutable_arg_map[0].0, 1); // arg position
-        assert_eq!(mutable_arg_map[0].1, setu_types::ObjectId::new([0xBB; 32])); // object ID
+        assert_eq!(mutable_arg_map[0].1, setu_types::ObjectId::new([0xBB; 32]));
+        // object ID
     }
 
     #[test]

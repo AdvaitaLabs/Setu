@@ -231,14 +231,15 @@ impl SetuObjectRuntime {
         sender: Address,
         epoch_timestamp_ms: u64,
     ) -> Self {
-        let input_map = input_objects
-            .into_iter()
-            .map(|obj| (obj.id, obj))
-            .collect();
+        let input_map = input_objects.into_iter().map(|obj| (obj.id, obj)).collect();
         let df_cache: BTreeMap<DfCacheKey, DfEntry> = df_preload
             .into_iter()
             .map(|rdf| {
-                let key = (rdf.parent_object_id, rdf.name_type_tag.clone(), rdf.name_bcs.clone());
+                let key = (
+                    rdf.parent_object_id,
+                    rdf.name_type_tag.clone(),
+                    rdf.name_bcs.clone(),
+                );
                 let entry = DfEntry {
                     df_oid: rdf.df_object_id,
                     value_bytes: rdf.value_bytes,
@@ -303,23 +304,25 @@ impl SetuObjectRuntime {
     }
 
     /// Record an object mutation.
-    pub fn mutate_object(
-        &mut self,
-        id: ObjectId,
-        type_tag: StructTag,
-        bcs_bytes: Vec<u8>,
-    ) {
-        self.mutated.insert(id, ObjectMutationEffect { type_tag, bcs_bytes });
+    pub fn mutate_object(&mut self, id: ObjectId, type_tag: StructTag, bcs_bytes: Vec<u8>) {
+        self.mutated.insert(
+            id,
+            ObjectMutationEffect {
+                type_tag,
+                bcs_bytes,
+            },
+        );
     }
 
     /// Record an object freeze (Ownership → Immutable).
-    pub fn freeze_object(
-        &mut self,
-        id: ObjectId,
-        type_tag: StructTag,
-        bcs_bytes: Vec<u8>,
-    ) {
-        self.frozen.insert(id, ObjectFreezeEffect { type_tag, bcs_bytes });
+    pub fn freeze_object(&mut self, id: ObjectId, type_tag: StructTag, bcs_bytes: Vec<u8>) {
+        self.frozen.insert(
+            id,
+            ObjectFreezeEffect {
+                type_tag,
+                bcs_bytes,
+            },
+        );
     }
 
     /// Record an object share (PWOO: Ownership → Shared).
@@ -328,12 +331,7 @@ impl SetuObjectRuntime {
     /// object was loaded as input; otherwise it defaults to 0 (same-TX
     /// newly-created + shared). Callers should have previously removed any
     /// conflicting transfer effect for the same id.
-    pub fn share_object(
-        &mut self,
-        id: ObjectId,
-        type_tag: StructTag,
-        bcs_bytes: Vec<u8>,
-    ) {
+    pub fn share_object(&mut self, id: ObjectId, type_tag: StructTag, bcs_bytes: Vec<u8>) {
         let initial_shared_version = self
             .input_objects
             .get(&id)
@@ -580,7 +578,13 @@ mod tests {
 
     #[test]
     fn test_epoch_timestamp_stored() {
-        let rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 1712700000000);
+        let rt = SetuObjectRuntime::new(
+            vec![],
+            vec![],
+            test_tx_hash(),
+            test_address(),
+            1712700000000,
+        );
         assert_eq!(rt.epoch_timestamp_ms(), 1712700000000);
     }
 
@@ -703,9 +707,30 @@ mod tests {
         // U1: preload 3 entries (1 Create + 2 Read) → cache populated correctly.
         let p = ObjectId::new([0x10; 32]);
         let preload = vec![
-            rdf(p, "u64", vec![0, 0, 0, 0, 0, 0, 0, 1], None, "u64", DfAccessMode::Create),
-            rdf(p, "u64", vec![0, 0, 0, 0, 0, 0, 0, 2], Some(vec![0xAA]), "u64", DfAccessMode::Read),
-            rdf(p, "u64", vec![0, 0, 0, 0, 0, 0, 0, 3], Some(vec![0xBB]), "u64", DfAccessMode::Mutate),
+            rdf(
+                p,
+                "u64",
+                vec![0, 0, 0, 0, 0, 0, 0, 1],
+                None,
+                "u64",
+                DfAccessMode::Create,
+            ),
+            rdf(
+                p,
+                "u64",
+                vec![0, 0, 0, 0, 0, 0, 0, 2],
+                Some(vec![0xAA]),
+                "u64",
+                DfAccessMode::Read,
+            ),
+            rdf(
+                p,
+                "u64",
+                vec![0, 0, 0, 0, 0, 0, 0, 3],
+                Some(vec![0xBB]),
+                "u64",
+                DfAccessMode::Mutate,
+            ),
         ];
         let rt = SetuObjectRuntime::new(vec![], preload, test_tx_hash(), test_address(), 0);
 

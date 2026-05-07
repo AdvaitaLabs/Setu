@@ -34,7 +34,11 @@ impl<'a, S: RawStore> SetuModuleResolver<'a, S> {
 
     /// Build storage key for a module: `"mod:{hex_addr}::{module_name}"`
     fn module_key(module_id: &ModuleId) -> String {
-        format!("mod:{}::{}", module_id.address().to_hex_literal(), module_id.name())
+        format!(
+            "mod:{}::{}",
+            module_id.address().to_hex_literal(),
+            module_id.name()
+        )
     }
 }
 

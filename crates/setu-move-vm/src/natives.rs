@@ -14,25 +14,21 @@ use std::sync::Arc;
 
 use move_binary_format::errors::{PartialVMError, PartialVMResult};
 use move_core_types::{
-    account_address::AccountAddress,
-    gas_algebra::InternalGas,
-    identifier::Identifier,
+    account_address::AccountAddress, gas_algebra::InternalGas, identifier::Identifier,
     vm_status::StatusCode,
 };
 use move_vm_runtime::native_functions::{NativeContext, NativeFunction, NativeFunctionTable};
 use move_vm_types::{
     loaded_data::runtime_types::Type,
     natives::function::NativeResult,
-    values::{Locals, Struct, StructRef, Value, VMValueCast},
+    values::{Locals, Struct, StructRef, VMValueCast, Value},
 };
 use smallvec::smallvec;
 
 use setu_types::dynamic_field::{derive_df_oid, DfAccessMode};
 use setu_types::object::ObjectId;
 
-use crate::object_runtime::{
-    DfCreateEffect, DfDeleteEffect, DfMutateEffect, SetuObjectRuntime,
-};
+use crate::object_runtime::{DfCreateEffect, DfDeleteEffect, DfMutateEffect, SetuObjectRuntime};
 
 // ═══════════════════════════════════════════════════════════════
 // Dynamic Field native abort codes (mirrors setu-framework/.../dynamic_field.move)
@@ -62,11 +58,7 @@ pub fn setu_native_functions() -> NativeFunctionTable {
         &[
             ("object", "new_uid_internal", native_object_new_uid),
             ("object", "delete_uid_internal", native_object_delete_uid),
-            (
-                "object",
-                "uid_to_address_internal",
-                native_uid_to_address,
-            ),
+            ("object", "uid_to_address_internal", native_uid_to_address),
             ("transfer", "transfer_internal", native_transfer_internal),
             ("transfer", "share_internal", native_share_internal),
             ("transfer", "freeze_internal", native_freeze_internal),
@@ -74,25 +66,77 @@ pub fn setu_native_functions() -> NativeFunctionTable {
             ("event", "emit_internal", native_event_emit),
             ("clock", "timestamp_ms_internal", native_clock_timestamp),
             ("dynamic_field", "add_internal", native_df_add_internal),
-            ("dynamic_field", "remove_internal", native_df_remove_internal),
-            ("dynamic_field", "borrow_internal", native_df_borrow_internal),
+            (
+                "dynamic_field",
+                "remove_internal",
+                native_df_remove_internal,
+            ),
+            (
+                "dynamic_field",
+                "borrow_internal",
+                native_df_borrow_internal,
+            ),
             (
                 "dynamic_field",
                 "borrow_mut_internal",
                 native_df_borrow_mut_internal,
             ),
-            ("dynamic_field", "exists_internal", native_df_exists_internal),
+            (
+                "dynamic_field",
+                "exists_internal",
+                native_df_exists_internal,
+            ),
             // ── B3 (Phase 6) natives — bcs / address / hash / crypto ──
-            ("bcs", "to_bytes_internal", crate::natives_b3::native_bcs_to_bytes),
-            ("bcs", "from_bytes_internal", crate::natives_b3::native_bcs_from_bytes),
-            ("address", "from_bytes_internal", crate::natives_b3::native_address_from_bytes),
-            ("address", "to_bytes_internal", crate::natives_b3::native_address_to_bytes),
-            ("hash", "sha2_256_internal", crate::natives_b3::native_hash_sha2_256),
-            ("hash", "sha3_256_internal", crate::natives_b3::native_hash_sha3_256),
-            ("hash", "blake3_internal", crate::natives_b3::native_hash_blake3),
-            ("hash", "keccak256_internal", crate::natives_b3::native_hash_keccak256),
-            ("crypto", "ed25519_verify_internal", crate::natives_b3::native_ed25519_verify),
-            ("crypto", "ecdsa_k1_verify_internal", crate::natives_b3::native_ecdsa_k1_verify),
+            (
+                "bcs",
+                "to_bytes_internal",
+                crate::natives_b3::native_bcs_to_bytes,
+            ),
+            (
+                "bcs",
+                "from_bytes_internal",
+                crate::natives_b3::native_bcs_from_bytes,
+            ),
+            (
+                "address",
+                "from_bytes_internal",
+                crate::natives_b3::native_address_from_bytes,
+            ),
+            (
+                "address",
+                "to_bytes_internal",
+                crate::natives_b3::native_address_to_bytes,
+            ),
+            (
+                "hash",
+                "sha2_256_internal",
+                crate::natives_b3::native_hash_sha2_256,
+            ),
+            (
+                "hash",
+                "sha3_256_internal",
+                crate::natives_b3::native_hash_sha3_256,
+            ),
+            (
+                "hash",
+                "blake3_internal",
+                crate::natives_b3::native_hash_blake3,
+            ),
+            (
+                "hash",
+                "keccak256_internal",
+                crate::natives_b3::native_hash_keccak256,
+            ),
+            (
+                "crypto",
+                "ed25519_verify_internal",
+                crate::natives_b3::native_ed25519_verify,
+            ),
+            (
+                "crypto",
+                "ecdsa_k1_verify_internal",
+                crate::natives_b3::native_ecdsa_k1_verify,
+            ),
         ],
     );
 
@@ -135,16 +179,10 @@ pub fn setu_native_functions() -> NativeFunctionTable {
     table
 }
 
-type RawNativeFn = fn(
-    &mut NativeContext,
-    Vec<Type>,
-    VecDeque<Value>,
-) -> PartialVMResult<NativeResult>;
+type RawNativeFn =
+    fn(&mut NativeContext, Vec<Type>, VecDeque<Value>) -> PartialVMResult<NativeResult>;
 
-fn make_table(
-    addr: AccountAddress,
-    entries: &[(&str, &str, RawNativeFn)],
-) -> NativeFunctionTable {
+fn make_table(addr: AccountAddress, entries: &[(&str, &str, RawNativeFn)]) -> NativeFunctionTable {
     entries
         .iter()
         .map(|(module, func, f)| {
@@ -210,7 +248,8 @@ fn native_object_delete_uid(
     if fields.is_empty() {
         return Err(PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR));
     }
-    let addr: AccountAddress = move_vm_types::values::VMValueCast::cast(fields.into_iter().next().unwrap())?;
+    let addr: AccountAddress =
+        move_vm_types::values::VMValueCast::cast(fields.into_iter().next().unwrap())?;
     let object_id = ObjectId::new(addr.into_bytes());
 
     let runtime = context.extensions_mut().get_mut::<SetuObjectRuntime>()?;
@@ -270,16 +309,16 @@ fn native_transfer_internal(
     mut args: VecDeque<Value>,
 ) -> PartialVMResult<NativeResult> {
     // Args: (obj: T, recipient: address)  — pop in reverse order
-    let recipient: AccountAddress =
-        move_vm_types::values::VMValueCast::cast(args.pop_back().ok_or_else(|| {
-            PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-        })?)?;
-    let obj_value = args.pop_back().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
-    let obj_type = ty_args.pop().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
+    let recipient: AccountAddress = move_vm_types::values::VMValueCast::cast(
+        args.pop_back()
+            .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?,
+    )?;
+    let obj_value = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let obj_type = ty_args
+        .pop()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
 
     // Type tag
     let type_tag = context.type_to_type_tag(&obj_type)?;
@@ -320,12 +359,12 @@ fn native_share_internal(
     mut ty_args: Vec<Type>,
     mut args: VecDeque<Value>,
 ) -> PartialVMResult<NativeResult> {
-    let obj_value = args.pop_back().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
-    let obj_type = ty_args.pop().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
+    let obj_value = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let obj_type = ty_args
+        .pop()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
 
     let type_tag = context.type_to_type_tag(&obj_type)?;
     let struct_tag = match type_tag {
@@ -358,12 +397,12 @@ fn native_freeze_internal(
     mut ty_args: Vec<Type>,
     mut args: VecDeque<Value>,
 ) -> PartialVMResult<NativeResult> {
-    let obj_value = args.pop_back().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
-    let obj_type = ty_args.pop().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
+    let obj_value = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let obj_type = ty_args
+        .pop()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
 
     let type_tag = context.type_to_type_tag(&obj_type)?;
     let struct_tag = match type_tag {
@@ -431,12 +470,12 @@ fn native_event_emit(
     mut ty_args: Vec<Type>,
     mut args: VecDeque<Value>,
 ) -> PartialVMResult<NativeResult> {
-    let event_value = args.pop_back().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
-    let event_type = ty_args.pop().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
+    let event_value = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let event_type = ty_args
+        .pop()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
 
     let type_tag = context.type_to_type_tag(&event_type)?;
     let struct_tag = match type_tag {
@@ -471,7 +510,10 @@ fn native_clock_timestamp(
 ) -> PartialVMResult<NativeResult> {
     let runtime = context.extensions_mut().get_mut::<SetuObjectRuntime>()?;
     let ts = runtime.epoch_timestamp_ms();
-    Ok(NativeResult::ok(InternalGas::zero(), smallvec![Value::u64(ts)]))
+    Ok(NativeResult::ok(
+        InternalGas::zero(),
+        smallvec![Value::u64(ts)],
+    ))
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -573,12 +615,12 @@ fn native_df_add_internal(
     mut args: VecDeque<Value>,
 ) -> PartialVMResult<NativeResult> {
     // ty_args: [K, V]
-    let v_ty = ty_args.pop().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
-    let k_ty = ty_args.pop().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
+    let v_ty = ty_args
+        .pop()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let k_ty = ty_args
+        .pop()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
     // args reverse order: value, name, parent
     let value_val = args
         .pop_back()
@@ -626,10 +668,7 @@ fn native_df_add_internal(
         return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
     }
     if entry.value_bytes.is_some() {
-        return Ok(NativeResult::err(
-            InternalGas::zero(),
-            E_DF_ALREADY_EXISTS,
-        ));
+        return Ok(NativeResult::err(InternalGas::zero(), E_DF_ALREADY_EXISTS));
     }
     if entry.value_type_tag != value_tag {
         return Ok(NativeResult::err(InternalGas::zero(), E_DF_TYPE_MISMATCH));
@@ -687,12 +726,12 @@ fn native_df_remove_internal(
     mut ty_args: Vec<Type>,
     mut args: VecDeque<Value>,
 ) -> PartialVMResult<NativeResult> {
-    let v_ty = ty_args.pop().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
-    let k_ty = ty_args.pop().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
+    let v_ty = ty_args
+        .pop()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let k_ty = ty_args
+        .pop()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
     let name_val = args
         .pop_back()
         .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
@@ -702,9 +741,7 @@ fn native_df_remove_internal(
 
     let parent_oid = extract_parent_oid_from_uid_ref(parent_ref_val)?;
     let (name_tag, name_bcs) = serialize_name(context, &k_ty, name_val)?;
-    let v_tag = context
-        .type_to_type_tag(&v_ty)?
-        .to_canonical_string(true);
+    let v_tag = context.type_to_type_tag(&v_ty)?.to_canonical_string(true);
     let cache_key = (parent_oid, name_tag.clone(), name_bcs.clone());
 
     // Extract needed info under the runtime borrow, then deserialize after drop.
@@ -725,10 +762,7 @@ fn native_df_remove_internal(
         let bytes = match &entry.value_bytes {
             Some(b) => b.clone(),
             None => {
-                return Ok(NativeResult::err(
-                    InternalGas::zero(),
-                    E_DF_DOES_NOT_EXIST,
-                ));
+                return Ok(NativeResult::err(InternalGas::zero(), E_DF_DOES_NOT_EXIST));
             }
         };
         let df_oid = entry.df_oid;
@@ -768,12 +802,12 @@ fn native_df_borrow_internal(
     mut ty_args: Vec<Type>,
     mut args: VecDeque<Value>,
 ) -> PartialVMResult<NativeResult> {
-    let v_ty = ty_args.pop().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
-    let k_ty = ty_args.pop().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
+    let v_ty = ty_args
+        .pop()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let k_ty = ty_args
+        .pop()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
     let name_val = args
         .pop_back()
         .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
@@ -800,10 +834,7 @@ fn native_df_borrow_internal(
         match &entry.value_bytes {
             Some(b) => b.clone(),
             None => {
-                return Ok(NativeResult::err(
-                    InternalGas::zero(),
-                    E_DF_DOES_NOT_EXIST,
-                ));
+                return Ok(NativeResult::err(InternalGas::zero(), E_DF_DOES_NOT_EXIST));
             }
         }
     };
@@ -832,12 +863,12 @@ fn native_df_borrow_mut_internal(
     mut ty_args: Vec<Type>,
     mut args: VecDeque<Value>,
 ) -> PartialVMResult<NativeResult> {
-    let v_ty = ty_args.pop().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
-    let k_ty = ty_args.pop().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
+    let v_ty = ty_args
+        .pop()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let k_ty = ty_args
+        .pop()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
     let name_val = args
         .pop_back()
         .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
@@ -867,10 +898,7 @@ fn native_df_borrow_mut_internal(
         let bytes = match &entry.value_bytes {
             Some(b) => b.clone(),
             None => {
-                return Ok(NativeResult::err(
-                    InternalGas::zero(),
-                    E_DF_DOES_NOT_EXIST,
-                ));
+                return Ok(NativeResult::err(InternalGas::zero(), E_DF_DOES_NOT_EXIST));
             }
         };
         let df_oid = entry.df_oid;
@@ -907,9 +935,9 @@ fn native_df_exists_internal(
     mut ty_args: Vec<Type>,
     mut args: VecDeque<Value>,
 ) -> PartialVMResult<NativeResult> {
-    let k_ty = ty_args.pop().ok_or_else(|| {
-        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
-    })?;
+    let k_ty = ty_args
+        .pop()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
     let name_val = args
         .pop_back()
         .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
@@ -942,9 +970,7 @@ fn native_df_exists_internal(
 /// First 32 bytes = the address (all nested structs start at offset 0 in BCS).
 fn extract_uid_from_bcs(bcs_bytes: &[u8]) -> PartialVMResult<ObjectId> {
     if bcs_bytes.len() < 32 {
-        return Err(PartialVMError::new(
-            StatusCode::VALUE_DESERIALIZATION_ERROR,
-        ));
+        return Err(PartialVMError::new(StatusCode::VALUE_DESERIALIZATION_ERROR));
     }
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&bcs_bytes[..32]);

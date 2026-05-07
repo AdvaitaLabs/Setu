@@ -11,8 +11,7 @@ use std::path::PathBuf;
 
 fn main() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
-    let manifest_dir =
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
     // setu-framework/compiled/ relative to workspace root
     // crates/setu-move-vm/ → parent = crates/ → parent = workspace root
@@ -65,9 +64,7 @@ fn main() {
         let mv_path = compiled_dir.join(format!("{}.mv", name));
         if mv_path.exists() {
             // Use canonical path for include_bytes!
-            let canonical = mv_path
-                .canonicalize()
-                .unwrap_or_else(|_| mv_path.clone());
+            let canonical = mv_path.canonicalize().unwrap_or_else(|_| mv_path.clone());
             code.push_str(&format!(
                 "    (\"{name}\", include_bytes!(\"{}\")),\n",
                 canonical.display()

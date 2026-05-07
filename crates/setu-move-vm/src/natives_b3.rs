@@ -14,15 +14,13 @@ use std::collections::VecDeque;
 
 use move_binary_format::errors::{PartialVMError, PartialVMResult};
 use move_core_types::{
-    account_address::AccountAddress,
-    gas_algebra::InternalGas,
-    vm_status::StatusCode,
+    account_address::AccountAddress, gas_algebra::InternalGas, vm_status::StatusCode,
 };
 use move_vm_runtime::native_functions::NativeContext;
 use move_vm_types::{
     loaded_data::runtime_types::Type,
     natives::function::NativeResult,
-    values::{Reference, Value, VMValueCast, Vector},
+    values::{Reference, VMValueCast, Value, Vector},
 };
 use smallvec::smallvec;
 
@@ -70,7 +68,10 @@ fn ok_bytes(out: Vec<u8>) -> PartialVMResult<NativeResult> {
 }
 
 fn ok_bool(b: bool) -> PartialVMResult<NativeResult> {
-    Ok(NativeResult::ok(InternalGas::zero(), smallvec![Value::bool(b)]))
+    Ok(NativeResult::ok(
+        InternalGas::zero(),
+        smallvec![Value::bool(b)],
+    ))
 }
 
 fn err_abort(code: u64) -> PartialVMResult<NativeResult> {

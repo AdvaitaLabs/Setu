@@ -186,7 +186,10 @@ mod tests {
         let m = CompiledModule::deserialize_with_defaults(bytes).unwrap();
         let mut canonical = Vec::new();
         m.serialize_with_version(m.version, &mut canonical).unwrap();
-        assert_eq!(back, canonical, "relink must be involutive modulo canonicalisation");
+        assert_eq!(
+            back, canonical,
+            "relink must be involutive modulo canonicalisation"
+        );
     }
 
     #[test]
