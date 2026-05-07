@@ -109,8 +109,16 @@ fn apply_module_changes_to_diff(
     for mc in module_changes {
         match mc {
             setu_move_vm::engine::ModuleChange::Publish(id, bytes) => {
+                // Use `to_hex_literal()` (zero-stripped, `0x`-prefixed) for the
+                // address segment so the key is byte-identical to (a) the
+                // legacy `infra_executor.rs::execute_contract_publish` writer
+                // and (b) the engine's compat-check reader at
+                // `engine.rs::lower_upgrade_inline` (line 2056). The default
+                // `AccountAddress::Display` is the zero-padded canonical form
+                // and does NOT round-trip with the readers — see
+                // docs/feat/fix-ptb-upgrade-zero-events/ §R2 for details.
                 diff.add_write(WriteSetEntry::new(
-                    format!("mod:{}::{}", id.address(), id.name()),
+                    format!("mod:{}::{}", id.address().to_hex_literal(), id.name()),
                     bytes.clone(),
                 ));
             }
@@ -121,11 +129,12 @@ fn apply_module_changes_to_diff(
                 package_addr,
                 version,
             } => {
-                // mod:{addr}::{name}
+                // mod:{to_hex_literal(addr)}::{name} — see comment in the
+                // `Publish` arm above for why `to_hex_literal()` is required.
                 diff.add_write(WriteSetEntry::new(
                     format!(
                         "mod:{}::{}",
-                        module_id.address(),
+                        module_id.address().to_hex_literal(),
                         module_id.name()
                     ),
                     bytecode.clone(),
@@ -160,7 +169,7 @@ fn apply_module_changes_to_diff(
                 diff.add_write(WriteSetEntry::new(
                     format!(
                         "mod:{}::{}",
-                        module_id.address(),
+                        module_id.address().to_hex_literal(),
                         module_id.name()
                     ),
                     bytecode.clone(),
@@ -506,12 +515,21 @@ impl MockEnclave {
             }
         }
 
-        // Load module bytecode from module_read_set
+        // Load module bytecode + linkage entries from module_read_set.
+        // Phase 8 (PTB upgrade) needs `linkage:latest:` and `linkage:hist:`
+        // entries to be readable by the engine — see
+        // docs/feat/fix-ptb-upgrade-zero-events/. Without this filter
+        // expansion, the validator-injected entries would be silently
+        // dropped and `lower_upgrade_inline` would fail with
+        // "no linkage entry for family=...".
         for entry in module_read_set {
-            if entry.key.starts_with("mod:") {
+            let accept = entry.key.starts_with("mod:")
+                || entry.key.starts_with("linkage:latest:")
+                || entry.key.starts_with("linkage:hist:");
+            if accept {
                 store.set_raw(&entry.key, entry.value.clone())
                     .map_err(|e| StfError::InternalError(format!(
-                        "Failed to store module: {}", e
+                        "Failed to store module/linkage entry: {}", e
                     )))?;
             }
         }

@@ -1344,27 +1344,101 @@ impl TaskPreparer {
         )?;
 
         // 3. Module read-set: union of every (package, module) referenced by
-        //    Command::MoveCall in ptb.commands.
+        //    Command::MoveCall in ptb.commands, plus the `linkage:latest:` +
+        //    prev-package `mod:{addr}::{name}` entries that
+        //    `lower_upgrade_inline` (engine.rs:1968 / engine.rs:2056) needs
+        //    when a `Command::Upgrade` is present. See
+        //    docs/feat/fix-ptb-upgrade-zero-events/ for the analysis.
         let mut module_read_set: Vec<ReadSetEntry> = Vec::new();
         let mut seen: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
+        let mut seen_raw: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for cmd in &ptb.commands {
-            if let setu_types::ptb::Command::MoveCall(mc) = cmd {
-                // Use canonical (zero-stripped) form to match how `mod:`
-                // SMT keys are written — `infra_executor.rs::execute_contract_publish`
-                // uses `to_hex_literal()`. Padded `hex::encode(.as_bytes())` here
-                // would mis-key for any package whose address has leading zeros
-                // (e.g. v0 family `0xcafe`). See iter-7
-                // docs/feat/fix-package-addr-hex-encoding/.
-                let pkg_hex = crate::network::move_handler::canonical_addr_hex(
-                    &format!("0x{}", hex::encode(mc.package.as_bytes())),
-                );
-                if !seen.insert((pkg_hex.clone(), mc.module.clone())) {
-                    continue;
+            match cmd {
+                setu_types::ptb::Command::MoveCall(mc) => {
+                    // Use canonical (zero-stripped) form to match how `mod:`
+                    // SMT keys are written — `infra_executor.rs::execute_contract_publish`
+                    // uses `to_hex_literal()`. Padded `hex::encode(.as_bytes())` here
+                    // would mis-key for any package whose address has leading zeros
+                    // (e.g. v0 family `0xcafe`). See iter-7
+                    // docs/feat/fix-package-addr-hex-encoding/.
+                    let pkg_hex = crate::network::move_handler::canonical_addr_hex(
+                        &format!("0x{}", hex::encode(mc.package.as_bytes())),
+                    );
+                    if !seen.insert((pkg_hex.clone(), mc.module.clone())) {
+                        continue;
+                    }
+                    let module_set =
+                        self.resolve_module_dependencies(&pkg_hex, &mc.module)?;
+                    module_read_set.extend(module_set);
                 }
-                let module_set =
-                    self.resolve_module_dependencies(&pkg_hex, &mc.module)?;
-                module_read_set.extend(module_set);
+                setu_types::ptb::Command::Upgrade {
+                    current_package,
+                    modules,
+                    ..
+                } => {
+                    // (a) linkage:latest:{family_hex} — engine.rs:1968 reads this
+                    //     to discover prev_package_addr + prev_version. Without it
+                    //     `lower_upgrade_inline` aborts with "no linkage entry for
+                    //     family=...". Format mirrors the publish writer at
+                    //     mock/mod.rs:140 (hex::encode of 32-byte family_id).
+                    let family_hex = hex::encode(current_package.as_bytes());
+                    let linkage_key = format!("linkage:latest:{}", family_hex);
+                    if seen_raw.insert(linkage_key.clone()) {
+                        let linkage_bytes =
+                            self.state_provider.get_raw(&linkage_key).ok_or_else(|| {
+                                TaskPrepareError::ModuleNotFound(linkage_key.clone())
+                            })?;
+                        // (b) Decode (Address, u64) shape written by
+                        //     apply_module_changes_to_diff in mock/mod.rs:138.
+                        let (prev_addr, _prev_ver): (
+                            setu_types::object::Address,
+                            u64,
+                        ) = bcs::from_bytes(&linkage_bytes).map_err(|e| {
+                            TaskPrepareError::InvalidModule(format!(
+                                "linkage:latest decode for {family_hex}: {e}"
+                            ))
+                        })?;
+                        module_read_set.push(ReadSetEntry::new(
+                            linkage_key,
+                            linkage_bytes,
+                        ));
+
+                        // (c) For each module in the upgrade bundle, look up the
+                        //     prev_addr's `mod:{prev_addr}::{name}` entry that
+                        //     engine.rs:2056 feeds to `Compatibility::check`.
+                        //     Use to_hex_literal() to match the engine reader byte-for-byte.
+                        let prev_account_hex_literal =
+                            move_core_types::account_address::AccountAddress::new(
+                                *prev_addr.as_bytes(),
+                            )
+                            .to_hex_literal();
+                        for bytecode in modules {
+                            let cm = move_binary_format::CompiledModule::deserialize_with_defaults(bytecode)
+                                .map_err(|e| {
+                                    TaskPrepareError::InvalidModule(format!(
+                                        "Upgrade input module deserialize failed: {e}"
+                                    ))
+                                })?;
+                            let name = cm.self_id().name().to_string();
+                            let key = format!(
+                                "mod:{}::{}",
+                                prev_account_hex_literal, name
+                            );
+                            if !seen_raw.insert(key.clone()) {
+                                continue;
+                            }
+                            let bytes =
+                                self.state_provider.get_raw(&key).ok_or_else(|| {
+                                    TaskPrepareError::ModuleNotFound(key.clone())
+                                })?;
+                            module_read_set
+                                .push(ReadSetEntry::new(key, bytes));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
