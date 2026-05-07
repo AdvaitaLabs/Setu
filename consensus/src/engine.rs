@@ -282,6 +282,17 @@ impl ConsensusEngine {
         std::mem::take(&mut *pending)
     }
 
+    /// Mark finalized anchor events as no longer pending in the active DAG.
+    ///
+    /// Durable persistence and GC still happen later via
+    /// `DagManager::on_anchor_finalized()`. This only closes the window where
+    /// a locally-finalized event can be selected by another CF before the
+    /// persistence path gets to run.
+    async fn mark_anchor_events_finalized_in_active_dag(&self, anchor: &setu_types::Anchor) {
+        let mut dag = self.dag.write().await;
+        dag.finalize_events(&anchor.event_ids);
+    }
+
     /// Set the network broadcaster for P2P message delivery
     /// 
     /// This should be called after the network layer is initialized.
@@ -565,6 +576,7 @@ impl ConsensusEngine {
         let dag = self.dag.read().await;
         // AnchorBuilder now handles all Merkle tree computation internally
         let cf = manager.try_create_cf(&dag, &vlc);
+        drop(dag);
 
         if let Some(ref frame) = cf {
             info!(
@@ -590,6 +602,8 @@ impl ConsensusEngine {
                     // would get a depth below anchor_depth, causing permanent InsufficientEvents.
                     let new_anchor_depth = manager.anchor_builder().anchor_depth();
                     self.dag_manager.update_min_depth(new_anchor_depth);
+                    self.mark_anchor_events_finalized_in_active_dag(&frame.anchor)
+                        .await;
                     info!(
                         cf_id = %frame.id,
                         new_min_depth = new_anchor_depth,
@@ -922,6 +936,12 @@ impl ConsensusEngine {
         let cf_data = manager.last_finalized_cf().map(|cf| (cf.id.clone(), cf.anchor.clone(), cf.clone()));
         
         let finalized_anchor = if let Some((cf_id, anchor, cf)) = cf_data {
+            // Remove finalized events from Active DAG pending before any
+            // notification/broadcast awaits can interleave with a new event
+            // submission. The events remain in DAG.events for persistence.
+            self.dag_manager.update_min_depth(anchor.depth + 1);
+            self.mark_anchor_events_finalized_in_active_dag(&anchor).await;
+
             // Send finalization to internal channel (legacy, for local listeners)
             let _ = self
                 .message_tx
@@ -958,9 +978,6 @@ impl ConsensusEngine {
             // Advance to next round (ValidatorSet manages rounds)
             let mut validator_set = self.validator_set.write().await;
             validator_set.advance_round();
-
-            // Update depth floor so new events land above anchor_depth
-            self.dag_manager.update_min_depth(anchor.depth + 1);
 
             Some(anchor)
         } else {
@@ -1119,6 +1136,7 @@ impl ConsensusEngine {
         let dag = self.dag.read().await;
 
         let cf = manager.try_create_cf_heartbeat(&dag, &vlc, heartbeat_interval);
+        drop(dag);
 
         if let Some(ref frame) = cf {
             info!(
@@ -1136,6 +1154,8 @@ impl ConsensusEngine {
                 if manager.check_finalization(&frame.id) {
                     let new_anchor_depth = manager.anchor_builder().anchor_depth();
                     self.dag_manager.update_min_depth(new_anchor_depth);
+                    self.mark_anchor_events_finalized_in_active_dag(&frame.anchor)
+                        .await;
                     info!(cf_id = %frame.id, "Heartbeat CF finalized (single-node)");
 
                     {
@@ -1376,6 +1396,39 @@ mod tests {
 
         let stats = engine.get_dag_stats().await;
         assert_eq!(stats.node_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_inline_finalization_removes_events_from_pending_before_persistence() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 1,
+        };
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+
+        let event = Event::genesis(
+            "v1".to_string(),
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 0,
+                physical_time: 0,
+            },
+        );
+
+        let _event_id = engine.add_event(event).await.unwrap();
+
+        let stats = engine.get_dag_stats().await;
+        assert_eq!(stats.node_count, 1);
+        assert_eq!(
+            stats.pending_count, 0,
+            "inline-finalized events must leave DAG.pending before anchor persistence"
+        );
+
+        let anchors = engine.take_pending_anchors().await;
+        assert_eq!(anchors.len(), 1, "anchor still awaits durable persistence");
     }
 
     #[tokio::test]
