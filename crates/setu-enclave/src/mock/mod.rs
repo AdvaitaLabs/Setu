@@ -81,6 +81,109 @@ fn default_coin_type() -> String {
     "ROOT".to_string()  // ROOT subnet's native token (consistent with storage)
 }
 
+/// Translate `setu_move_vm::engine::ModuleChange` entries into `WriteSetEntry`s
+/// on the supplied `StateDiff`.
+///
+/// Three variants → up-to-three writes per entry:
+/// - `Publish(id, bytes)`        → `mod:{addr}::{name}`
+/// - `PublishWithLinkage { … }`  → `mod:`, `linkage:latest:{family}`,
+///   `linkage:hist:{family}:{ver}`
+/// - `Upgrade { … }`             → `mod:`, `linkage:latest:{family}`,
+///   `linkage:hist:{family}:{ver}` (overwrites latest)
+///
+/// **Why this is a free function**: both the legacy `MoveCall` arm and the
+/// PTB arm in `execute_single_event` consume `output.module_changes`. Prior
+/// to this helper, the translation was inlined in MoveCall only and a stale
+/// "PTB does not emit module changes (Phase 1)" comment caused the PTB arm
+/// to silently drop them after Phase 8 added `Command::Publish` /
+/// `Command::Upgrade` lowering — see
+/// `docs/bugs/20260507-ptb-publish-linkage-not-persisted.md`. Routing both
+/// arms through this helper makes the exhaustive `match` the single source
+/// of truth: any future `ModuleChange` variant forces an update here, and
+/// adding a third call site cannot diverge silently.
+#[cfg(feature = "move-vm")]
+fn apply_module_changes_to_diff(
+    diff: &mut StateDiff,
+    module_changes: &[setu_move_vm::engine::ModuleChange],
+) {
+    for mc in module_changes {
+        match mc {
+            setu_move_vm::engine::ModuleChange::Publish(id, bytes) => {
+                diff.add_write(WriteSetEntry::new(
+                    format!("mod:{}::{}", id.address(), id.name()),
+                    bytes.clone(),
+                ));
+            }
+            setu_move_vm::engine::ModuleChange::PublishWithLinkage {
+                module_id,
+                bytecode,
+                family_id,
+                package_addr,
+                version,
+            } => {
+                // mod:{addr}::{name}
+                diff.add_write(WriteSetEntry::new(
+                    format!(
+                        "mod:{}::{}",
+                        module_id.address(),
+                        module_id.name()
+                    ),
+                    bytecode.clone(),
+                ));
+                // linkage:latest:{family_id} → bcs(LinkageEntry { package_addr, version })
+                // linkage:hist:{family_id}:{version} → bcs({ package_addr })
+                // Both keys are content-addressed in the SMT via
+                // `update_indexes_for_value` ignoring linkage:* prefix.
+                let latest = bcs::to_bytes(&(*package_addr, *version))
+                    .expect("LinkageEntry serializes");
+                diff.add_write(WriteSetEntry::new(
+                    format!("linkage:latest:{}", hex::encode(family_id.as_bytes())),
+                    latest.clone(),
+                ));
+                diff.add_write(WriteSetEntry::new(
+                    format!(
+                        "linkage:hist:{}:{:020}",
+                        hex::encode(family_id.as_bytes()),
+                        version
+                    ),
+                    latest,
+                ));
+            }
+            setu_move_vm::engine::ModuleChange::Upgrade {
+                module_id,
+                bytecode,
+                family_id,
+                prev_package: _,
+                new_package_addr,
+                new_version,
+            } => {
+                diff.add_write(WriteSetEntry::new(
+                    format!(
+                        "mod:{}::{}",
+                        module_id.address(),
+                        module_id.name()
+                    ),
+                    bytecode.clone(),
+                ));
+                let latest = bcs::to_bytes(&(*new_package_addr, *new_version))
+                    .expect("LinkageEntry serializes");
+                diff.add_write(WriteSetEntry::new(
+                    format!("linkage:latest:{}", hex::encode(family_id.as_bytes())),
+                    latest.clone(),
+                ));
+                diff.add_write(WriteSetEntry::new(
+                    format!(
+                        "linkage:hist:{}:{:020}",
+                        hex::encode(family_id.as_bytes()),
+                        new_version
+                    ),
+                    latest,
+                ));
+            }
+        }
+    }
+}
+
 /// Mock enclave measurement (constant for testing)
 const MOCK_MEASUREMENT: [u8; 32] = [
     0x4d, 0x4f, 0x43, 0x4b, // "MOCK"
@@ -1090,83 +1193,8 @@ impl MockEnclave {
                     }
                 }
 
-                // 8. Module changes to diff
-                for mc in &output.module_changes {
-                    match mc {
-                        setu_move_vm::engine::ModuleChange::Publish(id, bytes) => {
-                            diff.add_write(WriteSetEntry::new(
-                                format!("mod:{}::{}", id.address(), id.name()),
-                                bytes.clone(),
-                            ));
-                        }
-                        setu_move_vm::engine::ModuleChange::PublishWithLinkage {
-                            module_id,
-                            bytecode,
-                            family_id,
-                            package_addr,
-                            version,
-                        } => {
-                            // mod:{addr}::{name}
-                            diff.add_write(WriteSetEntry::new(
-                                format!(
-                                    "mod:{}::{}",
-                                    module_id.address(),
-                                    module_id.name()
-                                ),
-                                bytecode.clone(),
-                            ));
-                            // linkage:latest:{family_id} → bcs(LinkageEntry { package_addr, version })
-                            // linkage:hist:{family_id}:{version} → bcs({ package_addr })
-                            // Both keys are content-addressed in the SMT via
-                            // `update_indexes_for_value` ignoring linkage:* prefix.
-                            let latest = bcs::to_bytes(&(*package_addr, *version))
-                                .expect("LinkageEntry serializes");
-                            diff.add_write(WriteSetEntry::new(
-                                format!("linkage:latest:{}", hex::encode(family_id.as_bytes())),
-                                latest.clone(),
-                            ));
-                            diff.add_write(WriteSetEntry::new(
-                                format!(
-                                    "linkage:hist:{}:{:020}",
-                                    hex::encode(family_id.as_bytes()),
-                                    version
-                                ),
-                                latest,
-                            ));
-                        }
-                        setu_move_vm::engine::ModuleChange::Upgrade {
-                            module_id,
-                            bytecode,
-                            family_id,
-                            prev_package: _,
-                            new_package_addr,
-                            new_version,
-                        } => {
-                            diff.add_write(WriteSetEntry::new(
-                                format!(
-                                    "mod:{}::{}",
-                                    module_id.address(),
-                                    module_id.name()
-                                ),
-                                bytecode.clone(),
-                            ));
-                            let latest = bcs::to_bytes(&(*new_package_addr, *new_version))
-                                .expect("LinkageEntry serializes");
-                            diff.add_write(WriteSetEntry::new(
-                                format!("linkage:latest:{}", hex::encode(family_id.as_bytes())),
-                                latest.clone(),
-                            ));
-                            diff.add_write(WriteSetEntry::new(
-                                format!(
-                                    "linkage:hist:{}:{:020}",
-                                    hex::encode(family_id.as_bytes()),
-                                    new_version
-                                ),
-                                latest,
-                            ));
-                        }
-                    }
-                }
+                // 8. Module changes to diff (mod: + linkage:latest: + linkage:hist:)
+                apply_module_changes_to_diff(diff, &output.module_changes);
 
                 // 9. Log emitted events (for debugging / future indexer integration)
                 for (i, (type_tag, bcs_bytes)) in output.events.iter().enumerate() {
@@ -1288,8 +1316,12 @@ impl MockEnclave {
                     }
                 }
 
-                // PTB does not emit module changes (no Publish command in
-                // Phase 1 — see docs/feat/move-vm-phase9-ptb-event-wire/design.md §6).
+                // Module changes from `Command::Publish` / `Command::Upgrade`
+                // (Phase 8) — translated into `mod:` + `linkage:latest:` +
+                // `linkage:hist:` writes via the same helper as the MoveCall
+                // arm. See `docs/bugs/20260507-ptb-publish-linkage-not-persisted.md`
+                // for the regression that motivated unifying both arms.
+                apply_module_changes_to_diff(diff, &output.module_changes);
 
                 for (i, (type_tag, bcs_bytes)) in output.events.iter().enumerate() {
                     tracing::info!(
