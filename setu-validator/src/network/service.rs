@@ -139,10 +139,10 @@ pub struct ValidatorNetworkService {
     /// Empty (and forever so) when constructed without consensus.
     execution_outcomes: Arc<DashMap<String, ExecutionOutcome>>,
 
-    /// B1 · Per-object version watcher for the `wait_min_version` long-poll
-    /// API. Optional — if `None`, `wait_move_object_min_version` returns
-    /// [`WaitMoveObjectOutcome::Unavailable`] (HTTP 503).
-    /// Wired during validator boot via [`set_version_watcher`](Self::set_version_watcher).
+    /// B1 · Per-object version watcher for `wait_min_version` long-poll.
+    /// Set during boot via [`set_version_watcher`] so it shares the same
+    /// `Arc` with `GlobalStateManager::set_version_watcher`. `None` until
+    /// then → `wait_move_object_min_version` returns `Unavailable`.
     version_watcher: parking_lot::RwLock<Option<Arc<setu_storage::WatcherRegistry>>>,
 }
 
@@ -354,6 +354,15 @@ impl ValidatorNetworkService {
         self.governance_service = Some(service);
     }
 
+    /// B1 · Attach the shared `WatcherRegistry` for `wait_min_version` long-poll.
+    /// Boot calls this after constructing the service so the network layer and
+    /// `GlobalStateManager` share the same Arc — otherwise CF-finalized writes
+    /// wake nobody. Uses `&self` so tests can hot-swap the registry without
+    /// re-constructing the service.
+    pub fn set_version_watcher(&self, watcher: Arc<setu_storage::WatcherRegistry>) {
+        *self.version_watcher.write() = Some(watcher);
+    }
+
     /// Get the governance service (if enabled).
     pub fn governance_service(&self) -> Option<&Arc<GovernanceService>> {
         self.governance_service.as_ref()
@@ -545,6 +554,7 @@ impl ValidatorNetworkService {
             // Phase 4: Move VM endpoints
             .route("/api/v1/move/call", post(setu_api::http_submit_move_call::<ValidatorNetworkService>))
             .route("/api/v1/move/publish", post(setu_api::http_submit_move_publish::<ValidatorNetworkService>))
+            // B5: Move package upgrade (legacy single-event entry).
             .route("/api/v1/move/upgrade", post(setu_api::http_submit_move_upgrade::<ValidatorNetworkService>))
             // Phase 9 / B6a: Programmable Transaction Block (wire-only stub).
             .route("/api/v1/move/ptb", post(setu_api::http_submit_move_ptb::<ValidatorNetworkService>))
@@ -769,20 +779,6 @@ impl ValidatorNetworkService {
         response
     }
 
-    pub async fn submit_move_upgrade(&self, request: setu_api::MoveUpgradeRequest) -> setu_api::MoveUpgradeResponse {
-        let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst);
-        let executor = self.infra_executor();
-        let (response, event) = move_handler::MoveUpgradeHandler::submit_move_upgrade(
-            &executor, vlc_time, request,
-        ).await;
-
-        if let Some(event) = event {
-            self.add_event_to_dag(event).await;
-        }
-
-        response
-    }
-
     /// Submit a Programmable Transaction Block (PTB).
     ///
     /// Decodes + wire-validates the BCS-encoded PTB, then delegates to
@@ -948,85 +944,6 @@ impl ValidatorNetworkService {
         }
     }
 
-    /// B1 · attach a `WatcherRegistry`. Called during boot (also passed to
-    /// `GlobalStateManager::set_version_watcher`) so leaders and followers
-    /// share one canonical waker.
-    pub fn set_version_watcher(&self, watcher: Arc<setu_storage::WatcherRegistry>) {
-        *self.version_watcher.write() = Some(watcher);
-    }
-
-    /// B1 · long-poll until `version >= min_version` or `timeout_ms` elapses.
-    pub async fn wait_move_object_min_version(
-        &self,
-        object_id_hex: &str,
-        finalized: bool,
-        min_version: u64,
-        timeout_ms: u64,
-    ) -> setu_api::WaitMoveObjectOutcome {
-        let watcher: Arc<setu_storage::WatcherRegistry> = match self
-            .version_watcher
-            .read()
-            .as_ref()
-            .map(Arc::clone)
-        {
-            Some(w) => w,
-            None => return setu_api::WaitMoveObjectOutcome::Unavailable,
-        };
-
-        // Parse oid hex → 32-byte key (same shape as parse_state_change_key
-        // for the `oid:` prefix used everywhere else).
-        let stripped = object_id_hex.strip_prefix("0x").unwrap_or(object_id_hex);
-        let oid_key: [u8; 32] = match hex::decode(stripped)
-            .ok()
-            .and_then(|b| <[u8; 32]>::try_from(b).ok())
-        {
-            Some(k) => k,
-            None => {
-                // Invalid id — return as a normal Resolved with the existing
-                // error path (matches the legacy non-blocking shape).
-                let mut resp = self.get_move_object(object_id_hex, finalized);
-                resp.error.get_or_insert_with(|| {
-                    "wait_min_version: invalid object id hex".to_string()
-                });
-                return setu_api::WaitMoveObjectOutcome::Resolved(resp);
-            }
-        };
-
-        // Register with caps.
-        let guard = match watcher.register(oid_key) {
-            Ok(g) => g,
-            Err(e) => {
-                return setu_api::WaitMoveObjectOutcome::CapExceeded {
-                    reason: e.to_string(),
-                };
-            }
-        };
-
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(timeout_ms);
-
-        loop {
-            // Pre-arm BEFORE re-reading state — eliminates lost-wakeup race
-            // (design §4.4).
-            let notified = guard.notified();
-
-            let resp = self.get_move_object(object_id_hex, finalized);
-            if resp.exists && resp.version >= min_version {
-                return setu_api::WaitMoveObjectOutcome::Resolved(resp);
-            }
-
-            tokio::select! {
-                _ = notified => {
-                    // Spurious or successful wake — re-loop to recheck version.
-                    continue;
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    return setu_api::WaitMoveObjectOutcome::Timeout(resp);
-                }
-            }
-        }
-    }
-
     /// Query module ABI (function list) by address and name
     pub fn get_module_abi(&self, address: &str, name: &str) -> setu_api::GetModuleAbiResponse {
         let not_found = setu_api::GetModuleAbiResponse {
@@ -1037,16 +954,15 @@ impl ValidatorNetworkService {
             error: None,
         };
 
-        // Try storage first, then embedded stdlib
         // Normalize the URL-supplied address so both padded 64-hex and
-        // zero-stripped forms reach the same SMT key.
-        // See docs/feat/fix-package-addr-hex-encoding/.
-        let canonical = crate::network::move_handler::canonical_addr_hex(address);
+        // zero-stripped forms reach the same SMT key. Writers use
+        // `AccountAddress::to_hex_literal()` (zero-stripped).
+        let canonical = move_handler::canonical_addr_hex(address);
         let stripped = canonical.strip_prefix("0x").unwrap_or(&canonical);
         let module_key = format!("mod:{}::{}", canonical, name);
         let bytecode = self.task_preparer.state_provider().get_raw(&module_key)
             .or_else(|| {
-                if stripped == "1" || stripped == "0000000000000000000000000000000000000000000000000000000000000001" {
+                if stripped == "1" {
                     setu_move_vm::engine::STDLIB_MODULES.iter()
                         .find(|(n, _)| *n == name)
                         .map(|(_, bytes)| bytes.to_vec())
@@ -1105,10 +1021,12 @@ impl ValidatorNetworkService {
 
     /// List all modules published at an address
     pub fn list_modules(&self, address: &str) -> setu_api::ListModulesResponse {
-        let stripped = address.strip_prefix("0x").unwrap_or(address);
+        // Normalize first (see `get_module_abi` rationale).
+        let canonical = move_handler::canonical_addr_hex(address);
+        let stripped = canonical.strip_prefix("0x").unwrap_or(&canonical);
 
         // For stdlib (0x1), return embedded module names
-        if stripped == "1" || stripped == "0000000000000000000000000000000000000000000000000000000000000001" {
+        if stripped == "1" {
             let modules: Vec<String> = setu_move_vm::engine::STDLIB_MODULES.iter()
                 .map(|(name, _)| name.to_string())
                 .collect();
@@ -1503,7 +1421,88 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
     }
 
     async fn submit_move_upgrade(&self, request: setu_api::MoveUpgradeRequest) -> setu_api::MoveUpgradeResponse {
-        self.submit_move_upgrade(request).await
+        let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst);
+        let executor = self.infra_executor();
+        let (response, event) = move_handler::MoveUpgradeHandler::submit_move_upgrade(
+            &executor, vlc_time, request,
+        ).await;
+        if let Some(event) = event {
+            self.add_event_to_dag(event).await;
+        }
+        response
+    }
+
+    async fn wait_move_object_min_version(
+        &self,
+        object_id_hex: &str,
+        finalized: bool,
+        min_version: u64,
+        timeout_ms: u64,
+    ) -> setu_api::WaitMoveObjectOutcome {
+        // B1 long-poll loop. Uses the canonical pre-arm pattern documented
+        // on `setu_storage::WatcherRegistry`.
+        let watcher: Arc<setu_storage::WatcherRegistry> = match self
+            .version_watcher
+            .read()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            Some(w) => w,
+            None => return setu_api::WaitMoveObjectOutcome::Unavailable,
+        };
+
+        // Parse oid hex → 32-byte key (same shape as `parse_state_change_key`
+        // for the `oid:` prefix used everywhere else).
+        let stripped = object_id_hex.strip_prefix("0x").unwrap_or(object_id_hex);
+        let oid_key: [u8; 32] = match hex::decode(stripped)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        {
+            Some(k) => k,
+            None => {
+                // Invalid id — return as a normal Resolved with the existing
+                // error path (matches the legacy non-blocking shape).
+                let mut resp = self.get_move_object(object_id_hex, finalized);
+                resp.error.get_or_insert_with(|| {
+                    "wait_min_version: invalid object id hex".to_string()
+                });
+                return setu_api::WaitMoveObjectOutcome::Resolved(resp);
+            }
+        };
+
+        // Register with caps; RAII `WaitGuard::Drop` decrements counters on
+        // success, timeout, AND client-disconnect (axum cancels the future).
+        let guard = match watcher.register(oid_key) {
+            Ok(g) => g,
+            Err(e) => {
+                return setu_api::WaitMoveObjectOutcome::CapExceeded {
+                    reason: e.to_string(),
+                };
+            }
+        };
+
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(timeout_ms);
+
+        loop {
+            // Pre-arm BEFORE re-reading state — eliminates lost-wakeup race.
+            let notified = guard.notified();
+
+            let resp = self.get_move_object(object_id_hex, finalized);
+            if resp.exists && resp.version >= min_version {
+                return setu_api::WaitMoveObjectOutcome::Resolved(resp);
+            }
+
+            tokio::select! {
+                _ = notified => {
+                    // Spurious or successful wake — re-loop to recheck version.
+                    continue;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return setu_api::WaitMoveObjectOutcome::Timeout(resp);
+                }
+            }
+        }
     }
 
     async fn submit_move_ptb(
@@ -1515,17 +1514,6 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
 
     fn get_move_object(&self, object_id: &str, finalized: bool) -> setu_api::GetMoveObjectResponse {
         self.get_move_object(object_id, finalized)
-    }
-
-    async fn wait_move_object_min_version(
-        &self,
-        object_id: &str,
-        finalized: bool,
-        min_version: u64,
-        timeout_ms: u64,
-    ) -> setu_api::WaitMoveObjectOutcome {
-        self.wait_move_object_min_version(object_id, finalized, min_version, timeout_ms)
-            .await
     }
 
     fn get_module_abi(&self, address: &str, name: &str) -> setu_api::GetModuleAbiResponse {

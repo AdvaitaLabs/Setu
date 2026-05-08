@@ -276,10 +276,8 @@ fn native_uid_to_address(
         .pop_back()
         .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
 
-    // UID layout in BCS: Struct { id: ID { bytes: address } }
-    // Front 32 bytes = the address.
-    use move_vm_types::values::VMValueCast;
-    let uid_struct: Struct = VMValueCast::cast(uid_val)?;
+    let uid_ref: StructRef = VMValueCast::cast(uid_val)?;
+    let uid_struct: Struct = uid_ref.read_ref()?.cast()?;
     let mut uid_fields: Vec<Value> = uid_struct.unpack()?.collect();
     if uid_fields.is_empty() {
         return Err(PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR));

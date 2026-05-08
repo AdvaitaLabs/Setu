@@ -90,7 +90,7 @@ module examples::dex_pool {
         token_b: address,
         reserve_a: u64,
         reserve_b: u64,
-        ctx: &TxContext,
+        ctx: &mut TxContext,
     ) {
         let pair = Pair { token_a, token_b };
         assert!(!df::exists_<Pair>(&pool.id, pair), E_PAIR_EXISTS);
@@ -118,7 +118,7 @@ module examples::dex_pool {
         token_b: address,
         reserve_a: u64,
         reserve_b: u64,
-        ctx: &TxContext,
+        ctx: &mut TxContext,
     ) {
         let pair = Pair { token_a, token_b };
         assert!(df::exists_<Pair>(&pool.id, pair), E_PAIR_MISSING);

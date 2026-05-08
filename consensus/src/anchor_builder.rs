@@ -16,17 +16,16 @@
 //! This ensures that rejected/timeout CFs don't corrupt state.
 
 use crate::dag::Dag;
-use crate::vlc::VLC;
-use crate::router::{EventRouter, RoutedEvents};
 use crate::merkle_integration::compute_events_root;
 use crate::outcome_sink::OutcomeSink;
-use setu_types::{
-    Anchor, AnchorMerkleRoots, ConsensusConfig, ConsensusFrame, Event, EventId, SubnetId,
-    ExecutionOutcome,
-    event::StateChange,
-};
-use setu_storage::{GlobalStateManager, SharedStateManager, StateApplySummary, StateApplyError, ConflictRecord};
+use crate::router::{EventRouter, RoutedEvents};
+use crate::vlc::VLC;
 use setu_merkle::HashValue;
+use setu_storage::{GlobalStateManager, SharedStateManager, StateApplyError, StateApplySummary};
+use setu_types::{
+    event::StateChange, Anchor, AnchorMerkleRoots, ConsensusConfig, ConsensusFrame, Event, EventId,
+    ExecutionOutcome, SubnetId,
+};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -97,12 +96,14 @@ fn collect_event_write_keys(event: &Event) -> HashSet<ClaimedWriteKey> {
 /// as impossible. See design §3.2.
 ///
 /// See `docs/feat/strict-same-key-cf-fold/design.md` §3.2.
-fn apply_strict_same_key_fold_policy(
-    events: Vec<Event>,
-) -> (Vec<Event>, Vec<Event>) {
+fn apply_strict_same_key_fold_policy(events: Vec<Event>) -> (Vec<Event>, Vec<Event>) {
     let mut sorted = events;
     sorted.sort_by(|a, b| {
-        match a.vlc_snapshot.logical_time.cmp(&b.vlc_snapshot.logical_time) {
+        match a
+            .vlc_snapshot
+            .logical_time
+            .cmp(&b.vlc_snapshot.logical_time)
+        {
             Ordering::Equal => a.id.cmp(&b.id),
             other => other,
         }
@@ -151,32 +152,32 @@ pub struct BuilderStateSnapshot {
 }
 
 /// 待提交的 Anchor 构建结果
-/// 
+///
 /// 在 CF finalized 之前，所有状态变更都保存在这里，
 /// 不会实际修改 AnchorBuilder 或 GlobalStateManager。
 #[derive(Debug, Clone)]
 pub struct PendingAnchorBuild {
     /// 构建的 Anchor
     pub anchor: Anchor,
-    
+
     /// 路由后的事件
     pub routed_events: RoutedEvents,
-    
+
     /// 待应用的状态变更（按 subnet 分组）
     pub pending_state_changes: HashMap<SubnetId, Vec<StateChangeEntry>>,
-    
+
     /// 构建前的快照（用于验证）
     pub pre_build_snapshot: BuilderStateSnapshot,
-    
+
     /// 计算得到的 events_root
     pub events_root: [u8; 32],
-    
+
     /// 新的 anchor_chain_root (构建后)
     pub new_anchor_chain_root: [u8; 32],
-    
+
     /// 新的 anchor_depth (构建后)
     pub new_anchor_depth: u64,
-    
+
     /// 新的 last_fold_vlc (构建后)
     pub new_last_fold_vlc: u64,
 }
@@ -225,7 +226,7 @@ pub enum AnchorBuildError {
     /// No events to process
     NoEvents,
     /// Snapshot mismatch during commit (并发冲突)
-    /// 
+    ///
     /// 当 commit_build 时发现当前状态与 prepare_build 时的快照不一致。
     /// 这通常意味着另一个 CF 已经被 commit，当前 pending build 已失效。
     SnapshotMismatch {
@@ -233,10 +234,7 @@ pub enum AnchorBuildError {
         actual_depth: u64,
     },
     /// Missing events during Follower sync
-    MissingEvents {
-        expected: usize,
-        found: usize,
-    },
+    MissingEvents { expected: usize, found: usize },
     /// State root mismatch during Follower verification
     RootMismatch {
         expected: [u8; 32],
@@ -248,23 +246,42 @@ impl std::fmt::Display for AnchorBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AnchorBuildError::InsufficientEvents { required, found } => {
-                write!(f, "Insufficient events: required {}, found {}", required, found)
+                write!(
+                    f,
+                    "Insufficient events: required {}, found {}",
+                    required, found
+                )
             }
             AnchorBuildError::DeltaNotReached { required, current } => {
-                write!(f, "VLC delta not reached: required {}, current {}", required, current)
+                write!(
+                    f,
+                    "VLC delta not reached: required {}, current {}",
+                    required, current
+                )
             }
             AnchorBuildError::StateApplyError(e) => write!(f, "State apply error: {}", e),
             AnchorBuildError::MerkleError(e) => write!(f, "Merkle error: {}", e),
             AnchorBuildError::NoEvents => write!(f, "No events to process"),
-            AnchorBuildError::SnapshotMismatch { expected_depth, actual_depth } => {
-                write!(f, "Snapshot mismatch: expected depth {}, actual {}", expected_depth, actual_depth)
+            AnchorBuildError::SnapshotMismatch {
+                expected_depth,
+                actual_depth,
+            } => {
+                write!(
+                    f,
+                    "Snapshot mismatch: expected depth {}, actual {}",
+                    expected_depth, actual_depth
+                )
             }
             AnchorBuildError::MissingEvents { expected, found } => {
                 write!(f, "Missing events: expected {}, found {}", expected, found)
             }
             AnchorBuildError::RootMismatch { expected, actual } => {
-                write!(f, "Root mismatch: expected {:?}, actual {:?}", 
-                    hex::encode(expected), hex::encode(actual))
+                write!(
+                    f,
+                    "Root mismatch: expected {:?}, actual {:?}",
+                    hex::encode(expected),
+                    hex::encode(actual)
+                )
             }
         }
     }
@@ -296,7 +313,7 @@ pub struct AnchorBuilder {
     /// Last fold VLC timestamp
     last_fold_vlc: u64,
     /// Cumulative anchor chain root (chain hash of all previous anchors)
-    /// 
+    ///
     /// Uses chain hashing: new_root = hash(prev_root || anchor_hash)
     /// This provides O(1) memory and O(1) computation while maintaining
     /// cryptographic commitment to the entire anchor history.
@@ -337,11 +354,14 @@ impl AnchorBuilder {
             prepare_base_roots: parking_lot::Mutex::new(HashMap::new()),
         }
     }
-    
+
     /// Create with a shared GlobalStateManager
-    /// 
+    ///
     /// This allows sharing state between components (e.g., TaskPreparer and ConsensusValidator)
-    pub fn with_shared_state_manager(config: ConsensusConfig, state_manager: Arc<SharedStateManager>) -> Self {
+    pub fn with_shared_state_manager(
+        config: ConsensusConfig,
+        state_manager: Arc<SharedStateManager>,
+    ) -> Self {
         Self {
             config,
             shared: state_manager,
@@ -356,10 +376,12 @@ impl AnchorBuilder {
             prepare_base_roots: parking_lot::Mutex::new(HashMap::new()),
         }
     }
-    
+
     /// Check if we should attempt to fold
     pub fn should_fold(&self, current_vlc: &VLC) -> bool {
-        let delta = current_vlc.logical_time().saturating_sub(self.last_fold_vlc);
+        let delta = current_vlc
+            .logical_time()
+            .saturating_sub(self.last_fold_vlc);
         delta >= self.config.vlc_delta_threshold
     }
 
@@ -381,18 +403,12 @@ impl AnchorBuilder {
     /// Genesis events short-circuit to `Applied` regardless of conflict set —
     /// Genesis is pre-applied at startup, so any apply-phase "conflict" here
     /// is an expected re-apply, not a real stale read (R1-ISSUE-1).
-    fn ingest_outcomes(
-        &self,
-        cf_id: &str,
-        applied_events: &[Event],
-        summary: &StateApplySummary,
-    ) {
+    fn ingest_outcomes(&self, cf_id: &str, applied_events: &[Event], summary: &StateApplySummary) {
         let Some(sink) = self.outcomes_sink.as_ref() else {
             return;
         };
 
-        let failed: HashSet<&str> =
-            summary.failed_events.iter().map(String::as_str).collect();
+        let failed: HashSet<&str> = summary.failed_events.iter().map(String::as_str).collect();
         let conflicted: HashMap<&str, &str> = summary
             .conflicted_events
             .iter()
@@ -403,7 +419,9 @@ impl AnchorBuilder {
             if ev.is_genesis() {
                 sink.record(
                     ev.id.clone(),
-                    ExecutionOutcome::Applied { cf_id: cf_id.to_string() },
+                    ExecutionOutcome::Applied {
+                        cf_id: cf_id.to_string(),
+                    },
                 );
                 continue;
             }
@@ -417,28 +435,27 @@ impl AnchorBuilder {
                     ),
                 }
             } else if failed.contains(ev.id.as_str()) {
-                let reason = ev
-                    .execution_result
-                    .as_ref()
-                    .and_then(|r| r.message.clone());
+                let reason = ev.execution_result.as_ref().and_then(|r| r.message.clone());
                 ExecutionOutcome::ExecutionFailed {
                     cf_id: cf_id.to_string(),
                     reason,
                 }
             } else {
-                ExecutionOutcome::Applied { cf_id: cf_id.to_string() }
+                ExecutionOutcome::Applied {
+                    cf_id: cf_id.to_string(),
+                }
             };
             sink.record(ev.id.clone(), outcome);
         }
     }
-    
+
     /// Get the shared state manager
     pub fn shared_state_manager(&self) -> Arc<SharedStateManager> {
         Arc::clone(&self.shared)
     }
-    
+
     /// Restore AnchorBuilder state from storage after restart
-    /// 
+    ///
     /// This should be called during node initialization to recover:
     /// - last_anchor_chain_root: for continuing the chain hash
     /// - anchor_depth: for creating next anchor
@@ -455,9 +472,9 @@ impl AnchorBuilder {
         self.total_anchor_count = total_anchor_count;
         self.last_fold_vlc = last_fold_vlc;
     }
-    
+
     /// Get write access to the global state manager
-    /// 
+    ///
     /// Note: This acquires the write lock. Caller must ensure not to hold it across await points.
     pub fn with_state_manager_mut<F, R>(&self, f: F) -> R
     where
@@ -466,7 +483,7 @@ impl AnchorBuilder {
         let mut guard = self.shared.lock_write();
         f(&mut guard)
     }
-    
+
     /// Get read access to the global state manager
     pub fn with_state_manager<F, R>(&self, f: F) -> R
     where
@@ -479,7 +496,7 @@ impl AnchorBuilder {
     // ========================================================================
     // Deferred Commit Mode API
     // ========================================================================
-    
+
     /// Take a snapshot of current builder state (lightweight, no SMT)
     pub fn take_snapshot(&self) -> BuilderStateSnapshot {
         BuilderStateSnapshot {
@@ -490,7 +507,7 @@ impl AnchorBuilder {
             total_anchor_count: self.total_anchor_count,
         }
     }
-    
+
     /// Verify that current state matches a snapshot
     fn verify_snapshot(&self, snapshot: &BuilderStateSnapshot) -> bool {
         self.anchor_depth == snapshot.anchor_depth
@@ -498,7 +515,7 @@ impl AnchorBuilder {
             && self.last_anchor_chain_root == snapshot.last_anchor_chain_root
             && self.last_anchor.as_ref().map(|a| &a.id) == snapshot.last_anchor_id.as_ref()
     }
-    
+
     /// Prepare to build an anchor (read-only, does not modify state)
     ///
     /// This is the new main entry point for deferred commit mode. It:
@@ -530,12 +547,12 @@ impl AnchorBuilder {
                 current: delta,
             });
         }
-        
+
         // D1: depth-independent event selection via DAG pending-set.
         // `to_depth = dag.max_depth()` is still needed for the new-anchor-depth
         // arithmetic (to_depth + 1) and for the anchor payload.
         let to_depth = dag.max_depth();
-        
+
         // Debug: log selection inputs
         tracing::debug!(
             from_depth = self.anchor_depth,
@@ -545,7 +562,7 @@ impl AnchorBuilder {
             in_flight_count = in_flight_event_ids.len(),
             "prepare_build: selecting pending events"
         );
-        
+
         let events: Vec<Event> = dag
             .get_pending_events()
             .into_iter()
@@ -577,14 +594,14 @@ impl AnchorBuilder {
                 found: events.len(),
             });
         }
-        
+
         if events.is_empty() {
             return Err(AnchorBuildError::NoEvents);
         }
-        
+
         self.prepare_build_internal(events, vlc, to_depth)
     }
-    
+
     /// Force prepare build from specific events (bypasses checks)
     ///
     /// WARNING: bypasses γ strict-same-key fold policy (docs/feat/strict-same-key-cf-fold/).
@@ -609,7 +626,7 @@ impl AnchorBuilder {
         }
         self.prepare_build_internal(events, vlc, depth)
     }
-    
+
     /// Internal prepare build implementation
     fn prepare_build_internal(
         &self,
@@ -619,47 +636,44 @@ impl AnchorBuilder {
     ) -> Result<PendingAnchorBuild, AnchorBuildError> {
         // Take snapshot before any computation
         let pre_build_snapshot = self.take_snapshot();
-        
+
         // Route events by subnet
         let routed = EventRouter::route_events(&events);
-        
+
         // Collect state changes (for metadata in PendingAnchorBuild)
         let pending_state_changes = self.collect_state_changes(&events);
-        
+
         // Compute events root (Binary Merkle Tree)
         let events_root_hash = compute_events_root(&events);
         let events_root = *events_root_hash.as_bytes();
-        
+
         // Compute state root using same deterministic logic as Follower:
         // VLC-sorted, conflict-detected, cloned from write GSM
         #[cfg(feature = "diag-root-drift")]
         let mut prepare_base: [u8; 32] = [0u8; 32];
-        let (global_state_root, subnet_roots) = 
-            self.compute_state_root_from_events(
-                &events,
-                #[cfg(feature = "diag-root-drift")] &mut prepare_base,
-            );
-        
+        let (global_state_root, subnet_roots) = self.compute_state_root_from_events(
+            &events,
+            #[cfg(feature = "diag-root-drift")]
+            &mut prepare_base,
+        );
+
         // Compute new anchor chain root (what it will be after commit)
         let anchor_chain_root = self.last_anchor_chain_root;
-        
+
         // Build merkle roots
         let merkle_roots = AnchorMerkleRoots {
             events_root,
             global_state_root,
-            anchor_chain_root,  // Store "before" value
+            anchor_chain_root, // Store "before" value
             subnet_roots,
         };
-        
+
         // Collect event IDs. γ + trim has already capped `events.len()` to
         // `max_events_per_cf` at the `prepare_build` layer (design §2.0), so
         // do NOT re-trim here — `events_root` and `state_root` above were
         // computed on this exact `events` slice and must match the event_ids.
-        let event_ids: Vec<EventId> = events
-            .iter()
-            .map(|e| e.id.clone())
-            .collect();
-        
+        let event_ids: Vec<EventId> = events.iter().map(|e| e.id.clone()).collect();
+
         // Create anchor (but don't store it yet)
         let anchor = Anchor::with_merkle_roots(
             event_ids,
@@ -679,7 +693,7 @@ impl AnchorBuilder {
         // Compute what the new chain root will be
         let anchor_hash = anchor.compute_hash();
         let new_anchor_chain_root = Self::chain_hash(&self.last_anchor_chain_root, &anchor_hash);
-        
+
         Ok(PendingAnchorBuild {
             anchor,
             routed_events: routed,
@@ -691,7 +705,7 @@ impl AnchorBuilder {
             new_last_fold_vlc: vlc.logical_time(),
         })
     }
-    
+
     /// Clear speculative-overlay entries owned by the events of a finalized CF.
     ///
     /// Invariant F-A (docs/feat/overlay-clear-on-error-path/design.md):
@@ -715,7 +729,10 @@ impl AnchorBuilder {
     ///
     /// This applies all the state changes that were prepared in `prepare_build()`.
     /// Should only be called when the CF has been successfully finalized.
-    pub fn commit_build(&mut self, pending: PendingAnchorBuild) -> Result<StateApplySummary, AnchorBuildError> {
+    pub fn commit_build(
+        &mut self,
+        pending: PendingAnchorBuild,
+    ) -> Result<StateApplySummary, AnchorBuildError> {
         // Verify snapshot consistency (detect concurrent modifications)
         if !self.verify_snapshot(&pending.pre_build_snapshot) {
             // F-A: clear overlay on SnapshotMismatch error path.
@@ -726,7 +743,7 @@ impl AnchorBuilder {
                 actual_depth: self.anchor_depth,
             });
         }
-        
+
         // Apply state changes to SMT and commit in a single write lock
         let events = pending.all_events();
         let anchor_id = self.anchor_depth + 1;
@@ -823,8 +840,7 @@ impl AnchorBuilder {
         // Other validators may not have staged anything (no-op for them), but the
         // validator that executed the MoveCall needs the entries removed so SMT
         // becomes the sole source of truth.
-        let finalized_event_ids: Vec<String> =
-            events.iter().map(|e| e.id.clone()).collect();
+        let finalized_event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
         let _cleared = self.shared.clear_overlay_events(&finalized_event_ids);
 
         // Update AnchorBuilder state
@@ -834,10 +850,10 @@ impl AnchorBuilder {
         self.last_anchor_chain_root = pending.new_anchor_chain_root;
         self.total_anchor_count += 1;
         self.last_fold_instant = Some(std::time::Instant::now());
-        
+
         Ok(state_summary)
     }
-    
+
     /// Apply a finalized CF as a Follower (verify then apply)
     ///
     /// This is used by Follower nodes to apply state from a CF that was
@@ -862,7 +878,7 @@ impl AnchorBuilder {
                 found: events.len(),
             });
         }
-        
+
         // Hold write lock for the ENTIRE verify+commit to prevent race conditions.
         // Without this, concurrent CF proposals can clone the same base state,
         // and the second one's verification becomes stale after the first commits.
@@ -884,7 +900,7 @@ impl AnchorBuilder {
                 let mut temp_manager = (*guard).clone();
                 let verify_summary = temp_manager.apply_committed_events(events);
                 let (expected_root, _) = temp_manager.compute_global_root_bytes();
-                
+
                 if expected_root != merkle_roots.global_state_root {
                     // DIAG (docs/bugs/20260422-stress-same-key-divergence.md):
                     // Dump per-event + per-conflict detail BEFORE returning so
@@ -965,15 +981,14 @@ impl AnchorBuilder {
         self.ingest_outcomes(&cf.anchor.id, events, &state_summary);
 
         // M4: CF finalized — clear speculative overlay entries owned by these events.
-        let finalized_event_ids: Vec<String> =
-            events.iter().map(|e| e.id.clone()).collect();
+        let finalized_event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
         let _cleared = self.shared.clear_overlay_events(&finalized_event_ids);
 
         self.synchronize_finalized_anchor(&cf.anchor);
-        
+
         Ok(state_summary)
     }
-    
+
     /// DIAG only: Phase 3 H4 instrumentation. Emits three probes per CF on
     /// both leader and follower so that `tests/stress/same_key_divergence.sh`
     /// can pair evidence across roles by `cf_id`:
@@ -1030,7 +1045,11 @@ impl AnchorBuilder {
         // sequence matches production order exactly.
         let mut sorted: Vec<&Event> = events.iter().collect();
         sorted.sort_by(|a, b| {
-            match a.vlc_snapshot.logical_time.cmp(&b.vlc_snapshot.logical_time) {
+            match a
+                .vlc_snapshot
+                .logical_time
+                .cmp(&b.vlc_snapshot.logical_time)
+            {
                 std::cmp::Ordering::Equal => a.id.cmp(&b.id),
                 other => other,
             }
@@ -1105,14 +1124,11 @@ impl AnchorBuilder {
                 );
                 continue;
             };
-            let sc = ev
-                .execution_result
-                .as_ref()
-                .and_then(|r| {
-                    r.state_changes
-                        .iter()
-                        .find(|sc| sc.key == rec.conflicting_object)
-                });
+            let sc = ev.execution_result.as_ref().and_then(|r| {
+                r.state_changes
+                    .iter()
+                    .find(|sc| sc.key == rec.conflicting_object)
+            });
             let (expected_old_hex, target_subnet, new_hex) = match sc {
                 Some(sc) => {
                     let exp = sc
@@ -1185,11 +1201,11 @@ impl AnchorBuilder {
             "DIAG follower RootMismatch — see docs/bugs/20260422-stress-same-key-divergence.md"
         );
     }
-    
+
     /// Collect state changes from events without applying them
     fn collect_state_changes(&self, events: &[Event]) -> HashMap<SubnetId, Vec<StateChangeEntry>> {
         let mut changes: HashMap<SubnetId, Vec<StateChangeEntry>> = HashMap::new();
-        
+
         for event in events {
             let subnet_id = event.get_subnet_id();
             if let Some(result) = &event.execution_result {
@@ -1203,10 +1219,10 @@ impl AnchorBuilder {
                 }
             }
         }
-        
+
         changes
     }
-    
+
     /// Compute state root by applying events using the same deterministic logic
     /// as Follower verification (`apply_committed_events`).
     ///
@@ -1239,39 +1255,39 @@ impl AnchorBuilder {
             (*guard).clone()
         };
         // Mutex released — computation is on a detached clone
-        
+
         // Apply using identical logic to Follower:
         // VLC-sorted, conflict-detected, genesis-aware
         temp_manager.apply_committed_events(events);
-        
+
         // Compute and return the root
         temp_manager.compute_global_root_bytes()
     }
-    
+
     // ========================================================================
     // Getters
     // ========================================================================
-    
+
     /// Get the last created anchor
     pub fn last_anchor(&self) -> Option<&Anchor> {
         self.last_anchor.as_ref()
     }
-    
+
     /// Get the current anchor depth
     pub fn anchor_depth(&self) -> u64 {
         self.anchor_depth
     }
-    
+
     /// Get the last fold VLC timestamp
     pub fn last_fold_vlc(&self) -> u64 {
         self.last_fold_vlc
     }
-    
+
     /// Get total anchor count
     pub fn anchor_count(&self) -> usize {
         self.total_anchor_count as usize
     }
-    
+
     /// Get the current anchor chain root
     pub fn anchor_chain_root(&self) -> [u8; 32] {
         self.last_anchor_chain_root
@@ -1285,14 +1301,18 @@ impl AnchorBuilder {
             .unwrap_or(std::time::Duration::from_secs(u64::MAX))
     }
 
-    /// Heartbeat variant of prepare_build: relaxed VLC delta requirement.
+    /// Heartbeat variant of prepare_build: time-guarded pending-event flush.
     ///
     /// Conditions (ALL must be true):
-    /// - delta >= 1 (at least one new event since last fold)
     /// - elapsed_since_last_fold() > heartbeat_interval
+    /// - after filtering in-flight CFs, at least one pending event remains
     /// - events.len() >= min_events_per_cf
     ///
-    /// Does NOT bypass min_events_per_cf — if DAG has 0 pending events, returns NoEvents.
+    /// Unlike the regular fast path, heartbeat deliberately does not require
+    /// a new VLC tick. Gamma-deferred same-key events can remain pending after
+    /// a heartbeat CF commits, but they are old events; requiring `delta >= 1`
+    /// would stall them until an unrelated new event arrives.
+    ///
     /// Does NOT bypass min_events_per_cf — if DAG has 0 pending events, returns NoEvents.
     ///
     /// D1: uses the same pending-status selection as `prepare_build`.
@@ -1303,15 +1323,8 @@ impl AnchorBuilder {
         heartbeat_interval: std::time::Duration,
         in_flight_event_ids: &HashSet<EventId>,
     ) -> Result<PendingAnchorBuild, AnchorBuildError> {
-        let delta = vlc.logical_time().saturating_sub(self.last_fold_vlc);
-        if delta < 1 {
-            return Err(AnchorBuildError::DeltaNotReached {
-                required: 1,
-                current: delta,
-            });
-        }
-
         if self.elapsed_since_last_fold() < heartbeat_interval {
+            let delta = vlc.logical_time().saturating_sub(self.last_fold_vlc);
             return Err(AnchorBuildError::DeltaNotReached {
                 required: self.config.vlc_delta_threshold,
                 current: delta,
@@ -1358,7 +1371,7 @@ impl AnchorBuilder {
     }
 
     /// Synchronize state after a CF is finalized (Follower path, metadata only)
-    /// 
+    ///
     /// This is called by follower nodes when a CF is finalized to synchronize their
     /// anchor chain state with the leader. It updates:
     /// - last_anchor_chain_root: Computes the new chain root by hashing
@@ -1366,7 +1379,7 @@ impl AnchorBuilder {
     /// - anchor_depth: Updates to the next depth
     /// - last_fold_vlc: Updates VLC timestamp
     /// - total_anchor_count: Increments counter
-    /// 
+    ///
     /// Note: This only updates metadata. For Followers, use `apply_follower_finalized_cf`
     /// which also applies state changes with verification.
     pub fn synchronize_finalized_anchor(&mut self, anchor: &Anchor) {
@@ -1374,12 +1387,10 @@ impl AnchorBuilder {
         // The anchor stores the "before" root, we compute the "after" root
         if let Some(ref merkle_roots) = anchor.merkle_roots {
             let anchor_hash = anchor.compute_hash();
-            self.last_anchor_chain_root = Self::chain_hash(
-                &merkle_roots.anchor_chain_root,
-                &anchor_hash
-            );
+            self.last_anchor_chain_root =
+                Self::chain_hash(&merkle_roots.anchor_chain_root, &anchor_hash);
         }
-        
+
         // Update other state to match the finalized anchor
         self.last_anchor = Some(anchor.clone());
         self.anchor_depth = anchor.depth + 1;
@@ -1387,22 +1398,22 @@ impl AnchorBuilder {
         self.total_anchor_count += 1;
         self.last_fold_instant = Some(std::time::Instant::now());
     }
-    
+
     /// Get a subnet's current state root
     pub fn get_subnet_root(&self, subnet_id: &SubnetId) -> Option<[u8; 32]> {
         let snapshot = self.shared.load_snapshot();
         snapshot.get_subnet_root_bytes(subnet_id)
     }
-    
+
     /// Get the current global state root
     pub fn get_global_root(&self) -> [u8; 32] {
         let snapshot = self.shared.load_snapshot();
         let (root, _) = snapshot.compute_global_root_bytes();
         root
     }
-    
+
     /// Chain hash: combines previous chain root with new anchor hash
-    /// 
+    ///
     /// Anchor chain append hash.
     ///
     /// new_root = BLAKE3("SETU_ANCHOR_CHAIN:" || prev_root || anchor_hash)
@@ -1416,9 +1427,10 @@ impl AnchorBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_types::{EventType, ExecutionResult, StateChange};
+    use setu_storage::ConflictRecord;
     use setu_types::event::VLCSnapshot;
-    
+    use setu_types::{EventType, ExecutionResult, StateChange};
+
     fn create_vlc(node_id: &str, time: u64) -> VLC {
         let mut vlc = VLC::new(node_id.to_string());
         for _ in 0..time {
@@ -1426,7 +1438,7 @@ mod tests {
         }
         vlc
     }
-    
+
     fn create_event_with_result(subnet_id: SubnetId, changes: Vec<StateChange>) -> Event {
         let mut event = Event::new(
             EventType::Transfer,
@@ -1449,7 +1461,7 @@ mod tests {
         let hash = setu_types::hash_utils::setu_hash(seed.as_bytes());
         format!("oid:{}", hex::encode(hash))
     }
-    
+
     #[test]
     fn test_prepare_build_does_not_modify_state() {
         let config = ConsensusConfig {
@@ -1458,39 +1470,37 @@ mod tests {
             max_events_per_cf: 100,
             ..Default::default()
         };
-        
+
         let builder = AnchorBuilder::new(config);
         let vlc = create_vlc("node1", 10);
-        
+
         // Create event with state changes
         let event = create_event_with_result(
             SubnetId::ROOT,
-            vec![
-                StateChange {
-                    key: test_oid_key("balance:alice"),
-                    old_value: Some(vec![0; 8]),
-                    new_value: Some(vec![100; 8]),
-                    target_subnet: None,
-                },
-            ],
+            vec![StateChange {
+                key: test_oid_key("balance:alice"),
+                old_value: Some(vec![0; 8]),
+                new_value: Some(vec![100; 8]),
+                target_subnet: None,
+            }],
         );
-        
+
         // Take snapshot before prepare
         let snapshot_before = builder.take_snapshot();
         let root_before = builder.get_global_root();
-        
+
         // Prepare build (should not modify state)
         let pending = builder.force_prepare_build(vec![event], &vlc, 1).unwrap();
-        
+
         // Verify state unchanged
         assert_eq!(builder.take_snapshot(), snapshot_before);
         assert_eq!(builder.get_global_root(), root_before);
-        
+
         // But pending should have computed values
         assert!(pending.anchor.merkle_roots.is_some());
         assert_eq!(pending.new_anchor_depth, 2);
     }
-    
+
     #[test]
     fn test_commit_build_updates_state() {
         let config = ConsensusConfig {
@@ -1499,10 +1509,10 @@ mod tests {
             max_events_per_cf: 100,
             ..Default::default()
         };
-        
+
         let mut builder = AnchorBuilder::new(config);
         let vlc = create_vlc("node1", 10);
-        
+
         // Create event
         let event = create_event_with_result(
             SubnetId::ROOT,
@@ -1510,24 +1520,24 @@ mod tests {
                 key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
-                    target_subnet: None,
+                target_subnet: None,
             }],
         );
-        
+
         // Prepare and commit
         let pending = builder.force_prepare_build(vec![event], &vlc, 1).unwrap();
         let expected_depth = pending.new_anchor_depth;
         let expected_vlc = pending.new_last_fold_vlc;
-        
+
         let result = builder.commit_build(pending);
         assert!(result.is_ok());
-        
+
         // Verify state updated
         assert_eq!(builder.anchor_depth(), expected_depth);
         assert_eq!(builder.last_fold_vlc(), expected_vlc);
         assert_eq!(builder.anchor_count(), 1);
     }
-    
+
     #[test]
     fn test_discard_build_no_state_change() {
         let config = ConsensusConfig {
@@ -1536,13 +1546,13 @@ mod tests {
             max_events_per_cf: 100,
             ..Default::default()
         };
-        
+
         let builder = AnchorBuilder::new(config);
         let vlc = create_vlc("node1", 10);
-        
+
         // Take initial snapshot
         let initial_snapshot = builder.take_snapshot();
-        
+
         // Create event
         let event = create_event_with_result(
             SubnetId::ROOT,
@@ -1550,18 +1560,18 @@ mod tests {
                 key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
-                    target_subnet: None,
+                target_subnet: None,
             }],
         );
-        
+
         // Prepare but don't commit (simulate rejection)
         let pending = builder.force_prepare_build(vec![event], &vlc, 1).unwrap();
-        drop(pending);  // Discard the pending build
-        
+        drop(pending); // Discard the pending build
+
         // Verify state unchanged (no rollback needed!)
         assert_eq!(builder.take_snapshot(), initial_snapshot);
     }
-    
+
     #[test]
     fn test_snapshot_mismatch_on_concurrent_commit() {
         let config = ConsensusConfig {
@@ -1570,11 +1580,11 @@ mod tests {
             max_events_per_cf: 100,
             ..Default::default()
         };
-        
+
         let mut builder = AnchorBuilder::new(config);
         let vlc1 = create_vlc("node1", 10);
         let vlc2 = create_vlc("node1", 20);
-        
+
         // Create two events
         let event1 = create_event_with_result(
             SubnetId::ROOT,
@@ -1582,7 +1592,7 @@ mod tests {
                 key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
-                    target_subnet: None,
+                target_subnet: None,
             }],
         );
         let event2 = create_event_with_result(
@@ -1591,22 +1601,25 @@ mod tests {
                 key: test_oid_key("balance:bob"),
                 old_value: None,
                 new_value: Some(vec![200; 8]),
-                    target_subnet: None,
+                target_subnet: None,
             }],
         );
-        
+
         // Prepare two builds concurrently
         let pending1 = builder.force_prepare_build(vec![event1], &vlc1, 1).unwrap();
         let pending2 = builder.force_prepare_build(vec![event2], &vlc2, 2).unwrap();
-        
+
         // Commit first one
         builder.commit_build(pending1).unwrap();
-        
+
         // Try to commit second one - should fail with SnapshotMismatch
         let result = builder.commit_build(pending2);
-        assert!(matches!(result, Err(AnchorBuildError::SnapshotMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(AnchorBuildError::SnapshotMismatch { .. })
+        ));
     }
-    
+
     #[test]
     fn test_multi_subnet_prepare_and_commit() {
         let config = ConsensusConfig {
@@ -1615,13 +1628,13 @@ mod tests {
             max_events_per_cf: 100,
             ..Default::default()
         };
-        
+
         let mut builder = AnchorBuilder::new(config);
         let vlc = create_vlc("node1", 10);
-        
+
         // Create events for different subnets
         let app_subnet = SubnetId::from_str_id("my-app");
-        
+
         let events = vec![
             create_event_with_result(
                 SubnetId::ROOT,
@@ -1642,20 +1655,20 @@ mod tests {
                 }],
             ),
         ];
-        
+
         // Prepare and commit
         let pending = builder.force_prepare_build(events, &vlc, 1).unwrap();
-        
+
         // Verify pending has computed roots for both subnets
         let merkle_roots = pending.anchor.merkle_roots.as_ref().unwrap();
         assert_eq!(merkle_roots.subnet_roots.len(), 3); // ROOT + GOVERNANCE + app_subnet
-        
+
         let result = builder.commit_build(pending).unwrap();
-        
+
         // Should have processed events from both subnets
         assert_eq!(result.subnets_updated(), 2);
     }
-    
+
     #[test]
     fn test_anchor_chain_continuity() {
         let config = ConsensusConfig {
@@ -1664,9 +1677,9 @@ mod tests {
             max_events_per_cf: 100,
             ..Default::default()
         };
-        
+
         let mut builder = AnchorBuilder::new(config);
-        
+
         // Build first anchor
         let vlc1 = create_vlc("node1", 10);
         let event1 = create_event_with_result(
@@ -1675,14 +1688,14 @@ mod tests {
                 key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
-                    target_subnet: None,
+                target_subnet: None,
             }],
         );
         let pending1 = builder.force_prepare_build(vec![event1], &vlc1, 1).unwrap();
         builder.commit_build(pending1).unwrap();
-        
+
         let chain_root1 = builder.anchor_chain_root();
-        
+
         // Build second anchor
         let vlc2 = create_vlc("node1", 20);
         let event2 = create_event_with_result(
@@ -1691,20 +1704,20 @@ mod tests {
                 key: test_oid_key("balance:bob"),
                 old_value: None,
                 new_value: Some(vec![200; 8]),
-                    target_subnet: None,
+                target_subnet: None,
             }],
         );
         let pending2 = builder.force_prepare_build(vec![event2], &vlc2, 2).unwrap();
         builder.commit_build(pending2).unwrap();
-        
+
         let chain_root2 = builder.anchor_chain_root();
-        
+
         // Chain roots should be different (linked)
         assert_ne!(chain_root1, chain_root2);
-        
+
         // Anchor count should be 2
         assert_eq!(builder.anchor_count(), 2);
-        
+
         // Last anchor should link to first
         let last_anchor = builder.last_anchor().unwrap();
         assert!(last_anchor.previous_anchor.is_some());
@@ -1916,7 +1929,7 @@ mod tests {
     // function returns.
     // ========================================================================
 
-    use setu_types::{Anchor, merkle::AnchorMerkleRoots, ConsensusFrame};
+    use setu_types::{merkle::AnchorMerkleRoots, Anchor, ConsensusFrame};
 
     fn fa_make_event(id_suffix: &str, changes: Vec<StateChange>) -> Event {
         let mut ev = create_event_with_result(SubnetId::ROOT, changes);
@@ -1924,7 +1937,11 @@ mod tests {
         ev
     }
 
-    fn fa_stage_overlay(shared: &std::sync::Arc<SharedStateManager>, event_id: &str, oid_seed: &str) {
+    fn fa_stage_overlay(
+        shared: &std::sync::Arc<SharedStateManager>,
+        event_id: &str,
+        oid_seed: &str,
+    ) {
         let key = test_oid_key(oid_seed);
         let change = StateChange::insert(key, vec![1, 2, 3]);
         shared
@@ -1943,7 +1960,10 @@ mod tests {
             fa_stage_overlay(&shared, &ev.id, &format!("fa-coin-{i}"));
             events.push(ev);
         }
-        assert_eq!(builder.shared_state_manager().overlay_stats().entry_count, n_entries);
+        assert_eq!(
+            builder.shared_state_manager().overlay_stats().entry_count,
+            n_entries
+        );
         (builder, events)
     }
 
@@ -2036,7 +2056,10 @@ mod tests {
             .expect("prepare should succeed");
 
         let result = builder.commit_build(pending);
-        assert!(result.is_ok(), "leader commit should succeed, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "leader commit should succeed, got {result:?}"
+        );
         assert_eq!(
             builder.shared_state_manager().overlay_stats().entry_count,
             0,
@@ -2053,7 +2076,10 @@ mod tests {
         let events_template: Vec<Event> = (0..2)
             .map(|i| {
                 let key = test_oid_key(&format!("fa-coin-{i}"));
-                fa_make_event(&format!("{i}"), vec![StateChange::insert(key, vec![i as u8; 4])])
+                fa_make_event(
+                    &format!("{i}"),
+                    vec![StateChange::insert(key, vec![i as u8; 4])],
+                )
             })
             .collect();
         let vlc = create_vlc("n1", 10);
@@ -2073,12 +2099,18 @@ mod tests {
         for (i, ev) in events_template.iter().enumerate() {
             fa_stage_overlay(&shared, &ev.id, &format!("fa-coin-{i}"));
         }
-        assert_eq!(follower.shared_state_manager().overlay_stats().entry_count, 2);
+        assert_eq!(
+            follower.shared_state_manager().overlay_stats().entry_count,
+            2
+        );
 
         let cf = fa_make_cf(&events_template, expected_root, 1);
         let mut follower = follower;
         let result = follower.apply_follower_finalized_cf(&events_template, &cf);
-        assert!(result.is_ok(), "follower apply should succeed, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "follower apply should succeed, got {result:?}"
+        );
         assert_eq!(
             follower.shared_state_manager().overlay_stats().entry_count,
             0,
@@ -2216,7 +2248,10 @@ mod tests {
         assert_eq!(folded_ids.len(), 2);
         assert!(folded_ids.contains("p1"));
         assert!(folded_ids.contains("p3"));
-        assert!(!folded_ids.contains("p2"), "in-flight event must be excluded");
+        assert!(
+            !folded_ids.contains("p2"),
+            "in-flight event must be excluded"
+        );
     }
 
     /// T6: Events already finalized in the DAG are skipped (they are no
@@ -2239,7 +2274,10 @@ mod tests {
         let folded_ids: HashSet<EventId> = pending.anchor.event_ids.iter().cloned().collect();
         assert_eq!(folded_ids.len(), 1);
         assert!(folded_ids.contains("p1"));
-        assert!(!folded_ids.contains("f1"), "finalized event must be excluded");
+        assert!(
+            !folded_ids.contains("f1"),
+            "finalized event must be excluded"
+        );
     }
 
     /// T7: All pending events are in-flight → `InsufficientEvents`.
@@ -2260,7 +2298,13 @@ mod tests {
             .prepare_build(&dag, &vlc, &in_flight)
             .expect_err("should error when no selectable events remain");
         assert!(
-            matches!(err, AnchorBuildError::InsufficientEvents { required: 1, found: 0 }),
+            matches!(
+                err,
+                AnchorBuildError::InsufficientEvents {
+                    required: 1,
+                    found: 0
+                }
+            ),
             "expected InsufficientEvents, got {err:?}"
         );
     }
@@ -2277,7 +2321,13 @@ mod tests {
             .prepare_build(&dag, &vlc, &in_flight)
             .expect_err("empty pending set → error");
         assert!(
-            matches!(err, AnchorBuildError::InsufficientEvents { required: 1, found: 0 }),
+            matches!(
+                err,
+                AnchorBuildError::InsufficientEvents {
+                    required: 1,
+                    found: 0
+                }
+            ),
             "expected InsufficientEvents, got {err:?}"
         );
     }
@@ -2315,13 +2365,25 @@ mod tests {
         // assertion fails, prepare_build_internal needs to sort events
         // before computing events_root (determinism gap). We leave this
         // assertion strict so the gap becomes visible if it exists.
-        assert_eq!(er1, er2, "events_root must be stable across insertion orders");
-        assert_eq!(er2, er3, "events_root must be stable across insertion orders");
+        assert_eq!(
+            er1, er2,
+            "events_root must be stable across insertion orders"
+        );
+        assert_eq!(
+            er2, er3,
+            "events_root must be stable across insertion orders"
+        );
 
         // global_state_root goes through compute_state_root_from_events
         // which already VLC-sorts internally; it must be stable.
-        assert_eq!(gr1, gr2, "global_state_root must be stable across insertion orders");
-        assert_eq!(gr2, gr3, "global_state_root must be stable across insertion orders");
+        assert_eq!(
+            gr1, gr2,
+            "global_state_root must be stable across insertion orders"
+        );
+        assert_eq!(
+            gr2, gr3,
+            "global_state_root must be stable across insertion orders"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2341,12 +2403,7 @@ mod tests {
 
     /// Build a success-result event with a fixed id, a specific logical_time,
     /// and a set of state-change keys targeting `subnet`.
-    fn gamma_make_event(
-        id: &str,
-        subnet: SubnetId,
-        logical_time: u64,
-        keys: &[&str],
-    ) -> Event {
+    fn gamma_make_event(id: &str, subnet: SubnetId, logical_time: u64, keys: &[&str]) -> Event {
         let mut ev = Event::new(
             EventType::Transfer,
             vec![],
@@ -2429,10 +2486,18 @@ mod tests {
             new_value: Some(vec![2u8; 8]),
             target_subnet: None,
         };
-        ev.execution_result.as_mut().unwrap().state_changes.push(dup);
+        ev.execution_result
+            .as_mut()
+            .unwrap()
+            .state_changes
+            .push(dup);
 
         let keys = collect_event_write_keys(&ev);
-        assert_eq!(keys.len(), 1, "duplicate same-key state_changes must dedupe");
+        assert_eq!(
+            keys.len(),
+            1,
+            "duplicate same-key state_changes must dedupe"
+        );
 
         let (kept, deferred) = apply_strict_same_key_fold_policy(vec![ev]);
         assert_eq!(kept.len(), 1);
@@ -2457,7 +2522,11 @@ mod tests {
         e1.execution_result = None;
         let e2 = gamma_make_event("e2", SubnetId::ROOT, 2, &["A"]);
         let (kept, _deferred) = apply_strict_same_key_fold_policy(vec![e1, e2]);
-        assert_eq!(kept.len(), 2, "events with no execution_result claim no keys");
+        assert_eq!(
+            kept.len(),
+            2,
+            "events with no execution_result claim no keys"
+        );
     }
 
     // --- #8 cross-subnet target: same ObjectId in different subnets ---
@@ -2485,7 +2554,10 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].id, "e1");
         let deferred_ids: HashSet<_> = deferred.iter().map(|e| e.id.clone()).collect();
-        assert_eq!(deferred_ids, ["e2".to_string(), "e3".to_string()].into_iter().collect());
+        assert_eq!(
+            deferred_ids,
+            ["e2".to_string(), "e3".to_string()].into_iter().collect()
+        );
     }
 
     // --- #10 multi-key write blocks on any intersect ---
@@ -2555,7 +2627,10 @@ mod tests {
         assert_eq!(ids_a, ids_b, "kept order must be permutation-invariant");
         let def_ids_a: Vec<_> = def_a.iter().map(|e| e.id.clone()).collect();
         let def_ids_b: Vec<_> = def_b.iter().map(|e| e.id.clone()).collect();
-        assert_eq!(def_ids_a, def_ids_b, "deferred order must be permutation-invariant");
+        assert_eq!(
+            def_ids_a, def_ids_b,
+            "deferred order must be permutation-invariant"
+        );
     }
 
     // --- #13 prepare_build defers same-key events across rounds ---
@@ -2565,7 +2640,12 @@ mod tests {
         let builder = AnchorBuilder::new(gamma_config(100));
         let mut dag = ConsensusDag::new();
         for i in 0..3 {
-            let mut ev = gamma_make_event(&format!("e{}", i + 1), SubnetId::ROOT, (i + 1) as u64, &["HOT"]);
+            let mut ev = gamma_make_event(
+                &format!("e{}", i + 1),
+                SubnetId::ROOT,
+                (i + 1) as u64,
+                &["HOT"],
+            );
             ev.parent_ids.clear();
             dag.add_event_with_depth(ev, (i + 1) as u64)
                 .expect("add_event_with_depth");
@@ -2574,16 +2654,26 @@ mod tests {
         assert_eq!(initial_pending, 3);
 
         let mut vlc = VLC::new("node1".to_string());
-        for _ in 0..10 { vlc.tick(); }
+        for _ in 0..10 {
+            vlc.tick();
+        }
 
         // Round 1: γ keeps exactly 1 event
         let empty_in_flight: HashSet<EventId> = HashSet::new();
         let pending1 = builder
             .prepare_build(&dag, &vlc, &empty_in_flight)
             .expect("round 1 prepare_build");
-        assert_eq!(pending1.anchor.event_ids.len(), 1, "γ must keep exactly 1 same-key event");
+        assert_eq!(
+            pending1.anchor.event_ids.len(),
+            1,
+            "γ must keep exactly 1 same-key event"
+        );
         // DAG pending is NOT mutated by γ — still 3
-        assert_eq!(dag.get_pending_count(), initial_pending, "γ must not mutate DAG pending");
+        assert_eq!(
+            dag.get_pending_count(),
+            initial_pending,
+            "γ must not mutate DAG pending"
+        );
 
         // Round 2: same-DAG call without in_flight mask → same event kept again (deterministic)
         let pending2 = builder
@@ -2626,7 +2716,9 @@ mod tests {
         }
 
         let mut vlc = VLC::new("node1".to_string());
-        for _ in 0..10 { vlc.tick(); }
+        for _ in 0..10 {
+            vlc.tick();
+        }
 
         let empty_in_flight: HashSet<EventId> = HashSet::new();
         let pending = builder
@@ -2665,14 +2757,21 @@ mod tests {
         let builder = AnchorBuilder::new(gamma_config(100));
         let mut dag = ConsensusDag::new();
         for i in 0..2 {
-            let mut ev = gamma_make_event(&format!("hb{}", i + 1), SubnetId::ROOT, (i + 1) as u64, &["HK"]);
+            let mut ev = gamma_make_event(
+                &format!("hb{}", i + 1),
+                SubnetId::ROOT,
+                (i + 1) as u64,
+                &["HK"],
+            );
             ev.parent_ids.clear();
             dag.add_event_with_depth(ev, (i + 1) as u64)
                 .expect("add_event_with_depth");
         }
 
         let mut vlc = VLC::new("node1".to_string());
-        for _ in 0..5 { vlc.tick(); }
+        for _ in 0..5 {
+            vlc.tick();
+        }
 
         let empty_in_flight: HashSet<EventId> = HashSet::new();
         // Fresh builder → elapsed_since_last_fold == Duration::MAX; any heartbeat_interval satisfied.
@@ -2684,17 +2783,78 @@ mod tests {
                 &empty_in_flight,
             )
             .expect("heartbeat prepare");
-        assert_eq!(pending.anchor.event_ids.len(), 1, "heartbeat γ keeps 1 of 2 same-key events");
+        assert_eq!(
+            pending.anchor.event_ids.len(),
+            1,
+            "heartbeat γ keeps 1 of 2 same-key events"
+        );
     }
 
-    // --- #16 force_prepare_build bypasses γ (still trims) ---
+    // --- #16 heartbeat refolds gamma-deferred same-key events without a new VLC tick ---
+    #[test]
+    fn gamma_heartbeat_refolds_deferred_same_key_without_new_vlc_tick() {
+        use crate::dag::Dag as ConsensusDag;
+
+        let mut builder = AnchorBuilder::new(gamma_config(100));
+        let mut dag = ConsensusDag::new();
+        for i in 0..2 {
+            let mut ev = gamma_make_event(
+                &format!("hb-stall-{}", i + 1),
+                SubnetId::ROOT,
+                (i + 1) as u64,
+                &["HOT"],
+            );
+            ev.parent_ids.clear();
+            dag.add_event_with_depth(ev, (i + 1) as u64)
+                .expect("add_event_with_depth");
+        }
+
+        let mut vlc = VLC::new("node1".to_string());
+        for _ in 0..5 {
+            vlc.tick();
+        }
+
+        let empty_in_flight: HashSet<EventId> = HashSet::new();
+        let first = builder
+            .prepare_build_heartbeat(
+                &dag,
+                &vlc,
+                std::time::Duration::from_millis(0),
+                &empty_in_flight,
+            )
+            .expect("first heartbeat prepare");
+        assert_eq!(first.anchor.event_ids.len(), 1);
+
+        let first_ids = first.anchor.event_ids.clone();
+        builder.commit_build(first).expect("commit first heartbeat");
+        dag.finalize_events(&first_ids);
+
+        let second = builder
+            .prepare_build_heartbeat(
+                &dag,
+                &vlc,
+                std::time::Duration::from_millis(0),
+                &empty_in_flight,
+            )
+            .expect("gamma-deferred event should refold without new VLC tick");
+
+        assert_eq!(second.anchor.event_ids.len(), 1);
+        assert_ne!(
+            second.anchor.event_ids[0], first_ids[0],
+            "second heartbeat must select the deferred same-key event",
+        );
+    }
+
+    // --- #17 force_prepare_build bypasses γ (still trims) ---
     #[test]
     fn gamma_force_prepare_build_bypasses_policy() {
         let builder = AnchorBuilder::new(gamma_config(10));
         let e1 = gamma_make_event("f1", SubnetId::ROOT, 1, &["SAME"]);
         let e2 = gamma_make_event("f2", SubnetId::ROOT, 2, &["SAME"]);
         let mut vlc = VLC::new("node1".to_string());
-        for _ in 0..3 { vlc.tick(); }
+        for _ in 0..3 {
+            vlc.tick();
+        }
         let pending = builder
             .force_prepare_build(vec![e1, e2], &vlc, 1)
             .expect("force_prepare_build");
