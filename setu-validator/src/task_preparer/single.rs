@@ -61,9 +61,8 @@ impl TaskPreparer {
     /// This creates a real `MerkleStateProvider` backed by `GlobalStateManager`
     /// with some test coins initialized.
     /// 
-    /// ## Initialized accounts (20 total):
-    /// - `alice`, `bob`, `charlie`: 10,000,000 balance each
-    /// - `user_01` to `user_17`: 5,000,000 balance each
+    /// ## Initialized accounts:
+    /// - `alice`, `bob`, `charlie`: 1,000,000,000 each, split across 5 coins
     /// 
     /// ## Example
     /// 

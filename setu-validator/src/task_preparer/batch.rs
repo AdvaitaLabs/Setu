@@ -98,8 +98,7 @@ impl BatchTaskPreparer {
     /// Create a BatchTaskPreparer with pre-initialized test accounts
     ///
     /// Same initialization as `TaskPreparer::new_for_testing()`:
-    /// - `alice`, `bob`, `charlie`: 10,000,000 balance each
-    /// - `user_01` to `user_17`: 5,000,000 balance each
+    /// - `alice`, `bob`, `charlie`: 1,000,000,000 each, split across 5 coins
     pub fn new_for_testing(validator_id: String) -> Self {
         // Use shared test utility to avoid code duplication
         let state_provider = super::create_test_state_provider();
@@ -742,25 +741,29 @@ mod tests {
         // Test balance accumulation detection (overdraft prevention)
         let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
 
-        // alice has 10,000,000 balance (single coin)
-        // Send 3 transfers totaling 15M - should detect overdraft
+        // alice has 1B split across five 200M coins. Each transfer fits a
+        // single seed coin, but 6 × 190M exceeds total available balance.
         let transfers = vec![
-            Transfer::new("tx-1", "alice", "bob", 6_000_000)
+            Transfer::new("tx-1", "alice", "bob", 190_000_000)
                 .with_type(TransferType::SetuTransfer),
-            Transfer::new("tx-2", "alice", "charlie", 6_000_000)
+            Transfer::new("tx-2", "alice", "charlie", 190_000_000)
                 .with_type(TransferType::SetuTransfer),
-            Transfer::new("tx-3", "alice", "bob", 3_000_000)  // This should fail
+            Transfer::new("tx-3", "alice", "bob", 190_000_000)
+                .with_type(TransferType::SetuTransfer),
+            Transfer::new("tx-4", "alice", "charlie", 190_000_000)
+                .with_type(TransferType::SetuTransfer),
+            Transfer::new("tx-5", "alice", "bob", 190_000_000)
+                .with_type(TransferType::SetuTransfer),
+            Transfer::new("tx-6", "alice", "charlie", 190_000_000)
                 .with_type(TransferType::SetuTransfer),
         ];
 
         let result = preparer.prepare_transfers_batch(&transfers);
 
-        // Two should succeed, one should fail due to overdraft prevention
-        assert_eq!(result.stats.total_transfers, 3);
-        // Note: The order of processing may vary, but at most 2 can succeed
-        // with total amount <= 10M
-        assert!(result.stats.successful <= 2, "At most 2 should succeed (overdraft)");
-        assert!(result.stats.failed >= 1, "At least 1 should fail (overdraft)");
+        // Five seed coins can fund five transfers; the sixth must fail.
+        assert_eq!(result.stats.total_transfers, 6);
+        assert_eq!(result.stats.successful, 5);
+        assert_eq!(result.stats.failed, 1);
         assert!(
             result.stats.same_sender_conflicts >= 1,
             "Should detect same-sender conflict"
@@ -785,8 +788,8 @@ mod tests {
     fn test_batch_prepare_insufficient_balance() {
         let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
 
-        // alice only has 10,000,000 - requesting 100M should fail
-        let transfer = Transfer::new("tx-over", "alice", "bob", 100_000_000)
+        // alice only has 1B total - requesting more than that should fail
+        let transfer = Transfer::new("tx-over", "alice", "bob", 1_200_000_000)
             .with_type(TransferType::SetuTransfer);
 
         let result = preparer.prepare_transfers_batch(&[transfer]);
