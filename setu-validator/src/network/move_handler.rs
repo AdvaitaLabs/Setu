@@ -15,6 +15,51 @@ use setu_types::SubnetId;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+fn lower_contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn classify_prepare_error(detail: &str) -> &'static str {
+    let lower = detail.to_ascii_lowercase();
+    if lower_contains_any(&lower, &["dynamic field", "df ", "df_"]) {
+        setu_api::ERROR_DYNAMIC_FIELD
+    } else if lower_contains_any(&lower, &["ticket", "receipt", "commit"]) {
+        setu_api::ERROR_PTB_AUTH
+    } else if lower_contains_any(&lower, &["stale", "root mismatch", "rootmismatch", "state conflict"]) {
+        setu_api::ERROR_CONSENSUS_STORAGE
+    } else {
+        setu_api::ERROR_PREPARE_INPUT
+    }
+}
+
+fn classify_execution_error(detail: &str) -> &'static str {
+    let lower = detail.to_ascii_lowercase();
+    if lower_contains_any(&lower, &["dynamic field", "df ", "df_"]) {
+        setu_api::ERROR_DYNAMIC_FIELD
+    } else if lower_contains_any(&lower, &["ticket", "receipt", "commit"]) {
+        setu_api::ERROR_PTB_AUTH
+    } else if lower_contains_any(&lower, &["package", "upgrade", "linkage", "compat", "cap"]) {
+        setu_api::ERROR_PACKAGE_UPGRADE
+    } else if lower_contains_any(&lower, &["stale", "root mismatch", "rootmismatch", "state conflict"]) {
+        setu_api::ERROR_CONSENSUS_STORAGE
+    } else if lower_contains_any(&lower, &["solver", "route"]) {
+        setu_api::ERROR_SOLVER_UNAVAILABLE
+    } else {
+        setu_api::ERROR_MOVE_VM
+    }
+}
+
+fn classify_upgrade_error(detail: &str) -> &'static str {
+    let lower = detail.to_ascii_lowercase();
+    if lower_contains_any(&lower, &["dynamic field", "df ", "df_"]) {
+        setu_api::ERROR_DYNAMIC_FIELD
+    } else if lower_contains_any(&lower, &["stale", "root mismatch", "rootmismatch", "state conflict"]) {
+        setu_api::ERROR_CONSENSUS_STORAGE
+    } else {
+        setu_api::ERROR_PACKAGE_UPGRADE
+    }
+}
+
 /// MoveCall handler — unit struct matching TransferHandler pattern
 pub struct MoveCallHandler;
 
@@ -43,7 +88,7 @@ impl MoveCallHandler {
                     success: false,
                     state_changes: 0,
                     created_objects: vec![],
-                    error: Some(e),
+                    error: Some(setu_api::stable_error(setu_api::ERROR_PREPARE_INPUT, e)),
                 };
             }
         };
@@ -116,7 +161,10 @@ impl MoveCallHandler {
                     success: false,
                     state_changes: 0,
                     created_objects: vec![],
-                    error: Some(format!("Task preparation failed: {}", e)),
+                    error: Some(setu_api::stable_error(
+                        classify_prepare_error(&e.to_string()),
+                        format!("Task preparation failed: {}", e),
+                    )),
                 };
             }
         };
@@ -131,7 +179,10 @@ impl MoveCallHandler {
                     success: false,
                     state_changes: 0,
                     created_objects: vec![],
-                    error: Some(format!("No solver available: {}", e)),
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_SOLVER_UNAVAILABLE,
+                        format!("No solver available: {}", e),
+                    )),
                 };
             }
         };
@@ -153,7 +204,9 @@ impl MoveCallHandler {
                 let error = if success {
                     None
                 } else {
-                    exec_result.and_then(|r| r.message.clone())
+                    exec_result.and_then(|r| r.message.clone()).map(|detail| {
+                        setu_api::stable_error(classify_execution_error(&detail), detail)
+                    })
                 };
 
                 // Debug: log all state change keys
@@ -250,7 +303,10 @@ impl MoveCallHandler {
                     success: false,
                     state_changes: 0,
                     created_objects: vec![],
-                    error: Some(format!("Execution failed: {}", e)),
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_MOVE_VM,
+                        format!("Execution failed: {}", e),
+                    )),
                 }
             }
         }
@@ -335,7 +391,10 @@ impl MovePublishHandler {
                 event_id: String::new(),
                 module_count: 0,
                 success: false,
-                error: Some("Empty module list".into()),
+                error: Some(setu_api::stable_error(
+                    setu_api::ERROR_PREPARE_INPUT,
+                    "Empty module list",
+                )),
                 package_addr: None,
             }, None);
         }
@@ -351,7 +410,7 @@ impl MovePublishHandler {
                     event_id: String::new(),
                     module_count: 0,
                     success: false,
-                    error: Some(e),
+                    error: Some(setu_api::stable_error(setu_api::ERROR_PREPARE_INPUT, e)),
                     package_addr: None,
                 }, None);
             }
@@ -402,7 +461,7 @@ impl MovePublishHandler {
                     event_id: String::new(),
                     module_count: 0,
                     success: false,
-                    error: Some(e),
+                    error: Some(setu_api::stable_error(setu_api::ERROR_MOVE_VM, e)),
                     package_addr: None,
                 }, None)
             }
@@ -433,7 +492,10 @@ impl MoveUpgradeHandler {
                     new_package_addr: None,
                     new_version: None,
                     success: false,
-                    error: Some("Empty module list".into()),
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_PREPARE_INPUT,
+                        "Empty module list",
+                    )),
                 },
                 None,
             );
@@ -450,7 +512,10 @@ impl MoveUpgradeHandler {
                         new_package_addr: None,
                         new_version: None,
                         success: false,
-                        error: Some(format!("Invalid current_package: {}", e)),
+                        error: Some(setu_api::stable_error(
+                            setu_api::ERROR_PREPARE_INPUT,
+                            format!("Invalid current_package: {}", e),
+                        )),
                     },
                     None,
                 );
@@ -476,7 +541,7 @@ impl MoveUpgradeHandler {
                         new_package_addr: None,
                         new_version: None,
                         success: false,
-                        error: Some(e),
+                        error: Some(setu_api::stable_error(setu_api::ERROR_PREPARE_INPUT, e)),
                     },
                     None,
                 );
@@ -499,7 +564,10 @@ impl MoveUpgradeHandler {
                         new_package_addr: None,
                         new_version: None,
                         success: false,
-                        error: Some(format!("Invalid dep ObjectId: {}", e)),
+                        error: Some(setu_api::stable_error(
+                            setu_api::ERROR_PREPARE_INPUT,
+                            format!("Invalid dep ObjectId: {}", e),
+                        )),
                     },
                     None,
                 );
@@ -564,7 +632,7 @@ impl MoveUpgradeHandler {
                         new_package_addr: None,
                         new_version: None,
                         success: false,
-                        error: Some(e),
+                        error: Some(setu_api::stable_error(classify_upgrade_error(&e), e)),
                     },
                     None,
                 )
@@ -627,7 +695,10 @@ pub(crate) fn canonical_addr_hex(input: &str) -> String {
 
 #[cfg(test)]
 mod hex_canonical_tests {
-    use super::{canonical_addr_hex, MoveCallHandler};
+    use super::{
+        canonical_addr_hex, classify_execution_error, classify_prepare_error,
+        classify_upgrade_error, MoveCallHandler,
+    };
     use setu_api::MoveCallRequest;
     use setu_types::dynamic_field::DfAccessMode;
     use setu_types::event::DynamicFieldAccess;
@@ -706,6 +777,30 @@ mod hex_canonical_tests {
             Some("u64")
         );
     }
+
+    #[test]
+    fn error_classifiers_map_common_domains() {
+        assert_eq!(
+            classify_prepare_error("Dynamic field parent not declared"),
+            setu_api::ERROR_DYNAMIC_FIELD,
+        );
+        assert_eq!(
+            classify_prepare_error("forged ticket was rejected"),
+            setu_api::ERROR_PTB_AUTH,
+        );
+        assert_eq!(
+            classify_execution_error("compatibility check failed during package upgrade"),
+            setu_api::ERROR_PACKAGE_UPGRADE,
+        );
+        assert_eq!(
+            classify_execution_error("RootMismatch while applying state"),
+            setu_api::ERROR_CONSENSUS_STORAGE,
+        );
+        assert_eq!(
+            classify_upgrade_error("unknown package linkage"),
+            setu_api::ERROR_PACKAGE_UPGRADE,
+        );
+    }
 }
 
 /// PTB handler — unit struct matching MoveCallHandler pattern.
@@ -752,13 +847,16 @@ impl MovePtbHandler {
             return setu_api::MovePtbResponse {
                 event_id: String::new(),
                 success: false,
-                error: Some(format!(
-                    "gas_budget {} outside [{}..{}]",
-                    resolved_gas,
-                    setu_move_vm::gas::MIN_GAS_PTB,
-                    setu_move_vm::gas::MAX_GAS_BUDGET,
+                error: Some(setu_api::stable_error(
+                    setu_api::ERROR_MOVE_VM,
+                    format!(
+                        "gas_budget {} outside [{}..{}]",
+                        resolved_gas,
+                        setu_move_vm::gas::MIN_GAS_PTB,
+                        setu_move_vm::gas::MAX_GAS_BUDGET,
+                    ),
                 )),
-                code: None,
+                code: Some(setu_api::ERROR_MOVE_VM.to_string()),
                 cap_ids: vec![],
                 gas_used: None,
             };
@@ -818,11 +916,13 @@ impl MovePtbHandler {
             }
             Err(e) => {
                 error!(error = %e, "PTB task preparation failed");
+                let detail = format!("Task preparation failed: {}", e);
+                let marker = classify_prepare_error(&detail);
                 return setu_api::MovePtbResponse {
                     event_id: String::new(),
                     success: false,
-                    error: Some(format!("Task preparation failed: {}", e)),
-                    code: None,
+                    error: Some(setu_api::stable_error(marker, detail)),
+                    code: Some(marker.to_string()),
                     cap_ids: vec![],
                     gas_used: None,
                 };
@@ -837,8 +937,11 @@ impl MovePtbHandler {
                 return setu_api::MovePtbResponse {
                     event_id: String::new(),
                     success: false,
-                    error: Some(format!("No solver available: {}", e)),
-                    code: None,
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_SOLVER_UNAVAILABLE,
+                        format!("No solver available: {}", e),
+                    )),
+                    code: Some(setu_api::ERROR_SOLVER_UNAVAILABLE.to_string()),
                     cap_ids: vec![],
                     gas_used: None,
                 };
@@ -850,15 +953,19 @@ impl MovePtbHandler {
         match tee_executor.execute_solver_inline_batch(
             &call_id, &solver_id, solver_task, vec![],
         ).await {
-            Ok((result_event, execution_time_us, events_processed, gas_used)) => {
+            Ok((mut result_event, execution_time_us, events_processed, gas_used)) => {
                 let event_id = result_event.id.clone();
                 let exec_result = result_event.execution_result.as_ref();
                 let success = exec_result.map(|r| r.success).unwrap_or(false);
-                let mut error = if success {
-                    None
-                } else {
-                    exec_result.and_then(|r| r.message.clone())
-                };
+                let mut code = None;
+                let mut error = None;
+                if !success {
+                    if let Some(detail) = exec_result.and_then(|r| r.message.clone()) {
+                        let marker = classify_execution_error(&detail);
+                        code = Some(marker.to_string());
+                        error = Some(setu_api::stable_error(marker, detail));
+                    }
+                }
 
                 // iter-8α — surface fresh `UpgradeCap` UIDs minted by the
                 // engine on `Command::Publish`. Filter is structural:
@@ -906,31 +1013,81 @@ impl MovePtbHandler {
                         expected = expected_publish_caps,
                         "iter-8α: cap minting count mismatch"
                     );
-                    error = Some(format!(
-                        "cap minting count mismatch: got {} caps for {} Publish commands",
-                        cap_ids.len(),
-                        expected_publish_caps,
+                    code = Some(setu_api::ERROR_PACKAGE_UPGRADE.to_string());
+                    error = Some(setu_api::stable_error(
+                        setu_api::ERROR_PACKAGE_UPGRADE,
+                        format!(
+                            "cap minting count mismatch: got {} caps for {} Publish commands",
+                            cap_ids.len(),
+                            expected_publish_caps,
+                        ),
                     ));
                 }
                 let final_success = success && error.is_none();
 
+                // Bug F2: when the defensive cap-mismatch check downgrades
+                // a TEE-success to an HTTP-failure, we MUST also block the
+                // event from entering the DAG. Otherwise the speculative
+                // overlay + CF apply path would write divergent state
+                // (HTTP says failure, canonical state says success).
+                //
+                // Rationale for "quarantine" (Option B in design.md §3.2):
+                // current consensus admission gates
+                // (`ConsensusValidator::submit_event`,
+                //  `EventHandler::quick_check`) reject `success=false`
+                // events outright, so we cannot ship a deterministic
+                // failure event without changing consensus admission.
+                // Until that follow-up FDP lands, drop the event entirely
+                // — the cap count is a pure function of the PTB input
+                // and engine output, so every honest validator will
+                // independently quarantine the same event.
+                if !final_success {
+                    if let Some(r) = result_event.execution_result.as_mut() {
+                        r.success = false;
+                        if r.message.is_none() {
+                            r.message = error.clone();
+                        }
+                        r.state_changes.clear();
+                    }
+                    cap_ids.clear();
+                    error!(
+                        target: "consensus.quarantine",
+                        event_id = %event_id,
+                        reason = "ptb_cap_mismatch",
+                        expected = expected_publish_caps,
+                        got = result_event
+                            .execution_result
+                            .as_ref()
+                            .map(|r| r.state_changes.len())
+                            .unwrap_or(0),
+                        "PTB result quarantined: not staging overlay, not submitting to DAG"
+                    );
+
+                    return setu_api::MovePtbResponse {
+                        event_id,
+                        success: false,
+                        error,
+                        code,
+                        cap_ids,
+                        gas_used: Some(gas_used),
+                    };
+                }
+
                 // Stage to speculative overlay so the client can immediately
                 // read-your-writes from this validator. CF finalize will
                 // apply the canonical state via apply_committed_events.
-                if success {
-                    if let Some(r) = result_event.execution_result.as_ref() {
-                        let shared = state_provider.shared_state_manager();
-                        if let Err(e) = shared.stage_overlay(
-                            &result_event.id,
-                            SubnetId::ROOT,
-                            &r.state_changes,
-                        ) {
-                            error!(
-                                event_id = %result_event.id,
-                                error = %e,
-                                "PTB state_change has malformed key; overlay stage skipped"
-                            );
-                        }
+                if let Some(r) = result_event.execution_result.as_ref() {
+                    let shared = state_provider.shared_state_manager();
+                    if let Err(e) = shared.stage_overlay(
+                        &result_event.id,
+                        SubnetId::ROOT,
+                        &r.state_changes,
+                    ) {
+                        error!(
+                            event_id = %result_event.id,
+                            error = %e,
+                            "PTB state_change has malformed key; overlay stage skipped"
+                        );
                     }
                 }
 
@@ -948,7 +1105,7 @@ impl MovePtbHandler {
                     event_id,
                     success: final_success,
                     error,
-                    code: None,
+                    code,
                     cap_ids,
                     gas_used: Some(gas_used),
                 }
@@ -958,8 +1115,11 @@ impl MovePtbHandler {
                 setu_api::MovePtbResponse {
                     event_id: String::new(),
                     success: false,
-                    error: Some(format!("Execution failed: {}", e)),
-                    code: None,
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_MOVE_VM,
+                        format!("Execution failed: {}", e),
+                    )),
+                    code: Some(setu_api::ERROR_MOVE_VM.to_string()),
                     cap_ids: vec![],
                     gas_used: None,
                 }

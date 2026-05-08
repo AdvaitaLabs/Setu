@@ -701,6 +701,21 @@ async fn main() -> anyhow::Result<()> {
     let network_service = Arc::new(network_service);
     info!("✓ GovernanceService initialized");
 
+    // Bug F1: mirror the engine's restored logical-time counter into the
+    // service-level `vlc_counter` so Move/PTB/Publish/Upgrade handlers
+    // (which still bypass `get_vlc_time()` and call `vlc_counter.fetch_add`
+    // directly) do not reuse low logical times after a restart.
+    {
+        let restored_vlc = consensus_validator.engine().peek_logical_time();
+        if restored_vlc > 0 {
+            network_service.restore_vlc_counter(restored_vlc);
+            info!(
+                "✓ Service VLC counter restored from consensus engine: {}",
+                restored_vlc
+            );
+        }
+    }
+
     // ========================================
     // Components Status
     // ========================================

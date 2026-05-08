@@ -438,6 +438,17 @@ impl ValidatorNetworkService {
         }
     }
 
+    /// Restore the service-level `vlc_counter` after consensus recovery.
+    ///
+    /// Bug F1: the Move/PTB/Publish/Upgrade handlers consume `self.vlc_counter`
+    /// directly via `fetch_add`, bypassing `get_vlc_time()`. After
+    /// `ConsensusValidator::recover_from_storage()` restores the engine's
+    /// `logical_time_counter`, callers must mirror that value into this
+    /// counter so post-restart Move events do not reuse low logical times.
+    pub fn restore_vlc_counter(&self, logical_time: u64) {
+        self.vlc_counter.store(logical_time, Ordering::SeqCst);
+    }
+
     /// Get count of pending TEE tasks
     pub fn pending_tee_count(&self) -> u64 {
         self.tee_executor.pending_count()
@@ -796,8 +807,11 @@ impl ValidatorNetworkService {
                 return Err(setu_api::MovePtbResponse {
                     event_id: String::new(),
                     success: false,
-                    error: Some(format!("Invalid hex in `ptb` field: {}", e)),
-                    code: None,
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_PTB_WIRE,
+                        format!("Invalid hex in `ptb` field: {}", e),
+                    )),
+                    code: Some(setu_api::ERROR_PTB_WIRE.to_string()),
                     cap_ids: vec![],
                     gas_used: None,
                 });
@@ -811,8 +825,11 @@ impl ValidatorNetworkService {
                 return Err(setu_api::MovePtbResponse {
                     event_id: String::new(),
                     success: false,
-                    error: Some(format!("BCS deserialize failed: {}", e)),
-                    code: None,
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_PTB_WIRE,
+                        format!("BCS deserialize failed: {}", e),
+                    )),
+                    code: Some(setu_api::ERROR_PTB_WIRE.to_string()),
                     cap_ids: vec![],
                     gas_used: None,
                 });
@@ -824,8 +841,11 @@ impl ValidatorNetworkService {
             return Err(setu_api::MovePtbResponse {
                 event_id: String::new(),
                 success: false,
-                error: Some(format!("PTB validation failed: {}", e)),
-                code: None,
+                error: Some(setu_api::stable_error(
+                    setu_api::ERROR_PTB_WIRE,
+                    format!("PTB validation failed: {}", e),
+                )),
+                code: Some(setu_api::ERROR_PTB_WIRE.to_string()),
                 cap_ids: vec![],
                 gas_used: None,
             });
@@ -877,7 +897,10 @@ impl ValidatorNetworkService {
                     type_tag: String::new(), version: 0,
                     data_hex: String::new(), exists: false,
                     digest_hex: String::new(),
-                    error: Some(format!("Invalid object ID hex: {}", stripped)),
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_PREPARE_INPUT,
+                        format!("Invalid object ID hex: {}", stripped),
+                    )),
                 };
             }
         };
@@ -938,7 +961,10 @@ impl ValidatorNetworkService {
                     data_hex: hex::encode(&data),
                     exists: true,
                     digest_hex: String::new(),
-                    error: Some("Unknown storage format".into()),
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_CONSENSUS_STORAGE,
+                        "Unknown storage format",
+                    )),
                 }
             }
         }
@@ -953,6 +979,25 @@ impl ValidatorNetworkService {
             exists: false,
             error: None,
         };
+
+        // v1 contract: distinguish "invalid address" (PREPARE_INPUT) from
+        // "address valid but module absent" (plain not-found). Without this
+        // probe `canonical_addr_hex` silently returns the input unchanged on
+        // parse failure, collapsing both cases into `error: None` not-found
+        // and breaking cross-validator marker assertions.
+        use move_core_types::account_address::AccountAddress;
+        if AccountAddress::from_hex_literal(address).is_err() {
+            return setu_api::GetModuleAbiResponse {
+                address: address.to_string(),
+                name: name.to_string(),
+                functions: vec![],
+                exists: false,
+                error: Some(setu_api::stable_error(
+                    setu_api::ERROR_PREPARE_INPUT,
+                    format!("invalid module address: {}", address),
+                )),
+            };
+        }
 
         // Normalize the URL-supplied address so both padded 64-hex and
         // zero-stripped forms reach the same SMT key. Writers use
@@ -986,7 +1031,10 @@ impl ValidatorNetworkService {
                     name: name.to_string(),
                     functions: vec![],
                     exists: true,
-                    error: Some(format!("Failed to deserialize module: {}", e)),
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_CONSENSUS_STORAGE,
+                        format!("Failed to deserialize module: {}", e),
+                    )),
                 };
             }
         };
@@ -1021,6 +1069,20 @@ impl ValidatorNetworkService {
 
     /// List all modules published at an address
     pub fn list_modules(&self, address: &str) -> setu_api::ListModulesResponse {
+        // v1 contract: invalid address must surface as PREPARE_INPUT, not be
+        // bucketed with the "enumeration not implemented" case below.
+        use move_core_types::account_address::AccountAddress;
+        if AccountAddress::from_hex_literal(address).is_err() {
+            return setu_api::ListModulesResponse {
+                address: address.to_string(),
+                modules: vec![],
+                error: Some(setu_api::stable_error(
+                    setu_api::ERROR_PREPARE_INPUT,
+                    format!("invalid module address: {}", address),
+                )),
+            };
+        }
+
         // Normalize first (see `get_module_abi` rationale).
         let canonical = move_handler::canonical_addr_hex(address);
         let stripped = canonical.strip_prefix("0x").unwrap_or(&canonical);
@@ -1043,7 +1105,10 @@ impl ValidatorNetworkService {
         setu_api::ListModulesResponse {
             address: address.to_string(),
             modules: vec![],
-            error: Some("Module enumeration for user addresses requires index (not yet implemented)".into()),
+            error: Some(setu_api::stable_error(
+                setu_api::ERROR_PREPARE_INPUT,
+                "Module enumeration for user addresses requires index (not yet implemented)",
+            )),
         }
     }
 

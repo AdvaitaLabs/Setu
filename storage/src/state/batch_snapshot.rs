@@ -277,7 +277,14 @@ impl MerkleStateProvider {
                 let mut matched_registered_coin = false;
 
                 for (object_id_bytes, coin_type) in registered {
-                    if coin_type != *coin_namespace {
+                    // Bug F3: write side stores `coin_type` as the raw
+                    // subnet_id string (e.g. "gaming-subnet"), while the
+                    // read-side `coin_namespace_string` returns
+                    // `subnet_id.to_string()` (short hex Display) for
+                    // non-ROOT subnets. Compare via the canonical
+                    // `MerkleStateProvider::resolve_subnet_id` so both
+                    // representations map back to the same SubnetId.
+                    if MerkleStateProvider::resolve_subnet_id(&coin_type) != *subnet_id {
                         continue;
                     }
                     matched_registered_coin = true;
@@ -290,6 +297,15 @@ impl MerkleStateProvider {
                 }
 
                 if !matched_registered_coin {
+                    // Legacy deterministic-coin-id fallback. Only meaningful
+                    // for ROOT (pre-registration legacy path covered by
+                    // existing tests). For non-ROOT subnets, if the
+                    // owner_object_index has no entry there is genuinely no
+                    // coin — match the canonical `get_coins_for_address`
+                    // semantics and skip the synthesized lookup.
+                    if *subnet_id != SubnetId::ROOT {
+                        continue;
+                    }
                     let object_id_bytes = Self::coin_object_id_with_type(canonical_sender, coin_namespace);
                     coin_queries.push(CoinQuery {
                         sender: sender.clone(),
@@ -563,8 +579,15 @@ mod tests {
         assert!(alice_root.is_some());
         assert_eq!(alice_root.unwrap()[0].balance, 1000);
 
-        // Note: gaming-subnet lookup depends on how SubnetId::from_str_id hashes
-        // This test verifies the multi-subnet query mechanism works
+        // Bug F3: alice's gaming-subnet coin must also be discoverable on
+        // the batch path. Before the fix, the batch path compared the
+        // persisted `coin_type = "gaming-subnet"` against
+        // `subnet_id.to_string()` (short hex Display) and never matched.
+        let alice_gaming = snapshot
+            .get_coins_for_sender_subnet("alice", &gaming_subnet)
+            .expect("alice gaming-subnet coin must be discoverable");
+        assert_eq!(alice_gaming.len(), 1);
+        assert_eq!(alice_gaming[0].balance, 500);
     }
 
     #[test]

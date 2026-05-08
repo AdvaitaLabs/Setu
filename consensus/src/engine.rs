@@ -1265,6 +1265,24 @@ impl ConsensusEngine {
         self.logical_time_counter.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    /// Restore the fast-path logical-time counter from durable consensus state.
+    ///
+    /// This must be called during startup recovery whenever `vlc` is restored,
+    /// otherwise locally-created events after restart can reuse low logical
+    /// times even though the full VLC snapshot was recovered.
+    pub fn restore_logical_time_counter(&self, logical_time: u64) {
+        self.logical_time_counter.store(logical_time, Ordering::SeqCst);
+    }
+
+    /// Read the current value of the fast-path logical-time counter without
+    /// incrementing it. Used by external components (e.g.
+    /// `ValidatorNetworkService`) to mirror the restored counter into their
+    /// own local state after `recover_from_storage`. See bug F1.
+    #[inline]
+    pub fn peek_logical_time(&self) -> u64 {
+        self.logical_time_counter.load(Ordering::SeqCst)
+    }
+
     /// Atomically increment VLC and return the new snapshot
     ///
     /// This is the correct method to use when assigning VLC to events,
