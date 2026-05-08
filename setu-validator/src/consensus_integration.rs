@@ -495,9 +495,29 @@ impl ConsensusValidator {
         {
             let mut cm = self.engine.consensus_manager().write().await;
             cm.anchor_builder_mut().restore_state(chain_root, depth, count, vlc_time);
+            drop(cm);
+
+            let recovery_round = count as Round;
+            {
+                let mut engine_vs = self.engine.validator_set_ref().write().await;
+                engine_vs.set_round(recovery_round);
+            }
+            {
+                let mut local_vs = self.validator_set.write().await;
+                local_vs.set_round(recovery_round);
+            }
+
+            self.engine.dag_manager().update_min_depth(depth + 1);
+            self.engine.restore_logical_time_counter(vlc_time);
             info!(
                 "AnchorBuilder restored: depth={}, anchor_count={}, vlc_time={}",
                 depth, count, vlc_time
+            );
+            info!(
+                "Consensus progress restored: round={}, min_depth={}, logical_time_counter={}",
+                recovery_round,
+                depth + 1,
+                vlc_time
             );
         }
         
@@ -998,7 +1018,8 @@ impl ConsensusMessageHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_types::EventType;
+    use setu_storage::{AnchorStore, CFStore, EventStore};
+    use setu_types::{Anchor, AnchorMerkleRoots};
     use setu_vlc::VectorClock;
 
     fn create_test_config() -> ConsensusValidatorConfig {
@@ -1073,6 +1094,51 @@ mod tests {
         assert_eq!(stats.validator_id, "test-validator");
         assert!(stats.is_leader);
         assert_eq!(stats.current_round, 0);
+    }
+
+    #[tokio::test]
+    async fn test_recover_from_storage_restores_consensus_progress() {
+        let config = create_test_config();
+        let event_store: Arc<dyn EventStoreBackend> = Arc::new(EventStore::new());
+        let cf_store: Arc<dyn CFStoreBackend> = Arc::new(CFStore::new());
+        let anchor_store = Arc::new(AnchorStore::new());
+        let anchor_store_backend: Arc<dyn AnchorStoreBackend> = anchor_store.clone();
+        let state_manager = Arc::new(SharedStateManager::new(GlobalStateManager::default()));
+        let validator = ConsensusValidator::with_all_backends(
+            config,
+            state_manager,
+            event_store,
+            cf_store,
+            anchor_store_backend,
+        );
+
+        for idx in 0..3u64 {
+            let roots = AnchorMerkleRoots::with_roots(
+                [idx as u8; 32],
+                [idx as u8 + 1; 32],
+                [idx as u8 + 2; 32],
+            );
+            let mut anchor = Anchor::with_merkle_roots(
+                vec![format!("event-{idx}")],
+                setu_vlc::VLCSnapshot {
+                    vector_clock: VectorClock::new(),
+                    logical_time: 70 + idx,
+                    physical_time: 0,
+                },
+                roots,
+                if idx == 0 { None } else { Some(format!("anchor-{}", idx - 1)) },
+                35 + idx,
+            );
+            anchor.id = format!("anchor-{idx}");
+            anchor.timestamp = idx;
+            anchor_store.store(anchor).await.unwrap();
+        }
+
+        validator.recover_from_storage().await.unwrap();
+
+        assert_eq!(validator.current_round().await, 3);
+        assert_eq!(validator.engine().dag_manager().min_depth(), 38);
+        assert_eq!(validator.allocate_logical_time(), 73);
     }
     
     #[tokio::test]

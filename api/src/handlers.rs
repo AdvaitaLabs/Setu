@@ -485,7 +485,13 @@ pub async fn http_get_move_object<S: ValidatorService>(
                         data_hex: String::new(),
                         exists: false,
                         digest_hex: String::new(),
-                        error: Some(reason),
+                        // v1 contract: object query failures that are NOT a
+                        // normal not-found must carry a stable class marker.
+                        // Backpressure is not directly listed in the v1 marker
+                        // table; classify under SOLVER_UNAVAILABLE because
+                        // both surface to clients as "validator cannot serve
+                        // this request right now, retry later".
+                        error: Some(stable_error(ERROR_SOLVER_UNAVAILABLE, reason)),
                     }),
                 ),
                 WaitMoveObjectOutcome::Unavailable => (
@@ -500,7 +506,14 @@ pub async fn http_get_move_object<S: ValidatorService>(
                         data_hex: String::new(),
                         exists: false,
                         digest_hex: String::new(),
-                        error: Some("wait_min_version not supported on this validator".into()),
+                        // v1 contract: a watcher-less validator is an
+                        // infrastructure/wiring failure, classify as
+                        // CONSENSUS_STORAGE so cross-validator scripts can
+                        // assert the marker rather than the raw string.
+                        error: Some(stable_error(
+                            ERROR_CONSENSUS_STORAGE,
+                            "wait_min_version not supported on this validator",
+                        )),
                     }),
                 ),
             }

@@ -209,6 +209,32 @@ pub struct MoveUpgradeResponse {
 /// compatibility with B6a-era clients still pattern-matching on it.
 pub const PTB_NOT_YET_EXECUTABLE: &str = "PTB_NOT_YET_EXECUTABLE";
 
+/// Stable v1 error class markers for public Move API failures.
+pub const ERROR_PREPARE_INPUT: &str = "PREPARE_INPUT";
+pub const ERROR_DYNAMIC_FIELD: &str = "DYNAMIC_FIELD";
+pub const ERROR_MOVE_VM: &str = "MOVE_VM";
+pub const ERROR_PACKAGE_UPGRADE: &str = "PACKAGE_UPGRADE";
+pub const ERROR_PTB_WIRE: &str = "PTB_WIRE";
+pub const ERROR_PTB_AUTH: &str = "PTB_AUTH";
+pub const ERROR_CONSENSUS_STORAGE: &str = "CONSENSUS_STORAGE";
+pub const ERROR_SOLVER_UNAVAILABLE: &str = "SOLVER_UNAVAILABLE";
+
+/// Prefix raw detail with a stable marker while preserving the original text.
+///
+/// Idempotence: only skip re-prefixing when `detail` is already in the
+/// canonical `"{MARKER}"` or `"{MARKER}: ..."` shape. Substring overlap such
+/// as `"MOVE_VM_INTERNAL"` would otherwise bypass normalization and break
+/// the documented `MARKER: detail` contract.
+pub fn stable_error(marker: &str, detail: impl AsRef<str>) -> String {
+    let detail = detail.as_ref();
+    let prefix = format!("{}: ", marker);
+    if detail == marker || detail.starts_with(&prefix) {
+        detail.to_string()
+    } else {
+        format!("{}: {}", marker, detail)
+    }
+}
+
 /// Request to submit a Programmable Transaction Block.
 ///
 /// `ptb` is BCS-encoded and hex-wrapped over the wire to keep the JSON
@@ -235,7 +261,8 @@ pub struct MovePtbRequest {
 /// HTTP mapping (post `move-vm-phase9-ptb-event-wire`):
 ///   * `success = true`  → HTTP 200, `event_id` populated, `code = None`.
 ///   * `success = false` → HTTP 400, `error` describes the wire/domain
-///                          rejection, `code = None`.
+///                          rejection, `code` carries the stable v1 class
+///                          when the validator can classify it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MovePtbResponse {
     /// Event ID of the submitted event (empty when wire validation failed).
@@ -245,10 +272,10 @@ pub struct MovePtbResponse {
     /// Error message (if failed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Reserved for stable error codes. Currently always `None`; retained as
-    /// an extension point for future error taxonomies and for backward
-    /// compatibility with B6a-era clients that pattern-matched on
-    /// `PTB_NOT_YET_EXECUTABLE`.
+    /// Stable v1 error class code for classified failures. `None` on success
+    /// and on failures that have not yet been classified. The legacy
+    /// `PTB_NOT_YET_EXECUTABLE` value is retained only as a compatibility
+    /// constant; live executable PTB paths should use the `ERROR_*` classes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     /// B5 / Phase 8 iter-8α — fresh `UpgradeCap` UIDs minted by `Command::Publish`
@@ -466,6 +493,35 @@ mod m5_pre_tests {
             Some("u64")
         );
     }
+
+    /// `stable_error` must produce the canonical `MARKER: detail` shape and
+    /// must not be fooled by substring overlap (e.g. `MOVE_VM_INTERNAL`
+    /// must still be re-prefixed by `MOVE_VM`). Idempotent only on the
+    /// exact `"{MARKER}"` or `"{MARKER}: ..."` shape.
+    #[test]
+    fn stable_error_idempotence_only_on_canonical_shape() {
+        // Bare detail is prefixed.
+        assert_eq!(
+            stable_error(ERROR_MOVE_VM, "abort code 7"),
+            "MOVE_VM: abort code 7"
+        );
+        // Already-prefixed detail is left alone.
+        assert_eq!(
+            stable_error(ERROR_MOVE_VM, "MOVE_VM: abort code 7"),
+            "MOVE_VM: abort code 7"
+        );
+        // Bare marker (no detail) is left alone.
+        assert_eq!(stable_error(ERROR_MOVE_VM, "MOVE_VM"), "MOVE_VM");
+        // Substring overlap must NOT bypass normalization.
+        assert_eq!(
+            stable_error(ERROR_MOVE_VM, "MOVE_VM_INTERNAL bug"),
+            "MOVE_VM: MOVE_VM_INTERNAL bug"
+        );
+        assert_eq!(
+            stable_error(ERROR_PTB_AUTH, "PTB_AUTHZ failed"),
+            "PTB_AUTH: PTB_AUTHZ failed"
+        );
+    }
 }
 
 // ============================================
@@ -510,8 +566,8 @@ mod b6a_ptb_tests {
         let bcs_bytes = hex::decode(hex_str).map_err(|e| MovePtbResponse {
             event_id: String::new(),
             success: false,
-            error: Some(format!("Invalid hex in `ptb` field: {}", e)),
-            code: None,
+            error: Some(stable_error(ERROR_PTB_WIRE, format!("Invalid hex in `ptb` field: {}", e))),
+            code: Some(ERROR_PTB_WIRE.to_string()),
             cap_ids: vec![],
             gas_used: None,
         })?;
@@ -519,16 +575,16 @@ mod b6a_ptb_tests {
             bcs::from_bytes(&bcs_bytes).map_err(|e| MovePtbResponse {
                 event_id: String::new(),
                 success: false,
-                error: Some(format!("BCS deserialize failed: {}", e)),
-                code: None,
+                error: Some(stable_error(ERROR_PTB_WIRE, format!("BCS deserialize failed: {}", e))),
+                code: Some(ERROR_PTB_WIRE.to_string()),
                 cap_ids: vec![],
                 gas_used: None,
             })?;
         ptb.validate_wire().map_err(|e| MovePtbResponse {
             event_id: String::new(),
             success: false,
-            error: Some(format!("PTB validation failed: {}", e)),
-            code: None,
+            error: Some(stable_error(ERROR_PTB_WIRE, format!("PTB validation failed: {}", e))),
+            code: Some(ERROR_PTB_WIRE.to_string()),
             cap_ids: vec![],
             gas_used: None,
         })?;
@@ -550,11 +606,10 @@ mod b6a_ptb_tests {
     }
 
     /// I2: malformed PTB (over MAX_PTB_COMMANDS) is rejected at wire
-    /// validation — maps to HTTP 4xx in the live system. The `code` field
-    /// must be `None`: there is no longer a `PTB_NOT_YET_EXECUTABLE` marker
-    /// to distinguish from (event-wire FDP removed it).
+    /// validation — maps to HTTP 4xx in the live system with the stable
+    /// v1 `PTB_WIRE` class marker.
     #[test]
-    fn i2_submit_move_ptb_malformed_rejected_with_code_none() {
+    fn i2_submit_move_ptb_malformed_rejected_with_ptb_wire_code() {
         let mut ptb = well_formed_ptb();
         ptb.commands = (0..MAX_PTB_COMMANDS + 1)
             .map(|_| {
@@ -575,9 +630,8 @@ mod b6a_ptb_tests {
         };
         let resp = drive_wire_validation(req).expect_err("oversize PTB must be rejected");
         assert!(!resp.success);
-        assert!(resp.code.is_none(),
-            "Plain validation error — no PTB_NOT_YET_EXECUTABLE marker after event-wire FDP.");
-        assert!(resp.error.unwrap().contains("validation failed"));
+        assert_eq!(resp.code.as_deref(), Some(ERROR_PTB_WIRE));
+        assert!(resp.error.unwrap().contains(ERROR_PTB_WIRE));
     }
 
     /// I4: HTTP boundary converts hex DynamicFieldAccess → binary PtbDfAccess.
