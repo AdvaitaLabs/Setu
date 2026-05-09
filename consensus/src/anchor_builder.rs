@@ -817,6 +817,25 @@ impl AnchorBuilder {
                         }
                     }
 
+                    // DIAG P5 (cf_apply_progress): one structured INFO line per
+                    // successful CF apply, keyed by (cf_id, role), so future
+                    // finalize-progress triage can pair leader/follower roots
+                    // by cf_id and detect lag (max anchor_id per node) from
+                    // logs alone. See docs/feat/add-cf-apply-progress-diag/.
+                    #[cfg(feature = "diag-root-drift")]
+                    {
+                        let (post_apply_root, _) = (*guard).compute_global_root_bytes();
+                        tracing::info!(
+                            target: "consensus::diag::cf_apply_progress",
+                            cf_id = %cf_id,
+                            role = "leader",
+                            anchor_id = anchor_id,
+                            n_events = events.len(),
+                            post_apply_root = %hex::encode(post_apply_root),
+                            "DIAG P5: CF applied"
+                        );
+                    }
+
                     // Publish snapshot while still holding Mutex (atomic consistency)
                     self.shared.publish_snapshot(&guard);
                     Ok(summary)
@@ -949,6 +968,20 @@ impl AnchorBuilder {
 
                     match guard.commit(anchor_id) {
                         Ok(()) => {
+                            // DIAG P5 (cf_apply_progress): see leader-side note.
+                            #[cfg(feature = "diag-root-drift")]
+                            {
+                                let (post_apply_root, _) = (*guard).compute_global_root_bytes();
+                                tracing::info!(
+                                    target: "consensus::diag::cf_apply_progress",
+                                    cf_id = %cf.anchor.id,
+                                    role = "follower",
+                                    anchor_id = anchor_id,
+                                    n_events = events.len(),
+                                    post_apply_root = %hex::encode(post_apply_root),
+                                    "DIAG P5: CF applied"
+                                );
+                            }
                             self.shared.publish_snapshot(&guard);
                             Ok(summary)
                         }
@@ -960,6 +993,20 @@ impl AnchorBuilder {
                 let summary = guard.apply_committed_events(events);
                 match guard.commit(anchor_id) {
                     Ok(()) => {
+                        // DIAG P5 (cf_apply_progress): see leader-side note.
+                        #[cfg(feature = "diag-root-drift")]
+                        {
+                            let (post_apply_root, _) = (*guard).compute_global_root_bytes();
+                            tracing::info!(
+                                target: "consensus::diag::cf_apply_progress",
+                                cf_id = %cf.anchor.id,
+                                role = "follower",
+                                anchor_id = anchor_id,
+                                n_events = events.len(),
+                                post_apply_root = %hex::encode(post_apply_root),
+                                "DIAG P5: CF applied (legacy anchor, no merkle_roots)"
+                            );
+                        }
                         self.shared.publish_snapshot(&guard);
                         Ok(summary)
                     }
