@@ -117,8 +117,31 @@ impl InfraExecutor {
         // applied to the write-GSM here. The canonical write path is
         // `apply_committed_events` invoked from CF finalize. Eager-apply on
         // the ingress validator caused cross-node SMT divergence (OBS-026).
+        //
+        // BUG-20260510 fix: SubnetRegister is a root event so its
+        // `event.get_subnet_id()` is `SubnetId::ROOT`. Without an explicit
+        // `target_subnet`, `apply_committed_events` would write the minted
+        // coin into the ROOT SMT while `get_coins_for_address` resolves the
+        // coin's `coin_type` (= the new subnet id) via `resolve_subnet_id`
+        // and looks in the app subnet SMT — silently dropping the balance.
+        // We mark every state-change for an object in `output.created_objects`
+        // (the mint coin id; subnet-meta is intentionally not in
+        // `created_objects` per current runtime code) with the new subnet
+        // as `target_subnet`, using the same canonical mapping the read
+        // path uses. The subnet-meta state-change keeps `target_subnet =
+        // None` so it lands in ROOT (the global subnet registry).
+        let mint_object_ids: std::collections::HashSet<ObjectId> =
+            output.created_objects.iter().copied().collect();
+        let new_subnet_target =
+            MerkleStateProvider::resolve_subnet_id(&registration.subnet_id);
         let state_changes: Vec<EventStateChange> = output.state_changes.iter()
-            .map(|sc| sc.to_event_state_change())
+            .map(|sc| {
+                let mut esc = sc.to_event_state_change();
+                if mint_object_ids.contains(&sc.object_id) {
+                    esc.target_subnet = Some(new_subnet_target);
+                }
+                esc
+            })
             .collect();
 
         event.set_execution_result(ExecutionResult {
@@ -801,6 +824,105 @@ mod tests {
         let event = result.unwrap();
         assert!(event.execution_result.is_some());
         assert!(event.execution_result.as_ref().unwrap().success);
+    }
+
+    /// BUG-20260510 regression: SubnetRegister with `initial_token_supply > 0`
+    /// must produce a mint state-change whose `target_subnet` is the new
+    /// subnet (matching `MerkleStateProvider::resolve_subnet_id` of the
+    /// subnet's string id). Without this, `apply_committed_events` would
+    /// route the coin into the ROOT SMT while the read path looks in the
+    /// app subnet SMT, and `get_balance` returns 0.
+    #[test]
+    fn test_subnet_register_mint_targets_new_subnet() {
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(shared));
+        let executor = InfraExecutor::new("validator-1".to_string(), provider);
+
+        let subnet_str = "infra-subnet-mint-target-test";
+        let registration = SubnetRegistration::new(
+            subnet_str,
+            "Mint Target Test",
+            "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+            "MTT",
+        )
+        .with_initial_supply(1_000_000);
+
+        let event = executor
+            .execute_subnet_register(&registration, test_vlc())
+            .expect("subnet_register must succeed");
+
+        let result = event
+            .execution_result
+            .as_ref()
+            .expect("execution_result populated");
+        assert!(result.success, "registration must succeed");
+
+        let expected_target = MerkleStateProvider::resolve_subnet_id(subnet_str);
+        assert_ne!(
+            expected_target,
+            SubnetId::ROOT,
+            "test setup: app subnet must not collide with ROOT"
+        );
+
+        // Exactly one state-change must be routed to the new subnet (the mint).
+        // Subnet-meta state-change must keep target_subnet = None (lands in ROOT).
+        let mut mint_routed = 0usize;
+        let mut meta_in_root = 0usize;
+        for sc in &result.state_changes {
+            match sc.target_subnet {
+                Some(t) => {
+                    assert_eq!(
+                        t, expected_target,
+                        "mint state-change must target the new subnet, not {:?}",
+                        t
+                    );
+                    mint_routed += 1;
+                }
+                None => {
+                    meta_in_root += 1;
+                }
+            }
+        }
+        assert_eq!(
+            mint_routed, 1,
+            "expected exactly one mint state-change routed to the new subnet, got {}",
+            mint_routed
+        );
+        assert!(
+            meta_in_root >= 1,
+            "expected at least one ROOT-bound state-change (subnet metadata), got {}",
+            meta_in_root
+        );
+    }
+
+    /// BUG-20260510 negative case: when `initial_token_supply` is None or 0,
+    /// no mint state-change is produced, and every state-change stays in
+    /// ROOT (subnet metadata only).
+    #[test]
+    fn test_subnet_register_no_supply_keeps_all_in_root() {
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(shared));
+        let executor = InfraExecutor::new("validator-1".to_string(), provider);
+
+        let registration = SubnetRegistration::new(
+            "infra-subnet-no-supply-test",
+            "No Supply Test",
+            "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+            "NST",
+        );
+
+        let event = executor
+            .execute_subnet_register(&registration, test_vlc())
+            .expect("subnet_register must succeed");
+
+        let result = event.execution_result.as_ref().unwrap();
+        assert!(result.success);
+        for sc in &result.state_changes {
+            assert!(
+                sc.target_subnet.is_none(),
+                "no mint expected, all state-changes must keep target_subnet = None"
+            );
+        }
     }
 
     #[test]

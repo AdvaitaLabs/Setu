@@ -373,12 +373,16 @@ impl MerkleStateProvider {
     
     /// Convert subnet_id string to SubnetId
     ///
-    /// Visibility: `pub(crate)` so sibling modules in `storage::state`
-    /// (notably `batch_snapshot`) can use the same canonical mapping as the
-    /// canonical read path. See bug F3 — write side stores raw subnet_id
-    /// strings (e.g. "gaming-subnet"), and any read path that compares
-    /// against `SubnetId::Display` directly would silently mismatch.
-    pub(crate) fn resolve_subnet_id(subnet_id_str: &str) -> SubnetId {
+    /// Visibility: `pub` so cross-crate callers (notably
+    /// `setu-validator::infra_executor` when routing SubnetRegister mint
+    /// state-changes into the new subnet's SMT) can use the same canonical
+    /// mapping as the read path. See bug F3 — write side stores raw
+    /// subnet_id strings (e.g. "gaming-subnet"), and any read path that
+    /// compares against `SubnetId::Display` directly would silently
+    /// mismatch. Also see BUG-20260510 — write side that did not call
+    /// this canonical mapping landed coins in ROOT SMT while reads looked
+    /// in the app SMT.
+    pub fn resolve_subnet_id(subnet_id_str: &str) -> SubnetId {
         if subnet_id_str == "ROOT" {
             SubnetId::ROOT
         } else {
