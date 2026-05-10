@@ -271,6 +271,15 @@ impl ConsensusManager {
             self.finalized_cfs.iter().any(|cf| cf.id == cf_id)
     }
 
+    pub fn is_finalized_cf(&self, cf_id: &str) -> bool {
+        self.finalized_cfs.iter().any(|cf| cf.id == cf_id)
+    }
+
+    #[cfg(test)]
+    pub fn pending_counts_for_testing(&self) -> (usize, usize) {
+        (self.pending_cfs.len(), self.pending_cf_events.len())
+    }
+
     pub fn receive_cf(&mut self, cf: ConsensusFrame) {
         let cf_id = cf.id.clone();
         if !self.pending_cfs.contains_key(&cf_id) {
@@ -287,6 +296,25 @@ impl ConsensusManager {
                 }
             }
         }
+    }
+
+    pub fn receive_finalized_cf(&mut self, cf: ConsensusFrame) -> bool {
+        let cf_id = cf.id.clone();
+        if self.is_finalized_cf(&cf_id) {
+            return false;
+        }
+
+        if let Some(existing) = self.pending_cfs.get_mut(&cf_id) {
+            for vote in cf.votes.values() {
+                if !existing.votes.contains_key(&vote.validator_id) {
+                    existing.add_vote(vote.clone());
+                }
+            }
+        } else {
+            self.receive_cf(cf);
+        }
+
+        self.check_finalization(&cf_id)
     }
 
     /// Vote for a ConsensusFrame
@@ -331,8 +359,11 @@ impl ConsensusManager {
 
     /// Receive a vote from another validator
     /// 
-    /// Returns true if the CF is finalized after this vote.
-    /// Duplicate votes from the same validator are ignored (idempotent).
+    /// Returns true if this vote changes the CF lifecycle by finalizing,
+    /// rejecting, or timing out the pending CF. Duplicate votes from the same
+    /// validator are ignored (idempotent). Engine callers must verify the
+    /// target CF is actually the last finalized CF before running finalization
+    /// side effects such as broadcast, persistence, or round advance.
     pub fn receive_vote(&mut self, vote: Vote) -> bool {
         let cf_id = vote.cf_id.clone();
         let voter_id = vote.validator_id.clone();
@@ -357,7 +388,9 @@ impl ConsensusManager {
     /// This is called after adding a vote to check if finalization/rejection should occur.
     /// Public because engine.receive_cf() needs to check after vote_for_cf().
     /// 
-    /// Returns true if CF was finalized or rejected (removed from pending).
+    /// Returns true if CF was finalized or rejected/timed out (removed from pending).
+    /// Engine callers must check the last finalized CF id before treating this
+    /// as a finalized outcome.
     pub fn check_finalization(&mut self, cf_id: &str) -> bool {
         let decision = {
             let cf = match self.pending_cfs.get(cf_id) {
@@ -709,7 +742,7 @@ impl ConsensusManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_types::{Event, EventType};
+    use setu_types::{Event, EventType, VLCSnapshot};
 
     fn create_vlc(node_id: &str, time: u64) -> VLC {
         let mut vlc = VLC::new(node_id.to_string());
@@ -804,5 +837,37 @@ mod tests {
         // Global root should be computed
         let global_root = manager.get_global_root();
         assert_ne!(global_root, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_receive_finalized_cf_merges_votes_into_pending_cf() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 5,
+            min_events_per_cf: 1,
+            validator_count: 3,
+            ..Default::default()
+        };
+        let mut manager = ConsensusManager::new(config, "validator1".to_string());
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut pending_cf = ConsensusFrame::new(anchor, "validator1".to_string());
+        let cf_id = pending_cf.id.clone();
+        pending_cf.add_vote(Vote::new("validator1".to_string(), cf_id.clone(), true));
+        manager.receive_cf(pending_cf.clone());
+
+        let mut finalized_cf = pending_cf;
+        finalized_cf.add_vote(Vote::new("validator2".to_string(), cf_id.clone(), true));
+        finalized_cf.add_vote(Vote::new("validator3".to_string(), cf_id.clone(), true));
+        finalized_cf.finalize();
+        let duplicate_finalized_cf = finalized_cf.clone();
+
+        assert!(manager.receive_finalized_cf(finalized_cf));
+        assert!(manager.is_finalized_cf(&cf_id));
+        assert!(!manager.receive_finalized_cf(duplicate_finalized_cf));
     }
 }

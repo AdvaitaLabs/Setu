@@ -405,6 +405,7 @@ impl ConsensusValidator {
             self.engine.clone(),
             self.event_store.clone(),
             self.anchor_store.clone(),
+            self.cf_store.clone(),
         ));
         
         info!(
@@ -424,10 +425,31 @@ impl ConsensusValidator {
     pub fn event_store(&self) -> Arc<dyn EventStoreBackend> {
         Arc::clone(&self.event_store)
     }
+
+    /// Resolve an event for post-finalization HTTP projection.
+    ///
+    /// Finalization notifications are emitted before persistence/GC completes,
+    /// so the event is usually still in the active DAG. If this subscriber runs
+    /// after persistence and GC, fall back to the shared event store.
+    pub async fn event_for_http_projection(&self, event_id: &str) -> Option<Event> {
+        let event_id = event_id.to_string();
+        {
+            let dag = self.engine.dag_manager().dag().read().await;
+            if let Some(event) = dag.get_event(&event_id) {
+                return Some(event.clone());
+            }
+        }
+
+        self.event_store.get(&event_id).await
+    }
     
     /// Get the anchor store (for queries of finalized anchors)
     pub fn anchor_store(&self) -> Arc<dyn AnchorStoreBackend> {
         Arc::clone(&self.anchor_store)
+    }
+
+    pub fn cf_store(&self) -> Arc<dyn CFStoreBackend> {
+        Arc::clone(&self.cf_store)
     }
 
     /// R5 · Get the shared execution-outcome map for RPC reads.
@@ -844,6 +866,18 @@ impl ConsensusValidator {
         self.finalization_tx.subscribe()
     }
 
+    /// Rebuild the finalization broadcast channel with a caller-provided capacity.
+    ///
+    /// This is primarily for lag/catch-up tests that need a tiny buffer. It is a
+    /// consuming builder and should be called before the validator is wrapped in
+    /// `Arc` or any subscribers are created.
+    pub fn with_finalization_capacity(mut self, capacity: usize) -> Self {
+        let (finalization_tx, _) = broadcast::channel(capacity.max(1));
+        self.engine.set_finalization_tx(finalization_tx.clone());
+        self.finalization_tx = finalization_tx;
+        self
+    }
+
     /// Heartbeat: periodically try to create CF for events stuck below vlc_delta_threshold.
     /// Called by background timer in main.rs. No-op if not Leader or no stale events.
     pub async fn try_heartbeat(&self, heartbeat_interval: std::time::Duration) -> SetuResult<()> {
@@ -919,6 +953,10 @@ impl FinalizationPersister for ConsensusValidator {
     
     fn anchor_store(&self) -> &Arc<dyn AnchorStoreBackend> {
         &self.anchor_store
+    }
+
+    fn cf_store(&self) -> &Arc<dyn CFStoreBackend> {
+        &self.cf_store
     }
 }
 
@@ -1094,6 +1132,25 @@ mod tests {
         assert_eq!(stats.validator_id, "test-validator");
         assert!(stats.is_leader);
         assert_eq!(stats.current_round, 0);
+    }
+
+    #[tokio::test]
+    async fn test_f3_with_finalization_capacity_rewires_engine_sender() {
+        let config = create_test_config();
+        let validator = ConsensusValidator::new(config);
+        let mut old_rx = validator.subscribe_finalization();
+
+        let validator = validator.with_finalization_capacity(1);
+
+        let old_result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(50),
+            old_rx.recv(),
+        )
+        .await
+        .expect("old receiver should close after channel rewrite");
+        assert!(matches!(old_result, Err(tokio::sync::broadcast::error::RecvError::Closed)));
+
+        let _new_rx = validator.subscribe_finalization();
     }
 
     #[tokio::test]

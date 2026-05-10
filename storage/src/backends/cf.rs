@@ -24,7 +24,7 @@ pub trait CFStoreBackend: Send + Sync + Debug {
     async fn get(&self, cf_id: &CFId) -> Option<ConsensusFrame>;
 
     /// Mark a pending CF as finalized
-    async fn mark_finalized(&self, cf_id: &CFId);
+    async fn mark_finalized(&self, cf_id: &CFId) -> SetuResult<()>;
 
     // =========================================================================
     // Query operations
@@ -62,7 +62,7 @@ impl CFStoreBackend for CFStore {
         CFStore::get(self, cf_id).await
     }
 
-    async fn mark_finalized(&self, cf_id: &CFId) {
+    async fn mark_finalized(&self, cf_id: &CFId) -> SetuResult<()> {
         CFStore::mark_finalized(self, cf_id).await
     }
 
@@ -103,7 +103,7 @@ impl CFStoreBackend for RocksDBCFStore {
         RocksDBCFStore::get(self, cf_id).await
     }
 
-    async fn mark_finalized(&self, cf_id: &CFId) {
+    async fn mark_finalized(&self, cf_id: &CFId) -> SetuResult<()> {
         RocksDBCFStore::mark_finalized(self, cf_id).await
     }
 

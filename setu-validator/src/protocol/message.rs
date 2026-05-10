@@ -327,6 +327,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_cf_finalized_bincode_roundtrip() {
+        use setu_types::consensus::Anchor;
+
+        let anchor = Anchor::new(
+            vec!["genesis-event".to_string()],
+            VLCSnapshot::default(),
+            "state-root-hash".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "validator-1".to_string());
+        cf.add_vote(Vote::new("validator-1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("validator-2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("validator-3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+
+        let msg = SetuMessage::CFFinalized {
+            cf: cf.clone(),
+            sender_id: "validator-2".to_string(),
+        };
+        let bytes = bincode::serialize(&msg).expect("CFFinalized serialize");
+        let decoded: SetuMessage = bincode::deserialize(&bytes)
+            .expect("CFFinalized deserialization failed!");
+
+        match decoded {
+            SetuMessage::CFFinalized { cf: decoded_cf, sender_id } => {
+                assert_eq!(sender_id, "validator-2");
+                assert_eq!(decoded_cf.id, cf.id);
+                assert_eq!(decoded_cf.approve_count(), 3);
+            }
+            other => panic!("Expected CFFinalized, got {:?}", other.message_type()),
+        }
+    }
+
     /// CRITICAL TEST: Event with execution_result containing StateChange
     /// StateChange.target_subnet has #[serde(skip_serializing_if = "Option::is_none")]
     /// which is incompatible with bincode.

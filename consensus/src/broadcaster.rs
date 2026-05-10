@@ -136,7 +136,7 @@ pub trait ConsensusBroadcaster: Send + Sync + Debug {
     ///
     /// Called when a CF is finalized (quorum reached).
     /// This helps late-joining nodes sync up.
-    async fn broadcast_finalized(&self, cf_id: &str) -> Result<BroadcastResult, BroadcastError>;
+    async fn broadcast_finalized(&self, cf: &ConsensusFrame) -> Result<BroadcastResult, BroadcastError>;
 
     /// Broadcast an event to all peer validators
     ///
@@ -182,7 +182,7 @@ impl ConsensusBroadcaster for NoOpBroadcaster {
         Ok(BroadcastResult::success(0, 0))
     }
 
-    async fn broadcast_finalized(&self, _cf_id: &str) -> Result<BroadcastResult, BroadcastError> {
+    async fn broadcast_finalized(&self, _cf: &ConsensusFrame) -> Result<BroadcastResult, BroadcastError> {
         Ok(BroadcastResult::success(0, 0))
     }
 
@@ -280,11 +280,11 @@ impl ConsensusBroadcaster for MockBroadcaster {
         Ok(BroadcastResult::success(self.peer_count, self.peer_count))
     }
 
-    async fn broadcast_finalized(&self, cf_id: &str) -> Result<BroadcastResult, BroadcastError> {
+    async fn broadcast_finalized(&self, cf: &ConsensusFrame) -> Result<BroadcastResult, BroadcastError> {
         if self.simulate_failure.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(BroadcastError::AllFailed("Simulated failure".to_string()));
         }
-        self.finalized_broadcasts.lock().unwrap().push(cf_id.to_string());
+        self.finalized_broadcasts.lock().unwrap().push(cf.id.clone());
         Ok(BroadcastResult::success(self.peer_count, self.peer_count))
     }
 

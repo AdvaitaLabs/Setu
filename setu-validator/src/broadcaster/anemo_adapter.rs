@@ -116,20 +116,37 @@ impl ConsensusBroadcaster for AnemoConsensusBroadcaster {
         }
     }
 
-    async fn broadcast_finalized(&self, cf_id: &str) -> Result<BroadcastResult, BroadcastError> {
-        // For finalization, we notify the network layer
+    async fn broadcast_finalized(&self, cf: &ConsensusFrame) -> Result<BroadcastResult, BroadcastError> {
         let peers = self.network.get_connected_peers();
         let total_peers = peers.len();
         
         if total_peers == 0 {
-            debug!(cf_id = %cf_id, "No peers to broadcast finalization to");
+            debug!(cf_id = %cf.id, "No peers to broadcast finalization to");
             return Ok(BroadcastResult::success(0, 0));
         }
 
-        // For MVP, finalization is implicitly communicated through vote quorum
-        debug!(cf_id = %cf_id, peer_count = total_peers, "CF finalization acknowledged (implicit via votes)");
-        
-        Ok(BroadcastResult::success(total_peers, total_peers))
+        let message = SetuMessage::CFFinalized {
+            cf: cf.clone(),
+            sender_id: self.local_validator_id.clone(),
+        };
+        let bytes = Self::serialize(&message)?;
+
+        match self.network.broadcast(SETU_ROUTE, bytes).await {
+            Ok((success, total)) => {
+                info!(
+                    cf_id = %cf.id,
+                    success = success,
+                    total = total,
+                    "CF finalization broadcasted"
+                );
+                Ok(BroadcastResult::success(success, total))
+            }
+            Err(e) => {
+                let error_msg = format!("{}", e);
+                warn!(cf_id = %cf.id, error = %error_msg, "Failed to broadcast CF finalization");
+                Err(BroadcastError::AllFailed(error_msg))
+            }
+        }
     }
 
     async fn broadcast_event(&self, event: &Event) -> Result<BroadcastResult, BroadcastError> {

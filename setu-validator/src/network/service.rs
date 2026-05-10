@@ -46,7 +46,7 @@ use setu_rpc::{
     SubmitTransferRequest, SubmitTransferResponse, ValidatorListItem,
     SubmitTransfersBatchRequest, SubmitTransfersBatchResponse,
 };
-use setu_types::event::{Event, EventPayload};
+use setu_types::event::{Event, EventPayload, EventStatus};
 use setu_types::ExecutionOutcome;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1344,6 +1344,72 @@ impl ValidatorNetworkService {
         }
     }
 
+    pub fn cache_finalized_event_for_query(&self, event: Event) {
+        self.cache_finalized_event_for_query_with_outcome(event, None);
+    }
+
+    pub fn cache_finalized_event_for_query_with_outcome(
+        &self,
+        mut event: Event,
+        outcome: Option<ExecutionOutcome>,
+    ) {
+        let event_id = event.id.clone();
+        if let Some(outcome) = outcome {
+            self.execution_outcomes.insert(event_id.clone(), outcome);
+        }
+
+        event.set_status(EventStatus::Finalized);
+        self.events.insert(event_id.clone(), event.clone());
+
+        let mut dag_events = self.dag_events.write();
+        if !dag_events.iter().any(|id| id == &event_id) {
+            dag_events.push(event_id.clone());
+        }
+    }
+
+    pub fn apply_live_finalized_side_effects(&self, event: &Event) {
+        match &event.payload {
+            EventPayload::ValidatorRegister(reg) => {
+                self.validators.write().insert(
+                    reg.validator_id.clone(),
+                    ValidatorInfo::from_registration(reg, "online", event.timestamp),
+                );
+            }
+            EventPayload::ValidatorUnregister(unreg) => {
+                self.validators.write().remove(&unreg.node_id);
+            }
+            EventPayload::SolverRegister(reg) => {
+                self.solver_info.insert(
+                    reg.solver_id.clone(),
+                    SolverInfo::from_registration(reg, "active", event.timestamp),
+                );
+            }
+            EventPayload::SolverUnregister(unreg) => {
+                self.solver_info.remove(&unreg.node_id);
+            }
+            EventPayload::SubnetRegister(reg) => {
+                self.registered_subnets.insert(
+                    reg.subnet_id.clone(),
+                    SubnetInfo::from_registration(reg, event.timestamp),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    pub fn startup_projection_outcome(event: &Event, cf_id: &str) -> Option<ExecutionOutcome> {
+        match event.execution_result.as_ref() {
+            Some(result) if result.success => Some(ExecutionOutcome::Applied {
+                cf_id: cf_id.to_string(),
+            }),
+            Some(result) => Some(ExecutionOutcome::ExecutionFailed {
+                cf_id: cf_id.to_string(),
+                reason: result.message.clone(),
+            }),
+            None => None,
+        }
+    }
+
     /// Get all registered subnets (used for testing/inspection).
     pub fn get_all_subnets(&self) -> Vec<SubnetInfo> {
         self.registered_subnets.iter().map(|r| r.value().clone()).collect()
@@ -2063,5 +2129,204 @@ mod tests {
 
         assert!(response.success);
         assert_eq!(service.validator_count(), 1);
+    }
+
+    #[test]
+    fn finalized_applied_subnet_event_is_query_visible() {
+        let service = create_test_service();
+        let vlc_snapshot = setu_vlc::VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1,
+        };
+        let mut event = Event::subnet_register(
+            setu_types::SubnetRegistration::new("subnet-live", "Live", "owner", "LIVE"),
+            vec![],
+            vlc_snapshot,
+            "validator-1".to_string(),
+        );
+        event.set_execution_result(setu_types::ExecutionResult::success());
+        let event_id = event.id.clone();
+
+        service.cache_finalized_event_for_query_with_outcome(
+            event.clone(),
+            Some(ExecutionOutcome::Applied {
+                cf_id: "cf-1".to_string(),
+            }),
+        );
+        service.apply_live_finalized_side_effects(&event);
+
+        let response = service
+            .get_event_by_id(&event_id)
+            .expect("finalized event should be query visible");
+        assert_eq!(response.status, "Finalized");
+        assert!(matches!(
+            response.on_chain,
+            Some(setu_api::OnChainOutcome::Applied { ref cf_id }) if cf_id == "cf-1"
+        ));
+        assert!(service.get_subnet_info("subnet-live").is_some());
+    }
+
+    #[test]
+    fn finalized_stale_subnet_event_does_not_update_subnet_list() {
+        let service = create_test_service();
+        let vlc_snapshot = setu_vlc::VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1,
+        };
+        let mut event = Event::subnet_register(
+            setu_types::SubnetRegistration::new("subnet-stale", "Stale", "owner", "STL"),
+            vec![],
+            vlc_snapshot,
+            "validator-1".to_string(),
+        );
+        event.set_execution_result(setu_types::ExecutionResult::success());
+        let event_id = event.id.clone();
+
+        service.execution_outcomes.insert(
+            event_id.clone(),
+            ExecutionOutcome::StaleRead {
+                cf_id: "cf-1".to_string(),
+                conflicting_object: "oid:abc".to_string(),
+                retry_hint: "retry".to_string(),
+            },
+        );
+        service.cache_finalized_event_for_query(event);
+
+        let response = service
+            .get_event_by_id(&event_id)
+            .expect("finalized stale event should still be query visible");
+        assert!(matches!(
+            response.on_chain,
+            Some(setu_api::OnChainOutcome::StaleRead { ref cf_id, .. }) if cf_id == "cf-1"
+        ));
+        assert!(service.get_subnet_info("subnet-stale").is_none());
+    }
+
+    /// F2 regression: startup query projection must not run live side effects.
+    /// Replay tags solver as "replayed" without registering a router channel;
+    /// HTTP projection may make the event queryable, but must not promote the
+    /// solver to "active" without a real live registration path.
+    #[test]
+    fn test_f2_startup_projection_preserves_replayed_solver_status() {
+        let service = create_test_service();
+        let vlc_snapshot = setu_vlc::VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1,
+        };
+        let registration = setu_types::SolverRegistration::new(
+            "solver-phantom",
+            "127.0.0.1",
+            9999,
+            "0xdead",
+            vec![],
+            vec![],
+        );
+        let mut event = Event::solver_register(
+            registration,
+            vec![],
+            vlc_snapshot,
+            "validator-1".to_string(),
+        );
+        event.set_execution_result(setu_types::ExecutionResult::success());
+
+        // Step 1: replay path (mirrors DAG replay in main.rs)
+        let action = service.apply_replay_event(&event);
+        assert!(matches!(action, crate::dag_replay::ReplayAction::Applied(_)));
+        let post_replay_status = service
+            .solver_info
+            .get("solver-phantom")
+            .map(|r| r.value().status.clone())
+            .expect("solver_info populated by replay");
+        assert_eq!(
+            post_replay_status, "replayed",
+            "replay must keep status=replayed (no router channel)"
+        );
+        assert_eq!(
+            service.router_manager().solver_count(),
+            0,
+            "replay must NOT register a router channel"
+        );
+
+        // Step 2: startup HTTP projection (mirrors main.rs Phase 3.24)
+        service.cache_finalized_event_for_query_with_outcome(
+            event,
+            Some(ExecutionOutcome::Applied {
+                cf_id: "cf-startup".to_string(),
+            }),
+        );
+
+        let post_projection_status = service
+            .solver_info
+            .get("solver-phantom")
+            .map(|r| r.value().status.clone())
+            .expect("solver_info still populated after projection");
+        assert_eq!(
+            post_projection_status, "replayed",
+            "startup projection must not promote replayed solver to active"
+        );
+        assert_eq!(
+            service.router_manager().solver_count(),
+            0,
+            "startup projection must not register a router channel"
+        );
+    }
+
+    /// F5 regression: startup projection must not synthesize Applied for an
+    /// event whose execution_result is None.
+    #[test]
+    fn test_f5_startup_projection_does_not_promote_none_result_to_applied() {
+        let vlc_snapshot = setu_vlc::VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1,
+        };
+        let event_no_result = Event::subnet_register(
+            setu_types::SubnetRegistration::new("subnet-failed-apply", "X", "owner", "FAIL"),
+            vec![],
+            vlc_snapshot,
+            "validator-2".to_string(),
+        );
+        // Critical: do NOT call set_execution_result. This mirrors the
+        // follower-apply error path where execution_result remains None.
+        assert!(event_no_result.execution_result.is_none());
+
+        let outcome = ValidatorNetworkService::startup_projection_outcome(&event_no_result, "cf-restart");
+        assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn test_f5_startup_projection_maps_explicit_results_only() {
+        let vlc_snapshot = setu_vlc::VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1,
+        };
+        let mut success_event = Event::subnet_register(
+            setu_types::SubnetRegistration::new("subnet-success", "S", "owner", "S"),
+            vec![],
+            vlc_snapshot.clone(),
+            "validator-2".to_string(),
+        );
+        success_event.set_execution_result(setu_types::ExecutionResult::success());
+        assert!(matches!(
+            ValidatorNetworkService::startup_projection_outcome(&success_event, "cf-ok"),
+            Some(ExecutionOutcome::Applied { ref cf_id }) if cf_id == "cf-ok"
+        ));
+
+        let mut failed_event = Event::subnet_register(
+            setu_types::SubnetRegistration::new("subnet-failed", "F", "owner", "F"),
+            vec![],
+            vlc_snapshot,
+            "validator-2".to_string(),
+        );
+        failed_event.set_execution_result(setu_types::ExecutionResult::failure("boom"));
+        assert!(matches!(
+            ValidatorNetworkService::startup_projection_outcome(&failed_event, "cf-fail"),
+            Some(ExecutionOutcome::ExecutionFailed { ref cf_id, ref reason })
+                if cf_id == "cf-fail" && Option::as_deref(reason) == Some("boom")
+        ));
     }
 }

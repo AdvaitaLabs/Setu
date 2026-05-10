@@ -28,7 +28,7 @@ use setu_storage::{
     MerkleStateProvider,
 };
 use setu_types::{
-    NodeInfo, ConsensusConfig,
+    NodeInfo, ConsensusConfig, ConsensusFrame,
     GenesisConfig, Event, EventPayload, ExecutionResult, StateChange,
     CoinState, Address, VLCSnapshot,
 };
@@ -38,6 +38,63 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::{info, error, warn, Level};
 use tracing_subscriber;
+
+type ProjectionWatermark = (u64, u64, String);
+
+#[derive(Debug, Default)]
+struct ProjectionStats {
+    projected: usize,
+    skipped: usize,
+}
+
+impl ProjectionStats {
+    fn complete(&self) -> bool {
+        self.skipped == 0
+    }
+}
+
+fn cf_projection_key(cf: &ConsensusFrame) -> ProjectionWatermark {
+    (cf.anchor.depth, cf.created_at, cf.id.clone())
+}
+
+async fn project_cf_for_http(
+    consensus_validator: &ConsensusValidator,
+    network_service: &ValidatorNetworkService,
+    cf: &ConsensusFrame,
+    live_side_effects: bool,
+) -> ProjectionStats {
+    let mut stats = ProjectionStats::default();
+
+    for event_id in &cf.anchor.event_ids {
+        match consensus_validator.event_for_http_projection(event_id).await {
+            Some(event) => {
+                let outcome = if live_side_effects {
+                    None
+                } else {
+                    ValidatorNetworkService::startup_projection_outcome(&event, &cf.id)
+                };
+                network_service.cache_finalized_event_for_query_with_outcome(
+                    event.clone(),
+                    outcome,
+                );
+                if live_side_effects {
+                    network_service.apply_live_finalized_side_effects(&event);
+                }
+                stats.projected += 1;
+            }
+            None => {
+                stats.skipped += 1;
+                warn!(
+                    cf_id = %cf.id,
+                    event_id = %event_id,
+                    "Finalized event missing from DAG and event store; HTTP projection skipped"
+                );
+            }
+        }
+    }
+
+    stats
+}
 
 /// Validator configuration from environment
 #[derive(Debug, Clone)]
@@ -325,6 +382,9 @@ async fn main() -> anyhow::Result<()> {
         consensus_validator.engine().set_private_key(private_key_bytes).await;
         info!("✓ Private key injected for vote signing");
     }
+
+    consensus_validator.engine().enable_strict_vote_signatures();
+    info!("✓ Strict consensus vote signature verification enabled");
 
     // Attempt to recover state from storage (if any)
     // This is safe to call even with empty storage (fresh start)
@@ -809,6 +869,112 @@ async fn main() -> anyhow::Result<()> {
                 warn!("DAG replay failed (non-fatal, registries may be incomplete): {}", e);
             }
         }
+    }
+
+    // ========================================
+    // Phase 3.24: Restart finalized event HTTP projection
+    // ========================================
+    let mut startup_projection_watermark: Option<ProjectionWatermark> = None;
+    {
+        let cf_store = consensus_validator.cf_store();
+        let anchor_store = consensus_validator.anchor_store();
+        let mut finalized_cfs = cf_store.get_finalized().await;
+        finalized_cfs.sort_by_key(|cf| (cf.anchor.depth, cf.created_at));
+
+        let mut projected = 0usize;
+        let mut skipped = 0usize;
+
+        for cf in finalized_cfs {
+            if anchor_store.get(&cf.anchor.id).await.is_none() {
+                skipped += cf.anchor.event_ids.len();
+                continue;
+            }
+
+            let stats = project_cf_for_http(
+                &consensus_validator,
+                &network_service,
+                &cf,
+                false,
+            ).await;
+            projected += stats.projected;
+            skipped += stats.skipped;
+
+            if stats.complete() {
+                startup_projection_watermark = Some(cf_projection_key(&cf));
+            }
+        }
+
+        if projected > 0 || skipped > 0 {
+            info!(
+                projected = projected,
+                skipped = skipped,
+                "✓ Restart finalized event HTTP projection complete"
+            );
+        } else {
+            info!("✓ Restart finalized event HTTP projection: no finalized CFs to replay");
+        }
+    }
+
+    // ========================================
+    // Phase 3.25: Live finalized event HTTP projection
+    // ========================================
+    {
+        let mut finalization_rx = consensus_validator.subscribe_finalization();
+        let projection_consensus = Arc::clone(&consensus_validator);
+        let projection_service = Arc::clone(&network_service);
+        let mut projection_watermark = startup_projection_watermark;
+        let _finalized_event_projection_handle = tokio::spawn(async move {
+            loop {
+                match finalization_rx.recv().await {
+                    Ok(cf) => {
+                        let stats = project_cf_for_http(
+                            &projection_consensus,
+                            &projection_service,
+                            &cf,
+                            true,
+                        ).await;
+                        if stats.complete() {
+                            projection_watermark = Some(cf_projection_key(&cf));
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(lagged = n, "Finalized event HTTP projector lagged CF notifications");
+                        let mut finalized_cfs = projection_consensus.cf_store().get_finalized().await;
+                        finalized_cfs.sort_by_key(|cf| (cf.anchor.depth, cf.created_at, cf.id.clone()));
+
+                        for cf in finalized_cfs {
+                            let key = cf_projection_key(&cf);
+                            if projection_watermark
+                                .as_ref()
+                                .map(|watermark| key <= *watermark)
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
+
+                            let stats = project_cf_for_http(
+                                &projection_consensus,
+                                &projection_service,
+                                &cf,
+                                true,
+                            ).await;
+                            if stats.complete() {
+                                projection_watermark = Some(key);
+                            } else {
+                                warn!(
+                                    cf_id = %cf.id,
+                                    skipped = stats.skipped,
+                                    "Lag catch-up stopped before advancing HTTP projection watermark"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        info!("✓ Finalized event HTTP projector started");
     }
 
     // ========================================

@@ -20,7 +20,7 @@
 use setu_storage::{EventStore, EventStoreBackend, SharedStateManager};
 use setu_types::{ConsensusConfig, ConsensusFrame, Event, EventId, SetuResult, Vote};
 use setu_vlc::VLCSnapshot;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
@@ -74,6 +74,8 @@ pub struct ConsensusEngine {
     /// Private key for signing votes (ed25519, 32 bytes)
     /// If None, votes will not be signed (backward compatibility mode)
     private_key: Arc<RwLock<Option<Vec<u8>>>>,
+    /// Production trust boundary: reject unsigned votes when explicitly enabled.
+    strict_vote_signatures: AtomicBool,
     /// Channel for sending consensus messages (legacy, for internal use)
     message_tx: mpsc::Sender<ConsensusMessage>,
     /// Channel for receiving consensus messages (reserved for future use)
@@ -84,6 +86,8 @@ pub struct ConsensusEngine {
     /// Anchors from inline-finalized CFs (single-node mode) pending persistence.
     /// Callers should drain this after add_event() to persist finalized anchors.
     pending_persist_anchors: Arc<Mutex<Vec<setu_types::Anchor>>>,
+    /// Full finalized CFs pending durable indexing alongside their anchors.
+    pending_persist_cfs: Arc<Mutex<Vec<ConsensusFrame>>>,
     /// Broadcast channel for CF finalization notifications.
     /// Injected by caller (ConsensusValidator) via set_finalization_tx().
     /// Uses parking_lot::RwLock: broadcast::Sender::send() is synchronous.
@@ -117,10 +121,12 @@ impl ConsensusEngine {
             ))),
             local_validator_id: validator_id,
             private_key: Arc::new(RwLock::new(None)),
+            strict_vote_signatures: AtomicBool::new(false),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
+            pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
             finalization_tx: parking_lot::RwLock::new(None),
         }
     }
@@ -160,10 +166,12 @@ impl ConsensusEngine {
             ))),
             local_validator_id: validator_id,
             private_key: Arc::new(RwLock::new(None)),
+            strict_vote_signatures: AtomicBool::new(false),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
+            pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
             finalization_tx: parking_lot::RwLock::new(None),
         }
     }
@@ -199,10 +207,12 @@ impl ConsensusEngine {
             ))),
             local_validator_id: validator_id,
             private_key: Arc::new(RwLock::new(None)),
+            strict_vote_signatures: AtomicBool::new(false),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
+            pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
             finalization_tx: parking_lot::RwLock::new(None),
         }
     }
@@ -237,10 +247,12 @@ impl ConsensusEngine {
             ))),
             local_validator_id: validator_id,
             private_key: Arc::new(RwLock::new(None)),
+            strict_vote_signatures: AtomicBool::new(false),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
+            pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
             finalization_tx: parking_lot::RwLock::new(None),
         }
     }
@@ -258,12 +270,41 @@ impl ConsensusEngine {
         *self.private_key.write().await = None;
     }
 
+    /// Enable production vote signature enforcement.
+    ///
+    /// Constructors stay permissive for legacy tests and local fixtures;
+    /// deployment code opts in after validator construction and key loading.
+    pub fn enable_strict_vote_signatures(&self) {
+        self.strict_vote_signatures.store(true, Ordering::SeqCst);
+    }
+
+    fn require_vote_signatures(&self) -> bool {
+        self.strict_vote_signatures.load(Ordering::SeqCst)
+    }
+
     /// Take all pending anchors that were finalized inline (single-node mode).
     /// Callers should persist these anchors to durable storage.
     /// Returns an empty Vec if no anchors are pending.
     pub async fn take_pending_anchors(&self) -> Vec<setu_types::Anchor> {
+        // TODO(F1-residual): this is still a destructive drain. If caller-side
+        // anchor persistence fails, there is no in-engine retry source. See the
+        // follow-up FDP `fix-m2-anchor-retry-source`.
         let mut pending = self.pending_persist_anchors.lock().await;
         std::mem::take(&mut *pending)
+    }
+
+    pub async fn take_pending_finalized_cfs(&self) -> Vec<ConsensusFrame> {
+        let mut pending = self.pending_persist_cfs.lock().await;
+        std::mem::take(&mut *pending)
+    }
+
+    pub async fn peek_pending_finalized_cfs(&self) -> Vec<ConsensusFrame> {
+        self.pending_persist_cfs.lock().await.clone()
+    }
+
+    pub async fn drain_pending_finalized_cfs(&self, cf_ids: &[setu_types::CFId]) {
+        let mut pending = self.pending_persist_cfs.lock().await;
+        pending.retain(|cf| !cf_ids.iter().any(|id| id == &cf.id));
     }
 
     /// Mark finalized anchor events as no longer pending in the active DAG.
@@ -594,7 +635,9 @@ impl ConsensusEngine {
                 debug!(cf_id = %frame.id, "Leader self-voted for CF");
 
                 // Check if this vote causes finalization (single-node mode)
-                if manager.check_finalization(&frame.id) {
+                if manager.check_finalization(&frame.id)
+                    && Self::manager_last_finalized_matches(&manager, &frame.id)
+                {
                     // Immediately update depth floor so new events land above anchor_depth.
                     // This is critical: without it, events referencing old parents (e.g., genesis)
                     // would get a depth below anchor_depth, causing permanent InsufficientEvents.
@@ -607,19 +650,29 @@ impl ConsensusEngine {
                         new_min_depth = new_anchor_depth,
                         "CF finalized (single-node mode), depth floor updated"
                     );
-                    // Buffer anchor for persistence by caller (submit_event).
+                    let finalized_cf = manager.last_finalized_cf().cloned();
+
+                    // Buffer anchor/CF for persistence by caller (submit_event).
                     // The internal message channel is not consumed in production,
                     // so persistence must be triggered by the caller.
-                    {
-                        let mut pending = self.pending_persist_anchors.lock().await;
-                        pending.push(frame.anchor.clone());
+                    if let Some(ref cf) = finalized_cf {
+                        {
+                            let mut pending = self.pending_persist_anchors.lock().await;
+                            pending.push(cf.anchor.clone());
+                        }
+                        {
+                            let mut pending = self.pending_persist_cfs.lock().await;
+                            pending.push(cf.clone());
+                        }
                     }
 
                     // Notify finalization subscribers (single-node mode)
                     {
                         let tx_guard = self.finalization_tx.read();
                         if let Some(ref tx) = *tx_guard {
-                            let _ = tx.send(frame.clone());
+                            if let Some(cf) = finalized_cf {
+                                let _ = tx.send(cf);
+                            }
                         }
                     }
                 }
@@ -698,7 +751,7 @@ impl ConsensusEngine {
     /// This ensures followers have consistent state with the leader.
     pub async fn receive_cf(
         &self,
-        cf: ConsensusFrame,
+        mut cf: ConsensusFrame,
     ) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
         // Step 0: Verify CF ID matches content (anti-tampering)
         if !cf.verify_id() {
@@ -755,121 +808,14 @@ impl ConsensusEngine {
             }
         }
 
-        // Step 3: Ensure all referenced events are available in local DAG
-        // This is critical for state consistency - we cannot verify or apply
-        // state changes without having all the events.
-        {
-            let dag = self.dag.read().await;
-            let missing_event_ids: Vec<EventId> = cf
-                .anchor
-                .event_ids
-                .iter()
-                .filter(|id| !dag.contains(id))
-                .cloned()
-                .collect();
+        self.ensure_cf_events_available(&cf).await?;
 
-            if !missing_event_ids.is_empty() {
-                // Release dag lock before network call
-                drop(dag);
+        self.filter_embedded_votes_for_strict_mode(&mut cf).await;
 
-                // Try to fetch missing events from peers with retry
-                let broadcaster = self.broadcaster.read().await;
-                if let Some(ref b) = *broadcaster {
-                    info!(
-                        cf_id = %cf.id,
-                        missing_count = missing_event_ids.len(),
-                        "Fetching missing events for CF"
-                    );
-
-                    // Retry up to 3 times for transient network failures
-                    const MAX_RETRY: usize = 3;
-                    let mut last_error = None;
-                    let mut fetch_success = false;
-
-                    for retry in 0..MAX_RETRY {
-                        match b.request_events(&missing_event_ids).await {
-                            Ok(fetched_events) => {
-                                fetch_success = true;
-                                last_error = None;
-                                // Add fetched events through DagManager with retry (handles TOCTOU)
-                                for event in fetched_events {
-                                    // Update VLC when adding fetched events
-                                    {
-                                        let mut vlc = self.vlc.write().await;
-                                        vlc.merge(&event.vlc_snapshot);
-                                    }
-
-                                    match self.dag_manager.add_event_with_retry(event.clone()).await
-                                    {
-                                        Ok(_) => {}
-                                        Err(DagManagerError::DuplicateEvent(_)) => {
-                                            // DuplicateEvent is OK (race condition)
-                                        }
-                                        Err(e) => {
-                                            warn!(event_id = %event.id, error = %e, "Failed to add fetched event");
-                                        }
-                                    }
-                                }
-
-                                // Re-check if we still have missing events
-                                let dag = self.dag.read().await;
-                                let still_missing: Vec<_> = cf
-                                    .anchor
-                                    .event_ids
-                                    .iter()
-                                    .filter(|id| !dag.contains(id))
-                                    .collect();
-
-                                if !still_missing.is_empty() {
-                                    // Still have missing events, continue retry
-                                    last_error = Some(format!(
-                                        "Still missing {} events after fetch",
-                                        still_missing.len()
-                                    ));
-                                    drop(dag);
-                                } else {
-                                    // All events fetched successfully
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                last_error = Some(format!("Fetch failed: {}", e));
-                                if retry < MAX_RETRY - 1 {
-                                    warn!(
-                                        cf_id = %cf.id,
-                                        retry = retry + 1,
-                                        max_retry = MAX_RETRY,
-                                        error = %e,
-                                        "Failed to fetch missing events, retrying..."
-                                    );
-                                    // Wait before retry with exponential backoff
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(
-                                        100 * (retry as u64 + 1),
-                                    ))
-                                    .await;
-                                }
-                            }
-                        }
-                    }
-
-                    // Check final result
-                    if !fetch_success {
-                        return Err(setu_types::SetuError::InvalidData(format!(
-                            "CF {} references {} missing events and all fetch attempts failed: {}",
-                            cf.id,
-                            missing_event_ids.len(),
-                            last_error.unwrap_or_else(|| "unknown error".to_string())
-                        )));
-                    }
-                } else {
-                    // No broadcaster configured - cannot fetch missing events
-                    return Err(setu_types::SetuError::InvalidData(format!(
-                        "CF {} references {} events not in local DAG (no broadcaster to fetch)",
-                        cf.id,
-                        missing_event_ids.len()
-                    )));
-                }
-            }
+        if self.require_vote_signatures() && self.private_key.read().await.is_none() {
+            return Err(setu_types::SetuError::InvalidData(
+                "Strict vote signature mode requires a local private key before voting on CF proposals".to_string(),
+            ));
         }
 
         // Now we have all events, proceed with verification
@@ -922,7 +868,8 @@ impl ConsensusEngine {
 
             // Check if our vote caused finalization
             // (vote_for_cf adds vote but doesn't check finalization, so we check here)
-            let finalized = manager.check_finalization(&cf_id);
+            let finalized = manager.check_finalization(&cf_id)
+                && Self::manager_last_finalized_matches(&manager, &cf_id);
             if finalized {
                 return self.handle_finalization(&mut manager).await;
             }
@@ -931,7 +878,333 @@ impl ConsensusEngine {
         Ok((false, None))
     }
 
-    /// Handle CF finalization: broadcast notification and return anchor for persistence
+    pub async fn receive_finalized_cf(
+        &self,
+        cf: ConsensusFrame,
+    ) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
+        if !cf.verify_id() {
+            return Err(setu_types::SetuError::InvalidData(format!(
+                "Finalized CF ID verification failed - possible tampering: {}",
+                cf.id
+            )));
+        }
+
+        self.verify_finalized_cf_votes(&cf).await?;
+
+        {
+            let manager = self.consensus_manager.read().await;
+            if manager.is_finalized_cf(&cf.id) {
+                return Ok((false, None));
+            }
+        }
+
+        if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
+            let local_chain_root = {
+                let manager = self.consensus_manager.read().await;
+                manager.anchor_builder().anchor_chain_root()
+            };
+
+            if merkle_roots.anchor_chain_root != local_chain_root {
+                return Err(setu_types::SetuError::InvalidData(
+                    format!(
+                        "Finalized CF anchor chain root mismatch - possible fork or time-travel attack: expected {}, got {}",
+                        hex::encode(local_chain_root),
+                        hex::encode(merkle_roots.anchor_chain_root)
+                    )
+                ));
+            }
+        }
+
+        self.ensure_cf_events_available(&cf).await?;
+
+        let dag = self.dag.read().await;
+        let mut manager = self.consensus_manager.write().await;
+
+        if manager.is_finalized_cf(&cf.id) {
+            return Ok((false, None));
+        }
+
+        if !manager.verify_cf_merkle_roots(&cf) {
+            return Err(setu_types::SetuError::InvalidData(
+                "Finalized CF merkle roots verification failed".to_string(),
+            ));
+        }
+
+        manager.apply_cf_state_changes(&dag, &cf);
+        drop(dag);
+
+        let finalized = manager.receive_finalized_cf(cf.clone())
+            && Self::manager_last_finalized_matches(&manager, &cf.id);
+        if finalized {
+            return self.handle_finalization(&mut manager).await;
+        }
+
+        Ok((false, None))
+    }
+
+    async fn verify_finalized_cf_votes(&self, cf: &ConsensusFrame) -> SetuResult<()> {
+        let validator_set = self.validator_set.read().await;
+        let validator_count = validator_set.count();
+        if !cf.check_quorum(validator_count) {
+            return Err(setu_types::SetuError::InvalidData(format!(
+                "Finalized CF {} does not contain quorum votes: approve_count={}, validator_count={}",
+                cf.id,
+                cf.approve_count(),
+                validator_count
+            )));
+        }
+
+        let all_validators = validator_set.all_validators();
+        for vote in cf.votes.values() {
+            if vote.cf_id != cf.id {
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Finalized CF {} contains vote for different CF {}",
+                    cf.id, vote.cf_id
+                )));
+            }
+
+            let Some(validator) = all_validators
+                .iter()
+                .find(|v| v.node.id == vote.validator_id)
+            else {
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Finalized CF {} contains vote from non-validator {}",
+                    cf.id, vote.validator_id
+                )));
+            };
+
+            self.verify_vote_signature_policy(
+                vote,
+                &validator.node.public_key,
+                "finalized CF vote",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    async fn filter_embedded_votes_for_strict_mode(&self, cf: &mut ConsensusFrame) {
+        if !self.require_vote_signatures() || cf.votes.is_empty() {
+            return;
+        }
+
+        let validators = {
+            let validator_set = self.validator_set.read().await;
+            validator_set
+                .all_validators()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let cf_id = cf.id.clone();
+        cf.votes.retain(|validator_id, vote| {
+            if vote.cf_id != cf_id {
+                warn!(
+                    cf_id = %cf_id,
+                    vote_cf_id = %vote.cf_id,
+                    voter = %vote.validator_id,
+                    "Dropping embedded vote for different CF in strict mode"
+                );
+                return false;
+            }
+
+            let Some(validator) = validators
+                .iter()
+                .find(|candidate| candidate.node.id == validator_id.as_str())
+            else {
+                warn!(
+                    cf_id = %cf_id,
+                    voter = %vote.validator_id,
+                    "Dropping embedded vote from non-validator in strict mode"
+                );
+                return false;
+            };
+
+            if vote.signature.is_empty() || validator.node.public_key.is_empty() {
+                warn!(
+                    cf_id = %cf_id,
+                    voter = %vote.validator_id,
+                    "Dropping unsigned embedded vote in strict mode"
+                );
+                return false;
+            }
+
+            if !vote.verify_signature(&validator.node.public_key) {
+                warn!(
+                    cf_id = %cf_id,
+                    voter = %vote.validator_id,
+                    "Dropping invalid embedded vote signature in strict mode"
+                );
+                return false;
+            }
+
+            true
+        });
+    }
+
+    fn verify_vote_signature_policy(
+        &self,
+        vote: &Vote,
+        public_key: &[u8],
+        context: &str,
+    ) -> SetuResult<()> {
+        if vote.signature.is_empty() {
+            if self.require_vote_signatures() {
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Unsigned {} from validator: {}",
+                    context, vote.validator_id
+                )));
+            }
+
+            warn!(
+                cf_id = %vote.cf_id,
+                voter = %vote.validator_id,
+                context = context,
+                "Vote has no signature - signature verification skipped (insecure in production)"
+            );
+            return Ok(());
+        }
+
+        if public_key.is_empty() {
+            if self.require_vote_signatures() {
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Missing public key for signed {} from validator: {}",
+                    context, vote.validator_id
+                )));
+            }
+
+            warn!(
+                voter = %vote.validator_id,
+                context = context,
+                "Validator has no public key configured, skipping signature verification"
+            );
+            return Ok(());
+        }
+
+        if !vote.verify_signature(public_key) {
+            return Err(setu_types::SetuError::InvalidData(format!(
+                "Invalid {} signature from validator: {}",
+                context, vote.validator_id
+            )));
+        }
+
+        debug!(
+            cf_id = %vote.cf_id,
+            voter = %vote.validator_id,
+            context = context,
+            "Vote signature verified successfully"
+        );
+        Ok(())
+    }
+
+    async fn ensure_cf_events_available(&self, cf: &ConsensusFrame) -> SetuResult<()> {
+        let mut missing_event_ids = {
+            let dag = self.dag.read().await;
+            cf.anchor
+                .event_ids
+                .iter()
+                .filter(|id| !dag.contains(id))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        if missing_event_ids.is_empty() {
+            return Ok(());
+        }
+
+        let broadcaster = self.broadcaster.read().await;
+        let Some(ref b) = *broadcaster else {
+            return Err(setu_types::SetuError::InvalidData(format!(
+                "CF {} references {} events not in local DAG (no broadcaster to fetch)",
+                cf.id,
+                missing_event_ids.len()
+            )));
+        };
+
+        info!(
+            cf_id = %cf.id,
+            missing_count = missing_event_ids.len(),
+            "Fetching missing events for CF"
+        );
+
+        const MAX_RETRY: usize = 3;
+        let mut last_error = None;
+
+        for retry in 0..MAX_RETRY {
+            match b.request_events(&missing_event_ids).await {
+                Ok(fetched_events) => {
+                    for event in fetched_events {
+                        {
+                            let mut vlc = self.vlc.write().await;
+                            vlc.merge(&event.vlc_snapshot);
+                        }
+
+                        match self.dag_manager.add_event_with_retry(event.clone()).await {
+                            Ok(_) => {}
+                            Err(DagManagerError::DuplicateEvent(_)) => {}
+                            Err(e) => {
+                                warn!(event_id = %event.id, error = %e, "Failed to add fetched event");
+                            }
+                        }
+                    }
+
+                    missing_event_ids = {
+                        let dag = self.dag.read().await;
+                        cf.anchor
+                            .event_ids
+                            .iter()
+                            .filter(|id| !dag.contains(id))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    };
+
+                    if missing_event_ids.is_empty() {
+                        return Ok(());
+                    }
+
+                    last_error = Some(format!(
+                        "Still missing {} events after fetch",
+                        missing_event_ids.len()
+                    ));
+                }
+                Err(e) => {
+                    last_error = Some(format!("Fetch failed: {}", e));
+                    if retry < MAX_RETRY - 1 {
+                        warn!(
+                            cf_id = %cf.id,
+                            retry = retry + 1,
+                            max_retry = MAX_RETRY,
+                            error = %e,
+                            "Failed to fetch missing events, retrying..."
+                        );
+                    }
+                }
+            }
+
+            if retry < MAX_RETRY - 1 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    100 * (retry as u64 + 1),
+                ))
+                .await;
+            }
+        }
+
+        Err(setu_types::SetuError::InvalidData(format!(
+            "CF {} references missing events after fetch attempts: {}",
+            cf.id,
+            last_error.unwrap_or_else(|| "unknown error".to_string())
+        )))
+    }
+
+    /// Handle CF finalization: broadcast notification and return anchor for persistence.
+    ///
+    /// F7 note: this method intentionally broadcasts local and network
+    /// finalization notifications before the caller persists the returned anchor.
+    /// That leaves an originator crash window where peers may learn a finalized
+    /// CF while the originator has not durably stored the anchor yet. Reordering
+    /// the broadcast is a separate consensus redesign; this path relies on peer
+    /// state-sync after restart if a crash lands in that window.
     ///
     /// Note: This method extracts data from manager before acquiring other locks
     /// to avoid potential deadlock from holding multiple write locks.
@@ -952,6 +1225,11 @@ impl ConsensusEngine {
             self.mark_anchor_events_finalized_in_active_dag(&anchor)
                 .await;
 
+            {
+                let mut pending = self.pending_persist_cfs.lock().await;
+                pending.push(cf.clone());
+            }
+
             // Send finalization to internal channel (legacy, for local listeners)
             let _ = self
                 .message_tx
@@ -962,14 +1240,14 @@ impl ConsensusEngine {
             {
                 let tx_guard = self.finalization_tx.read();
                 if let Some(ref tx) = *tx_guard {
-                    let _ = tx.send(cf);
+                    let _ = tx.send(cf.clone());
                 }
             }
 
             // Broadcast finalization to network via broadcaster (if configured)
             let broadcaster = self.broadcaster.read().await;
             if let Some(ref b) = *broadcaster {
-                match b.broadcast_finalized(&cf_id).await {
+                match b.broadcast_finalized(&cf).await {
                     Ok(result) => {
                         info!(
                             cf_id = %cf_id,
@@ -997,75 +1275,43 @@ impl ConsensusEngine {
         Ok((true, finalized_anchor))
     }
 
+    fn manager_last_finalized_matches(
+        manager: &ConsensusManager,
+        cf_id: &str,
+    ) -> bool {
+        manager
+            .last_finalized_cf()
+            .map(|cf| cf.id == cf_id)
+            .unwrap_or(false)
+    }
+
     /// Receive a vote from another validator
     ///
     /// Returns (finalized, Option<Anchor>) - the anchor is returned when finalized
     /// so the caller can persist it to storage.
     pub async fn receive_vote(&self, vote: Vote) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
-        // Step 1: Verify voter is a valid validator
-        {
+        let validator = {
             let validator_set = self.validator_set.read().await;
             let all_validators = validator_set.all_validators();
-            if !all_validators
-                .iter()
-                .any(|v| v.node.id == vote.validator_id)
-            {
-                return Err(setu_types::SetuError::InvalidData(format!(
-                    "Vote from non-validator: {}",
-                    vote.validator_id
-                )));
-            }
-        }
+            all_validators
+                .into_iter()
+                .find(|candidate| candidate.node.id == vote.validator_id)
+                .cloned()
+        };
 
-        // Step 2: Verify vote signature
-        if !vote.signature.is_empty() {
-            // Get the public key for this validator
-            let public_key = {
-                let validator_set = self.validator_set.read().await;
-                let all_validators = validator_set.all_validators();
-                all_validators
-                    .iter()
-                    .find(|v| v.node.id == vote.validator_id)
-                    .map(|v| v.node.public_key.clone())
-            };
+        let Some(validator) = validator else {
+            return Err(setu_types::SetuError::InvalidData(format!(
+                "Vote from non-validator: {}",
+                vote.validator_id
+            )));
+        };
 
-            if let Some(pub_key) = public_key {
-                if !pub_key.is_empty() {
-                    if !vote.verify_signature(&pub_key) {
-                        return Err(setu_types::SetuError::InvalidData(format!(
-                            "Invalid vote signature from validator: {}",
-                            vote.validator_id
-                        )));
-                    }
-                    debug!(
-                        cf_id = %vote.cf_id,
-                        voter = %vote.validator_id,
-                        "Vote signature verified successfully"
-                    );
-                } else {
-                    warn!(
-                        voter = %vote.validator_id,
-                        "Validator has no public key configured, skipping signature verification"
-                    );
-                }
-            } else {
-                // This shouldn't happen as we already checked validator existence
-                return Err(setu_types::SetuError::InvalidData(format!(
-                    "Could not find public key for validator: {}",
-                    vote.validator_id
-                )));
-            }
-        } else {
-            // Empty signature - for backward compatibility or testing
-            warn!(
-                cf_id = %vote.cf_id,
-                voter = %vote.validator_id,
-                "Vote has no signature - signature verification skipped (insecure in production)"
-            );
-        }
+        self.verify_vote_signature_policy(&vote, &validator.node.public_key, "vote")?;
 
+        let cf_id = vote.cf_id.clone();
         let mut manager = self.consensus_manager.write().await;
-        let finalized = manager.receive_vote(vote);
+        let finalized = manager.receive_vote(vote)
+            && Self::manager_last_finalized_matches(&manager, &cf_id);
 
         if finalized {
             self.handle_finalization(&mut manager).await
@@ -1173,23 +1419,34 @@ impl ConsensusEngine {
 
             let self_vote = manager.vote_for_cf(&frame.id, true, key_ref);
             if self_vote.is_some() {
-                if manager.check_finalization(&frame.id) {
+                if manager.check_finalization(&frame.id)
+                    && Self::manager_last_finalized_matches(&manager, &frame.id)
+                {
                     let new_anchor_depth = manager.anchor_builder().anchor_depth();
                     self.dag_manager.update_min_depth(new_anchor_depth);
                     self.mark_anchor_events_finalized_in_active_dag(&frame.anchor)
                         .await;
                     info!(cf_id = %frame.id, "Heartbeat CF finalized (single-node)");
 
-                    {
-                        let mut pending = self.pending_persist_anchors.lock().await;
-                        pending.push(frame.anchor.clone());
+                    let finalized_cf = manager.last_finalized_cf().cloned();
+                    if let Some(ref cf) = finalized_cf {
+                        {
+                            let mut pending = self.pending_persist_anchors.lock().await;
+                            pending.push(cf.anchor.clone());
+                        }
+                        {
+                            let mut pending = self.pending_persist_cfs.lock().await;
+                            pending.push(cf.clone());
+                        }
                     }
 
                     // Notify finalization subscribers
                     {
                         let tx_guard = self.finalization_tx.read();
                         if let Some(ref tx) = *tx_guard {
-                            let _ = tx.send(frame.clone());
+                            if let Some(cf) = finalized_cf {
+                                let _ = tx.send(cf);
+                            }
                         }
                     }
                 }
@@ -1440,6 +1697,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_receive_finalized_cf_catches_up_and_is_idempotent() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v2".to_string(), create_validator_set());
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+
+        let (finalized, anchor) = engine.receive_finalized_cf(cf.clone()).await.unwrap();
+        assert!(finalized);
+        assert!(anchor.is_some());
+        assert_eq!(engine.current_round().await, 1);
+
+        let (finalized_again, anchor_again) = engine.receive_finalized_cf(cf).await.unwrap();
+        assert!(!finalized_again);
+        assert!(anchor_again.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_receive_finalized_cf_allows_lagged_round_catch_up() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v2".to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+
+        let (finalized, anchor) = engine.receive_finalized_cf(cf).await.unwrap();
+
+        assert!(finalized);
+        assert!(anchor.is_some());
+        assert_eq!(engine.current_round().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_f4_receive_finalized_cf_rejects_unsigned_in_strict_mode() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        engine.enable_strict_vote_signatures();
+
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+
+        let result = engine.receive_finalized_cf(cf).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_f4_receive_vote_rejects_unsigned_in_strict_mode() {
+        let config = ConsensusConfig::default();
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        engine.enable_strict_vote_signatures();
+
+        let vote = Vote::new("v1".to_string(), "cf-unsigned".to_string(), true);
+        let result = engine.receive_vote(vote).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_f4_permissive_mode_keeps_legacy_unsigned_vote_compat() {
+        let config = ConsensusConfig::default();
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+
+        let vote = Vote::new("v1".to_string(), "cf-legacy".to_string(), true);
+        let result = engine.receive_vote(vote).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_f4_receive_cf_strict_mode_filters_bad_embedded_votes() {
+        let config = ConsensusConfig::default();
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        engine.enable_strict_vote_signatures();
+
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true).with_signature(vec![7; 64]));
+
+        engine.filter_embedded_votes_for_strict_mode(&mut cf).await;
+
+        assert!(cf.votes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_f6_strict_mode_rejection_does_not_buffer_pending() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        engine.enable_strict_vote_signatures();
+
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+
+        let result = engine.receive_finalized_cf(cf).await;
+        assert!(result.is_err());
+
+        let manager = engine.consensus_manager.read().await;
+        assert_eq!(manager.pending_counts_for_testing(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn test_receive_vote_timeout_does_not_report_finalized() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 1,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        cf.created_at = 0;
+        let cf_id = cf.id.clone();
+
+        {
+            let mut manager = engine.consensus_manager.write().await;
+            manager.receive_cf(cf);
+        }
+
+        let (finalized, anchor) = engine
+            .receive_vote(Vote::new("v2".to_string(), cf_id, true))
+            .await
+            .unwrap();
+
+        assert!(!finalized);
+        assert!(anchor.is_none());
+        assert_eq!(engine.current_round().await, 0);
+    }
+
+    #[tokio::test]
     async fn test_inline_finalization_removes_events_from_pending_before_persistence() {
         let config = ConsensusConfig {
             vlc_delta_threshold: 1,
@@ -1470,6 +1933,10 @@ mod tests {
 
         let anchors = engine.take_pending_anchors().await;
         assert_eq!(anchors.len(), 1, "anchor still awaits durable persistence");
+
+        let cfs = engine.take_pending_finalized_cfs().await;
+        assert_eq!(cfs.len(), 1, "finalized CF still awaits durable indexing");
+        assert_eq!(cfs[0].anchor.id, anchors[0].id);
     }
 
     #[tokio::test]

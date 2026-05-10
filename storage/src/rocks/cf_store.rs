@@ -22,7 +22,7 @@ use crate::rocks::core::{SetuDB, ColumnFamily};
 use setu_types::{ConsensusFrame, CFId, CFStatus, SetuResult, SetuError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Key prefixes for different data types in ConsensusFrames CF
 mod key_prefix {
@@ -178,15 +178,15 @@ impl RocksDBCFStore {
     }
     
     /// Mark a pending CF as finalized
-    pub async fn mark_finalized(&self, cf_id: &CFId) {
+    pub async fn mark_finalized(&self, cf_id: &CFId) -> SetuResult<()> {
         // Get current CF
         let mut cf = match self.get(cf_id).await {
             Some(cf) => cf,
-            None => return,
+            None => return Err(SetuError::InvalidData(format!("CF not found: {}", cf_id))),
         };
         
         if cf.status == CFStatus::Finalized {
-            return; // Already finalized
+            return Ok(()); // Already finalized
         }
         
         // Update status
@@ -196,15 +196,14 @@ impl RocksDBCFStore {
         
         // Update CF
         let cf_key = Self::cf_key(cf_id);
-        if self.db.batch_put_raw(&mut batch, ColumnFamily::ConsensusFrames, &cf_key, &cf).is_err() {
-            warn!("Failed to update CF status");
-            return;
-        }
+        self.db
+            .batch_put_raw(&mut batch, ColumnFamily::ConsensusFrames, &cf_key, &cf)
+            .map_err(|e| SetuError::StorageError(format!("Failed to update CF status: {}", e)))?;
         
         // Remove from pending index (need to find the key)
         let pending_keys = match self.db.prefix_scan_keys(ColumnFamily::ConsensusFrames, key_prefix::PENDING) {
             Ok(keys) => keys,
-            Err(_) => return,
+            Err(e) => return Err(SetuError::StorageError(format!("Failed to scan pending CF index: {}", e))),
         };
         
         for key in pending_keys {
@@ -219,14 +218,19 @@ impl RocksDBCFStore {
         // Add to finalized index
         let seq = self.finalized_seq.fetch_add(1, Ordering::SeqCst);
         let finalized_key = Self::finalized_key(seq, cf_id);
-        let _ = self.db.batch_put_raw(&mut batch, ColumnFamily::ConsensusFrames, &finalized_key, &());
+        self.db
+            .batch_put_raw(&mut batch, ColumnFamily::ConsensusFrames, &finalized_key, &())
+            .map_err(|e| SetuError::StorageError(format!("Failed to update finalized CF index: {}", e)))?;
         
         // Update sequence counter
-        let _ = self.db.batch_put_raw(&mut batch, ColumnFamily::ConsensusFrames, key_prefix::META_FINALIZED_SEQ, &(seq + 1));
+        self.db
+            .batch_put_raw(&mut batch, ColumnFamily::ConsensusFrames, key_prefix::META_FINALIZED_SEQ, &(seq + 1))
+            .map_err(|e| SetuError::StorageError(format!("Failed to update finalized CF sequence: {}", e)))?;
         
-        if let Err(e) = self.db.write_batch(batch) {
-            warn!("Failed to write mark_finalized batch: {}", e);
-        }
+        self.db
+            .write_batch(batch)
+            .map_err(|e| SetuError::StorageError(format!("Failed to write mark_finalized batch: {}", e)))?;
+        Ok(())
     }
     
     /// Get all pending consensus frames
