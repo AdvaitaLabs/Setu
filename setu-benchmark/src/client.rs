@@ -4,7 +4,7 @@
 
 use crate::metrics::RequestMetrics;
 use anyhow::Result;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
@@ -125,6 +125,13 @@ pub struct BenchClient {
 }
 
 impl BenchClient {
+    fn with_raw_transfer_token(builder: RequestBuilder) -> RequestBuilder {
+        match std::env::var("SETU_RAW_TRANSFER_API_TOKEN") {
+            Ok(token) if !token.is_empty() => builder.header("X-Setu-Admin-Token", token),
+            _ => builder,
+        }
+    }
+
     /// Create a new benchmark client
     pub fn new(base_url: String, timeout_secs: u64, keep_alive: bool) -> Result<Self> {
         let mut builder = Client::builder()
@@ -150,10 +157,7 @@ impl BenchClient {
         let url = format!("{}/api/v1/transfer", self.base_url);
         let start = Instant::now();
 
-        let result = self
-            .client
-            .post(&url)
-            .json(&request)
+        let result = Self::with_raw_transfer_token(self.client.post(&url).json(&request))
             .send()
             .await;
 
@@ -225,10 +229,7 @@ impl BenchClient {
 
         let batch_request = BenchBatchRequest { transfers: requests };
 
-        let result = self
-            .client
-            .post(&url)
-            .json(&batch_request)
+        let result = Self::with_raw_transfer_token(self.client.post(&url).json(&batch_request))
             .send()
             .await;
 

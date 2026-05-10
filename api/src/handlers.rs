@@ -4,7 +4,7 @@
 //! These handlers are designed to work with Axum web framework.
 
 use crate::types::*;
-use axum::{extract::State, Json};
+use axum::{extract::State, http::HeaderMap, Json};
 use serde::Deserialize;
 use setu_rpc::{
     GetSolverListRequest, GetSolverListResponse, GetTransferStatusRequest,
@@ -28,6 +28,73 @@ use setu_rpc::{
     CheckMembershipResponse, GetUserSubnetsResponse,
 };
 use std::sync::Arc;
+
+const RAW_TRANSFER_TOKEN_ENV: &str = "SETU_RAW_TRANSFER_API_TOKEN";
+const RAW_TRANSFER_TOKEN_HEADER: &str = "x-setu-admin-token";
+
+fn raw_transfer_auth_error(headers: &HeaderMap) -> Option<String> {
+    let expected = std::env::var(RAW_TRANSFER_TOKEN_ENV).unwrap_or_default();
+    if expected.is_empty() {
+        return Some(format!(
+            "Raw transfer API disabled: set {} to enable internal/admin use",
+            RAW_TRANSFER_TOKEN_ENV
+        ));
+    }
+
+    let observed = headers
+        .get(RAW_TRANSFER_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if observed != expected {
+        return Some("Raw transfer API requires a valid X-Setu-Admin-Token".to_string());
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{raw_transfer_auth_error, RAW_TRANSFER_TOKEN_ENV, RAW_TRANSFER_TOKEN_HEADER};
+    use axum::http::{HeaderMap, HeaderValue};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn raw_transfer_auth_rejects_when_token_unset() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::remove_var(RAW_TRANSFER_TOKEN_ENV);
+        let headers = HeaderMap::new();
+
+        let error = raw_transfer_auth_error(&headers).expect("unset token must reject raw transfer");
+
+        assert!(error.contains("Raw transfer API disabled"));
+    }
+
+    #[test]
+    fn raw_transfer_auth_rejects_wrong_token() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::set_var(RAW_TRANSFER_TOKEN_ENV, "expected-token");
+        let mut headers = HeaderMap::new();
+        headers.insert(RAW_TRANSFER_TOKEN_HEADER, HeaderValue::from_static("wrong-token"));
+
+        let error = raw_transfer_auth_error(&headers).expect("wrong token must reject raw transfer");
+
+        assert!(error.contains("valid X-Setu-Admin-Token"));
+        std::env::remove_var(RAW_TRANSFER_TOKEN_ENV);
+    }
+
+    #[test]
+    fn raw_transfer_auth_accepts_matching_token() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::set_var(RAW_TRANSFER_TOKEN_ENV, "expected-token");
+        let mut headers = HeaderMap::new();
+        headers.insert(RAW_TRANSFER_TOKEN_HEADER, HeaderValue::from_static("expected-token"));
+
+        assert!(raw_transfer_auth_error(&headers).is_none());
+        std::env::remove_var(RAW_TRANSFER_TOKEN_ENV);
+    }
+}
 
 /// Trait that the validator service must implement to work with these handlers
 pub trait ValidatorService: Send + Sync {
@@ -221,8 +288,20 @@ pub async fn http_get_subnets<S: ValidatorService>(
 /// Submit a transfer
 pub async fn http_submit_transfer<S: ValidatorService>(
     State(service): State<Arc<S>>,
+    headers: HeaderMap,
     Json(request): Json<SubmitTransferRequest>,
 ) -> Json<SubmitTransferResponse> {
+    if let Some(message) = raw_transfer_auth_error(&headers) {
+        return Json(SubmitTransferResponse {
+            success: false,
+            message,
+            transfer_id: None,
+            event_id: None,
+            solver_id: None,
+            processing_steps: vec![],
+        });
+    }
+
     Json(service.submit_transfer(request).await)
 }
 
@@ -246,8 +325,20 @@ pub async fn http_submit_transfer<S: ValidatorService>(
 /// - Warning threshold: 100 transfers
 pub async fn http_submit_transfers_batch<S: ValidatorService>(
     State(service): State<Arc<S>>,
+    headers: HeaderMap,
     Json(request): Json<SubmitTransfersBatchRequest>,
 ) -> Json<SubmitTransfersBatchResponse> {
+    if let Some(message) = raw_transfer_auth_error(&headers) {
+        return Json(SubmitTransfersBatchResponse {
+            success: false,
+            message,
+            submitted: 0,
+            failed: request.transfers.len(),
+            results: vec![],
+            stats: Default::default(),
+        });
+    }
+
     Json(service.submit_transfers_batch(request).await)
 }
 

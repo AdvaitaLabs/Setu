@@ -2251,11 +2251,10 @@ mod tests {
         );
 
         // Step 2: startup HTTP projection (mirrors main.rs Phase 3.24)
+        let outcome = ValidatorNetworkService::startup_projection_outcome(&event, "cf-startup");
         service.cache_finalized_event_for_query_with_outcome(
             event,
-            Some(ExecutionOutcome::Applied {
-                cf_id: "cf-startup".to_string(),
-            }),
+            outcome,
         );
 
         let post_projection_status = service

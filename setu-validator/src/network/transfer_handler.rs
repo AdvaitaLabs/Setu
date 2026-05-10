@@ -226,6 +226,8 @@ impl TransferHandler {
                 &transfer_id, sid, solver_task, reservation_handles,
             ).await {
                 Ok((event, execution_time_us, events_processed, _gas_used)) => {
+                    let event_id = event.id.clone();
+
                     // Fire-and-forget: consensus + storage (no coin held)
                     tee_executor.spawn_post_execution(
                         transfer_id.clone(), event, execution_time_us, events_processed,
@@ -237,6 +239,7 @@ impl TransferHandler {
                         success: true,
                         message: "Transfer executed, consensus pending".to_string(),
                         transfer_id: Some(transfer_id),
+                        event_id: Some(event_id),
                         solver_id,
                         processing_steps: steps,
                     }
@@ -257,6 +260,7 @@ impl TransferHandler {
                         success: false,
                         message: format!("TEE execution failed: {}", e),
                         transfer_id: Some(transfer_id),
+                        event_id: None,
                         solver_id,
                         processing_steps: steps,
                     }
@@ -268,6 +272,7 @@ impl TransferHandler {
                 success: true,
                 message: "Transfer submitted".to_string(),
                 transfer_id: Some(transfer_id),
+                event_id: None,
                 solver_id,
                 processing_steps: steps,
             }
@@ -307,6 +312,7 @@ impl TransferHandler {
             success: false,
             message: message.to_string(),
             transfer_id: Some(transfer_id),
+            event_id: None,
             solver_id: None,
             processing_steps: steps,
         }

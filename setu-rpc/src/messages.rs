@@ -253,6 +253,8 @@ pub struct SubmitTransferResponse {
     pub message: String,
     /// Assigned transfer ID
     pub transfer_id: Option<String>,
+    /// DAG event ID, available after solver execution succeeds
+    pub event_id: Option<String>,
     /// Assigned solver ID
     pub solver_id: Option<String>,
     /// Processing steps (for debugging/visualization)

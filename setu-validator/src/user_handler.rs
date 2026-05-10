@@ -114,6 +114,117 @@ impl ValidatorUserHandler {
         }
         Ok(())
     }
+
+    fn transfer_err(message: &str) -> TransferResponse {
+        TransferResponse {
+            success: false,
+            message: message.to_string(),
+            event_id: None,
+            estimated_confirmation: None,
+        }
+    }
+
+    fn is_user_address(address: &str) -> bool {
+        address.starts_with("0x") && (address.len() == 66 || address.len() == 42)
+    }
+
+    fn canonical_transfer_message(
+        from: &str,
+        to: &str,
+        amount: u64,
+        coin_type: &str,
+        timestamp: u64,
+    ) -> String {
+        format!(
+            "Transfer SETU: from={};to={};amount={};coin_type={};timestamp={}",
+            from,
+            to,
+            amount,
+            coin_type,
+            timestamp
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ValidatorUserHandler;
+    use setu_keys::{SetuKeyPair, SignatureScheme};
+
+    fn sign_for(
+        keypair: &SetuKeyPair,
+        from: &str,
+        to: &str,
+        amount: u64,
+        coin_type: &str,
+        timestamp: u64,
+    ) -> (String, Vec<u8>) {
+        let message = ValidatorUserHandler::canonical_transfer_message(
+            from,
+            to,
+            amount,
+            coin_type,
+            timestamp,
+        );
+        let signature = keypair.sign(message.as_bytes());
+        let mut signature_bytes = vec![signature.scheme().flag()];
+        signature_bytes.extend(signature.as_bytes());
+        (message, signature_bytes)
+    }
+
+    #[test]
+    fn transfer_canonical_message_binds_request_fields() {
+        let message = ValidatorUserHandler::canonical_transfer_message(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            42,
+            "setu",
+            1778390000000,
+        );
+
+        assert_eq!(
+            message,
+            "Transfer SETU: from=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;to=0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb;amount=42;coin_type=setu;timestamp=1778390000000"
+        );
+    }
+
+    #[test]
+    fn transfer_setu_native_signature_accepts_matching_address() {
+        std::env::remove_var("SETU_SKIP_SIG_VERIFY");
+        let keypair = SetuKeyPair::generate(SignatureScheme::ED25519);
+        let from = keypair.address().to_hex();
+        let to = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let (message, signature) = sign_for(&keypair, &from, to, 7, "setu", 1778390000000);
+
+        let result = ValidatorUserHandler::verify_signature(
+            &from,
+            &signature,
+            &message,
+            None,
+            Some(&keypair.public().encode_base64()),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn transfer_setu_native_signature_rejects_wrong_address() {
+        std::env::remove_var("SETU_SKIP_SIG_VERIFY");
+        let keypair = SetuKeyPair::generate(SignatureScheme::ED25519);
+        let wrong_from = "0x3333333333333333333333333333333333333333333333333333333333333333";
+        let to = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let (message, signature) = sign_for(&keypair, wrong_from, to, 7, "setu", 1778390000000);
+
+        let result = ValidatorUserHandler::verify_signature(
+            wrong_from,
+            &signature,
+            &message,
+            None,
+            Some(&keypair.public().encode_base64()),
+        );
+
+        assert!(result.is_err());
+    }
 }
 
 #[async_trait::async_trait]
@@ -457,13 +568,69 @@ impl UserRpcHandler for ValidatorUserHandler {
             amount = request.amount,
             "Processing transfer request"
         );
+
+        if !Self::is_user_address(&request.from) {
+            return Self::transfer_err(
+                "Invalid from address format: expected 0x + 64 hex (Setu) or 0x + 40 hex (Ethereum)",
+            );
+        }
+
+        if !Self::is_user_address(&request.to) {
+            return Self::transfer_err(
+                "Invalid to address format: expected 0x + 64 hex (Setu) or 0x + 40 hex (Ethereum)",
+            );
+        }
+
+        if request.amount == 0 {
+            return Self::transfer_err("Transfer amount must be greater than zero");
+        }
+
+        if let Err(e) = Self::check_timestamp(request.timestamp) {
+            return Self::transfer_err(&e);
+        }
+
+        let coin_type = request
+            .coin_type
+            .clone()
+            .unwrap_or_else(|| "setu".to_string())
+            .to_lowercase();
+        let expected_message = Self::canonical_transfer_message(
+            &request.from,
+            &request.to,
+            request.amount,
+            &coin_type,
+            request.timestamp,
+        );
+        let message = match request.message.as_deref() {
+            Some(message) if !message.is_empty() => message,
+            _ => return Self::transfer_err("Signed message is required for transfer"),
+        };
+        if message != expected_message {
+            return Self::transfer_err("Transfer signed message does not match request fields");
+        }
+
+        let signature = match request.signature.as_deref() {
+            Some(signature) if !signature.is_empty() => signature,
+            _ => return Self::transfer_err("Signature is required for transfer"),
+        };
+
+        if let Err(e) = Self::verify_signature(
+            &request.from,
+            signature,
+            message,
+            request.nostr_pubkey.as_deref(),
+            request.public_key.as_deref(),
+        ) {
+            warn!(from = %request.from, error = %e, "Transfer signature verification failed");
+            return Self::transfer_err(&e);
+        }
         
         // Convert to SubmitTransferRequest
         let submit_request = SubmitTransferRequest {
             from: request.from,
             to: request.to,
             amount: request.amount,
-            transfer_type: request.coin_type.unwrap_or_else(|| "setu".to_string()),
+            transfer_type: coin_type,
             resources: vec![],
             preferred_solver: None,
             shard_id: None,
@@ -476,7 +643,7 @@ impl UserRpcHandler for ValidatorUserHandler {
         TransferResponse {
             success: response.success,
             message: response.message,
-            event_id: response.transfer_id,
+            event_id: response.event_id,
             estimated_confirmation: Some(2), // ~2 seconds
         }
     }
