@@ -90,6 +90,8 @@ pub struct ConsensusValidator {
     cf_store: Arc<dyn CFStoreBackend>,
     /// Persistent store for anchors (supports both in-memory and RocksDB backends)
     anchor_store: Arc<dyn AnchorStoreBackend>,
+    /// Per-CF index-persistence retry counter (Layer D, retry-then-escalate).
+    cf_index_retries: Arc<parking_lot::Mutex<std::collections::HashMap<setu_types::CFId, u32>>>,
 
     /// Channel for sending consensus messages to network
     message_tx: mpsc::Sender<ConsensusMessage>,
@@ -160,6 +162,7 @@ impl ConsensusValidator {
             tee_verifier,
             event_store,  // Use the shared instance
             cf_store,
+            cf_index_retries: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             anchor_store,
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
@@ -221,6 +224,7 @@ impl ConsensusValidator {
             tee_verifier,
             event_store,  // Use the shared instance
             cf_store,
+            cf_index_retries: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             anchor_store,
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
@@ -284,6 +288,7 @@ impl ConsensusValidator {
             tee_verifier,
             event_store,
             cf_store,
+            cf_index_retries: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             anchor_store,
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
@@ -362,6 +367,7 @@ impl ConsensusValidator {
             tee_verifier,
             event_store,
             cf_store,
+            cf_index_retries: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             anchor_store,
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
@@ -610,13 +616,26 @@ impl ConsensusValidator {
         // In single-node mode, add_event() → try_create_cf() → check_finalization()
         // may finalize a CF immediately. The internal message channel is not consumed
         // in production, so we must persist here synchronously.
+        let mut any_persisted = false;
         for anchor in self.engine.take_pending_anchors().await {
-            if let Err(e) = self.persist_finalized_anchor(&anchor).await {
-                warn!(
-                    anchor_id = %anchor.id,
-                    error = %e,
-                    "Failed to persist inline-finalized anchor"
-                );
+            match self.persist_finalized_anchor(&anchor).await {
+                Ok(()) => { any_persisted = true; }
+                Err(e) => {
+                    warn!(
+                        anchor_id = %anchor.id,
+                        error = %e,
+                        "Failed to persist inline-finalized anchor"
+                    );
+                }
+            }
+        }
+        // Layer A: only run post-persist completion (broadcast + advance round)
+        // after at least one anchor durably persisted. If all persists failed,
+        // the queued completions stay in the engine and will be retried by the
+        // next caller invocation.
+        if any_persisted {
+            if let Err(e) = self.engine.complete_pending_finalizations().await {
+                warn!(error = %e, "complete_pending_finalizations failed after submit_event persist");
             }
         }
         
@@ -663,12 +682,20 @@ impl ConsensusValidator {
                     event_count = a.event_ids.len(),
                     "CF finalized after local vote, persisting"
                 );
-                if let Err(e) = self.persist_finalized_anchor(a).await {
-                    warn!(
-                        anchor_id = %a.id,
-                        error = %e,
-                        "Failed to persist finalized anchor (will retry)"
-                    );
+                match self.persist_finalized_anchor(a).await {
+                    Ok(()) => {
+                        // Layer A: trigger post-persist broadcast + round advance.
+                        if let Err(e) = self.engine.complete_pending_finalizations().await {
+                            warn!(error = %e, "complete_pending_finalizations failed after receive_cf persist");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            anchor_id = %a.id,
+                            error = %e,
+                            "Failed to persist finalized anchor (will retry)"
+                        );
+                    }
                 }
             }
         }
@@ -698,12 +725,19 @@ impl ConsensusValidator {
                     event_count = a.event_ids.len(),
                     "CF finalized via vote, persisting"
                 );
-                if let Err(e) = self.persist_finalized_anchor(a).await {
-                    warn!(
-                        anchor_id = %a.id,
-                        error = %e,
-                        "Failed to persist finalized anchor (will retry)"
-                    );
+                match self.persist_finalized_anchor(a).await {
+                    Ok(()) => {
+                        if let Err(e) = self.engine.complete_pending_finalizations().await {
+                            warn!(error = %e, "complete_pending_finalizations failed after receive_vote persist");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            anchor_id = %a.id,
+                            error = %e,
+                            "Failed to persist finalized anchor (will retry)"
+                        );
+                    }
                 }
             }
         }
@@ -885,8 +919,14 @@ impl ConsensusValidator {
 
         if result.is_some() {
             // Persist any inline-finalized anchors (same as submit_event)
+            let mut any_persisted = false;
             for anchor in self.engine.take_pending_anchors().await {
-                let _ = self.persist_finalized_anchor(&anchor).await;
+                if self.persist_finalized_anchor(&anchor).await.is_ok() {
+                    any_persisted = true;
+                }
+            }
+            if any_persisted {
+                let _ = self.engine.complete_pending_finalizations().await;
             }
         }
 
@@ -957,6 +997,10 @@ impl FinalizationPersister for ConsensusValidator {
 
     fn cf_store(&self) -> &Arc<dyn CFStoreBackend> {
         &self.cf_store
+    }
+
+    fn cf_index_retries(&self) -> &Arc<parking_lot::Mutex<std::collections::HashMap<setu_types::CFId, u32>>> {
+        &self.cf_index_retries
     }
 }
 
@@ -1234,5 +1278,168 @@ mod tests {
             tokio::time::Duration::from_millis(100),
             handle
         ).await;
+    }
+
+    // ---- fix-post-restart-finality-stall-v2 (Layer A + Layer D) ----
+
+    use async_trait::async_trait;
+    use setu_types::{CFId, SetuError, SetuResult};
+
+    /// CFStore stub that always fails on store(); used by F9 / Layer D test.
+    #[derive(Debug)]
+    struct AlwaysFailCFStore;
+
+    #[async_trait]
+    impl CFStoreBackend for AlwaysFailCFStore {
+        async fn store(&self, _cf: ConsensusFrame) -> SetuResult<()> {
+            Err(SetuError::InvalidData("simulated CFStore disk error".into()))
+        }
+        async fn get(&self, _cf_id: &CFId) -> Option<ConsensusFrame> { None }
+        async fn mark_finalized(&self, _cf_id: &CFId) -> SetuResult<()> { Ok(()) }
+        async fn get_pending(&self) -> Vec<ConsensusFrame> { Vec::new() }
+        async fn get_finalized(&self) -> Vec<ConsensusFrame> { Vec::new() }
+        async fn latest_finalized(&self) -> Option<ConsensusFrame> { None }
+        async fn finalized_count(&self) -> usize { 0 }
+        async fn pending_count(&self) -> usize { 0 }
+    }
+
+    /// Helper: build a finalized CF with a single-validator quorum (validator
+    /// id "test-validator") matching the default `create_test_config()`.
+    fn build_solo_quorum_cf() -> ConsensusFrame {
+        use setu_types::{Vote, VLCSnapshot};
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "test-validator".to_string());
+        cf.add_vote(Vote::new("test-validator".to_string(), cf.id.clone(), true));
+        cf.finalize();
+        cf
+    }
+
+    /// Helper: build a finalized CF with a 3-validator quorum.
+    fn build_quorum_cf(leader: &str) -> ConsensusFrame {
+        use setu_types::{Vote, VLCSnapshot};
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, leader.to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+        cf
+    }
+
+    fn three_validator_set() -> consensus::ValidatorSet {
+        use consensus::ValidatorSet;
+        use setu_types::ValidatorInfo;
+        let mut vs = ValidatorSet::new();
+        for id in ["v1", "v2", "v3"] {
+            let node = NodeInfo::new_validator(
+                id.to_string(),
+                "127.0.0.1".to_string(),
+                8080,
+            );
+            vs.add_validator(ValidatorInfo::new(node, false));
+        }
+        vs
+    }
+
+    /// F8: Layer A — `handle_finalization` enqueues the CF in
+    /// `pending_completions` but does NOT advance round or broadcast until
+    /// `complete_pending_finalizations()` is called.
+    #[tokio::test]
+    async fn test_f8_finalization_defers_broadcast_until_complete() {
+        let mut config = create_test_config();
+        config.consensus.validator_count = 3;
+        config.node_info = NodeInfo::new_validator("v1".to_string(), "127.0.0.1".to_string(), 8080);
+        let engine = consensus::ConsensusEngine::new(
+            config.consensus.clone(),
+            "v1".to_string(),
+            three_validator_set(),
+        );
+
+        let cf = build_quorum_cf("v1");
+        assert_eq!(engine.current_round().await, 0);
+        let (finalized, anchor) = engine.receive_finalized_cf(cf).await.unwrap();
+        assert!(finalized);
+        assert!(anchor.is_some());
+        // Layer A: round must NOT advance pre-completion.
+        assert_eq!(engine.current_round().await, 0);
+
+        engine.complete_pending_finalizations().await.unwrap();
+        // After completion: round advances exactly once.
+        assert_eq!(engine.current_round().await, 1);
+    }
+
+    /// F9 + Layer D: `persist_pending_finalized_cfs` retries on CFStore
+    /// failure for `MAX_CF_INDEX_RETRIES - 1` calls, then escalates with
+    /// `PersistenceError::CFIndexEscalated`. The CF stays in the engine
+    /// queue across all retries (peek-only semantics).
+    #[tokio::test]
+    async fn test_f9_cf_index_persistence_retries_then_escalates() {
+        use crate::persistence::{FinalizationPersister, MAX_CF_INDEX_RETRIES, PersistenceError};
+
+        // Single-validator config so the validator's own engine accepts the
+        // CF without quorum/identity mismatches.
+        let config = create_test_config();
+
+        let event_store: Arc<dyn EventStoreBackend> = Arc::new(EventStore::new());
+        let failing_cf_store: Arc<dyn CFStoreBackend> = Arc::new(AlwaysFailCFStore);
+        let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(AnchorStore::new());
+        let state_manager = Arc::new(SharedStateManager::new(GlobalStateManager::default()));
+        let validator = ConsensusValidator::with_all_backends(
+            config,
+            state_manager,
+            event_store,
+            failing_cf_store.clone(),
+            anchor_store,
+        );
+
+        let cf = build_solo_quorum_cf();
+        let (finalized, _) = validator.engine().receive_finalized_cf(cf.clone()).await.unwrap();
+        assert!(finalized);
+        assert_eq!(
+            validator.engine().peek_pending_finalized_cfs().await.len(),
+            1,
+            "engine queues CF for index persistence"
+        );
+
+        // Calls 1..MAX-1 stay under the retry budget and return Ok(()).
+        for attempt in 1..MAX_CF_INDEX_RETRIES {
+            let res = validator.persist_pending_finalized_cfs().await;
+            assert!(res.is_ok(), "attempt {} should be under budget: {:?}", attempt, res);
+            assert_eq!(
+                validator.engine().peek_pending_finalized_cfs().await.len(),
+                1,
+                "CF must remain queued after attempt {}",
+                attempt
+            );
+        }
+
+        // The MAX-th call escalates.
+        let final_res = validator.persist_pending_finalized_cfs().await;
+        match final_res {
+            Err(PersistenceError::CFIndexEscalated { retries, cf_id, .. }) => {
+                assert_eq!(retries, MAX_CF_INDEX_RETRIES);
+                assert_eq!(cf_id, cf.id.to_string());
+            }
+            other => panic!("expected CFIndexEscalated, got {:?}", other),
+        }
+        // Even after escalation, the CF stays queued so a future heal cycle
+        // can retry it once the underlying store recovers.
+        assert_eq!(
+            validator.engine().peek_pending_finalized_cfs().await.len(),
+            1,
+            "escalated CF must NOT be drained"
+        );
     }
 }

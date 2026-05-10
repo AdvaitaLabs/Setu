@@ -55,6 +55,9 @@ pub struct MessageRouter {
     anchor_store: Arc<dyn AnchorStoreBackend>,
     /// CF store for persisting finalized CF indexes
     cf_store: Arc<dyn CFStoreBackend>,
+    /// Per-CF index-persistence retry counter (Layer D, retry-then-escalate).
+    /// Initialized empty; entries are added on failure and removed on success.
+    cf_index_retries: Arc<parking_lot::Mutex<std::collections::HashMap<setu_types::CFId, u32>>>,
 
 }
 
@@ -71,6 +74,7 @@ impl MessageRouter {
             event_store,
             anchor_store,
             cf_store,
+            cf_index_retries: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         }
     }
     
@@ -139,6 +143,10 @@ impl FinalizationPersister for MessageRouter {
 
     fn cf_store(&self) -> &Arc<dyn CFStoreBackend> {
         &self.cf_store
+    }
+
+    fn cf_index_retries(&self) -> &Arc<parking_lot::Mutex<std::collections::HashMap<setu_types::CFId, u32>>> {
+        &self.cf_index_retries
     }
 }
 
@@ -256,12 +264,19 @@ impl NetworkEventHandler for MessageRouter {
                     
                     // Persist finalized data (same logic as handle_vote)
                     if let Some(anchor) = anchor {
-                        if let Err(e) = self.persist_finalized_anchor(&anchor).await {
-                            warn!(
-                                anchor_id = %anchor.id,
-                                error = %e,
-                                "Failed to persist finalized anchor (will retry)"
-                            );
+                        match self.persist_finalized_anchor(&anchor).await {
+                            Ok(()) => {
+                                if let Err(e) = self.engine.complete_pending_finalizations().await {
+                                    warn!(error = %e, "complete_pending_finalizations failed after handle_cf_proposal persist");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    anchor_id = %anchor.id,
+                                    error = %e,
+                                    "Failed to persist finalized anchor (will retry)"
+                                );
+                            }
                         }
                     }
                 } else {
@@ -297,12 +312,19 @@ impl NetworkEventHandler for MessageRouter {
                     
                     // Persist finalized data
                     if let Some(anchor) = anchor {
-                        if let Err(e) = self.persist_finalized_anchor(&anchor).await {
-                            warn!(
-                                anchor_id = %anchor.id,
-                                error = %e,
-                                "Failed to persist finalized anchor (will retry)"
-                            );
+                        match self.persist_finalized_anchor(&anchor).await {
+                            Ok(()) => {
+                                if let Err(e) = self.engine.complete_pending_finalizations().await {
+                                    warn!(error = %e, "complete_pending_finalizations failed after handle_vote persist");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    anchor_id = %anchor.id,
+                                    error = %e,
+                                    "Failed to persist finalized anchor (will retry)"
+                                );
+                            }
                         }
                     }
                 }
@@ -334,12 +356,19 @@ impl NetworkEventHandler for MessageRouter {
                     );
 
                     if let Some(anchor) = anchor {
-                        if let Err(e) = self.persist_finalized_anchor(&anchor).await {
-                            warn!(
-                                anchor_id = %anchor.id,
-                                error = %e,
-                                "Failed to persist finalized anchor from peer notification"
-                            );
+                        match self.persist_finalized_anchor(&anchor).await {
+                            Ok(()) => {
+                                if let Err(e) = self.engine.complete_pending_finalizations().await {
+                                    warn!(error = %e, "complete_pending_finalizations failed after handle_cf_finalized persist");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    anchor_id = %anchor.id,
+                                    error = %e,
+                                    "Failed to persist finalized anchor from peer notification"
+                                );
+                            }
                         }
                     }
                 } else {

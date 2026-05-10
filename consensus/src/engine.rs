@@ -88,6 +88,19 @@ pub struct ConsensusEngine {
     pending_persist_anchors: Arc<Mutex<Vec<setu_types::Anchor>>>,
     /// Full finalized CFs pending durable indexing alongside their anchors.
     pending_persist_cfs: Arc<Mutex<Vec<ConsensusFrame>>>,
+    /// CFs whose state apply + pending-persist queueing has happened in
+    /// `handle_finalization`, but whose externally observable side-effects
+    /// (network broadcast of `CFFinalized`, advancing `ValidatorSet.current_round`)
+    /// have NOT yet run. Caller invokes `complete_pending_finalizations()` AFTER
+    /// `persist_finalized_anchor()` succeeds. This closes the post-restart
+    /// round-drift window (see fix-post-restart-finality-stall-v2 design.md
+    /// Layer A and review-log.md R3-VERIFY-4/8).
+    ///
+    /// Each entry is `(ConsensusFrame, expected_round)` where `expected_round`
+    /// is the validator-set round captured at finalize time. The completion
+    /// step only advances the round if it still matches `expected_round`,
+    /// making the call idempotent under restart / duplicate dispatch.
+    pending_completions: Arc<Mutex<Vec<(ConsensusFrame, Round)>>>,
     /// Broadcast channel for CF finalization notifications.
     /// Injected by caller (ConsensusValidator) via set_finalization_tx().
     /// Uses parking_lot::RwLock: broadcast::Sender::send() is synchronous.
@@ -127,6 +140,7 @@ impl ConsensusEngine {
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
+            pending_completions: Arc::new(Mutex::new(Vec::new())),
             finalization_tx: parking_lot::RwLock::new(None),
         }
     }
@@ -172,6 +186,7 @@ impl ConsensusEngine {
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
+            pending_completions: Arc::new(Mutex::new(Vec::new())),
             finalization_tx: parking_lot::RwLock::new(None),
         }
     }
@@ -213,6 +228,7 @@ impl ConsensusEngine {
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
+            pending_completions: Arc::new(Mutex::new(Vec::new())),
             finalization_tx: parking_lot::RwLock::new(None),
         }
     }
@@ -253,6 +269,7 @@ impl ConsensusEngine {
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
+            pending_completions: Arc::new(Mutex::new(Vec::new())),
             finalization_tx: parking_lot::RwLock::new(None),
         }
     }
@@ -305,6 +322,89 @@ impl ConsensusEngine {
     pub async fn drain_pending_finalized_cfs(&self, cf_ids: &[setu_types::CFId]) {
         let mut pending = self.pending_persist_cfs.lock().await;
         pending.retain(|cf| !cf_ids.iter().any(|id| id == &cf.id));
+    }
+
+    /// Run the post-persist side of CF finalization for every CF queued by
+    /// `handle_finalization`: send the legacy internal channel notification,
+    /// fan out to external subscribers (`finalization_tx`), broadcast
+    /// `CFFinalized` to the P2P network, then advance `ValidatorSet.current_round`.
+    ///
+    /// Callers MUST invoke this AFTER `persist_finalized_anchor()` succeeds —
+    /// this is the load-bearing fix from `fix-post-restart-finality-stall-v2`
+    /// design.md Layer A. Doing the broadcast / round-advance only after
+    /// durable persistence eliminates the post-restart round-drift window
+    /// described in the bug.
+    ///
+    /// Idempotency contract (R3-VERIFY-8):
+    /// - The pending queue is drained on entry, so a second call sees nothing.
+    /// - Round advance is guarded by `current_round() == expected_round` so
+    ///   that if another path already moved past `expected_round` (e.g. a
+    ///   peer-driven `receive_finalized_cf` for the same CF on a later tick),
+    ///   we do not double-advance.
+    pub async fn complete_pending_finalizations(&self) -> SetuResult<()> {
+        let pending: Vec<(ConsensusFrame, Round)> = {
+            let mut q = self.pending_completions.lock().await;
+            std::mem::take(&mut *q)
+        };
+
+        for (cf, expected_round) in pending {
+            let cf_id = cf.id.clone();
+
+            // Internal channel (legacy local listeners).
+            let _ = self
+                .message_tx
+                .send(ConsensusMessage::FrameFinalized(cf.clone()))
+                .await;
+
+            // External broadcast subscribers (governance Task A, etc.).
+            // Now fires post-persist so subscribers only see durable CFs.
+            {
+                let tx_guard = self.finalization_tx.read();
+                if let Some(ref tx) = *tx_guard {
+                    let _ = tx.send(cf.clone());
+                }
+            }
+
+            // Network broadcast.
+            {
+                let broadcaster = self.broadcaster.read().await;
+                if let Some(ref b) = *broadcaster {
+                    match b.broadcast_finalized(&cf).await {
+                        Ok(result) => {
+                            info!(
+                                cf_id = %cf_id,
+                                success = result.success_count,
+                                "CF finalization broadcasted to peers (post-persist)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(cf_id = %cf_id, error = %e, "Failed to broadcast finalization");
+                        }
+                    }
+                }
+            }
+
+            // Advance round — last step, idempotent under restart / duplicate
+            // dispatch via the `current_round() == expected_round` guard.
+            let mut vs = self.validator_set.write().await;
+            if vs.current_round() == expected_round {
+                vs.advance_round();
+            } else {
+                debug!(
+                    cf_id = %cf_id,
+                    expected_round = expected_round,
+                    actual_round = vs.current_round(),
+                    "complete_pending_finalizations: round already past expected, skipping advance (idempotent)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Test-only: how many completions are queued waiting for `complete_pending_finalizations`.
+    #[cfg(test)]
+    pub async fn pending_completions_len(&self) -> usize {
+        self.pending_completions.lock().await.len()
     }
 
     /// Mark finalized anchor events as no longer pending in the active DAG.
@@ -1197,14 +1297,21 @@ impl ConsensusEngine {
         )))
     }
 
-    /// Handle CF finalization: broadcast notification and return anchor for persistence.
+    /// Handle CF finalization: queue the CF for post-persist completion and
+    /// return the anchor for the caller to persist.
     ///
-    /// F7 note: this method intentionally broadcasts local and network
-    /// finalization notifications before the caller persists the returned anchor.
-    /// That leaves an originator crash window where peers may learn a finalized
-    /// CF while the originator has not durably stored the anchor yet. Reordering
-    /// the broadcast is a separate consensus redesign; this path relies on peer
-    /// state-sync after restart if a crash lands in that window.
+    /// Layer A of fix-post-restart-finality-stall-v2: this method NO LONGER
+    /// broadcasts `CFFinalized` and NO LONGER advances `ValidatorSet.current_round`.
+    /// Both side-effects are deferred to `complete_pending_finalizations()`,
+    /// which the caller MUST invoke after `persist_finalized_anchor()` succeeds.
+    ///
+    /// What still happens here (must remain inside the manager write lock so
+    /// subsequent `receive_cf` calls observe consistent in-memory state — see
+    /// review-log.md R3-VERIFY-4b):
+    /// 1. `dag_manager.update_min_depth(...)`
+    /// 2. `mark_anchor_events_finalized_in_active_dag(...)`
+    /// 3. push to `pending_persist_cfs` (durable index queue)
+    /// 4. push `(cf, expected_round)` to `pending_completions` (post-persist queue)
     ///
     /// Note: This method extracts data from manager before acquiring other locks
     /// to avoid potential deadlock from holding multiple write locks.
@@ -1230,42 +1337,24 @@ impl ConsensusEngine {
                 pending.push(cf.clone());
             }
 
-            // Send finalization to internal channel (legacy, for local listeners)
-            let _ = self
-                .message_tx
-                .send(ConsensusMessage::FrameFinalized(cf.clone()))
-                .await;
-
-            // Broadcast to external subscribers (governance Task A, etc.)
+            // Layer A: capture the round at which this CF finalized so
+            // `complete_pending_finalizations` can advance the round
+            // idempotently after the caller has durably persisted the anchor.
+            // We do NOT broadcast or advance here — those happen post-persist.
+            let expected_round = {
+                let vs = self.validator_set.read().await;
+                vs.current_round()
+            };
             {
-                let tx_guard = self.finalization_tx.read();
-                if let Some(ref tx) = *tx_guard {
-                    let _ = tx.send(cf.clone());
-                }
+                let mut q = self.pending_completions.lock().await;
+                q.push((cf.clone(), expected_round));
             }
 
-            // Broadcast finalization to network via broadcaster (if configured)
-            let broadcaster = self.broadcaster.read().await;
-            if let Some(ref b) = *broadcaster {
-                match b.broadcast_finalized(&cf).await {
-                    Ok(result) => {
-                        info!(
-                            cf_id = %cf_id,
-                            success = result.success_count,
-                            "CF finalization broadcasted to peers"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(cf_id = %cf_id, error = %e, "Failed to broadcast finalization");
-                    }
-                }
-            }
-            // Release broadcaster lock before acquiring validator_set lock
-            drop(broadcaster);
-
-            // Advance to next round (ValidatorSet manages rounds)
-            let mut validator_set = self.validator_set.write().await;
-            validator_set.advance_round();
+            debug!(
+                cf_id = %cf_id,
+                expected_round = expected_round,
+                "CF finalized in-memory; queued for post-persist completion"
+            );
 
             Some(anchor)
         } else {
@@ -1722,11 +1811,17 @@ mod tests {
         let (finalized, anchor) = engine.receive_finalized_cf(cf.clone()).await.unwrap();
         assert!(finalized);
         assert!(anchor.is_some());
+        // Layer A: round advance is deferred until complete_pending_finalizations.
+        assert_eq!(engine.current_round().await, 0);
+        engine.complete_pending_finalizations().await.unwrap();
         assert_eq!(engine.current_round().await, 1);
 
         let (finalized_again, anchor_again) = engine.receive_finalized_cf(cf).await.unwrap();
         assert!(!finalized_again);
         assert!(anchor_again.is_none());
+        // Idempotent: no new pending completion, round stays at 1.
+        engine.complete_pending_finalizations().await.unwrap();
+        assert_eq!(engine.current_round().await, 1);
     }
 
     #[tokio::test]
@@ -1756,6 +1851,9 @@ mod tests {
 
         assert!(finalized);
         assert!(anchor.is_some());
+        // Layer A: deferred until completion drains.
+        assert_eq!(engine.current_round().await, 0);
+        engine.complete_pending_finalizations().await.unwrap();
         assert_eq!(engine.current_round().await, 1);
     }
 
