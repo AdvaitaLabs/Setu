@@ -1,6 +1,6 @@
 # Move Example Contracts
 
-Example Move contracts for the Setu network. Each demonstrates different aspects of the setu-framework.
+Example Move contracts for the Setu network. Each demonstrates different aspects of the setu-framework. Contracts marked as development coverage exercise testnet behavior and should not be treated as stable API examples.
 
 ## Contracts
 
@@ -10,9 +10,9 @@ Example Move contracts for the Setu network. Each demonstrates different aspects
 | [custom_token](custom_token/) | Custom fungible token (Coin\<GOLD\>), TreasuryCap, mint/burn |
 | [nft](nft/) | Unique NFT objects, freeze (immutable), burn (delete) |
 | [lightning](lightning/) | Payment channel (Sui contract adaptation), Balance lifecycle, parallel-vector patterns |
-| [pwoo_counter](pwoo_counter/) | Shared object + PWOO concurrent writes (single hotspot slot) |
-| [df_registry](df_registry/) | Dynamic fields end-to-end (`add` / `remove` / `borrow` / `borrow_mut` / `exists_`) |
-| [dex_pool](dex_pool/) | DF as a PWOO hotspot mitigation — per-pair liquidity under one shared pool |
+| [pwoo_counter](pwoo_counter/) | Development example for Setu shared ownership/PWOO single-hotspot pressure; not PTB shared-object support |
+| [df_registry](df_registry/) | Dynamic Field call-flow coverage (`add` / `remove` / `borrow` / `borrow_mut` / `exists_`); persistent in-place `borrow_mut` writeback remains outside the v1 stable contract |
+| [dex_pool](dex_pool/) | Dogfood example for DF-based hotspot mitigation; beta/development unless promoted by the v1 boundary |
 | [bad_df](bad_df/) | Negative case: `V: key` rejected at DF native entry |
 
 ## Prerequisites
@@ -22,7 +22,7 @@ These contracts depend on `setu-framework` (the Setu stdlib at address `0x1`).
 ## Building
 
 Move contracts are compiled and published as bytecode via the `/api/v1/move/publish` endpoint.
-See the [Move Developer Guide](../../docs/guide/move-developer-guide.md) for compilation and deployment instructions.
+Use the local Move compiler tooling under `tools/move-compile` to produce bytecode before publishing.
 
 ## Framework API Reference
 
@@ -34,11 +34,11 @@ The contracts above use these stdlib modules:
 - `setu::coin` — Fungible tokens: `mint()`, `burn()`, `split()`, `join()`, `transfer()`
 - `setu::balance` — Balance arithmetic: `value()`, `split()`, `join()`, `zero()`
 - `setu::setu` — Native SETU token type identifier
-- `setu::dynamic_field` — Per-key child state: `add()`, `remove()`, `borrow()`, `borrow_mut()`, `exists_()` (Phase 8)
+- `setu::dynamic_field` — Per-key child state: `add()`, `remove()`, `borrow()`, `borrow_mut()`, `exists_()` (Phase 8); use explicit update/remove+add patterns for persistent v1 writes
 
 ## Limitations
 
-- **Immutable packages** — Published modules cannot be upgraded (ADR-4).
+- **Package upgrade scope** — Simple examples usually treat published modules as fixed. Package upgrade flows are experimental unless explicitly documented in the public API surface.
 - **No on-chain events** — Move `emit()` is a placeholder; surface signals via object fields.
-- **DF value ability** — `dynamic_field::*<K, V>` rejects any `V` that has the `key` ability (object-typed DF is not supported; see [docs/feat/dynamic-fields/design.md](../../docs/feat/dynamic-fields/design.md) §1.5).
-- **DF pre-declaration** — Every DF access must be listed in `MoveCallPayload.dynamic_field_accesses`; the Move VM aborts `E_DF_NOT_PRELOADED` otherwise. See the handbook §6.6.
+- **DF value ability** — `dynamic_field::*<K, V>` rejects any `V` that has the `key` ability; object-typed DF values are not supported.
+- **DF pre-declaration** — Every DF access must be listed in `MoveCallPayload.dynamic_field_accesses`; the Move VM aborts `E_DF_NOT_PRELOADED` otherwise.

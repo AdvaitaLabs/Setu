@@ -11,6 +11,8 @@
 
 Setu is a next-generation distributed consensus network designed for high throughput and low latency. It combines **DAG-based consensus**, **Vector Logical Clocks (VLC)**, and **TEE-based execution** to achieve secure and efficient transaction processing.
 
+The current Move contract platform surface is testnet-oriented and focuses on package publishing, entry-function calls, object queries, and version-aware object visibility.
+
 ### Key Features
 
 - **DAG-Based Consensus**: DAG-BFT consensus with leader rotation
