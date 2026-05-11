@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# 停止 Validator 节点
+# 停止 Validator + Solver 节点
 # 用法: ./stop.sh [1|2|3|all]
 # ============================================================================
 set -e
@@ -19,6 +19,15 @@ stop_validator() {
 
     local output
     output=$(remote_exec "$host" "
+        # 先停止 Solver
+        SPID=\$(pidof setu-solver 2>/dev/null || true)
+        if [ -n \"\$SPID\" ]; then
+            kill \$SPID 2>/dev/null || true
+            sleep 1
+            kill -9 \$SPID 2>/dev/null || true
+            echo 'SOLVER_STOPPED'
+        fi
+        # 再停止 Validator
         VPID=\$(pidof setu-validator 2>/dev/null || true)
         if [ -n \"\$VPID\" ]; then
             kill \$VPID 2>/dev/null || true
@@ -28,23 +37,23 @@ stop_validator() {
         else
             echo 'NOT_RUNNING'
         fi
-        # 同时停止 solver (如果有)
-        SPID=\$(pidof setu-solver 2>/dev/null || true)
-        [ -n \"\$SPID\" ] && kill \$SPID 2>/dev/null || true
     " 2>&1) || {
         print_err "${vid}: SSH 连接失败 (${host})"
         return 1
     }
     
+    if echo "$output" | grep -q 'SOLVER_STOPPED'; then
+        print_ok "${vid} solver 已停止"
+    fi
     if echo "$output" | grep -q 'STOPPED'; then
-        print_ok "${vid} 已停止"
+        print_ok "${vid} validator 已停止"
     elif echo "$output" | grep -q 'NOT_RUNNING'; then
         echo "    ${vid} 未在运行"
     fi
 }
 
 # ── 主逻辑 ──────────────────────────────────────────────────────────────────
-print_header "停止 Setu Validator 集群"
+print_header "停止 Setu Validator + Solver 集群"
 
 case "$TARGET" in
     1) stop_validator 0 ;;
