@@ -756,6 +756,14 @@ impl UserRpcHandler for ValidatorUserHandler {
             return JoinSubnetResponse { success: false, message: e, event_id: None };
         }
 
+        if self.network_service.get_subnet_info(&request.subnet_id).is_none() {
+            return JoinSubnetResponse {
+                success: false,
+                message: format!("INFRA_SUBNET: Subnet '{}' is not registered", request.subnet_id),
+                event_id: None,
+            };
+        }
+
         // Duplicate join detection
         let membership_key = format!("user:{}:subnet:{}", request.address, request.subnet_id);
         let membership_oid = ObjectId::new(

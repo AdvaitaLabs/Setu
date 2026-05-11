@@ -292,6 +292,7 @@ impl Default for CoinReservationManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
 
     fn test_coin_id(n: u8) -> ObjectId {
         let mut bytes = [0u8; 32];
@@ -459,5 +460,56 @@ mod tests {
         let handles = mgr.try_reserve_batch(&[], "tx-empty").unwrap();
         assert!(handles.is_empty());
         assert_eq!(mgr.reservation_count(), 0);
+    }
+
+    #[test]
+    fn test_concurrent_same_coin_exactly_one_reservation_succeeds() {
+        let mgr = Arc::new(CoinReservationManager::default());
+        let barrier = Arc::new(Barrier::new(16));
+        let coin = test_coin_id(42);
+
+        let mut threads = Vec::new();
+        for thread_index in 0..16 {
+            let mgr = Arc::clone(&mgr);
+            let barrier = Arc::clone(&barrier);
+            let coin = coin.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                mgr.try_reserve(&coin, 100, &format!("tx-{thread_index}"))
+                    .is_some()
+            }));
+        }
+
+        let success_count = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("reservation test thread should join"))
+            .filter(|reserved| *reserved)
+            .count();
+
+        assert_eq!(success_count, 1);
+        assert_eq!(mgr.reservation_count(), 1);
+    }
+
+    #[test]
+    fn test_new_manager_after_restart_does_not_inherit_reservations() {
+        let old_mgr = CoinReservationManager::default();
+        let coin = test_coin_id(43);
+        let _old_handle = old_mgr.try_reserve(&coin, 100, "tx-before-restart").unwrap();
+        assert_eq!(old_mgr.reservation_count(), 1);
+
+        let restarted_mgr = CoinReservationManager::default();
+        let _new_handle = restarted_mgr.try_reserve(&coin, 100, "tx-after-restart").unwrap();
+        assert_eq!(restarted_mgr.reservation_count(), 1);
+    }
+
+    #[test]
+    fn test_batch_reserve_duplicate_coin_rolls_back() {
+        let mgr = CoinReservationManager::default();
+        let coin = test_coin_id(44);
+        let batch: Vec<(&ObjectId, u64)> = vec![(&coin, 100), (&coin, 100)];
+
+        assert!(mgr.try_reserve_batch(&batch, "tx-duplicate").is_none());
+        assert_eq!(mgr.reservation_count(), 0);
+        assert!(mgr.try_reserve(&coin, 100, "tx-after-rollback").is_some());
     }
 }

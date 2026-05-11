@@ -4,7 +4,11 @@
 //! These handlers are designed to work with Axum web framework.
 
 use crate::types::*;
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use serde::Deserialize;
 use setu_rpc::{
     GetSolverListRequest, GetSolverListResponse, GetTransferStatusRequest,
@@ -27,17 +31,19 @@ use setu_rpc::{
     LeaveSubnetRequest, LeaveSubnetResponse,
     CheckMembershipResponse, GetUserSubnetsResponse,
 };
+use setu_types::event::{EventPayload, EventType};
 use std::sync::Arc;
 
 const RAW_TRANSFER_TOKEN_ENV: &str = "SETU_RAW_TRANSFER_API_TOKEN";
+const RAW_EVENT_TOKEN_ENV: &str = "SETU_RAW_EVENT_API_TOKEN";
 const RAW_TRANSFER_TOKEN_HEADER: &str = "x-setu-admin-token";
 
-fn raw_transfer_auth_error(headers: &HeaderMap) -> Option<String> {
-    let expected = std::env::var(RAW_TRANSFER_TOKEN_ENV).unwrap_or_default();
+fn raw_admin_auth_error(headers: &HeaderMap, token_env: &str, surface: &str) -> Option<String> {
+    let expected = std::env::var(token_env).unwrap_or_default();
     if expected.is_empty() {
         return Some(format!(
-            "Raw transfer API disabled: set {} to enable internal/admin use",
-            RAW_TRANSFER_TOKEN_ENV
+            "{} API disabled: set {} to enable internal/admin use",
+            surface, token_env
         ));
     }
 
@@ -46,7 +52,72 @@ fn raw_transfer_auth_error(headers: &HeaderMap) -> Option<String> {
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     if observed != expected {
-        return Some("Raw transfer API requires a valid X-Setu-Admin-Token".to_string());
+        return Some(format!(
+            "{} API requires a valid X-Setu-Admin-Token",
+            surface
+        ));
+    }
+
+    None
+}
+
+fn raw_transfer_auth_error(headers: &HeaderMap) -> Option<String> {
+    raw_admin_auth_error(headers, RAW_TRANSFER_TOKEN_ENV, "Raw transfer")
+}
+
+fn raw_event_auth_error(headers: &HeaderMap) -> Option<String> {
+    raw_admin_auth_error(headers, RAW_EVENT_TOKEN_ENV, "Raw event")
+}
+
+fn infra_admission_error(detail: impl AsRef<str>) -> String {
+    stable_error("INFRA_ADMISSION", detail)
+}
+
+fn raw_event_admission_error(
+    headers: &HeaderMap,
+    request: &SubmitEventRequest,
+) -> Option<(StatusCode, String)> {
+    if let Some(message) = raw_event_auth_error(headers) {
+        return Some((StatusCode::UNAUTHORIZED, message));
+    }
+
+    let event = &request.event;
+    if event.event_type != EventType::System {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            infra_admission_error(format!(
+                "raw event admission allows only System diagnostic events, got {}",
+                event.event_type.name()
+            )),
+        ));
+    }
+
+    if !matches!(event.payload, EventPayload::None) {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            infra_admission_error("raw diagnostic event payload must be None"),
+        ));
+    }
+
+    let Some(result) = event.execution_result.as_ref() else {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            infra_admission_error("raw diagnostic event requires execution_result"),
+        ));
+    };
+
+    if !result.success {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            infra_admission_error("raw diagnostic event execution_result must be success"),
+        ));
+    }
+
+    if !result.state_changes.is_empty() {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            infra_admission_error("raw diagnostic event must not contain state changes"),
+        ));
     }
 
     None
@@ -54,8 +125,15 @@ fn raw_transfer_auth_error(headers: &HeaderMap) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{raw_transfer_auth_error, RAW_TRANSFER_TOKEN_ENV, RAW_TRANSFER_TOKEN_HEADER};
-    use axum::http::{HeaderMap, HeaderValue};
+    use super::{
+        raw_event_admission_error, raw_transfer_auth_error, RAW_EVENT_TOKEN_ENV,
+        RAW_TRANSFER_TOKEN_ENV, RAW_TRANSFER_TOKEN_HEADER,
+    };
+    use crate::types::SubmitEventRequest;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use setu_types::event::{
+        Event, EventPayload, EventType, ExecutionResult, StateChange, VLCSnapshot,
+    };
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -93,6 +171,86 @@ mod tests {
 
         assert!(raw_transfer_auth_error(&headers).is_none());
         std::env::remove_var(RAW_TRANSFER_TOKEN_ENV);
+    }
+
+    fn diagnostic_event_request() -> SubmitEventRequest {
+        let mut event = Event::new(
+            EventType::System,
+            vec![],
+            VLCSnapshot::new(),
+            "operator".to_string(),
+        );
+        event.payload = EventPayload::None;
+        event.set_execution_result(ExecutionResult::success());
+        SubmitEventRequest { event }
+    }
+
+    fn raw_event_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(RAW_TRANSFER_TOKEN_HEADER, HeaderValue::from_static("expected-token"));
+        headers
+    }
+
+    #[test]
+    fn raw_event_admission_rejects_when_token_unset() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::remove_var(RAW_EVENT_TOKEN_ENV);
+        let headers = HeaderMap::new();
+        let request = diagnostic_event_request();
+
+        let (status, message) = raw_event_admission_error(&headers, &request)
+            .expect("unset raw event token must reject");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(message.contains("Raw event API disabled"));
+    }
+
+    #[test]
+    fn raw_event_admission_accepts_empty_system_diagnostic() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::set_var(RAW_EVENT_TOKEN_ENV, "expected-token");
+        let headers = raw_event_headers();
+        let request = diagnostic_event_request();
+
+        assert!(raw_event_admission_error(&headers, &request).is_none());
+        std::env::remove_var(RAW_EVENT_TOKEN_ENV);
+    }
+
+    #[test]
+    fn raw_event_admission_rejects_state_changes() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::set_var(RAW_EVENT_TOKEN_ENV, "expected-token");
+        let headers = raw_event_headers();
+        let mut request = diagnostic_event_request();
+        request.event.set_execution_result(
+            ExecutionResult::success().with_changes(vec![StateChange::insert(
+                "oid:0000000000000000000000000000000000000000000000000000000000000000",
+                vec![1],
+            )]),
+        );
+
+        let (status, message) = raw_event_admission_error(&headers, &request)
+            .expect("state-changing raw event must reject");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("INFRA_ADMISSION"));
+        std::env::remove_var(RAW_EVENT_TOKEN_ENV);
+    }
+
+    #[test]
+    fn raw_event_admission_rejects_non_system_event() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::set_var(RAW_EVENT_TOKEN_ENV, "expected-token");
+        let headers = raw_event_headers();
+        let mut request = diagnostic_event_request();
+        request.event.event_type = EventType::Transfer;
+
+        let (status, message) = raw_event_admission_error(&headers, &request)
+            .expect("non-system raw event must reject");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("System diagnostic"));
+        std::env::remove_var(RAW_EVENT_TOKEN_ENV);
     }
 }
 
@@ -357,9 +515,23 @@ pub async fn http_get_transfer_status<S: ValidatorService>(
 /// Submit an event
 pub async fn http_submit_event<S: ValidatorService>(
     State(service): State<Arc<S>>,
-    Json(request): Json<SubmitEventRequest>,
-) -> Json<SubmitEventResponse> {
-    Json(service.submit_event(request).await)
+    headers: HeaderMap,
+    Json(mut request): Json<SubmitEventRequest>,
+) -> Result<Json<SubmitEventResponse>, (StatusCode, Json<SubmitEventResponse>)> {
+    if let Some((status, message)) = raw_event_admission_error(&headers, &request) {
+        return Err((
+            status,
+            Json(SubmitEventResponse {
+                success: false,
+                message,
+                event_id: Some(request.event.id),
+                vlc_time: None,
+            }),
+        ));
+    }
+
+    request.event.recompute_id();
+    Ok(Json(service.submit_event(request).await))
 }
 
 /// Get all events
@@ -452,10 +624,17 @@ pub async fn http_get_balance<S: ValidatorService>(
 
 /// Query object by key
 pub async fn http_get_object<S: ValidatorService>(
-    State(service): State<Arc<S>>,
+    State(_service): State<Arc<S>>,
     axum::extract::Path(key): axum::extract::Path<String>,
-) -> Json<GetObjectResponse> {
-    Json(service.get_object(&key))
+) -> Result<Json<GetObjectResponse>, (StatusCode, Json<serde_json::Value>)> {
+    Err((
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "key": key,
+            "supported": false,
+            "error": stable_error(ERROR_CONSENSUS_STORAGE, "unsupported raw object query"),
+        })),
+    ))
 }
 
 // ============================================

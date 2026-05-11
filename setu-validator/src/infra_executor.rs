@@ -25,11 +25,15 @@
 //! Token operations (initial minting, airdrops) use the same RuntimeExecutor
 //! logic as TEE to maintain consistency.
 
-use setu_runtime::{RuntimeExecutor, ExecutionContext, InMemoryStateStore};
-use setu_storage::MerkleStateProvider;
+use setu_runtime::{RuntimeExecutor, ExecutionContext, InMemoryStateStore, StateStore};
+use setu_storage::{MerkleStateProvider, StateProvider};
 use setu_types::{
     Address,
+    flux_state_object_id,
+    hash_utils::setu_hash_with_domain,
     object::ObjectId,
+    object_key,
+    power_state_object_id,
     registration::{SubnetRegistration, UserRegistration},
     event::{Event, ExecutionResult, MoveUpgradePayload, StateChange as EventStateChange},
 };
@@ -190,12 +194,25 @@ impl InfraExecutor {
             tx_hash,
         );
 
-        let temp_store = InMemoryStateStore::new();
-        let mut runtime = RuntimeExecutor::new(temp_store);
-
         let user_address = Address::from_hex(&registration.address)
             .map_err(|e| format!("Invalid user address '{}': {}", registration.address, e))?;
         let subnet_id = registration.subnet_id.as_deref().unwrap_or("subnet-0");
+
+        let mut temp_store = InMemoryStateStore::new();
+        let addr_str = user_address.to_string();
+        let flux_oid = flux_state_object_id(&addr_str);
+        if let Some(bytes) = self.state_provider.get_object(&flux_oid) {
+            temp_store
+                .set_raw_object(flux_oid, bytes)
+                .map_err(|e| format!("Runtime state seed error: {}", e))?;
+        }
+        let power_oid = power_state_object_id(&addr_str);
+        if let Some(bytes) = self.state_provider.get_object(&power_oid) {
+            temp_store
+                .set_raw_object(power_oid, bytes)
+                .map_err(|e| format!("Runtime state seed error: {}", e))?;
+        }
+        let mut runtime = RuntimeExecutor::new(temp_store);
 
         let output = runtime.execute_user_register(
             &user_address,
@@ -657,10 +674,17 @@ impl InfraExecutor {
             self.validator_id.clone(), timestamp, false, tx_hash,
         );
 
-        let temp_store = InMemoryStateStore::new();
-        let mut runtime = RuntimeExecutor::new(temp_store);
         let address = Address::from_hex(user_address)
             .map_err(|e| format!("Invalid address '{}': {}", user_address, e))?;
+        let profile_key = format!("profile:{}", address);
+        let profile_object_id = ObjectId::new(setu_hash_with_domain(
+            b"SETU_PROFILE:",
+            profile_key.as_bytes(),
+        ));
+        let existing_profile = self.state_provider.get_object(&profile_object_id);
+
+        let temp_store = InMemoryStateStore::new();
+        let mut runtime = RuntimeExecutor::new(temp_store);
 
         let output = runtime.execute_profile_update(
             &address, display_name, avatar_url, bio, attributes, &ctx,
@@ -675,9 +699,44 @@ impl InfraExecutor {
         );
 
         // Phase 5: no eager apply — see execute_subnet_register note (OBS-026).
-        let state_changes: Vec<EventStateChange> = output.state_changes.iter()
+        let mut state_changes: Vec<EventStateChange> = output.state_changes.iter()
             .map(|sc| sc.to_event_state_change())
             .collect();
+        if let Some(existing_profile_bytes) = existing_profile {
+            if state_changes.len() != 1 {
+                return Err(format!(
+                    "Profile update expected 1 state change, got {}",
+                    state_changes.len()
+                ));
+            }
+
+            let expected_key = object_key(&profile_object_id);
+            let state_change = &mut state_changes[0];
+            if state_change.key != expected_key {
+                return Err(format!(
+                    "Profile update state key mismatch: expected {}, got {}",
+                    expected_key, state_change.key
+                ));
+            }
+
+            let existing_json: serde_json::Value = serde_json::from_slice(&existing_profile_bytes)
+                .map_err(|e| format!("Existing profile state decode error: {}", e))?;
+            let created_at = existing_json
+                .get("created_at")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| "Existing profile state missing created_at".to_string())?;
+
+            let new_profile_bytes = state_change
+                .new_value
+                .as_mut()
+                .ok_or_else(|| "Profile update missing new profile state".to_string())?;
+            let mut new_json: serde_json::Value = serde_json::from_slice(new_profile_bytes)
+                .map_err(|e| format!("New profile state decode error: {}", e))?;
+            new_json["created_at"] = serde_json::json!(created_at);
+            *new_profile_bytes = serde_json::to_vec(&new_json)
+                .map_err(|e| format!("Profile update state encode error: {}", e))?;
+            state_change.old_value = Some(existing_profile_bytes);
+        }
         event.set_execution_result(ExecutionResult {
             success: true,
             message: output.message,
@@ -977,6 +1036,62 @@ mod tests {
         assert_eq!(er.state_changes.len(), 1);
         // Key must be "oid:{hex}" format
         assert!(er.state_changes[0].key.starts_with("oid:"));
+        assert!(er.state_changes[0].old_value.is_none());
+    }
+
+    #[test]
+    fn test_infra_profile_update_uses_update_state_change_when_profile_exists() {
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(Arc::clone(&shared)));
+        let executor = InfraExecutor::new("validator-1".to_string(), provider);
+        let attrs = std::collections::HashMap::new();
+        let address = "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf";
+
+        let first_event = executor
+            .execute_profile_update(address, Some("Alice"), None, Some("Hello"), &attrs, test_vlc())
+            .expect("first profile update must create profile");
+        let first_state_change = &first_event
+            .execution_result
+            .as_ref()
+            .expect("first event must have result")
+            .state_changes[0];
+        let first_profile_bytes = first_state_change
+            .new_value
+            .clone()
+            .expect("first update must contain new profile bytes");
+        let first_profile_json: serde_json::Value = serde_json::from_slice(&first_profile_bytes)
+            .expect("first profile bytes must be JSON");
+        let first_created_at = first_profile_json["created_at"]
+            .as_u64()
+            .expect("first profile must contain created_at");
+
+        {
+            let mut state_manager = shared.lock_write();
+            let summary = state_manager.apply_committed_events(&[first_event]);
+            assert!(summary.conflicted_events.is_empty());
+            shared.publish_snapshot(&state_manager);
+        }
+
+        let second_event = executor
+            .execute_profile_update(address, Some("Bob"), None, Some("Updated"), &attrs, test_vlc())
+            .expect("second profile update must update profile");
+        let second_state_change = &second_event
+            .execution_result
+            .as_ref()
+            .expect("second event must have result")
+            .state_changes[0];
+
+        assert_eq!(second_state_change.old_value.as_ref(), Some(&first_profile_bytes));
+        let second_profile_bytes = second_state_change
+            .new_value
+            .as_ref()
+            .expect("second update must contain new profile bytes");
+        let second_profile_json: serde_json::Value = serde_json::from_slice(second_profile_bytes)
+            .expect("second profile bytes must be JSON");
+        assert_eq!(second_profile_json["display_name"], "Bob");
+        assert_eq!(second_profile_json["bio"], "Updated");
+        assert_eq!(second_profile_json["created_at"], first_created_at);
+        assert!(second_profile_json["updated_at"].as_u64().is_some());
     }
 
     #[test]
