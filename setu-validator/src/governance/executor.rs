@@ -119,9 +119,10 @@ impl GovernanceExecutor {
     /// proposal_id in GovernancePayload = `subnet_id.to_bytes()`.
     pub fn execute_register_system_subnet(
         registration: SystemSubnetRegistration,
-        timestamp: u64,
+        _timestamp: u64,
         vlc_snapshot: VLCSnapshot,
         creator: String,
+        existing_registration_bytes: Option<Vec<u8>>,
         genesis_validators: &[GenesisValidator],
     ) -> Result<Event, GovernanceExecutorError> {
         // Validate: must be system subnet, not ROOT
@@ -174,7 +175,11 @@ impl GovernanceExecutor {
         let new_value = serde_json::to_vec(&registration)
             .map_err(|e| GovernanceExecutorError::Serialization(e.to_string()))?;
 
-        let state_changes = vec![StateChange::new(key, None, Some(new_value))];
+        let state_change = match existing_registration_bytes {
+            Some(old_value) => StateChange::update(key, old_value, new_value),
+            None => StateChange::new(key, None, Some(new_value)),
+        };
+        let state_changes = vec![state_change];
 
         // proposal_id = subnet_id.to_bytes() (R3-ISSUE-1)
         let payload = GovernancePayload {
@@ -684,6 +689,7 @@ mod tests {
             1000,
             sample_vlc(),
             "test-validator".to_string(),
+            None,
             &gv,
         );
         let event = result.unwrap();
@@ -717,6 +723,31 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_register_system_subnet_update_existing() {
+        let existing = sample_system_registration();
+        let existing_bytes = serde_json::to_vec(&existing).unwrap();
+        let mut reg = sample_system_registration();
+        reg.agent_endpoint = "http://oracle-new:8091".to_string();
+        reg.sign(&[42u8; 32]).unwrap();
+        let gv = sample_genesis_validators();
+        let event = GovernanceExecutor::execute_register_system_subnet(
+            reg,
+            1000,
+            sample_vlc(),
+            "test-validator".to_string(),
+            Some(existing_bytes.clone()),
+            &gv,
+        ).unwrap();
+        let er = event.execution_result.as_ref().unwrap();
+        assert_eq!(er.state_changes.len(), 1);
+        let sc = &er.state_changes[0];
+        assert_eq!(sc.old_value.as_ref(), Some(&existing_bytes));
+        let parsed: SystemSubnetRegistration =
+            serde_json::from_slice(sc.new_value.as_ref().unwrap()).unwrap();
+        assert_eq!(parsed.agent_endpoint, "http://oracle-new:8091");
+    }
+
+    #[test]
     fn test_execute_register_non_system_rejected() {
         let mut reg = sample_system_registration();
         reg.subnet_id = SubnetId::from_str_id("app-subnet"); // APP type
@@ -728,6 +759,7 @@ mod tests {
             1000,
             sample_vlc(),
             "test-validator".to_string(),
+            None,
             &gv,
         );
         assert!(result.is_err());
@@ -748,6 +780,7 @@ mod tests {
             1000,
             sample_vlc(),
             "test-validator".to_string(),
+            None,
             &gv,
         );
         assert!(result.is_err());
@@ -768,6 +801,7 @@ mod tests {
             1000,
             sample_vlc(),
             "test-validator".to_string(),
+            None,
             &gv,
         );
         assert!(result.is_err());
@@ -783,7 +817,7 @@ mod tests {
         reg.sign(&[42u8; 32]).unwrap();
         let gv = sample_genesis_validators();
         let result = GovernanceExecutor::execute_register_system_subnet(
-            reg, 1000, sample_vlc(), "test-validator".to_string(), &gv,
+            reg, 1000, sample_vlc(), "test-validator".to_string(), None, &gv,
         );
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GovernanceExecutorError::Unauthorized(_)));
@@ -798,7 +832,7 @@ mod tests {
         reg.sign(&[99u8; 32]).unwrap(); // Valid signature but wrong key
         let gv = sample_genesis_validators();
         let result = GovernanceExecutor::execute_register_system_subnet(
-            reg, 1000, sample_vlc(), "test-validator".to_string(), &gv,
+            reg, 1000, sample_vlc(), "test-validator".to_string(), None, &gv,
         );
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GovernanceExecutorError::Unauthorized(_)));
@@ -810,7 +844,7 @@ mod tests {
         reg.signature = hex::encode([0xFFu8; 64]); // Garbage signature
         let gv = sample_genesis_validators();
         let result = GovernanceExecutor::execute_register_system_subnet(
-            reg, 1000, sample_vlc(), "test-validator".to_string(), &gv,
+            reg, 1000, sample_vlc(), "test-validator".to_string(), None, &gv,
         );
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GovernanceExecutorError::Unauthorized(_)));
@@ -820,7 +854,7 @@ mod tests {
 
     #[test]
     fn test_execute_decision_update_resource_param_first_insert() {
-        use setu_types::{ResourceParamChange, ResourceGovernanceMode, ResourceParams, resource_params_object_id};
+        use setu_types::{ResourceParamChange, ResourceParams};
         let mut proposal = sample_proposal_pending();
         proposal.content.proposal_type = ProposalType::ResourceParamChange;
         proposal.content.action = ProposalEffect::UpdateResourceParam(
@@ -850,7 +884,7 @@ mod tests {
 
     #[test]
     fn test_execute_decision_update_resource_param_existing() {
-        use setu_types::{ResourceParamChange, ResourceGovernanceMode, ResourceParams, resource_params_object_id};
+        use setu_types::{ResourceParamChange, ResourceParams};
         let mut proposal = sample_proposal_pending();
         proposal.content.proposal_type = ProposalType::ResourceParamChange;
         proposal.content.action = ProposalEffect::UpdateResourceParam(

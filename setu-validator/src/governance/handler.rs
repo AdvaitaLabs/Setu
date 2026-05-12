@@ -24,6 +24,7 @@ pub struct ProposeRequest {
 pub struct ProposeResponse {
     pub success: bool,
     pub proposal_id: Option<String>,
+    pub event_id: Option<String>,
     pub message: String,
 }
 
@@ -39,6 +40,7 @@ pub struct CallbackRequest {
 #[derive(Debug, Serialize)]
 pub struct CallbackResponse {
     pub success: bool,
+    pub event_id: Option<String>,
     pub message: String,
 }
 
@@ -103,10 +105,11 @@ impl GovernanceHandler {
     ///
     /// 1. Generate proposal_id and callback_token
     /// 2. Build Propose Event via GovernanceExecutor
-    /// 3. Insert into GovernanceService pending_governance
-    /// 4. Return (event, proposal_id, callback_token) for the caller to:
+    /// 3. Build pending proposal state without mutating GovernanceService
+    /// 4. Return (event, proposal_id, callback_token, pending) for the caller to:
     ///    a. add_event_to_dag(event)
-    ///    b. dispatch_to_agent(proposal_id, content, callback_token)
+    ///    b. insert pending only after DAG submission succeeds
+    ///    c. dispatch_to_agent(proposal_id, content, callback_token)
     ///
     /// The caller (ValidatorNetworkService) owns the VLC and DAG, so we return
     /// the Event for the caller to submit.
@@ -138,8 +141,6 @@ impl GovernanceHandler {
             created_at: timestamp,
         };
 
-        governance_service.insert_pending(pending);
-
         info!(
             proposal_id = %hex::encode(proposal_id),
             "Governance proposal prepared"
@@ -149,15 +150,17 @@ impl GovernanceHandler {
             event,
             proposal_id,
             callback_token,
+            pending,
         })
     }
 
     /// Handle a callback request from the Agent subnet.
     ///
     /// 1. Validate callback_token
-    /// 2. Remove from pending
+    /// 2. Validate pending callback token without consuming pending state
     /// 3. Build Execute Event via GovernanceExecutor
-    /// 4. Return event for the caller to add_event_to_dag()
+    /// 4. Return event for the caller to add_event_to_dag(); caller removes
+    ///    pending only after DAG submission succeeds.
     pub fn prepare_execute(
         governance_service: &GovernanceService,
         proposal_id: [u8; 32],
@@ -191,9 +194,6 @@ impl GovernanceHandler {
             validator_id.to_string(),
             current_resource_params,
         )?;
-
-        // Remove from pending (consume the one-time token)
-        governance_service.remove_pending(&proposal_id);
 
         info!(
             proposal_id = %hex::encode(proposal_id),
@@ -232,9 +232,6 @@ impl GovernanceHandler {
             current_resource_params,
         )?;
 
-        // Remove from pending
-        governance_service.remove_pending(&proposal_id);
-
         info!(
             proposal_id = %hex::encode(proposal_id),
             "Governance timeout execute prepared"
@@ -255,6 +252,7 @@ impl GovernanceHandler {
         timestamp: u64,
         vlc_snapshot: setu_vlc::VLCSnapshot,
         validator_id: &str,
+        existing_registration_bytes: Option<Vec<u8>>,
         genesis_validators: &[setu_types::genesis::GenesisValidator],
     ) -> Result<setu_types::Event, GovernanceHandlerError> {
         // Parse SubnetId from hex
@@ -278,6 +276,7 @@ impl GovernanceHandler {
             timestamp,
             vlc_snapshot,
             validator_id.to_string(),
+            existing_registration_bytes,
             genesis_validators,
         )?;
 
@@ -295,6 +294,7 @@ pub struct PreparedProposal {
     pub event: setu_types::Event,
     pub proposal_id: [u8; 32],
     pub callback_token: [u8; 32],
+    pub pending: PendingProposal,
 }
 
 #[cfg(test)]
@@ -356,8 +356,9 @@ mod tests {
         let prepared = result.unwrap();
         assert!(!prepared.proposal_id.iter().all(|&b| b == 0));
         assert!(!prepared.callback_token.iter().all(|&b| b == 0));
-        // Should be in pending
-        assert_eq!(svc.pending_count(), 1);
+        assert_eq!(prepared.pending.proposal_id, prepared.proposal_id);
+        assert_eq!(prepared.pending.callback_token, prepared.callback_token);
+        assert_eq!(svc.pending_count(), 0);
     }
 
     #[test]
@@ -368,6 +369,7 @@ mod tests {
         let prepared =
             GovernanceHandler::prepare_propose(&svc, sample_content(), 1000, sample_vlc(), "test-validator")
                 .unwrap();
+        svc.insert_pending(prepared.pending.clone());
 
         let proposal = sample_proposal(prepared.proposal_id);
         let decision = GovernanceDecision {
@@ -388,7 +390,8 @@ mod tests {
             None,
         );
         assert!(result.is_ok());
-        // Should be removed from pending
+        assert_eq!(svc.pending_count(), 1);
+        svc.remove_pending(&prepared.proposal_id);
         assert_eq!(svc.pending_count(), 0);
     }
 
@@ -399,6 +402,7 @@ mod tests {
         let prepared =
             GovernanceHandler::prepare_propose(&svc, sample_content(), 1000, sample_vlc(), "test-validator")
                 .unwrap();
+        svc.insert_pending(prepared.pending.clone());
 
         let proposal = sample_proposal(prepared.proposal_id);
         let decision = GovernanceDecision {
@@ -474,6 +478,7 @@ mod tests {
             1000,
             sample_vlc(),
             "test-validator",
+            None,
             &gv,
         );
         assert!(result.is_ok());
@@ -498,6 +503,7 @@ mod tests {
             1000,
             sample_vlc(),
             "test-validator",
+            None,
             &gv,
         );
         assert!(result.is_err());

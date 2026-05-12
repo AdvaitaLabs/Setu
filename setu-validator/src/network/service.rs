@@ -26,7 +26,7 @@ use super::event_handler::EventHandler;
 use super::move_handler;
 use crate::{RouterManager, TaskPreparer, BatchTaskPreparer, ConsensusValidator, InfraExecutor};
 use crate::coin_reservation::CoinReservationManager;
-use crate::governance::service::GovernanceService;
+use crate::governance::service::{ConfigSource, GovernanceService, SystemSubnetConfig};
 use crate::governance::handler::{
     GovernanceHandler, ProposeRequest, ProposeResponse, CallbackRequest,
     CallbackResponse, StatusResponse, RegisterSystemSubnetRequest, RegisterSystemSubnetResponse,
@@ -40,6 +40,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use setu_types::Transfer;
+use setu_types::governance::SystemSubnetRegistration;
 use parking_lot::RwLock;
 use setu_rpc::{
     GetTransferStatusResponse, RegisterSolverRequest,
@@ -368,7 +369,7 @@ impl ValidatorNetworkService {
         self.governance_service.as_ref()
     }
 
-    /// Get a reference to the events DashMap (for governance background tasks).
+    /// Get a reference to the finalized/query-visible events DashMap.
     pub fn events_map(&self) -> &Arc<DashMap<String, Event>> {
         &self.events
     }
@@ -380,28 +381,43 @@ impl ValidatorNetworkService {
             .get_object_from_subnet(object_id_bytes, subnet_id)
     }
 
-    /// Eagerly apply state changes from an event to a subnet's SMT.
-    /// Workaround: finalization_tx.send() is not yet wired. CF state changes ARE applied
-    /// on finalization (via anchor_builder → apply_committed_events), but with a delay.
-    /// This method provides immediate visibility via the read path (get_subnet_object /
-    /// resource-params API). The duplicate write at CF finalization is harmless (conflict-skip).
+    /// Read an object from a specific subnet's finalized SMT snapshot, bypassing
+    /// the speculative overlay.
+    pub fn get_subnet_object_finalized(&self, subnet_id: &setu_types::SubnetId, object_id_bytes: &[u8; 32]) -> Option<Vec<u8>> {
+        self.batch_task_preparer.merkle_state_provider()
+            .get_object_from_subnet_finalized(object_id_bytes, subnet_id)
+    }
+
+    /// Stage governance state changes for immediate local visibility without
+    /// mutating the canonical SMT before CF finalization.
+    ///
+    /// The read path merges the speculative overlay with the SMT snapshot, so
+    /// governance callbacks can read their own freshly submitted proposal while
+    /// the CF-finalized apply path remains the sole canonical writer.
     pub fn apply_event_state_changes_eager(&self, subnet_id: &setu_types::SubnetId, event: &setu_types::Event) {
         if let Some(ref exec) = event.execution_result {
-            if exec.state_changes.is_empty() {
+            if !exec.success || exec.state_changes.is_empty() {
                 return;
             }
             let shared = self.batch_task_preparer.merkle_state_provider().shared_state_manager();
-            let mut gsm = shared.lock_write();
-            for sc in &exec.state_changes {
-                let target = sc.target_subnet.unwrap_or(*subnet_id);
-                gsm.apply_state_change(target, sc);
+            match shared.stage_overlay(&event.id, *subnet_id, &exec.state_changes) {
+                Ok(()) => {
+                    tracing::info!(
+                        subnet_id = %subnet_id,
+                        event_id = %event.id,
+                        n_changes = exec.state_changes.len(),
+                        "Staged governance state changes to speculative overlay"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        subnet_id = %subnet_id,
+                        event_id = %event.id,
+                        error = %e,
+                        "Governance overlay stage skipped"
+                    );
+                }
             }
-            shared.publish_snapshot(&gsm);
-            tracing::info!(
-                subnet_id = %subnet_id,
-                n_changes = exec.state_changes.len(),
-                "Eagerly applied governance state changes"
-            );
         }
     }
 
@@ -717,7 +733,7 @@ impl ValidatorNetworkService {
         })
     }
 
-    pub async fn add_event_to_dag(&self, event: Event) {
+    pub async fn add_event_to_dag(&self, event: Event) -> SubmitEventResponse {
         EventHandler::add_event_to_dag(
             &self.events,
             &self.dag_events,
@@ -1254,6 +1270,72 @@ impl ValidatorNetworkService {
         info!(solver_id = %node_id, "Solver unregistered");
     }
 
+    fn system_subnet_config_from_registration(reg: &SystemSubnetRegistration) -> SystemSubnetConfig {
+        SystemSubnetConfig {
+            agent_endpoint: reg.agent_endpoint.clone(),
+            callback_addr: reg.callback_addr.clone(),
+            timeout: Duration::from_secs(reg.timeout_secs.unwrap_or(300)),
+            source: ConfigSource::OnChain,
+        }
+    }
+
+    fn finalized_registration_matches_payload(&self, reg: &SystemSubnetRegistration) -> bool {
+        let Some(bytes) = self.get_subnet_object_finalized(
+            &setu_types::SubnetId::GOVERNANCE,
+            reg.subnet_id.as_bytes(),
+        ) else {
+            tracing::warn!(
+                subnet_id = %reg.subnet_id,
+                "Skipping replayed system subnet registry update: finalized SMT object missing"
+            );
+            return false;
+        };
+
+        let stored = match serde_json::from_slice::<SystemSubnetRegistration>(&bytes) {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::warn!(
+                    subnet_id = %reg.subnet_id,
+                    error = %e,
+                    "Skipping replayed system subnet registry update: finalized SMT object is not a registration"
+                );
+                return false;
+            }
+        };
+
+        let matches = stored.agent_endpoint == reg.agent_endpoint
+            && stored.callback_addr == reg.callback_addr
+            && stored.timeout_secs == reg.timeout_secs;
+        if !matches {
+            tracing::warn!(
+                subnet_id = %reg.subnet_id,
+                "Skipping replayed system subnet registry update: payload differs from finalized SMT"
+            );
+        }
+        matches
+    }
+
+    fn live_governance_event_applied(&self, event: &Event) -> bool {
+        match self.execution_outcomes.get(&event.id).map(|entry| entry.clone()) {
+            Some(ExecutionOutcome::Applied { .. }) => true,
+            Some(outcome) => {
+                tracing::warn!(
+                    event_id = %event.id,
+                    outcome = outcome.kind(),
+                    "Skipping live governance side effect for non-applied event"
+                );
+                false
+            }
+            None => {
+                tracing::warn!(
+                    event_id = %event.id,
+                    "Skipping live governance side effect: execution outcome missing"
+                );
+                false
+            }
+        }
+    }
+
     // ============================================
     // DAG Replay Support
     // ============================================
@@ -1305,7 +1387,6 @@ impl ValidatorNetworkService {
             EventPayload::Governance(payload) => {
                 // During replay, governance events are tracked for Propose→Execute matching.
                 // Unmatched Propose events become pending governance for re-dispatch.
-                // RegisterSystemSubnet events directly update the SystemSubnetRegistry.
                 use setu_types::governance::GovernanceAction;
                 match &payload.action {
                     GovernanceAction::Propose(content) => {
@@ -1321,22 +1402,19 @@ impl ValidatorNetworkService {
                         ))
                     }
                     GovernanceAction::RegisterSystemSubnet(reg) => {
-                        // Direct modification pattern (R3-ISSUE-2): write to DashMap directly
-                        if let Some(gov_svc) = &self.governance_service {
-                            use crate::governance::service::{SystemSubnetConfig, ConfigSource};
-                            gov_svc.register_system_endpoint(
-                                reg.subnet_id,
-                                SystemSubnetConfig {
-                                    agent_endpoint: reg.agent_endpoint.clone(),
-                                    callback_addr: reg.callback_addr.clone(),
-                                    timeout: std::time::Duration::from_secs(
-                                        reg.timeout_secs.unwrap_or(300),
-                                    ),
-                                    source: ConfigSource::OnChain,
-                                },
-                            );
+                        if self.finalized_registration_matches_payload(reg) {
+                            if let Some(gov_svc) = &self.governance_service {
+                                gov_svc.register_system_endpoint(
+                                    reg.subnet_id,
+                                    Self::system_subnet_config_from_registration(reg),
+                                );
+                                ReplayAction::Applied(ReplayKind::SystemSubnetRegister)
+                            } else {
+                                ReplayAction::Skipped
+                            }
+                        } else {
+                            ReplayAction::Skipped
                         }
-                        ReplayAction::Applied(ReplayKind::SystemSubnetRegister)
                     }
                 }
             }
@@ -1392,6 +1470,29 @@ impl ValidatorNetworkService {
                     reg.subnet_id.clone(),
                     SubnetInfo::from_registration(reg, event.timestamp),
                 );
+            }
+            EventPayload::Governance(payload) => {
+                if !self.live_governance_event_applied(event) {
+                    return;
+                }
+                let Some(gov_svc) = &self.governance_service else {
+                    return;
+                };
+                use setu_types::governance::GovernanceAction;
+                match &payload.action {
+                    GovernanceAction::Propose(_) => {
+                        gov_svc.track_proposal(payload.proposal_id, event.timestamp);
+                    }
+                    GovernanceAction::Execute(_) => {
+                        gov_svc.untrack_proposal(&payload.proposal_id);
+                    }
+                    GovernanceAction::RegisterSystemSubnet(reg) => {
+                        gov_svc.register_system_endpoint(
+                            reg.subnet_id,
+                            Self::system_subnet_config_from_registration(reg),
+                        );
+                    }
+                }
             }
             _ => {}
         }
@@ -1673,6 +1774,7 @@ async fn governance_propose_handler(
                 Json(ProposeResponse {
                     success: false,
                     proposal_id: None,
+                    event_id: None,
                     message: "Governance not enabled".into(),
                 }),
             );
@@ -1689,15 +1791,27 @@ async fn governance_propose_handler(
 
     match GovernanceHandler::prepare_propose(&governance_svc, req.content.clone(), timestamp, vlc_snapshot, service.validator_id()) {
         Ok(prepared) => {
-            // Eagerly apply state changes (write proposal to GOVERNANCE SMT)
+            let event = prepared.event.clone();
+            let submit_response = service.add_event_to_dag(event.clone()).await;
+            if !submit_response.success {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ProposeResponse {
+                        success: false,
+                        proposal_id: None,
+                        event_id: submit_response.event_id,
+                        message: submit_response.message,
+                    }),
+                );
+            }
+
+            let event_id = event.id.to_string();
+            governance_svc.insert_pending(prepared.pending.clone());
             service.apply_event_state_changes_eager(
-                &setu_types::SubnetId::GOVERNANCE, &prepared.event,
+                &setu_types::SubnetId::GOVERNANCE, &event,
             );
-            // Submit event to DAG
-            service.add_event_to_dag(prepared.event).await;
-            // Async dispatch to Agent (fire-and-forget)
             let svc = governance_svc.clone();
-            let content = req.content;
+            let content = prepared.pending.content.clone();
             let pid = prepared.proposal_id;
             let token = prepared.callback_token;
             let sys_ctx = serde_json::json!({
@@ -1717,6 +1831,7 @@ async fn governance_propose_handler(
                 Json(ProposeResponse {
                     success: true,
                     proposal_id: Some(hex::encode(prepared.proposal_id)),
+                    event_id: Some(event_id),
                     message: "Proposal submitted".into(),
                 }),
             )
@@ -1726,6 +1841,7 @@ async fn governance_propose_handler(
             Json(ProposeResponse {
                 success: false,
                 proposal_id: None,
+                event_id: None,
                 message: e.to_string(),
             }),
         ),
@@ -1744,6 +1860,7 @@ async fn governance_callback_handler(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(CallbackResponse {
                     success: false,
+                    event_id: None,
                     message: "Governance not enabled".into(),
                 }),
             );
@@ -1762,6 +1879,7 @@ async fn governance_callback_handler(
                 StatusCode::BAD_REQUEST,
                 Json(CallbackResponse {
                     success: false,
+                    event_id: None,
                     message: "Invalid proposal_id hex".into(),
                 }),
             );
@@ -1780,6 +1898,7 @@ async fn governance_callback_handler(
                 StatusCode::BAD_REQUEST,
                 Json(CallbackResponse {
                     success: false,
+                    event_id: None,
                     message: "Invalid callback_token hex".into(),
                 }),
             );
@@ -1797,6 +1916,7 @@ async fn governance_callback_handler(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(CallbackResponse {
                         success: false,
+                        event_id: None,
                         message: format!("Failed to deserialize proposal: {}", e),
                     }),
                 );
@@ -1810,7 +1930,7 @@ async fn governance_callback_handler(
                     content: pending.content,
                     status: setu_types::governance::ProposalStatus::Pending,
                     decision: None,
-                    created_at: current_timestamp_secs(),
+                    created_at: pending.created_at,
                     decided_at: None,
                 },
                 None => {
@@ -1818,6 +1938,7 @@ async fn governance_callback_handler(
                         StatusCode::NOT_FOUND,
                         Json(CallbackResponse {
                             success: false,
+                            event_id: None,
                             message: "Proposal not found".into(),
                         }),
                     );
@@ -1854,15 +1975,29 @@ async fn governance_callback_handler(
         resource_params.as_ref(),
     ) {
         Ok(event) => {
+            let event_id = event.id.to_string();
+            let submit_response = service.add_event_to_dag(event.clone()).await;
+            if !submit_response.success {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(CallbackResponse {
+                        success: false,
+                        event_id: submit_response.event_id,
+                        message: submit_response.message,
+                    }),
+                );
+            }
+
+            governance_svc.remove_pending(&proposal_id_bytes);
             governance_svc.record_decided(proposal_id_bytes, req.decision);
             service.apply_event_state_changes_eager(
                 &setu_types::SubnetId::GOVERNANCE, &event,
             );
-            service.add_event_to_dag(event).await;
             (
                 StatusCode::OK,
                 Json(CallbackResponse {
                     success: true,
+                    event_id: Some(event_id),
                     message: "Decision executed".into(),
                 }),
             )
@@ -1871,6 +2006,7 @@ async fn governance_callback_handler(
             StatusCode::FORBIDDEN,
             Json(CallbackResponse {
                 success: false,
+                event_id: None,
                 message: msg,
             }),
         ),
@@ -1878,6 +2014,7 @@ async fn governance_callback_handler(
             StatusCode::BAD_REQUEST,
             Json(CallbackResponse {
                 success: false,
+                event_id: None,
                 message: e.to_string(),
             }),
         ),
@@ -1985,41 +2122,40 @@ async fn governance_register_system_subnet_handler(
 
     let gov_svc = service.governance_service().unwrap();
     let genesis_validators = gov_svc.genesis_validators();
+    let existing_registration_bytes = setu_types::SubnetId::from_hex(&req.subnet_id)
+        .ok()
+        .and_then(|subnet_id| {
+            service.get_subnet_object_finalized(
+                &setu_types::SubnetId::GOVERNANCE,
+                subnet_id.as_bytes(),
+            )
+        });
     let prepare_result = GovernanceHandler::prepare_register_system_subnet(
         req,
         timestamp,
         vlc_snapshot,
         service.validator_id(),
+        existing_registration_bytes,
         genesis_validators,
     );
     match prepare_result {
         Ok(event) => {
             let event_id = event.id.to_string();
-
-            // Eagerly register endpoint in SystemSubnetRegistry so that
-            // dispatch_to_agent() works immediately without waiting for CF
-            // finalization (finalization_tx.send is not yet wired up).
-            if let setu_types::event::EventPayload::Governance(ref payload) = event.payload {
-                if let setu_types::governance::GovernanceAction::RegisterSystemSubnet(ref reg) = payload.action {
-                    use crate::governance::service::{SystemSubnetConfig, ConfigSource};
-                    gov_svc.register_system_endpoint(
-                        reg.subnet_id,
-                        SystemSubnetConfig {
-                            agent_endpoint: reg.agent_endpoint.clone(),
-                            callback_addr: reg.callback_addr.clone(),
-                            timeout: std::time::Duration::from_secs(
-                                reg.timeout_secs.unwrap_or(300),
-                            ),
-                            source: ConfigSource::OnChain,
-                        },
-                    );
-                }
+            let submit_response = service.add_event_to_dag(event.clone()).await;
+            if !submit_response.success {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(RegisterSystemSubnetResponse {
+                        success: false,
+                        event_id: submit_response.event_id,
+                        message: submit_response.message,
+                    }),
+                );
             }
 
             service.apply_event_state_changes_eager(
                 &setu_types::SubnetId::GOVERNANCE, &event,
             );
-            service.add_event_to_dag(event).await;
             (
                 StatusCode::OK,
                 Json(RegisterSystemSubnetResponse {
@@ -2067,6 +2203,7 @@ async fn governance_resource_params_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::governance::service::GovernanceServiceConfig;
     use setu_rpc::RegistrationHandler;
 
     fn create_test_service() -> Arc<ValidatorNetworkService> {
@@ -2082,6 +2219,75 @@ mod tests {
             batch_task_preparer,
             config,
         ))
+    }
+
+    fn create_test_service_with_governance() -> Arc<ValidatorNetworkService> {
+        let router_manager = Arc::new(RouterManager::new());
+        let task_preparer = Arc::new(TaskPreparer::new_for_testing("test-validator".to_string()));
+        let batch_task_preparer = Arc::new(BatchTaskPreparer::new_for_testing("test-validator".to_string()));
+        let config = NetworkServiceConfig::default();
+        let mut service = ValidatorNetworkService::new(
+            "test-validator".to_string(),
+            router_manager,
+            task_preparer,
+            batch_task_preparer,
+            config,
+        );
+        service.set_governance_service(Arc::new(GovernanceService::new(
+            GovernanceServiceConfig::default(),
+        )));
+        Arc::new(service)
+    }
+
+    fn test_vlc_snapshot() -> setu_vlc::VLCSnapshot {
+        setu_vlc::VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1,
+        }
+    }
+
+    fn sample_system_registration() -> SystemSubnetRegistration {
+        SystemSubnetRegistration {
+            subnet_id: setu_types::SubnetId::new_system(0x20),
+            agent_endpoint: "http://oracle:8091".to_string(),
+            callback_addr: Some("127.0.0.1:8080".to_string()),
+            timeout_secs: Some(60),
+            registrant: "validator-1".to_string(),
+            public_key: "pk".to_string(),
+            signature: "sig".to_string(),
+        }
+    }
+
+    fn register_system_subnet_event(registration: SystemSubnetRegistration) -> Event {
+        let proposal_id = registration.subnet_id.to_bytes();
+        let mut event = Event::new(
+            setu_types::EventType::Governance,
+            vec![],
+            test_vlc_snapshot(),
+            "validator-1".to_string(),
+        );
+        event.payload = EventPayload::Governance(setu_types::governance::GovernancePayload {
+            proposal_id,
+            action: setu_types::governance::GovernanceAction::RegisterSystemSubnet(registration),
+        });
+        event.set_execution_result(setu_types::ExecutionResult::success());
+        event
+    }
+
+    fn commit_registration_to_governance_smt(
+        service: &ValidatorNetworkService,
+        registration: &SystemSubnetRegistration,
+    ) {
+        let value = serde_json::to_vec(registration).unwrap();
+        let change = setu_types::StateChange::insert(
+            format!("oid:{}", hex::encode(registration.subnet_id.as_bytes())),
+            value,
+        );
+        let shared = service.batch_task_preparer.merkle_state_provider().shared_state_manager();
+        let mut gsm = shared.lock_write();
+        gsm.apply_state_change(setu_types::SubnetId::GOVERNANCE, &change);
+        shared.publish_snapshot(&gsm);
     }
 
     #[tokio::test]
@@ -2129,6 +2335,22 @@ mod tests {
 
         assert!(response.success);
         assert_eq!(service.validator_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_event_to_dag_surfaces_quick_check_failure() {
+        let service = create_test_service();
+        let event = Event::new(
+            setu_types::EventType::System,
+            vec![],
+            test_vlc_snapshot(),
+            "validator-1".to_string(),
+        );
+
+        let response = service.add_event_to_dag(event).await;
+
+        assert!(!response.success);
+        assert!(response.message.contains("Quick check failed"));
     }
 
     #[test]
@@ -2202,6 +2424,77 @@ mod tests {
             Some(setu_api::OnChainOutcome::StaleRead { ref cf_id, .. }) if cf_id == "cf-1"
         ));
         assert!(service.get_subnet_info("subnet-stale").is_none());
+    }
+
+    #[test]
+    fn live_governance_projection_skips_non_applied_registration() {
+        let service = create_test_service_with_governance();
+        let registration = sample_system_registration();
+        let event = register_system_subnet_event(registration.clone());
+
+        service.execution_outcomes.insert(
+            event.id.clone(),
+            ExecutionOutcome::StaleRead {
+                cf_id: "cf-1".to_string(),
+                conflicting_object: "oid:abc".to_string(),
+                retry_hint: "retry".to_string(),
+            },
+        );
+        service.apply_live_finalized_side_effects(&event);
+
+        let governance = service.governance_service().unwrap();
+        assert!(governance.resolve_endpoint(&registration.subnet_id).is_none());
+    }
+
+    #[test]
+    fn live_governance_projection_registers_applied_registration() {
+        let service = create_test_service_with_governance();
+        let registration = sample_system_registration();
+        let event = register_system_subnet_event(registration.clone());
+
+        service.execution_outcomes.insert(
+            event.id.clone(),
+            ExecutionOutcome::Applied {
+                cf_id: "cf-1".to_string(),
+            },
+        );
+        service.apply_live_finalized_side_effects(&event);
+
+        let governance = service.governance_service().unwrap();
+        let config = governance.resolve_endpoint(&registration.subnet_id).unwrap();
+        assert_eq!(config.agent_endpoint, registration.agent_endpoint);
+        assert_eq!(config.callback_addr, registration.callback_addr);
+        assert_eq!(config.timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn replay_register_system_subnet_requires_smt_match() {
+        let service = create_test_service_with_governance();
+        let registration = sample_system_registration();
+        let event = register_system_subnet_event(registration.clone());
+
+        let missing = service.apply_replay_event(&event);
+        assert!(matches!(missing, crate::dag_replay::ReplayAction::Skipped));
+        let governance = service.governance_service().unwrap();
+        assert!(governance.resolve_endpoint(&registration.subnet_id).is_none());
+
+        let mut mismatched = registration.clone();
+        mismatched.agent_endpoint = "http://other:8091".to_string();
+        commit_registration_to_governance_smt(&service, &mismatched);
+        let mismatch = service.apply_replay_event(&event);
+        assert!(matches!(mismatch, crate::dag_replay::ReplayAction::Skipped));
+        assert!(governance.resolve_endpoint(&registration.subnet_id).is_none());
+
+        commit_registration_to_governance_smt(&service, &registration);
+        let applied = service.apply_replay_event(&event);
+        assert!(matches!(
+            applied,
+            crate::dag_replay::ReplayAction::Applied(
+                crate::dag_replay::ReplayKind::SystemSubnetRegister
+            )
+        ));
+        let config = governance.resolve_endpoint(&registration.subnet_id).unwrap();
+        assert_eq!(config.agent_endpoint, registration.agent_endpoint);
     }
 
     /// F2 regression: startup query projection must not run live side effects.

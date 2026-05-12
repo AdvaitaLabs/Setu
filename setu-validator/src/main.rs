@@ -745,10 +745,24 @@ async fn main() -> anyhow::Result<()> {
         let callback_addr = std::env::var("VALIDATOR_CALLBACK_ADDR")
             .unwrap_or_else(|_| config.http_addr.to_string());
 
-        let gov_config = GovernanceServiceConfig {
+        let mut gov_config = GovernanceServiceConfig {
             callback_addr,
             ..Default::default()
         };
+        if let Ok(raw_timeout) = std::env::var("GOVERNANCE_TIMEOUT_SECS") {
+            match raw_timeout.parse::<u64>() {
+                Ok(0) => warn!("GOVERNANCE_TIMEOUT_SECS=0 ignored; keeping default governance timeout"),
+                Ok(timeout_secs) => {
+                    gov_config.timeout = Duration::from_secs(timeout_secs);
+                    info!(timeout_secs, "Governance timeout override applied");
+                }
+                Err(e) => warn!(
+                    value = %raw_timeout,
+                    error = %e,
+                    "Invalid GOVERNANCE_TIMEOUT_SECS; keeping default governance timeout"
+                ),
+            }
+        }
         let genesis_validators = match &genesis_result {
             Ok(gc) => gc.validators.clone(),
             Err(_) => Vec::new(),
@@ -981,56 +995,7 @@ async fn main() -> anyhow::Result<()> {
     // Phase 3.5: Governance Background Tasks
     // ========================================
     {
-        // Task A: subscribe_finalization → proposal_tracker
-        let gov_svc_tracker = Arc::clone(&governance_service);
-        let mut finalization_rx = consensus_validator.subscribe_finalization();
-        let tracker_events = Arc::clone(&network_service.events_map());
-        let _governance_tracker_handle = tokio::spawn(async move {
-            loop {
-                match finalization_rx.recv().await {
-                    Ok(cf) => {
-                        for event_id in &cf.anchor.event_ids {
-                            let event_id_str = event_id.to_string();
-                            if let Some(event) = tracker_events.get(&event_id_str) {
-                                if let setu_types::event::EventPayload::Governance(payload) = &event.payload {
-                                    match &payload.action {
-                                        setu_types::governance::GovernanceAction::Propose(_) => {
-                                            gov_svc_tracker.track_proposal(
-                                                payload.proposal_id,
-                                                event.timestamp,
-                                            );
-                                        }
-                                        setu_types::governance::GovernanceAction::Execute(_) => {
-                                            gov_svc_tracker.untrack_proposal(&payload.proposal_id);
-                                        }
-                                        setu_types::governance::GovernanceAction::RegisterSystemSubnet(reg) => {
-                                            // Side effect: update SystemSubnetRegistry
-                                            use setu_validator::governance::service::{SystemSubnetConfig, ConfigSource};
-                                            gov_svc_tracker.register_system_endpoint(
-                                                reg.subnet_id,
-                                                SystemSubnetConfig {
-                                                    agent_endpoint: reg.agent_endpoint.clone(),
-                                                    callback_addr: reg.callback_addr.clone(),
-                                                    timeout: std::time::Duration::from_secs(
-                                                        reg.timeout_secs.unwrap_or(300),
-                                                    ),
-                                                    source: ConfigSource::OnChain,
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Governance tracker lagged {n} CFs");
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        info!("✓ Governance finalization tracker started");
+        info!("✓ Governance finalized side effects handled by HTTP projector");
 
         // Task B: poll Agent results + timeout detection (every 10s)
         let gov_svc_poll = Arc::clone(&governance_service);
@@ -1098,22 +1063,32 @@ async fn main() -> anyhow::Result<()> {
                                     resource_params.as_ref(),
                                 )
                             {
-                                poll_network_svc.apply_event_state_changes_eager(
-                                    &setu_types::SubnetId::GOVERNANCE, &event,
-                                );
-                                poll_network_svc.add_event_to_dag(event).await;
-                                gov_svc_poll.record_decided(
-                                    pending.proposal_id,
-                                    setu_types::governance::GovernanceDecision {
+                                let submit_response = poll_network_svc.add_event_to_dag(event.clone()).await;
+                                if submit_response.success {
+                                    let timeout_decision = setu_types::governance::GovernanceDecision {
                                         approved: false,
                                         reasoning: "Proposal timed out".into(),
                                         conditions: vec![],
-                                    },
-                                );
-                                info!(
-                                    proposal_id = %hex::encode(pending.proposal_id),
-                                    "Governance proposal timed out, rejected"
-                                );
+                                    };
+                                    gov_svc_poll.remove_pending(&pending.proposal_id);
+                                    gov_svc_poll.record_decided(
+                                        pending.proposal_id,
+                                        timeout_decision,
+                                    );
+                                    poll_network_svc.apply_event_state_changes_eager(
+                                        &setu_types::SubnetId::GOVERNANCE, &event,
+                                    );
+                                    info!(
+                                        proposal_id = %hex::encode(pending.proposal_id),
+                                        "Governance proposal timed out, rejected"
+                                    );
+                                } else {
+                                    warn!(
+                                        proposal_id = %hex::encode(pending.proposal_id),
+                                        error = %submit_response.message,
+                                        "Governance timeout execute submission failed"
+                                    );
+                                }
                             }
                         }
                         continue;
@@ -1122,8 +1097,6 @@ async fn main() -> anyhow::Result<()> {
                     // Poll Agent for result
                     match gov_svc_poll.poll_agent_result(&setu_types::SubnetId::GOVERNANCE, pending.proposal_id).await {
                         Ok(Some(decision)) => {
-                            // Record decision before it's consumed by prepare_execute
-                            gov_svc_poll.record_decided(pending.proposal_id, decision.clone());
                             if let Some(proposal) = resolve_proposal(&poll_network_svc, &pending) {
                                 let vlc_time = poll_network_svc.get_vlc_time();
                                 let vlc_snapshot = setu_vlc::VLCSnapshot {
@@ -1143,7 +1116,7 @@ async fn main() -> anyhow::Result<()> {
                                         &gov_svc_poll,
                                         pending.proposal_id,
                                         pending.callback_token,
-                                        decision,
+                                        decision.clone(),
                                         ts,
                                         vlc_snapshot,
                                         &proposal,
@@ -1151,14 +1124,24 @@ async fn main() -> anyhow::Result<()> {
                                         resource_params.as_ref(),
                                     )
                                 {
-                                    poll_network_svc.apply_event_state_changes_eager(
-                                        &setu_types::SubnetId::GOVERNANCE, &event,
-                                    );
-                                    poll_network_svc.add_event_to_dag(event).await;
-                                    info!(
-                                        proposal_id = %hex::encode(pending.proposal_id),
-                                        "Governance decision received via polling"
-                                    );
+                                    let submit_response = poll_network_svc.add_event_to_dag(event.clone()).await;
+                                    if submit_response.success {
+                                        gov_svc_poll.remove_pending(&pending.proposal_id);
+                                        gov_svc_poll.record_decided(pending.proposal_id, decision);
+                                        poll_network_svc.apply_event_state_changes_eager(
+                                            &setu_types::SubnetId::GOVERNANCE, &event,
+                                        );
+                                        info!(
+                                            proposal_id = %hex::encode(pending.proposal_id),
+                                            "Governance decision received via polling"
+                                        );
+                                    } else {
+                                        warn!(
+                                            proposal_id = %hex::encode(pending.proposal_id),
+                                            error = %submit_response.message,
+                                            "Governance decision submission failed"
+                                        );
+                                    }
                                 }
                             }
                         }
