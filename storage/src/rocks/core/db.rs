@@ -268,7 +268,15 @@ impl SetuDB {
         impl Iterator<Item = std::result::Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>> + '_,
     > {
         let cf_handle = self.cf_handle(cf)?;
-        Ok(self.db.prefix_iterator_cf(cf_handle, prefix))
+        let prefix_owned = prefix.to_vec();
+
+        Ok(self
+            .db
+            .prefix_iterator_cf(cf_handle, prefix)
+            .take_while(move |result| match result {
+                Ok((k, _)) => k.starts_with(&prefix_owned),
+                Err(_) => false,
+            }))
     }
 
     /// Write a batch atomically
@@ -490,5 +498,26 @@ mod tests {
 
         assert_eq!(values.len(), 5);
         assert!(values.iter().all(|v| v.is_some()));
+    }
+
+    #[test]
+    fn test_raw_prefix_iterator_stops_at_prefix_boundary() {
+        let (db, _temp) = setup_test_db();
+        let value = TestValue {
+            name: "prefix".to_string(),
+            age: 1,
+        };
+
+        db.put_raw(ColumnFamily::Events, b"depth:abc", &value).unwrap();
+        db.put_raw(ColumnFamily::Events, b"depthidx:abc", &value).unwrap();
+        db.put_raw(ColumnFamily::Events, b"event:abc", &value).unwrap();
+
+        let keys: Vec<Vec<u8>> = db
+            .prefix_iterator(ColumnFamily::Events, b"depth:")
+            .unwrap()
+            .map(|item| item.unwrap().0.to_vec())
+            .collect();
+
+        assert_eq!(keys, vec![b"depth:abc".to_vec()]);
     }
 }

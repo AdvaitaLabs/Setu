@@ -963,4 +963,18 @@ mod tests {
         let anchors = store.list_anchors(&subnet_id, 15, 45).unwrap();
         assert_eq!(anchors, vec![20, 30, 40]);
     }
+
+    #[test]
+    fn test_list_registered_subnets_ignores_last_anchor_metadata() {
+        let (store, _temp_dir) = create_test_store();
+        let registered = test_subnet(0x11);
+        let anchor_only = test_subnet(0x22);
+
+        store.register_subnet(&registered).unwrap();
+        store.set_last_anchor(&anchor_only, 99).unwrap();
+
+        let subnets = store.list_registered_subnets().unwrap();
+        assert_eq!(subnets, vec![registered]);
+        assert!(!subnets.contains(&anchor_only));
+    }
 }

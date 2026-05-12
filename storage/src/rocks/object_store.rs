@@ -404,24 +404,19 @@ impl RocksObjectStore {
     pub fn clear_and_rebuild_coin_type_index(&self) -> SetuResult<RebuildIndexResult> {
         info!("Starting clear and rebuild of CoinsByOwnerAndType index");
         
-        // Clear existing index by iterating and deleting
-        // Note: RocksDB doesn't have a direct "clear column family" API,
-        // so we iterate and delete, or we could drop and recreate the CF
-        let iter = self.db.iter_values::<Coin>(ColumnFamily::Coins)
+        let iter = self.db.prefix_iterator(ColumnFamily::CoinsByOwnerAndType, b"")
             .map_err(|e| {
-                error!(error = %e, "Failed to create coin iterator for index clear");
+                error!(error = %e, "Failed to create owner+type index iterator for clear");
                 SetuError::StorageError(e.to_string())
             })?;
-        
-        // Collect all unique (owner, coin_type) keys to clear
-        let mut keys_to_clear = std::collections::HashSet::new();
-        for coin_result in iter {
-            if let Ok(coin) = coin_result {
-                if let Some(owner) = &coin.metadata.owner {
-                    let key = Self::make_owner_cointype_key(owner, &coin.data.coin_type);
-                    keys_to_clear.insert(key);
-                }
-            }
+
+        let mut keys_to_clear = Vec::new();
+        for item in iter {
+            let (key, _) = item.map_err(|e| {
+                error!(error = %e, "Failed to read owner+type index key during clear");
+                SetuError::StorageError(e.to_string())
+            })?;
+            keys_to_clear.push(key.to_vec());
         }
         
         let keys_count = keys_to_clear.len();
@@ -1009,5 +1004,42 @@ mod tests {
         
         let flux_coins = store.get_coins_by_owner_and_type(&alice, &CoinType::new("WETH")).unwrap();
         assert_eq!(flux_coins.len(), 1);
+    }
+
+    #[test]
+    fn test_clear_and_rebuild_coin_type_index_removes_orphan_keys() {
+        let (store, _temp) = setup_test_store();
+        let alice = Address::from_str_id("alice");
+        let bob = Address::from_str_id("bob");
+        let usdc = CoinType::new("USDC");
+        let coin = Coin::new_with_type(alice, 1000, usdc.clone());
+        let coin_id = coin.metadata.id;
+        let stale_key = RocksObjectStore::make_owner_cointype_key(&bob, &usdc);
+
+        store.store_coin(&coin).unwrap();
+        store
+            .db
+            .put_raw(ColumnFamily::CoinsByOwnerAndType, &stale_key, &vec![coin_id])
+            .unwrap();
+
+        let polluted = store.get_coins_by_owner_and_type(&bob, &usdc).unwrap();
+        assert_eq!(polluted.len(), 1);
+        assert_eq!(polluted[0].metadata.id, coin_id);
+
+        let result = store.clear_and_rebuild_coin_type_index().unwrap();
+        assert_eq!(result.total(), 1);
+        assert!(result.is_success());
+
+        let stale_entry: Option<Vec<ObjectId>> = store
+            .db
+            .get_raw(ColumnFamily::CoinsByOwnerAndType, &stale_key)
+            .unwrap();
+        assert!(stale_entry.is_none());
+
+        let bob_usdc = store.get_coins_by_owner_and_type(&bob, &usdc).unwrap();
+        assert!(bob_usdc.is_empty());
+        let alice_usdc = store.get_coins_by_owner_and_type(&alice, &usdc).unwrap();
+        assert_eq!(alice_usdc.len(), 1);
+        assert_eq!(alice_usdc[0].metadata.id, coin_id);
     }
 }

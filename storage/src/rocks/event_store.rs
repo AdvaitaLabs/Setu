@@ -125,6 +125,19 @@ impl RocksDBEventStore {
         prefix
     }
 
+    fn get_indexed_event_for_replay(&self, event_id: &EventId) -> SetuResult<Event> {
+        let event_key = Self::event_key(event_id);
+        self.db
+            .get_raw::<Event>(ColumnFamily::Events, &event_key)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?
+            .ok_or_else(|| {
+                SetuError::StorageError(format!(
+                    "Depth index references missing event body: {}",
+                    event_id
+                ))
+            })
+    }
+
     // =========================================================================
     // Core Storage Operations
     // =========================================================================
@@ -656,9 +669,8 @@ impl EventStoreBackend for RocksDBEventStore {
                     Some(id) if !id.is_empty() => id.to_string(),
                     _ => continue,
                 };
-                if let Some(event) = self.get(&event_id).await {
-                    results.push((event, depth));
-                }
+                let event = self.get_indexed_event_for_replay(&event_id)?;
+                results.push((event, depth));
             }
         }
 
@@ -678,12 +690,19 @@ impl EventStoreBackend for RocksDBEventStore {
                     Ok(id) => id,
                     Err(_) => continue,
                 };
-                if let Some(depth) = self.get_depth(&event_id).await {
-                    if depth >= min_depth && depth <= max_depth {
-                        if let Some(event) = self.get(&event_id).await {
-                            results.push((event, depth));
-                        }
-                    }
+                let depth = self
+                    .db
+                    .get_raw::<u64>(ColumnFamily::Events, &key)
+                    .map_err(|e| SetuError::StorageError(e.to_string()))?
+                    .ok_or_else(|| {
+                        SetuError::StorageError(format!(
+                            "Depth key disappeared during replay scan: {}",
+                            event_id
+                        ))
+                    })?;
+                if depth >= min_depth && depth <= max_depth {
+                    let event = self.get_indexed_event_for_replay(&event_id)?;
+                    results.push((event, depth));
                 }
             }
         }
@@ -735,5 +754,87 @@ impl EventStoreBackend for RocksDBEventStore {
         }
 
         max_depth
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_put_bytes(db: &SetuDB, cf: ColumnFamily, key: &[u8], value: &[u8]) {
+        let cf_handle = db.inner().cf_handle(cf.name()).expect("column family must exist");
+        db.inner().put_cf(cf_handle, key, value).expect("raw put must succeed");
+    }
+
+    fn test_event(creator: &str) -> Event {
+        Event::new(
+            setu_types::EventType::System,
+            Vec::new(),
+            setu_types::VLCSnapshot::new(),
+            creator.to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn depth_range_replay_errors_on_corrupt_event_body() {
+        let temp_dir = tempfile::tempdir().expect("temp dir must be created");
+        let store = RocksDBEventStore::new(
+            SetuDB::open_default(temp_dir.path()).expect("test db must open"),
+        );
+        let event = test_event("corrupt-event-owner");
+        let event_id = event.id.clone();
+
+        store
+            .store_with_depth(event, 42)
+            .await
+            .expect("event with depth must store");
+
+        raw_put_bytes(
+            store.db(),
+            ColumnFamily::Events,
+            &RocksDBEventStore::event_key(&event_id),
+            b"not-a-bcs-event",
+        );
+
+        let error = store
+            .get_events_by_depth_range(42, 42)
+            .await
+            .expect_err("corrupt indexed event body must fail replay");
+        assert!(
+            error.to_string().contains("deserialize")
+                || error.to_string().contains("invalid")
+                || error.to_string().contains("unexpected"),
+            "unexpected error: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn depth_range_replay_errors_on_missing_indexed_event_body() {
+        let temp_dir = tempfile::tempdir().expect("temp dir must be created");
+        let store = RocksDBEventStore::new(
+            SetuDB::open_default(temp_dir.path()).expect("test db must open"),
+        );
+        let event = test_event("missing-event-owner");
+        let event_id = event.id.clone();
+
+        store
+            .store_with_depth(event, 43)
+            .await
+            .expect("event with depth must store");
+        store
+            .db()
+            .delete_raw(ColumnFamily::Events, &RocksDBEventStore::event_key(&event_id))
+            .expect("event body delete must succeed");
+
+        let error = store
+            .get_events_by_depth_range(43, 43)
+            .await
+            .expect_err("missing indexed event body must fail replay");
+        assert!(
+            error.to_string().contains("missing event body"),
+            "unexpected error: {}",
+            error
+        );
     }
 }
