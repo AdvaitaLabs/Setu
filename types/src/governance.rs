@@ -57,14 +57,45 @@ pub struct SystemSubnetRegistration {
 impl SystemSubnetRegistration {
     /// Deterministic signing message (domain-separated, same pattern as CfVote).
     ///
-    /// Format: `SETU_REGISTER_SYSTEM_SUBNET_V1 || subnet_id(32B) || agent_endpoint || registrant`
+    /// Format: `SETU_REGISTER_SYSTEM_SUBNET_V2 || subnet_id(32B) ||
+    /// len(agent_endpoint) || agent_endpoint || callback_addr option ||
+    /// timeout_secs option || len(registrant) || registrant ||
+    /// len(public_key) || public_key`.
     pub fn signing_message(&self) -> Vec<u8> {
         let mut msg = Vec::new();
-        msg.extend_from_slice(b"SETU_REGISTER_SYSTEM_SUBNET_V1");
+        msg.extend_from_slice(b"SETU_REGISTER_SYSTEM_SUBNET_V2");
         msg.extend_from_slice(&self.subnet_id.to_bytes());
-        msg.extend_from_slice(self.agent_endpoint.as_bytes());
-        msg.extend_from_slice(self.registrant.as_bytes());
+        Self::extend_len_prefixed(&mut msg, self.agent_endpoint.as_bytes());
+        Self::extend_optional_str(&mut msg, self.callback_addr.as_deref());
+        Self::extend_optional_u64(&mut msg, self.timeout_secs);
+        Self::extend_len_prefixed(&mut msg, self.registrant.as_bytes());
+        Self::extend_len_prefixed(&mut msg, self.public_key.as_bytes());
         msg
+    }
+
+    fn extend_len_prefixed(msg: &mut Vec<u8>, bytes: &[u8]) {
+        msg.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        msg.extend_from_slice(bytes);
+    }
+
+    fn extend_optional_str(msg: &mut Vec<u8>, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                msg.push(1);
+                Self::extend_len_prefixed(msg, value.as_bytes());
+            }
+            None => msg.push(0),
+        }
+    }
+
+    fn extend_optional_u64(msg: &mut Vec<u8>, value: Option<u64>) {
+        match value {
+            Some(value) => {
+                msg.push(1);
+                msg.extend_from_slice(&value.to_be_bytes());
+            }
+            None => msg.push(0),
+        }
     }
 
     /// Sign the registration with a private key (Ed25519).
@@ -328,6 +359,39 @@ mod tests {
         // Tamper with endpoint → verification fails
         reg.agent_endpoint = "http://evil:9999".to_string();
         assert!(!reg.verify_signature(&pk_bytes));
+    }
+
+    #[test]
+    fn test_system_subnet_registration_signature_binds_runtime_fields() {
+        use ed25519_dalek::SigningKey;
+
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let pk_hex = hex::encode(signing_key.verifying_key().as_bytes());
+        let pk_bytes = signing_key.verifying_key().as_bytes().to_vec();
+
+        let mut reg = SystemSubnetRegistration {
+            subnet_id: crate::SubnetId::new_system(0x20),
+            agent_endpoint: "http://oracle:8091".to_string(),
+            callback_addr: Some("10.0.1.5:8080".to_string()),
+            timeout_secs: Some(60),
+            registrant: "validator-1".to_string(),
+            public_key: pk_hex,
+            signature: String::new(),
+        };
+        reg.sign(&[42u8; 32]).unwrap();
+        assert!(reg.verify_signature(&pk_bytes));
+
+        let mut changed_callback = reg.clone();
+        changed_callback.callback_addr = Some("10.0.9.9:8080".to_string());
+        assert!(!changed_callback.verify_signature(&pk_bytes));
+
+        let mut changed_timeout = reg.clone();
+        changed_timeout.timeout_secs = Some(120);
+        assert!(!changed_timeout.verify_signature(&pk_bytes));
+
+        let mut changed_public_key = reg.clone();
+        changed_public_key.public_key = hex::encode([7u8; 32]);
+        assert!(!changed_public_key.verify_signature(&pk_bytes));
     }
 
     #[test]
