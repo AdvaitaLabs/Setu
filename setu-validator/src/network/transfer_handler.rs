@@ -19,7 +19,7 @@ use super::tee_executor::TeeExecutor;
 use crate::{RouterManager, TaskPreparer, BatchTaskPreparer};
 use crate::coin_reservation::CoinReservationManager;
 use dashmap::DashMap;
-use setu_types::{Transfer, TransferType, AssignedVlc, SubnetId};
+use setu_types::{Transfer, TransferType, AssignedVlc};
 use setu_rpc::{
     GetTransferStatusResponse, ProcessingStep,
     SubmitTransferRequest, SubmitTransferResponse,
@@ -210,7 +210,7 @@ impl TransferHandler {
                 .push(transfer_id.clone());
         }
 
-        // Step 6: Execute Solver INLINE (await) → release coin → spawn consensus
+        // Step 6: Execute Solver INLINE (await) → release coin → submit consensus
         //
         // Key TPS optimization: By awaiting the Solver call here instead of spawning
         // a background task, we prevent tokio runtime starvation. Under high load,
@@ -221,23 +221,43 @@ impl TransferHandler {
         // - Coin held for ~2ms (Solver call time only)
         // - Natural backpressure (HTTP connection blocks until Solver responds)
         // - No retry storm (coin released before HTTP response)
+        // - No accepted-looking response until direct consensus submit succeeds
         if let Some(ref sid) = solver_id {
             match tee_executor.execute_solver_inline_batch(
                 &transfer_id, sid, solver_task, reservation_handles,
             ).await {
                 Ok((event, execution_time_us, events_processed, _gas_used)) => {
-                    let event_id = event.id.clone();
+                    let event_id = match tee_executor.submit_executed_event(
+                        &transfer_id,
+                        &event,
+                        execution_time_us,
+                        events_processed,
+                    ).await {
+                        Ok(event_id) => event_id,
+                        Err(e) => {
+                            let mut failed_steps = steps.clone();
+                            failed_steps.push(ProcessingStep {
+                                step: "consensus_submit".to_string(),
+                                status: "failed".to_string(),
+                                details: Some(e.clone()),
+                                timestamp: now,
+                            });
+                            return SubmitTransferResponse {
+                                success: false,
+                                message: e,
+                                transfer_id: Some(transfer_id),
+                                event_id: None,
+                                solver_id,
+                                processing_steps: failed_steps,
+                            };
+                        }
+                    };
 
-                    // Fire-and-forget: consensus + storage (no coin held)
-                    tee_executor.spawn_post_execution(
-                        transfer_id.clone(), event, execution_time_us, events_processed,
-                    );
-
-                    info!(transfer_id = %transfer_id, solver_id = ?solver_id, "Transfer executed inline, consensus spawned");
+                    info!(transfer_id = %transfer_id, solver_id = ?solver_id, "Transfer executed inline and submitted to consensus");
 
                     SubmitTransferResponse {
                         success: true,
-                        message: "Transfer executed, consensus pending".to_string(),
+                        message: "Transfer executed and accepted into consensus DAG; finality pending".to_string(),
                         transfer_id: Some(transfer_id),
                         event_id: Some(event_id),
                         solver_id,

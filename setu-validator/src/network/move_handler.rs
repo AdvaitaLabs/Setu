@@ -60,6 +60,21 @@ fn classify_upgrade_error(detail: &str) -> &'static str {
     }
 }
 
+fn ptb_no_dag_failure_response(
+    error: Option<String>,
+    code: Option<String>,
+    gas_used: Option<u64>,
+) -> setu_api::MovePtbResponse {
+    setu_api::MovePtbResponse {
+        event_id: String::new(),
+        success: false,
+        error,
+        code,
+        cap_ids: vec![],
+        gas_used,
+    }
+}
+
 /// MoveCall handler — unit struct matching TransferHandler pattern
 pub struct MoveCallHandler;
 
@@ -193,7 +208,6 @@ impl MoveCallHandler {
             &call_id, &solver_id, solver_task, vec![],
         ).await {
             Ok((result_event, execution_time_us, events_processed, _gas_used)) => {
-                let event_id = result_event.id.clone();
                 let exec_result = result_event.execution_result.as_ref();
                 let state_changes = exec_result
                     .map(|r| r.state_changes.len())
@@ -231,6 +245,31 @@ impl MoveCallHandler {
                             .collect()
                     })
                     .unwrap_or_default();
+
+                let accepted_event_id = if success {
+                    match tee_executor.submit_executed_event(
+                        &call_id,
+                        &result_event,
+                        execution_time_us,
+                        events_processed,
+                    ).await {
+                        Ok(event_id) => event_id,
+                        Err(e) => {
+                            return MoveCallResponse {
+                                event_id: String::new(),
+                                success: false,
+                                state_changes: 0,
+                                created_objects: vec![],
+                                error: Some(setu_api::stable_error(
+                                    setu_api::ERROR_CONSENSUS_STORAGE,
+                                    e,
+                                )),
+                            };
+                        }
+                    }
+                } else {
+                    String::new()
+                };
 
                 // Stage MoveCall state_changes into the speculative overlay so
                 // the same client can immediately read-your-writes from this
@@ -275,13 +314,8 @@ impl MoveCallHandler {
                     }
                 }
 
-                // Spawn consensus submission
-                tee_executor.spawn_post_execution(
-                    call_id, result_event, execution_time_us, events_processed,
-                );
-
                 info!(
-                    event_id = %event_id,
+                    event_id = %accepted_event_id,
                     state_changes,
                     created_objects = ?created_objects,
                     solver_id = %solver_id,
@@ -289,10 +323,10 @@ impl MoveCallHandler {
                 );
 
                 MoveCallResponse {
-                    event_id,
+                    event_id: accepted_event_id,
                     success,
                     state_changes,
-                    created_objects,
+                    created_objects: if success { created_objects } else { vec![] },
                     error,
                 }
             }
@@ -697,7 +731,7 @@ pub(crate) fn canonical_addr_hex(input: &str) -> String {
 mod hex_canonical_tests {
     use super::{
         canonical_addr_hex, classify_execution_error, classify_prepare_error,
-        classify_upgrade_error, MoveCallHandler,
+        classify_upgrade_error, ptb_no_dag_failure_response, MoveCallHandler,
     };
     use setu_api::MoveCallRequest;
     use setu_types::dynamic_field::DfAccessMode;
@@ -801,6 +835,29 @@ mod hex_canonical_tests {
             setu_api::ERROR_PACKAGE_UPGRADE,
         );
     }
+
+    #[test]
+    fn ptb_no_dag_failure_response_has_no_event_id() {
+        let response = ptb_no_dag_failure_response(
+            Some(setu_api::stable_error(
+                setu_api::ERROR_PTB_AUTH,
+                "PTB execution failed before DAG submission",
+            )),
+            Some(setu_api::ERROR_PTB_AUTH.to_string()),
+            Some(42),
+        );
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, "");
+        assert_eq!(response.code.as_deref(), Some(setu_api::ERROR_PTB_AUTH));
+        assert_eq!(response.gas_used, Some(42));
+        assert!(response.cap_ids.is_empty());
+        assert!(response
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains(setu_api::ERROR_PTB_AUTH));
+    }
 }
 
 /// PTB handler — unit struct matching MoveCallHandler pattern.
@@ -810,8 +867,8 @@ mod hex_canonical_tests {
 ///         → TaskPreparer.prepare_move_ptb_task
 ///         → RouterManager.route_any
 ///         → TeeExecutor.execute_solver_inline_batch
+///         → TeeExecutor.submit_executed_event
 ///         → stage_overlay (RYW)
-///         → spawn_post_execution (consensus)
 ///
 /// EventType reuse (not a new variant): see
 /// `docs/feat/move-vm-phase9-ptb-event-wire/design.md` §4.
@@ -1063,15 +1120,30 @@ impl MovePtbHandler {
                         "PTB result quarantined: not staging overlay, not submitting to DAG"
                     );
 
-                    return setu_api::MovePtbResponse {
-                        event_id,
-                        success: false,
-                        error,
-                        code,
-                        cap_ids,
-                        gas_used: Some(gas_used),
-                    };
+                    return ptb_no_dag_failure_response(error, code, Some(gas_used));
                 }
+
+                let accepted_event_id = match tee_executor.submit_executed_event(
+                    &call_id,
+                    &result_event,
+                    execution_time_us,
+                    events_processed,
+                ).await {
+                    Ok(event_id) => event_id,
+                    Err(e) => {
+                        return setu_api::MovePtbResponse {
+                            event_id: String::new(),
+                            success: false,
+                            error: Some(setu_api::stable_error(
+                                setu_api::ERROR_CONSENSUS_STORAGE,
+                                e,
+                            )),
+                            code: Some(setu_api::ERROR_CONSENSUS_STORAGE.to_string()),
+                            cap_ids: vec![],
+                            gas_used: Some(gas_used),
+                        };
+                    }
+                };
 
                 // Stage to speculative overlay so the client can immediately
                 // read-your-writes from this validator. CF finalize will
@@ -1091,18 +1163,14 @@ impl MovePtbHandler {
                     }
                 }
 
-                tee_executor.spawn_post_execution(
-                    call_id, result_event, execution_time_us, events_processed,
-                );
-
                 info!(
-                    event_id = %event_id,
+                    event_id = %accepted_event_id,
                     solver_id = %solver_id,
                     "PTB executed"
                 );
 
                 setu_api::MovePtbResponse {
-                    event_id,
+                    event_id: accepted_event_id,
                     success: final_success,
                     error,
                     code,

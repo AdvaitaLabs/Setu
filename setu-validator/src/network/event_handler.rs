@@ -51,7 +51,7 @@ impl EventHandler {
             return SubmitEventResponse {
                 success: false,
                 message: format!("Quick check failed: {}", e),
-                event_id: Some(event.id),
+                event_id: None,
                 vlc_time: None,
             };
         }
@@ -105,10 +105,11 @@ impl EventHandler {
                 }
                 Err(e) => {
                     error!(event_id = %event_id, error = %e, "Failed to submit event to consensus");
+                    pending_events.write().retain(|id| id != &event_id);
                     return SubmitEventResponse {
                         success: false,
                         message: format!("Consensus submission failed: {}", e),
-                        event_id: Some(event_id),
+                        event_id: None,
                         vlc_time: None,
                     };
                 }
@@ -230,7 +231,7 @@ impl EventHandler {
             return SubmitEventResponse {
                 success: false,
                 message: format!("Quick check failed: {}", e),
-                event_id: Some(event_id),
+                event_id: None,
                 vlc_time: None,
             };
         }
@@ -255,7 +256,7 @@ impl EventHandler {
                     return SubmitEventResponse {
                         success: false,
                         message: format!("Consensus submission failed: {}", e),
-                        event_id: Some(event_id),
+                        event_id: None,
                         vlc_time: None,
                     };
                 }

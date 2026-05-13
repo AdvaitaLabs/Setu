@@ -265,7 +265,9 @@ pub struct MovePtbRequest {
 ///                          when the validator can classify it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MovePtbResponse {
-    /// Event ID of the submitted event (empty when wire validation failed).
+    /// Event ID of the DAG-accepted event. Empty for wire, preparation,
+    /// execution, quarantine, or consensus-submit failures that did not enter
+    /// the DAG.
     pub event_id: String,
     /// Whether execution succeeded.
     pub success: bool,

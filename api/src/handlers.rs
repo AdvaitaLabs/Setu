@@ -524,7 +524,7 @@ pub async fn http_submit_event<S: ValidatorService>(
             Json(SubmitEventResponse {
                 success: false,
                 message,
-                event_id: Some(request.event.id),
+                event_id: None,
                 vlc_time: None,
             }),
         ));

@@ -145,6 +145,9 @@ pub struct ValidatorNetworkService {
     /// `Arc` with `GlobalStateManager::set_version_watcher`. `None` until
     /// then → `wait_move_object_min_version` returns `Unavailable`.
     version_watcher: parking_lot::RwLock<Option<Arc<setu_storage::WatcherRegistry>>>,
+
+    #[cfg(test)]
+    forced_add_event_response: Arc<RwLock<Option<SubmitEventResponse>>>,
 }
 
 impl ValidatorNetworkService {
@@ -227,6 +230,8 @@ impl ValidatorNetworkService {
             governance_service: None,
             execution_outcomes: Arc::new(DashMap::new()),
             version_watcher: parking_lot::RwLock::new(None),
+            #[cfg(test)]
+            forced_add_event_response: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -313,6 +318,8 @@ impl ValidatorNetworkService {
             governance_service: None,
             execution_outcomes,
             version_watcher: parking_lot::RwLock::new(None),
+            #[cfg(test)]
+            forced_add_event_response: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -734,6 +741,11 @@ impl ValidatorNetworkService {
     }
 
     pub async fn add_event_to_dag(&self, event: Event) -> SubmitEventResponse {
+        #[cfg(test)]
+        if let Some(response) = self.forced_add_event_response.write().take() {
+            return response;
+        }
+
         EventHandler::add_event_to_dag(
             &self.events,
             &self.dag_events,
@@ -741,6 +753,11 @@ impl ValidatorNetworkService {
             event,
         )
         .await
+    }
+
+    #[cfg(test)]
+    pub fn force_next_add_event_to_dag_response(&self, response: SubmitEventResponse) {
+        *self.forced_add_event_response.write() = Some(response);
     }
 
     // ============================================
@@ -800,7 +817,19 @@ impl ValidatorNetworkService {
 
         // If successful, submit event to DAG (same as SubnetRegister flow)
         if let Some(event) = event {
-            self.add_event_to_dag(event).await;
+            let submit_response = self.add_event_to_dag(event).await;
+            if !submit_response.success {
+                return setu_api::MovePublishResponse {
+                    event_id: String::new(),
+                    module_count: response.module_count,
+                    success: false,
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_CONSENSUS_STORAGE,
+                        submit_response.message,
+                    )),
+                    package_addr: None,
+                };
+            }
         }
 
         response
@@ -1659,7 +1688,20 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
             &executor, vlc_time, request,
         ).await;
         if let Some(event) = event {
-            self.add_event_to_dag(event).await;
+            let submit_response = self.add_event_to_dag(event).await;
+            if !submit_response.success {
+                return setu_api::MoveUpgradeResponse {
+                    event_id: String::new(),
+                    module_count: response.module_count,
+                    new_package_addr: None,
+                    new_version: None,
+                    success: false,
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_CONSENSUS_STORAGE,
+                        submit_response.message,
+                    )),
+                };
+            }
         }
         response
     }
@@ -2204,7 +2246,7 @@ async fn governance_resource_params_handler(
 mod tests {
     use super::*;
     use crate::governance::service::GovernanceServiceConfig;
-    use setu_rpc::RegistrationHandler;
+    use setu_rpc::{RegistrationHandler, UserRpcHandler};
 
     fn create_test_service() -> Arc<ValidatorNetworkService> {
         let router_manager = Arc::new(RouterManager::new());
@@ -2245,6 +2287,149 @@ mod tests {
             logical_time: 1,
             physical_time: 1,
         }
+    }
+
+    fn forced_submit_failure() -> SubmitEventResponse {
+        SubmitEventResponse {
+            success: false,
+            message: "forced submit failure".to_string(),
+            event_id: Some("forced-event-id".to_string()),
+            vlc_time: None,
+        }
+    }
+
+    fn signed_fields() -> (String, Vec<u8>, String) {
+        let keypair = setu_keys::SetuKeyPair::generate(setu_keys::SignatureScheme::ED25519);
+        let message = "setu test write".to_string();
+        let signature = keypair.sign(message.as_bytes());
+        let mut signature_bytes = vec![signature.scheme().flag()];
+        signature_bytes.extend(signature.as_bytes());
+        (keypair.address().to_hex(), signature_bytes, keypair.public().encode_base64())
+    }
+
+    fn now_millis() -> u64 {
+        current_timestamp_millis()
+    }
+
+    fn sample_solver_request(solver_id: &str) -> setu_rpc::RegisterSolverRequest {
+        setu_rpc::RegisterSolverRequest {
+            solver_id: solver_id.to_string(),
+            address: "127.0.0.1".to_string(),
+            port: 9001,
+            account_address: "0xtest".to_string(),
+            public_key: vec![],
+            signature: vec![],
+            capacity: 100,
+            shard_id: Some("shard-0".to_string()),
+            assigned_shard: None,
+            resources: vec!["ETH".to_string()],
+            permitted_subnets: vec![],
+        }
+    }
+
+    fn sample_validator_request(validator_id: &str) -> setu_rpc::RegisterValidatorRequest {
+        setu_rpc::RegisterValidatorRequest {
+            validator_id: validator_id.to_string(),
+            address: "127.0.0.1".to_string(),
+            port: 9002,
+            account_address: "0xtest".to_string(),
+            public_key: vec![],
+            signature: vec![],
+            stake_amount: 1000,
+            commission_rate: 10,
+        }
+    }
+
+    fn sample_subnet_request(subnet_id: &str) -> setu_rpc::RegisterSubnetRequest {
+        setu_rpc::RegisterSubnetRequest {
+            subnet_id: subnet_id.to_string(),
+            name: "Test Subnet".to_string(),
+            description: None,
+            owner: "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf".to_string(),
+            subnet_type: Some("app".to_string()),
+            parent_subnet_id: None,
+            max_users: None,
+            max_tps: None,
+            max_storage_bytes: None,
+            token_symbol: "TST".to_string(),
+            initial_token_supply: None,
+            token_decimals: None,
+            token_max_supply: None,
+            token_mintable: None,
+            token_burnable: None,
+            user_airdrop_amount: None,
+            assigned_solvers: vec![],
+        }
+    }
+
+    fn add_test_subnet(service: &ValidatorNetworkService, subnet_id: &str) {
+        service.add_subnet(SubnetInfo {
+            subnet_id: subnet_id.to_string(),
+            name: "Test Subnet".to_string(),
+            owner: "owner".to_string(),
+            subnet_type: "App".to_string(),
+            token_symbol: "TST".to_string(),
+            status: "active".to_string(),
+            registered_at: 1,
+        });
+    }
+
+    fn seed_membership(service: &ValidatorNetworkService, address: &str, subnet_id: &str) {
+        let membership_key = format!("user:{}:subnet:{}", address, subnet_id);
+        let membership_oid = setu_types::ObjectId::new(
+            setu_types::hash_utils::setu_hash_with_domain(
+                b"SETU_MEMBERSHIP:",
+                membership_key.as_bytes(),
+            ),
+        );
+        let value = serde_json::to_vec(&serde_json::json!({
+            "address": address,
+            "subnet_id": subnet_id,
+            "joined_at": 1u64,
+        })).expect("membership json encode");
+        let change = setu_types::StateChange::insert(
+            format!("oid:{}", hex::encode(membership_oid.as_bytes())),
+            value,
+        );
+        let shared = service.batch_task_preparer.merkle_state_provider().shared_state_manager();
+        let mut gsm = shared.lock_write();
+        gsm.apply_state_change(setu_types::SubnetId::ROOT, &change);
+        shared.publish_snapshot(&gsm);
+    }
+
+    fn make_module_bytes(addr: move_core_types::account_address::AccountAddress, name: &str) -> Vec<u8> {
+        use move_binary_format::file_format::*;
+        let mut module = empty_module();
+        module.address_identifiers[0] = addr;
+        module.identifiers[0] = move_core_types::identifier::Identifier::new(name).unwrap();
+        let mut buf = Vec::new();
+        module.serialize_with_version(move_binary_format::file_format_common::VERSION_MAX, &mut buf)
+            .expect("serialize empty module");
+        buf
+    }
+
+    fn seed_published_v0(
+        service: &ValidatorNetworkService,
+        addr: move_core_types::account_address::AccountAddress,
+        module_name: &str,
+        module_bytes: &[u8],
+    ) {
+        let addr_bytes = addr.into_bytes();
+        let setu_addr = setu_types::object::Address::new(addr_bytes);
+        let mod_key = format!("mod:{}::{}", addr.to_hex_literal(), module_name);
+        let linkage_key = format!("linkage:latest:{}", hex::encode(addr_bytes));
+        let linkage_payload = bcs::to_bytes(&(setu_addr, 0u64)).expect("bcs encode");
+        let shared = service.batch_task_preparer.merkle_state_provider().shared_state_manager();
+        let mut gsm = shared.lock_write();
+        gsm.apply_state_change(
+            setu_types::SubnetId::ROOT,
+            &setu_types::StateChange::insert(mod_key, module_bytes.to_vec()),
+        );
+        gsm.apply_state_change(
+            setu_types::SubnetId::ROOT,
+            &setu_types::StateChange::insert(linkage_key, linkage_payload),
+        );
+        shared.publish_snapshot(&gsm);
     }
 
     fn sample_system_registration() -> SystemSubnetRegistration {
@@ -2294,20 +2479,7 @@ mod tests {
     async fn test_register_solver() {
         let service = create_test_service();
         let handler = service.registration_handler();
-
-        let request = setu_rpc::RegisterSolverRequest {
-            solver_id: "solver-1".to_string(),
-            address: "127.0.0.1".to_string(),
-            port: 9001,
-            account_address: "0xtest".to_string(),
-            public_key: vec![],
-            signature: vec![],
-            capacity: 100,
-            shard_id: Some("shard-0".to_string()),
-            assigned_shard: None,
-            resources: vec!["ETH".to_string()],
-            permitted_subnets: vec![],
-        };
+        let request = sample_solver_request("solver-1");
 
         let response = handler.register_solver(request).await;
 
@@ -2319,22 +2491,217 @@ mod tests {
     async fn test_register_validator() {
         let service = create_test_service();
         let handler = service.registration_handler();
-
-        let request = setu_rpc::RegisterValidatorRequest {
-            validator_id: "validator-2".to_string(),
-            address: "127.0.0.1".to_string(),
-            port: 9002,
-            account_address: "0xtest".to_string(),
-            public_key: vec![],
-            signature: vec![],
-            stake_amount: 1000,
-            commission_rate: 10,
-        };
+        let request = sample_validator_request("validator-2");
 
         let response = handler.register_validator(request).await;
 
         assert!(response.success);
         assert_eq!(service.validator_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_solver_submit_failure_does_not_activate_solver() {
+        let service = create_test_service();
+        let handler = service.registration_handler();
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler.register_solver(sample_solver_request("solver-fail")).await;
+
+        assert!(!response.success);
+        assert_eq!(response.assigned_id, None);
+        assert!(response.message.contains("forced submit failure"));
+        assert_eq!(service.router_manager().solver_count(), 0);
+        assert!(service.get_all_solvers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn register_validator_submit_failure_does_not_activate_validator() {
+        let service = create_test_service();
+        let handler = service.registration_handler();
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler
+            .register_validator(sample_validator_request("validator-fail"))
+            .await;
+
+        assert!(!response.success);
+        assert!(response.message.contains("forced submit failure"));
+        assert_eq!(service.validator_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn register_subnet_submit_failure_does_not_activate_subnet() {
+        let service = create_test_service();
+        let handler = service.registration_handler();
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler
+            .register_subnet(sample_subnet_request("subnet-fail"))
+            .await;
+
+        assert!(!response.success);
+        assert_eq!(response.subnet_id, None);
+        assert_eq!(response.event_id, None);
+        assert!(response.message.contains("forced submit failure"));
+        assert!(service.get_subnet_info("subnet-fail").is_none());
+    }
+
+    #[tokio::test]
+    async fn user_register_submit_failure_returns_no_event_id() {
+        let service = create_test_service();
+        let handler = service.user_handler();
+        let (address, signature, public_key) = signed_fields();
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler
+            .register_user(setu_rpc::RegisterUserRequest {
+                address: address.clone(),
+                nostr_pubkey: None,
+                signature: Some(signature),
+                message: Some("setu test write".to_string()),
+                timestamp: now_millis(),
+                subnet_id: Some("subnet-0".to_string()),
+                display_name: None,
+                metadata: None,
+                invite_code: None,
+                public_key: Some(public_key),
+            })
+            .await;
+
+        assert!(!response.success);
+        assert_eq!(response.address, address);
+        assert_eq!(response.event_id, None);
+        assert_eq!(response.initial_power, 0);
+        assert!(response.message.contains("forced submit failure"));
+    }
+
+    #[tokio::test]
+    async fn update_profile_submit_failure_returns_no_event_id() {
+        let service = create_test_service();
+        let handler = service.user_handler();
+        let (address, signature, public_key) = signed_fields();
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler
+            .update_profile(setu_rpc::UpdateProfileRequest {
+                address,
+                display_name: Some("Alice".to_string()),
+                avatar_url: None,
+                bio: None,
+                attributes: None,
+                signature,
+                message: "setu test write".to_string(),
+                timestamp: now_millis(),
+                public_key: Some(public_key),
+                nostr_pubkey: None,
+            })
+            .await;
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, None);
+        assert!(response.message.contains("forced submit failure"));
+    }
+
+    #[tokio::test]
+    async fn join_subnet_submit_failure_returns_no_event_id() {
+        let service = create_test_service();
+        add_test_subnet(&service, "subnet-join-fail");
+        let handler = service.user_handler();
+        let (address, signature, public_key) = signed_fields();
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler
+            .join_subnet(setu_rpc::JoinSubnetRequest {
+                address,
+                subnet_id: "subnet-join-fail".to_string(),
+                signature,
+                message: "setu test write".to_string(),
+                timestamp: now_millis(),
+                public_key: Some(public_key),
+                nostr_pubkey: None,
+            })
+            .await;
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, None);
+        assert!(response.message.contains("forced submit failure"));
+    }
+
+    #[tokio::test]
+    async fn leave_subnet_submit_failure_returns_no_event_id() {
+        let service = create_test_service();
+        let handler = service.user_handler();
+        let (address, signature, public_key) = signed_fields();
+        seed_membership(&service, &address, "subnet-leave-fail");
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler
+            .leave_subnet(setu_rpc::LeaveSubnetRequest {
+                address,
+                subnet_id: "subnet-leave-fail".to_string(),
+                signature,
+                message: "setu test write".to_string(),
+                timestamp: now_millis(),
+                public_key: Some(public_key),
+                nostr_pubkey: None,
+            })
+            .await;
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, None);
+        assert!(response.message.contains("forced submit failure"));
+    }
+
+    #[tokio::test]
+    async fn move_publish_submit_failure_returns_consensus_storage_error() {
+        let service = create_test_service();
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+        )
+            .expect("valid address");
+        let module_hex = hex::encode(make_module_bytes(addr, "counter"));
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = service
+            .submit_move_publish(setu_api::MovePublishRequest {
+                sender: "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf".to_string(),
+                modules: vec![module_hex],
+            })
+            .await;
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, "");
+        assert_eq!(response.package_addr, None);
+        assert!(response.error.as_deref().unwrap_or("").contains(setu_api::ERROR_CONSENSUS_STORAGE));
+    }
+
+    #[tokio::test]
+    async fn move_upgrade_submit_failure_returns_consensus_storage_error() {
+        let service = create_test_service();
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal(
+            "0x2222222222222222222222222222222222222222222222222222222222222222",
+        )
+            .expect("valid address");
+        let module_bytes = make_module_bytes(addr, "counter");
+        seed_published_v0(&service, addr, "counter", &module_bytes);
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = setu_api::ValidatorService::submit_move_upgrade(
+            &*service,
+            setu_api::MoveUpgradeRequest {
+                sender: "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf".to_string(),
+                current_package: "0x2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+                modules: vec![hex::encode(module_bytes)],
+                deps: vec![],
+            },
+        )
+        .await;
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, "");
+        assert_eq!(response.new_package_addr, None);
+        assert_eq!(response.new_version, None);
+        assert!(response.error.as_deref().unwrap_or("").contains(setu_api::ERROR_CONSENSUS_STORAGE));
     }
 
     #[tokio::test]
@@ -2350,7 +2717,26 @@ mod tests {
         let response = service.add_event_to_dag(event).await;
 
         assert!(!response.success);
+        assert_eq!(response.event_id, None);
         assert!(response.message.contains("Quick check failed"));
+    }
+
+    #[tokio::test]
+    async fn submit_event_quick_check_failure_returns_no_event_id_or_pending_entry() {
+        let service = create_test_service();
+        let event = Event::new(
+            setu_types::EventType::System,
+            vec![],
+            test_vlc_snapshot(),
+            "validator-1".to_string(),
+        );
+
+        let response = service.submit_event(SubmitEventRequest { event }).await;
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, None);
+        assert!(response.message.contains("Quick check failed"));
+        assert!(service.pending_events.read().is_empty());
     }
 
     #[test]

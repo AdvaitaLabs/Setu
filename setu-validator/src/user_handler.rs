@@ -398,8 +398,7 @@ impl UserRpcHandler for ValidatorUserHandler {
         // ── Step 7: Delegate to InfraExecutor (路径 B) ──────────────
         // InfraExecutor:
         //   → RuntimeExecutor::execute_user_register()  (G11-compliant "oid:{hex}" state keys)
-        //   → apply_state_changes() to MerkleStateProvider
-        //   → returns Event with execution_result set
+        //   → returns Event with execution_result set; CF finalization applies state
         let event = match self
             .network_service
             .infra_executor()
@@ -415,7 +414,15 @@ impl UserRpcHandler for ValidatorUserHandler {
         let event_id = event.id.clone();
 
         // ── Step 8: Add event to DAG ────────────────────────────────
-        self.network_service.add_event_to_dag(event).await;
+        let submit_response = self.network_service.add_event_to_dag(event).await;
+        if !submit_response.success {
+            warn!(
+                address = %request.address,
+                message = %submit_response.message,
+                "User registration DAG submission failed"
+            );
+            return Self::reg_err(&submit_response.message, &request.address);
+        }
 
         info!(
             address = %request.address,
@@ -699,7 +706,19 @@ impl UserRpcHandler for ValidatorUserHandler {
         };
 
         let event_id = event.id.clone();
-        self.network_service.add_event_to_dag(event).await;
+        let submit_response = self.network_service.add_event_to_dag(event).await;
+        if !submit_response.success {
+            warn!(
+                address = %request.address,
+                message = %submit_response.message,
+                "Profile update DAG submission failed"
+            );
+            return UpdateProfileResponse {
+                success: false,
+                message: submit_response.message,
+                event_id: None,
+            };
+        }
 
         info!(address = %request.address, event_id = %event_id, "Profile updated");
         UpdateProfileResponse { success: true, message: "Profile updated".to_string(), event_id: Some(event_id) }
@@ -791,7 +810,20 @@ impl UserRpcHandler for ValidatorUserHandler {
         };
 
         let event_id = event.id.clone();
-        self.network_service.add_event_to_dag(event).await;
+        let submit_response = self.network_service.add_event_to_dag(event).await;
+        if !submit_response.success {
+            warn!(
+                address = %request.address,
+                subnet_id = %request.subnet_id,
+                message = %submit_response.message,
+                "Subnet join DAG submission failed"
+            );
+            return JoinSubnetResponse {
+                success: false,
+                message: submit_response.message,
+                event_id: None,
+            };
+        }
 
         info!(address = %request.address, subnet_id = %request.subnet_id, event_id = %event_id, "Joined subnet");
         JoinSubnetResponse { success: true, message: "Joined subnet".to_string(), event_id: Some(event_id) }
@@ -847,7 +879,20 @@ impl UserRpcHandler for ValidatorUserHandler {
         };
 
         let event_id = event.id.clone();
-        self.network_service.add_event_to_dag(event).await;
+        let submit_response = self.network_service.add_event_to_dag(event).await;
+        if !submit_response.success {
+            warn!(
+                address = %request.address,
+                subnet_id = %request.subnet_id,
+                message = %submit_response.message,
+                "Subnet leave DAG submission failed"
+            );
+            return LeaveSubnetResponse {
+                success: false,
+                message: submit_response.message,
+                event_id: None,
+            };
+        }
 
         info!(address = %request.address, subnet_id = %request.subnet_id, event_id = %event_id, "Left subnet");
         LeaveSubnetResponse { success: true, message: "Left subnet".to_string(), event_id: Some(event_id) }

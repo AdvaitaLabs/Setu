@@ -47,9 +47,6 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             warn!(solver_id = %request.solver_id, "Solver already registered, will update");
         }
 
-        // Create channel and register
-        let _channel = self.service.register_solver_internal(&request);
-
         // Create registration event
         let vlc_time = self.service.get_vlc_time();
         let mut vlc = setu_vlc::VectorClock::new();
@@ -94,7 +91,21 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
 
         // Add event to DAG (async to support consensus submission)
         let event_id = event.id.clone();
-        self.service.add_event_to_dag(event).await;
+        let submit_response = self.service.add_event_to_dag(event).await;
+        if !submit_response.success {
+            warn!(
+                solver_id = %request.solver_id,
+                message = %submit_response.message,
+                "Solver registration DAG submission failed"
+            );
+            return RegisterSolverResponse {
+                success: false,
+                message: submit_response.message,
+                assigned_id: None,
+            };
+        }
+
+        let _channel = self.service.register_solver_internal(&request);
 
         info!(
             solver_id = %request.solver_id,
@@ -161,7 +172,20 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             }],
         });
 
-        // Add to validators map
+        // Add event to DAG (async to support consensus submission)
+        let submit_response = self.service.add_event_to_dag(event).await;
+        if !submit_response.success {
+            warn!(
+                validator_id = %request.validator_id,
+                message = %submit_response.message,
+                "Validator registration DAG submission failed"
+            );
+            return RegisterValidatorResponse {
+                success: false,
+                message: submit_response.message,
+            };
+        }
+
         let now = current_timestamp_secs();
         let validator_info = ValidatorInfo {
             validator_id: request.validator_id.clone(),
@@ -172,7 +196,6 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         };
         self.service.add_validator(validator_info);
 
-        // Linkage: also update consensus layer (ValidatorSet + validator_count)
         if let Some(cv) = self.service.consensus_validator() {
             let peer_node_info = setu_types::NodeInfo::new_validator(
                 request.validator_id.clone(),
@@ -185,9 +208,6 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
                 request.validator_id
             );
         }
-
-        // Add event to DAG (async to support consensus submission)
-        self.service.add_event_to_dag(event).await;
 
         info!(
             validator_id = %request.validator_id,
@@ -351,7 +371,22 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
 
         let event_id = event.id.clone();
 
-        // Track subnet locally (in-memory DashMap — replayed from DAG on restart)
+        // Add event to DAG
+        let submit_response = self.service.add_event_to_dag(event).await;
+        if !submit_response.success {
+            warn!(
+                subnet_id = %request.subnet_id,
+                message = %submit_response.message,
+                "Subnet registration DAG submission failed"
+            );
+            return RegisterSubnetResponse {
+                success: false,
+                message: submit_response.message,
+                subnet_id: None,
+                event_id: None,
+            };
+        }
+
         self.service.add_subnet(SubnetInfo {
             subnet_id: request.subnet_id.clone(),
             name: request.name.clone(),
@@ -364,9 +399,6 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
                 .unwrap()
                 .as_secs(),
         });
-
-        // Add event to DAG
-        self.service.add_event_to_dag(event).await;
 
         info!(
             subnet_id = %request.subnet_id,
