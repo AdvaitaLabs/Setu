@@ -17,7 +17,6 @@ Replace <em>physical time + miners</em> with <em>verifiable work + TEE attestati
 </p>
 
 <p>
-<a href="https://github.com/AdvaitaLabs/Setu/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache_2.0-3D5AFE?style=for-the-badge" alt="License" /></a>
 <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.75+-FF6B35?style=for-the-badge&logo=rust&logoColor=white" alt="Rust" /></a>
 <a href="https://github.com/AdvaitaLabs/Setu/stargazers"><img src="https://img.shields.io/github/stars/AdvaitaLabs/Setu?style=for-the-badge&logo=github&color=FFD93D" alt="Stars" /></a>
 <a href="https://discord.gg/hetu"><img src="https://img.shields.io/badge/discord-join-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord" /></a>
