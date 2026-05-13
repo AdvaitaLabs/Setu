@@ -17,12 +17,13 @@
 //! 7. After quorum votes, the ConsensusFrame is finalized
 //! 8. Next round begins with the finalized frame as anchor
 
-use setu_types::{ConsensusConfig, ConsensusFrame, Event, EventId, SetuResult, ValidatorInfo, Vote};
-use setu_vlc::VLCSnapshot;
 use setu_storage::{EventStore, EventStoreBackend, SharedStateManager};
+use setu_types::{ConsensusConfig, ConsensusFrame, Event, EventId, SetuResult, Vote};
+use setu_vlc::VLCSnapshot;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{mpsc, RwLock, Mutex};
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::broadcaster::ConsensusBroadcaster;
@@ -30,6 +31,7 @@ use crate::dag::Dag;
 use crate::dag_manager::{DagManager, DagManagerError};
 use crate::folder::ConsensusManager;
 use crate::liveness::Round;
+use crate::outcome_sink::OutcomeSink;
 use crate::validator_set::ValidatorSet;
 use crate::vlc::VLC;
 
@@ -72,6 +74,8 @@ pub struct ConsensusEngine {
     /// Private key for signing votes (ed25519, 32 bytes)
     /// If None, votes will not be signed (backward compatibility mode)
     private_key: Arc<RwLock<Option<Vec<u8>>>>,
+    /// Production trust boundary: reject unsigned votes when explicitly enabled.
+    strict_vote_signatures: AtomicBool,
     /// Channel for sending consensus messages (legacy, for internal use)
     message_tx: mpsc::Sender<ConsensusMessage>,
     /// Channel for receiving consensus messages (reserved for future use)
@@ -82,28 +86,40 @@ pub struct ConsensusEngine {
     /// Anchors from inline-finalized CFs (single-node mode) pending persistence.
     /// Callers should drain this after add_event() to persist finalized anchors.
     pending_persist_anchors: Arc<Mutex<Vec<setu_types::Anchor>>>,
+    /// Full finalized CFs pending durable indexing alongside their anchors.
+    pending_persist_cfs: Arc<Mutex<Vec<ConsensusFrame>>>,
+    /// CFs whose state apply + pending-persist queueing has happened in
+    /// `handle_finalization`, but whose externally observable side-effects
+    /// (network broadcast of `CFFinalized`, advancing `ValidatorSet.current_round`)
+    /// have NOT yet run. Caller invokes `complete_pending_finalizations()` AFTER
+    /// `persist_finalized_anchor()` succeeds. This closes the post-restart
+    /// round-drift window (see fix-post-restart-finality-stall-v2 design.md
+    /// Layer A and review-log.md R3-VERIFY-4/8).
+    ///
+    /// Each entry is `(ConsensusFrame, expected_round)` where `expected_round`
+    /// is the validator-set round captured at finalize time. The completion
+    /// step only advances the round if it still matches `expected_round`,
+    /// making the call idempotent under restart / duplicate dispatch.
+    pending_completions: Arc<Mutex<Vec<(ConsensusFrame, Round)>>>,
+    /// Broadcast channel for CF finalization notifications.
+    /// Injected by caller (ConsensusValidator) via set_finalization_tx().
+    /// Uses parking_lot::RwLock: broadcast::Sender::send() is synchronous.
+    finalization_tx: parking_lot::RwLock<Option<broadcast::Sender<ConsensusFrame>>>,
 }
 
 impl ConsensusEngine {
     /// Create a new consensus engine
-    pub fn new(
-        config: ConsensusConfig,
-        validator_id: String,
-        validator_set: ValidatorSet,
-    ) -> Self {
+    pub fn new(config: ConsensusConfig, validator_id: String, validator_set: ValidatorSet) -> Self {
         let (tx, rx) = mpsc::channel(1000);
-        
+
         // Create shared DAG
         let dag = Arc::new(RwLock::new(Dag::new()));
-        
+
         // Create EventStore (in-memory for now)
         let event_store = Arc::new(EventStore::new());
-        
+
         // Create DagManager with the shared DAG
-        let dag_manager = Arc::new(DagManager::with_defaults(
-            Arc::clone(&dag),
-            event_store,
-        ));
+        let dag_manager = Arc::new(DagManager::with_defaults(Arc::clone(&dag), event_store));
 
         Self {
             config: config.clone(),
@@ -118,15 +134,19 @@ impl ConsensusEngine {
             ))),
             local_validator_id: validator_id,
             private_key: Arc::new(RwLock::new(None)),
+            strict_vote_signatures: AtomicBool::new(false),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
+            pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
+            pending_completions: Arc::new(Mutex::new(Vec::new())),
+            finalization_tx: parking_lot::RwLock::new(None),
         }
     }
-    
+
     /// Create a new consensus engine with state manager for Merkle tree persistence
-    /// 
+    ///
     /// This constructor allows injecting a pre-configured GlobalStateManager
     /// with MerkleStore for persisting state roots.
     pub fn with_shared_state_manager(
@@ -136,18 +156,15 @@ impl ConsensusEngine {
         state_manager: Arc<SharedStateManager>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1000);
-        
+
         // Create shared DAG
         let dag = Arc::new(RwLock::new(Dag::new()));
-        
+
         // Create EventStore (in-memory for now)
         let event_store = Arc::new(EventStore::new());
-        
+
         // Create DagManager with the shared DAG
-        let dag_manager = Arc::new(DagManager::with_defaults(
-            Arc::clone(&dag),
-            event_store,
-        ));
+        let dag_manager = Arc::new(DagManager::with_defaults(Arc::clone(&dag), event_store));
 
         Self {
             config: config.clone(),
@@ -163,15 +180,19 @@ impl ConsensusEngine {
             ))),
             local_validator_id: validator_id,
             private_key: Arc::new(RwLock::new(None)),
+            strict_vote_signatures: AtomicBool::new(false),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
+            pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
+            pending_completions: Arc::new(Mutex::new(Vec::new())),
+            finalization_tx: parking_lot::RwLock::new(None),
         }
     }
-    
+
     /// Create a new consensus engine with external EventStore
-    /// 
+    ///
     /// This constructor allows injecting a pre-configured EventStore,
     /// enabling the DagManager to persist events with depth information.
     pub fn with_event_store(
@@ -181,15 +202,12 @@ impl ConsensusEngine {
         event_store: Arc<dyn EventStoreBackend>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1000);
-        
+
         // Create shared DAG
         let dag = Arc::new(RwLock::new(Dag::new()));
-        
+
         // Create DagManager with the shared DAG and external EventStore
-        let dag_manager = Arc::new(DagManager::with_defaults(
-            Arc::clone(&dag),
-            event_store,
-        ));
+        let dag_manager = Arc::new(DagManager::with_defaults(Arc::clone(&dag), event_store));
 
         Self {
             config: config.clone(),
@@ -204,13 +222,17 @@ impl ConsensusEngine {
             ))),
             local_validator_id: validator_id,
             private_key: Arc::new(RwLock::new(None)),
+            strict_vote_signatures: AtomicBool::new(false),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
+            pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
+            pending_completions: Arc::new(Mutex::new(Vec::new())),
+            finalization_tx: parking_lot::RwLock::new(None),
         }
     }
-    
+
     /// Create with both shared state manager and event store
     pub fn with_stores(
         config: ConsensusConfig,
@@ -220,15 +242,12 @@ impl ConsensusEngine {
         event_store: Arc<dyn EventStoreBackend>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1000);
-        
+
         // Create shared DAG
         let dag = Arc::new(RwLock::new(Dag::new()));
-        
+
         // Create DagManager with the shared DAG and external EventStore
-        let dag_manager = Arc::new(DagManager::with_defaults(
-            Arc::clone(&dag),
-            event_store,
-        ));
+        let dag_manager = Arc::new(DagManager::with_defaults(Arc::clone(&dag), event_store));
 
         Self {
             config: config.clone(),
@@ -244,36 +263,163 @@ impl ConsensusEngine {
             ))),
             local_validator_id: validator_id,
             private_key: Arc::new(RwLock::new(None)),
+            strict_vote_signatures: AtomicBool::new(false),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
+            pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
+            pending_completions: Arc::new(Mutex::new(Vec::new())),
+            finalization_tx: parking_lot::RwLock::new(None),
         }
     }
 
     /// Set the private key for signing votes
-    /// 
+    ///
     /// The private key should be 32 bytes for ed25519 signatures.
     /// If not set, votes will not be signed (backward compatibility mode).
     pub async fn set_private_key(&self, key: Vec<u8>) {
         *self.private_key.write().await = Some(key);
     }
-    
+
     /// Clear the private key (disable vote signing)
     pub async fn clear_private_key(&self) {
         *self.private_key.write().await = None;
+    }
+
+    /// Enable production vote signature enforcement.
+    ///
+    /// Constructors stay permissive for legacy tests and local fixtures;
+    /// deployment code opts in after validator construction and key loading.
+    pub fn enable_strict_vote_signatures(&self) {
+        self.strict_vote_signatures.store(true, Ordering::SeqCst);
+    }
+
+    fn require_vote_signatures(&self) -> bool {
+        self.strict_vote_signatures.load(Ordering::SeqCst)
     }
 
     /// Take all pending anchors that were finalized inline (single-node mode).
     /// Callers should persist these anchors to durable storage.
     /// Returns an empty Vec if no anchors are pending.
     pub async fn take_pending_anchors(&self) -> Vec<setu_types::Anchor> {
+        // TODO(F1-residual): this is still a destructive drain. If caller-side
+        // anchor persistence fails, there is no in-engine retry source. See the
+        // follow-up FDP `fix-m2-anchor-retry-source`.
         let mut pending = self.pending_persist_anchors.lock().await;
         std::mem::take(&mut *pending)
     }
 
+    pub async fn take_pending_finalized_cfs(&self) -> Vec<ConsensusFrame> {
+        let mut pending = self.pending_persist_cfs.lock().await;
+        std::mem::take(&mut *pending)
+    }
+
+    pub async fn peek_pending_finalized_cfs(&self) -> Vec<ConsensusFrame> {
+        self.pending_persist_cfs.lock().await.clone()
+    }
+
+    pub async fn drain_pending_finalized_cfs(&self, cf_ids: &[setu_types::CFId]) {
+        let mut pending = self.pending_persist_cfs.lock().await;
+        pending.retain(|cf| !cf_ids.iter().any(|id| id == &cf.id));
+    }
+
+    /// Run the post-persist side of CF finalization for every CF queued by
+    /// `handle_finalization`: send the legacy internal channel notification,
+    /// fan out to external subscribers (`finalization_tx`), broadcast
+    /// `CFFinalized` to the P2P network, then advance `ValidatorSet.current_round`.
+    ///
+    /// Callers MUST invoke this AFTER `persist_finalized_anchor()` succeeds —
+    /// this is the load-bearing fix from `fix-post-restart-finality-stall-v2`
+    /// design.md Layer A. Doing the broadcast / round-advance only after
+    /// durable persistence eliminates the post-restart round-drift window
+    /// described in the bug.
+    ///
+    /// Idempotency contract (R3-VERIFY-8):
+    /// - The pending queue is drained on entry, so a second call sees nothing.
+    /// - Round advance is guarded by `current_round() == expected_round` so
+    ///   that if another path already moved past `expected_round` (e.g. a
+    ///   peer-driven `receive_finalized_cf` for the same CF on a later tick),
+    ///   we do not double-advance.
+    pub async fn complete_pending_finalizations(&self) -> SetuResult<()> {
+        let pending: Vec<(ConsensusFrame, Round)> = {
+            let mut q = self.pending_completions.lock().await;
+            std::mem::take(&mut *q)
+        };
+
+        for (cf, expected_round) in pending {
+            let cf_id = cf.id.clone();
+
+            // Internal channel (legacy local listeners).
+            let _ = self
+                .message_tx
+                .send(ConsensusMessage::FrameFinalized(cf.clone()))
+                .await;
+
+            // External broadcast subscribers (governance Task A, etc.).
+            // Now fires post-persist so subscribers only see durable CFs.
+            {
+                let tx_guard = self.finalization_tx.read();
+                if let Some(ref tx) = *tx_guard {
+                    let _ = tx.send(cf.clone());
+                }
+            }
+
+            // Network broadcast.
+            {
+                let broadcaster = self.broadcaster.read().await;
+                if let Some(ref b) = *broadcaster {
+                    match b.broadcast_finalized(&cf).await {
+                        Ok(result) => {
+                            info!(
+                                cf_id = %cf_id,
+                                success = result.success_count,
+                                "CF finalization broadcasted to peers (post-persist)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(cf_id = %cf_id, error = %e, "Failed to broadcast finalization");
+                        }
+                    }
+                }
+            }
+
+            // Advance round — last step, idempotent under restart / duplicate
+            // dispatch via the `current_round() == expected_round` guard.
+            let mut vs = self.validator_set.write().await;
+            if vs.current_round() == expected_round {
+                vs.advance_round();
+            } else {
+                debug!(
+                    cf_id = %cf_id,
+                    expected_round = expected_round,
+                    actual_round = vs.current_round(),
+                    "complete_pending_finalizations: round already past expected, skipping advance (idempotent)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Test-only: how many completions are queued waiting for `complete_pending_finalizations`.
+    #[cfg(test)]
+    pub async fn pending_completions_len(&self) -> usize {
+        self.pending_completions.lock().await.len()
+    }
+
+    /// Mark finalized anchor events as no longer pending in the active DAG.
+    ///
+    /// Durable persistence and GC still happen later via
+    /// `DagManager::on_anchor_finalized()`. This only closes the window where
+    /// a locally-finalized event can be selected by another CF before the
+    /// persistence path gets to run.
+    async fn mark_anchor_events_finalized_in_active_dag(&self, anchor: &setu_types::Anchor) {
+        let mut dag = self.dag.write().await;
+        dag.finalize_events(&anchor.event_ids);
+    }
+
     /// Set the network broadcaster for P2P message delivery
-    /// 
+    ///
     /// This should be called after the network layer is initialized.
     /// Without a broadcaster, consensus messages are only sent to internal channels.
     pub async fn set_broadcaster(&self, broadcaster: Arc<dyn ConsensusBroadcaster>) {
@@ -281,14 +427,37 @@ impl ConsensusEngine {
         *b = Some(broadcaster);
         info!("Consensus broadcaster configured");
     }
-    
+
     /// Check if a broadcaster is configured
     pub async fn has_broadcaster(&self) -> bool {
         self.broadcaster.read().await.is_some()
     }
-    
+
+    /// Inject a broadcast sender for CF finalization notifications.
+    /// Called by ConsensusValidator after engine construction.
+    pub fn set_finalization_tx(&self, tx: broadcast::Sender<ConsensusFrame>) {
+        *self.finalization_tx.write() = Some(tx);
+    }
+
+    /// R5 · Inject an outcome sink for apply-phase observability.
+    ///
+    /// Called by `ConsensusValidator::new` after engine construction. Forwards
+    /// to `ConsensusManager::set_outcomes_sink` → `AnchorBuilder::set_outcomes_sink`.
+    /// Default (no sink injected) keeps `ingest_outcomes` as a no-op, so tests
+    /// that build engines without wiring a sink remain unaffected.
+    ///
+    /// Must be invoked before consensus loops start, identical timing to
+    /// `set_finalization_tx`. Uses `try_write` so the call stays synchronous
+    /// and can run inside `ConsensusValidator::new()` (which is not async).
+    pub fn set_outcomes_sink(&self, sink: Arc<dyn OutcomeSink>) {
+        self.consensus_manager
+            .try_write()
+            .expect("set_outcomes_sink must be called before consensus starts")
+            .set_outcomes_sink(sink);
+    }
+
     /// Get a reference to the broadcaster for making network requests
-    /// 
+    ///
     /// Returns None if no broadcaster is configured.
     /// Used for fetching missing events or other network operations.
     pub async fn get_broadcaster(&self) -> Option<Arc<dyn ConsensusBroadcaster>> {
@@ -321,7 +490,7 @@ impl ConsensusEngine {
     }
 
     /// Add an event to the DAG and try to create a CF if conditions are met
-    /// 
+    ///
     /// This method uses DagManager as the single entry point for adding events,
     /// ensuring proper depth calculation and three-layer storage management.
     pub async fn add_event(&self, event: Event) -> SetuResult<EventId> {
@@ -342,9 +511,16 @@ impl ConsensusEngine {
                 return Ok(id);
             }
             Err(DagManagerError::MissingParent(id)) => {
-                return Err(setu_types::SetuError::InvalidData(format!("Missing parent: {}", id)));
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Missing parent: {}",
+                    id
+                )));
             }
-            Err(DagManagerError::ParentTooOld { parent_id, depth_diff, max_allowed }) => {
+            Err(DagManagerError::ParentTooOld {
+                parent_id,
+                depth_diff,
+                max_allowed,
+            }) => {
                 return Err(setu_types::SetuError::InvalidData(format!(
                     "Parent {} too old: depth_diff {} > max {}",
                     parent_id, depth_diff, max_allowed
@@ -370,7 +546,7 @@ impl ConsensusEngine {
                     debug!(event_id = %event.id, "Event broadcasted");
                 }
             }
-            
+
             // Still send to internal channel for backward compatibility or local monitoring
             let _ = self
                 .message_tx
@@ -406,9 +582,16 @@ impl ConsensusEngine {
                 return Ok(id);
             }
             Err(DagManagerError::MissingParent(id)) => {
-                return Err(setu_types::SetuError::InvalidData(format!("Missing parent: {}", id)));
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Missing parent: {}",
+                    id
+                )));
             }
-            Err(DagManagerError::ParentTooOld { parent_id, depth_diff, max_allowed }) => {
+            Err(DagManagerError::ParentTooOld {
+                parent_id,
+                depth_diff,
+                max_allowed,
+            }) => {
                 return Err(setu_types::SetuError::InvalidData(format!(
                     "Parent {} too old: depth_diff {} > max {}",
                     parent_id, depth_diff, max_allowed
@@ -420,7 +603,7 @@ impl ConsensusEngine {
         };
 
         // Note: We do NOT broadcast the event here since it came from the network
-        
+
         // Try to create a ConsensusFrame if we're the leader
         self.try_create_cf().await?;
 
@@ -522,7 +705,7 @@ impl ConsensusEngine {
             );
             return Ok(None);
         }
-        
+
         // Log when we actually start creating CF
         info!(
             vlc_logical_time = vlc.logical_time(),
@@ -532,6 +715,7 @@ impl ConsensusEngine {
         let dag = self.dag.read().await;
         // AnchorBuilder now handles all Merkle tree computation internally
         let cf = manager.try_create_cf(&dag, &vlc);
+        drop(dag);
 
         if let Some(ref frame) = cf {
             info!(
@@ -540,44 +724,66 @@ impl ConsensusEngine {
                 event_count = frame.anchor.event_ids.len(),
                 "CF created successfully"
             );
-            
+
             // Leader auto-votes for their own CF
             // Get private key for signing (if available)
             let private_key = self.private_key.read().await;
             let key_ref = private_key.as_ref().map(|k| k.as_slice());
-            
+
             let self_vote = manager.vote_for_cf(&frame.id, true, key_ref);
             if self_vote.is_some() {
                 debug!(cf_id = %frame.id, "Leader self-voted for CF");
-                
+
                 // Check if this vote causes finalization (single-node mode)
-                if manager.check_finalization(&frame.id) {
+                if manager.check_finalization(&frame.id)
+                    && Self::manager_last_finalized_matches(&manager, &frame.id)
+                {
                     // Immediately update depth floor so new events land above anchor_depth.
                     // This is critical: without it, events referencing old parents (e.g., genesis)
                     // would get a depth below anchor_depth, causing permanent InsufficientEvents.
                     let new_anchor_depth = manager.anchor_builder().anchor_depth();
                     self.dag_manager.update_min_depth(new_anchor_depth);
+                    self.mark_anchor_events_finalized_in_active_dag(&frame.anchor)
+                        .await;
                     info!(
                         cf_id = %frame.id,
                         new_min_depth = new_anchor_depth,
                         "CF finalized (single-node mode), depth floor updated"
                     );
-                    // Buffer anchor for persistence by caller (submit_event).
+                    let finalized_cf = manager.last_finalized_cf().cloned();
+
+                    // Buffer anchor/CF for persistence by caller (submit_event).
                     // The internal message channel is not consumed in production,
                     // so persistence must be triggered by the caller.
+                    if let Some(ref cf) = finalized_cf {
+                        {
+                            let mut pending = self.pending_persist_anchors.lock().await;
+                            pending.push(cf.anchor.clone());
+                        }
+                        {
+                            let mut pending = self.pending_persist_cfs.lock().await;
+                            pending.push(cf.clone());
+                        }
+                    }
+
+                    // Notify finalization subscribers (single-node mode)
                     {
-                        let mut pending = self.pending_persist_anchors.lock().await;
-                        pending.push(frame.anchor.clone());
+                        let tx_guard = self.finalization_tx.read();
+                        if let Some(ref tx) = *tx_guard {
+                            if let Some(cf) = finalized_cf {
+                                let _ = tx.send(cf);
+                            }
+                        }
                     }
                 }
             }
-            
+
             // Send to internal channel (legacy, not consumed in production)
             let _ = self
                 .message_tx
                 .send(ConsensusMessage::ProposeFrame(frame.clone()))
                 .await;
-            
+
             // Prepare CF for broadcast: embed leader's self-vote for atomic delivery.
             // This guarantees followers receive CF + leader vote in a single message,
             // eliminating the ordering dependency between separate CF and vote broadcasts.
@@ -586,7 +792,7 @@ impl ConsensusEngine {
             if let Some(ref v) = self_vote {
                 broadcast_frame.add_vote(v.clone());
             }
-            
+
             // Broadcast to network via broadcaster (if configured)
             let broadcaster = self.broadcaster.read().await;
             if let Some(ref b) = *broadcaster {
@@ -603,7 +809,7 @@ impl ConsensusEngine {
                         warn!(cf_id = %frame.id, error = %e, "Failed to broadcast CF");
                     }
                 }
-                
+
                 // Also broadcast vote separately as defense-in-depth backup.
                 // If CF arrived first, the embedded vote is already stored — this duplicate
                 // is detected by receive_vote()'s idempotency check and harmlessly ignored.
@@ -630,7 +836,7 @@ impl ConsensusEngine {
     }
 
     /// Receive a ConsensusFrame from another validator (Follower path)
-    /// 
+    ///
     /// When a follower receives a CF from the leader:
     /// 1. Verify proposer is valid for current round
     /// 2. Check if we've already processed this CF (idempotency)
@@ -640,29 +846,34 @@ impl ConsensusEngine {
     /// 6. Verify resulting state matches the anchor's state root
     /// 7. Vote for the CF
     /// 8. Check if our vote causes finalization
-    /// 
+    ///
     /// Returns (finalized, Option<Anchor>) so the caller can persist when finalized.
     /// This ensures followers have consistent state with the leader.
-    pub async fn receive_cf(&self, cf: ConsensusFrame) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
+    pub async fn receive_cf(
+        &self,
+        mut cf: ConsensusFrame,
+    ) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
         // Step 0: Verify CF ID matches content (anti-tampering)
         if !cf.verify_id() {
-            return Err(setu_types::SetuError::InvalidData(
-                format!("CF ID verification failed - possible tampering: {}", cf.id)
-            ));
+            return Err(setu_types::SetuError::InvalidData(format!(
+                "CF ID verification failed - possible tampering: {}",
+                cf.id
+            )));
         }
-        
+
         // Step 1: Verify proposer is valid for current round
         // This prevents malicious nodes from creating fake CFs
         {
             let validator_set = self.validator_set.read().await;
             let current_round = validator_set.current_round();
             if !validator_set.is_valid_proposer(&cf.proposer, current_round) {
-                return Err(setu_types::SetuError::InvalidData(
-                    format!("CF proposer {} is not valid for round {}", cf.proposer, current_round)
-                ));
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "CF proposer {} is not valid for round {}",
+                    cf.proposer, current_round
+                )));
             }
         }
-        
+
         // Step 1.5: Verify anchor chain consistency
         // This prevents historical fork attacks and time-travel attacks
         // The CF's anchor_chain_root must match our local chain root
@@ -671,7 +882,7 @@ impl ConsensusEngine {
                 let manager = self.consensus_manager.read().await;
                 manager.anchor_builder().anchor_chain_root()
             };
-            
+
             if merkle_roots.anchor_chain_root != local_chain_root {
                 return Err(setu_types::SetuError::InvalidData(
                     format!(
@@ -681,14 +892,14 @@ impl ConsensusEngine {
                     )
                 ));
             }
-            
+
             debug!(
                 cf_id = %cf.id,
                 chain_root = %hex::encode(local_chain_root),
                 "Anchor chain consistency verified"
             );
         }
-        
+
         // Step 2: Idempotency check (before acquiring write lock)
         {
             let manager = self.consensus_manager.read().await;
@@ -696,153 +907,47 @@ impl ConsensusEngine {
                 return Ok((false, None));
             }
         }
-        
-        // Step 3: Ensure all referenced events are available in local DAG
-        // This is critical for state consistency - we cannot verify or apply
-        // state changes without having all the events.
-        {
-            let dag = self.dag.read().await;
-            let missing_event_ids: Vec<EventId> = cf.anchor.event_ids
-                .iter()
-                .filter(|id| !dag.contains(id))
-                .cloned()
-                .collect();
-            
-            if !missing_event_ids.is_empty() {
-                // Release dag lock before network call
-                drop(dag);
-                
-                // Try to fetch missing events from peers with retry
-                let broadcaster = self.broadcaster.read().await;
-                if let Some(ref b) = *broadcaster {
-                    info!(
-                        cf_id = %cf.id,
-                        missing_count = missing_event_ids.len(),
-                        "Fetching missing events for CF"
-                    );
-                    
-                    // Retry up to 3 times for transient network failures
-                    const MAX_RETRY: usize = 3;
-                    let mut last_error = None;
-                    let mut fetch_success = false;
-                    
-                    for retry in 0..MAX_RETRY {
-                        match b.request_events(&missing_event_ids).await {
-                            Ok(fetched_events) => {
-                                fetch_success = true;
-                                last_error = None;
-                                // Add fetched events through DagManager with retry (handles TOCTOU)
-                                for event in fetched_events {
-                                    // Update VLC when adding fetched events
-                                    {
-                                        let mut vlc = self.vlc.write().await;
-                                        vlc.merge(&event.vlc_snapshot);
-                                    }
-                                    
-                                    match self.dag_manager.add_event_with_retry(event.clone()).await {
-                                        Ok(_) => {}
-                                        Err(DagManagerError::DuplicateEvent(_)) => {
-                                            // DuplicateEvent is OK (race condition)
-                                        }
-                                        Err(e) => {
-                                            warn!(event_id = %event.id, error = %e, "Failed to add fetched event");
-                                        }
-                                    }
-                                }
-                                
-                                // Re-check if we still have missing events
-                                let dag = self.dag.read().await;
-                                let still_missing: Vec<_> = cf.anchor.event_ids
-                                    .iter()
-                                    .filter(|id| !dag.contains(id))
-                                    .collect();
-                                
-                                if !still_missing.is_empty() {
-                                    // Still have missing events, continue retry
-                                    last_error = Some(format!(
-                                        "Still missing {} events after fetch",
-                                        still_missing.len()
-                                    ));
-                                    drop(dag);
-                                } else {
-                                    // All events fetched successfully
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                last_error = Some(format!("Fetch failed: {}", e));
-                                if retry < MAX_RETRY - 1 {
-                                    warn!(
-                                        cf_id = %cf.id,
-                                        retry = retry + 1,
-                                        max_retry = MAX_RETRY,
-                                        error = %e,
-                                        "Failed to fetch missing events, retrying..."
-                                    );
-                                    // Wait before retry with exponential backoff
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(100 * (retry as u64 + 1))).await;
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Check final result
-                    if !fetch_success {
-                        return Err(setu_types::SetuError::InvalidData(
-                            format!(
-                                "CF {} references {} missing events and all fetch attempts failed: {}",
-                                cf.id,
-                                missing_event_ids.len(),
-                                last_error.unwrap_or_else(|| "unknown error".to_string())
-                            )
-                        ));
-                    }
-                } else {
-                    // No broadcaster configured - cannot fetch missing events
-                    return Err(setu_types::SetuError::InvalidData(
-                        format!(
-                            "CF {} references {} events not in local DAG (no broadcaster to fetch)",
-                            cf.id,
-                            missing_event_ids.len()
-                        )
-                    ));
-                }
-            }
+
+        self.ensure_cf_events_available(&cf).await?;
+
+        self.filter_embedded_votes_for_strict_mode(&mut cf).await;
+
+        if self.require_vote_signatures() && self.private_key.read().await.is_none() {
+            return Err(setu_types::SetuError::InvalidData(
+                "Strict vote signature mode requires a local private key before voting on CF proposals".to_string(),
+            ));
         }
-        
+
         // Now we have all events, proceed with verification
         let dag = self.dag.read().await;
         let mut manager = self.consensus_manager.write().await;
-        
+
         // Double-check idempotency (another thread may have processed while we fetched)
         if manager.has_cf(&cf.id) {
             return Ok((false, None));
         }
-        
+
         // Step 4: Verify the CF's merkle roots are internally consistent
         if !manager.verify_cf_merkle_roots(&cf) {
             return Err(setu_types::SetuError::InvalidData(
-                "CF merkle roots verification failed".to_string()
+                "CF merkle roots verification failed".to_string(),
             ));
         }
-        
+
         // Step 5-6: Collect events from CF for deferred state application at finalization.
         // State is NOT applied here — it will be applied when the CF is finalized,
         // guaranteeing correct ordering even if CFs arrive out of network order.
         manager.apply_cf_state_changes(&dag, &cf);
-        
+        drop(dag);
+
         let cf_id = cf.id.clone();
-        
+
         // Receive the CF
         manager.receive_cf(cf.clone());
 
         // Vote for the CF (in MVP, we always approve valid CFs)
         let private_key = self.private_key.read().await;
-        let vote = manager.vote_for_cf(
-            &cf_id, 
-            true,
-            private_key.as_ref().map(|k| k.as_slice())
-        );
+        let vote = manager.vote_for_cf(&cf_id, true, private_key.as_ref().map(|k| k.as_slice()));
         if let Some(ref v) = vote {
             // Broadcast vote to network via broadcaster (if configured)
             let broadcaster = self.broadcaster.read().await;
@@ -860,10 +965,11 @@ impl ConsensusEngine {
                     }
                 }
             }
-            
+
             // Check if our vote caused finalization
             // (vote_for_cf adds vote but doesn't check finalization, so we check here)
-            let finalized = manager.check_finalization(&cf_id);
+            let finalized = manager.check_finalization(&cf_id)
+                && Self::manager_last_finalized_matches(&manager, &cf_id);
             if finalized {
                 return self.handle_finalization(&mut manager).await;
             }
@@ -871,47 +977,384 @@ impl ConsensusEngine {
 
         Ok((false, None))
     }
-    
-    /// Handle CF finalization: broadcast notification and return anchor for persistence
-    /// 
-    /// Note: This method extracts data from manager before acquiring other locks
-    /// to avoid potential deadlock from holding multiple write locks.
-    async fn handle_finalization(&self, manager: &mut tokio::sync::RwLockWriteGuard<'_, ConsensusManager>) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
-        // Extract data from manager first, before acquiring other locks
-        let cf_data = manager.last_finalized_cf().map(|cf| (cf.id.clone(), cf.anchor.clone(), cf.clone()));
-        
-        let finalized_anchor = if let Some((cf_id, anchor, cf)) = cf_data {
-            // Send finalization to internal channel (for local listeners)
-            let _ = self
-                .message_tx
-                .send(ConsensusMessage::FrameFinalized(cf))
-                .await;
 
-            // Broadcast finalization to network via broadcaster (if configured)
-            let broadcaster = self.broadcaster.read().await;
-            if let Some(ref b) = *broadcaster {
-                match b.broadcast_finalized(&cf_id).await {
-                    Ok(result) => {
-                        info!(
-                            cf_id = %cf_id,
-                            success = result.success_count,
-                            "CF finalization broadcasted to peers"
-                        );
+    pub async fn receive_finalized_cf(
+        &self,
+        cf: ConsensusFrame,
+    ) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
+        if !cf.verify_id() {
+            return Err(setu_types::SetuError::InvalidData(format!(
+                "Finalized CF ID verification failed - possible tampering: {}",
+                cf.id
+            )));
+        }
+
+        self.verify_finalized_cf_votes(&cf).await?;
+
+        {
+            let manager = self.consensus_manager.read().await;
+            if manager.is_finalized_cf(&cf.id) {
+                return Ok((false, None));
+            }
+        }
+
+        if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
+            let local_chain_root = {
+                let manager = self.consensus_manager.read().await;
+                manager.anchor_builder().anchor_chain_root()
+            };
+
+            if merkle_roots.anchor_chain_root != local_chain_root {
+                return Err(setu_types::SetuError::InvalidData(
+                    format!(
+                        "Finalized CF anchor chain root mismatch - possible fork or time-travel attack: expected {}, got {}",
+                        hex::encode(local_chain_root),
+                        hex::encode(merkle_roots.anchor_chain_root)
+                    )
+                ));
+            }
+        }
+
+        self.ensure_cf_events_available(&cf).await?;
+
+        let dag = self.dag.read().await;
+        let mut manager = self.consensus_manager.write().await;
+
+        if manager.is_finalized_cf(&cf.id) {
+            return Ok((false, None));
+        }
+
+        if !manager.verify_cf_merkle_roots(&cf) {
+            return Err(setu_types::SetuError::InvalidData(
+                "Finalized CF merkle roots verification failed".to_string(),
+            ));
+        }
+
+        manager.apply_cf_state_changes(&dag, &cf);
+        drop(dag);
+
+        let finalized = manager.receive_finalized_cf(cf.clone())
+            && Self::manager_last_finalized_matches(&manager, &cf.id);
+        if finalized {
+            return self.handle_finalization(&mut manager).await;
+        }
+
+        Ok((false, None))
+    }
+
+    async fn verify_finalized_cf_votes(&self, cf: &ConsensusFrame) -> SetuResult<()> {
+        let validator_set = self.validator_set.read().await;
+        let validator_count = validator_set.count();
+        if !cf.check_quorum(validator_count) {
+            return Err(setu_types::SetuError::InvalidData(format!(
+                "Finalized CF {} does not contain quorum votes: approve_count={}, validator_count={}",
+                cf.id,
+                cf.approve_count(),
+                validator_count
+            )));
+        }
+
+        let all_validators = validator_set.all_validators();
+        for vote in cf.votes.values() {
+            if vote.cf_id != cf.id {
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Finalized CF {} contains vote for different CF {}",
+                    cf.id, vote.cf_id
+                )));
+            }
+
+            let Some(validator) = all_validators
+                .iter()
+                .find(|v| v.node.id == vote.validator_id)
+            else {
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Finalized CF {} contains vote from non-validator {}",
+                    cf.id, vote.validator_id
+                )));
+            };
+
+            self.verify_vote_signature_policy(
+                vote,
+                &validator.node.public_key,
+                "finalized CF vote",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    async fn filter_embedded_votes_for_strict_mode(&self, cf: &mut ConsensusFrame) {
+        if !self.require_vote_signatures() || cf.votes.is_empty() {
+            return;
+        }
+
+        let validators = {
+            let validator_set = self.validator_set.read().await;
+            validator_set
+                .all_validators()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let cf_id = cf.id.clone();
+        cf.votes.retain(|validator_id, vote| {
+            if vote.cf_id != cf_id {
+                warn!(
+                    cf_id = %cf_id,
+                    vote_cf_id = %vote.cf_id,
+                    voter = %vote.validator_id,
+                    "Dropping embedded vote for different CF in strict mode"
+                );
+                return false;
+            }
+
+            let Some(validator) = validators
+                .iter()
+                .find(|candidate| candidate.node.id == validator_id.as_str())
+            else {
+                warn!(
+                    cf_id = %cf_id,
+                    voter = %vote.validator_id,
+                    "Dropping embedded vote from non-validator in strict mode"
+                );
+                return false;
+            };
+
+            if vote.signature.is_empty() || validator.node.public_key.is_empty() {
+                warn!(
+                    cf_id = %cf_id,
+                    voter = %vote.validator_id,
+                    "Dropping unsigned embedded vote in strict mode"
+                );
+                return false;
+            }
+
+            if !vote.verify_signature(&validator.node.public_key) {
+                warn!(
+                    cf_id = %cf_id,
+                    voter = %vote.validator_id,
+                    "Dropping invalid embedded vote signature in strict mode"
+                );
+                return false;
+            }
+
+            true
+        });
+    }
+
+    fn verify_vote_signature_policy(
+        &self,
+        vote: &Vote,
+        public_key: &[u8],
+        context: &str,
+    ) -> SetuResult<()> {
+        if vote.signature.is_empty() {
+            if self.require_vote_signatures() {
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Unsigned {} from validator: {}",
+                    context, vote.validator_id
+                )));
+            }
+
+            warn!(
+                cf_id = %vote.cf_id,
+                voter = %vote.validator_id,
+                context = context,
+                "Vote has no signature - signature verification skipped (insecure in production)"
+            );
+            return Ok(());
+        }
+
+        if public_key.is_empty() {
+            if self.require_vote_signatures() {
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Missing public key for signed {} from validator: {}",
+                    context, vote.validator_id
+                )));
+            }
+
+            warn!(
+                voter = %vote.validator_id,
+                context = context,
+                "Validator has no public key configured, skipping signature verification"
+            );
+            return Ok(());
+        }
+
+        if !vote.verify_signature(public_key) {
+            return Err(setu_types::SetuError::InvalidData(format!(
+                "Invalid {} signature from validator: {}",
+                context, vote.validator_id
+            )));
+        }
+
+        debug!(
+            cf_id = %vote.cf_id,
+            voter = %vote.validator_id,
+            context = context,
+            "Vote signature verified successfully"
+        );
+        Ok(())
+    }
+
+    async fn ensure_cf_events_available(&self, cf: &ConsensusFrame) -> SetuResult<()> {
+        let mut missing_event_ids = {
+            let dag = self.dag.read().await;
+            cf.anchor
+                .event_ids
+                .iter()
+                .filter(|id| !dag.contains(id))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        if missing_event_ids.is_empty() {
+            return Ok(());
+        }
+
+        let broadcaster = self.broadcaster.read().await;
+        let Some(ref b) = *broadcaster else {
+            return Err(setu_types::SetuError::InvalidData(format!(
+                "CF {} references {} events not in local DAG (no broadcaster to fetch)",
+                cf.id,
+                missing_event_ids.len()
+            )));
+        };
+
+        info!(
+            cf_id = %cf.id,
+            missing_count = missing_event_ids.len(),
+            "Fetching missing events for CF"
+        );
+
+        const MAX_RETRY: usize = 3;
+        let mut last_error = None;
+
+        for retry in 0..MAX_RETRY {
+            match b.request_events(&missing_event_ids).await {
+                Ok(fetched_events) => {
+                    for event in fetched_events {
+                        {
+                            let mut vlc = self.vlc.write().await;
+                            vlc.merge(&event.vlc_snapshot);
+                        }
+
+                        match self.dag_manager.add_event_with_retry(event.clone()).await {
+                            Ok(_) => {}
+                            Err(DagManagerError::DuplicateEvent(_)) => {}
+                            Err(e) => {
+                                warn!(event_id = %event.id, error = %e, "Failed to add fetched event");
+                            }
+                        }
                     }
-                    Err(e) => {
-                        warn!(cf_id = %cf_id, error = %e, "Failed to broadcast finalization");
+
+                    missing_event_ids = {
+                        let dag = self.dag.read().await;
+                        cf.anchor
+                            .event_ids
+                            .iter()
+                            .filter(|id| !dag.contains(id))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    };
+
+                    if missing_event_ids.is_empty() {
+                        return Ok(());
+                    }
+
+                    last_error = Some(format!(
+                        "Still missing {} events after fetch",
+                        missing_event_ids.len()
+                    ));
+                }
+                Err(e) => {
+                    last_error = Some(format!("Fetch failed: {}", e));
+                    if retry < MAX_RETRY - 1 {
+                        warn!(
+                            cf_id = %cf.id,
+                            retry = retry + 1,
+                            max_retry = MAX_RETRY,
+                            error = %e,
+                            "Failed to fetch missing events, retrying..."
+                        );
                     }
                 }
             }
-            // Release broadcaster lock before acquiring validator_set lock
-            drop(broadcaster);
 
-            // Advance to next round (ValidatorSet manages rounds)
-            let mut validator_set = self.validator_set.write().await;
-            validator_set.advance_round();
+            if retry < MAX_RETRY - 1 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    100 * (retry as u64 + 1),
+                ))
+                .await;
+            }
+        }
 
-            // Update depth floor so new events land above anchor_depth
+        Err(setu_types::SetuError::InvalidData(format!(
+            "CF {} references missing events after fetch attempts: {}",
+            cf.id,
+            last_error.unwrap_or_else(|| "unknown error".to_string())
+        )))
+    }
+
+    /// Handle CF finalization: queue the CF for post-persist completion and
+    /// return the anchor for the caller to persist.
+    ///
+    /// Layer A of fix-post-restart-finality-stall-v2: this method NO LONGER
+    /// broadcasts `CFFinalized` and NO LONGER advances `ValidatorSet.current_round`.
+    /// Both side-effects are deferred to `complete_pending_finalizations()`,
+    /// which the caller MUST invoke after `persist_finalized_anchor()` succeeds.
+    ///
+    /// What still happens here (must remain inside the manager write lock so
+    /// subsequent `receive_cf` calls observe consistent in-memory state — see
+    /// review-log.md R3-VERIFY-4b):
+    /// 1. `dag_manager.update_min_depth(...)`
+    /// 2. `mark_anchor_events_finalized_in_active_dag(...)`
+    /// 3. push to `pending_persist_cfs` (durable index queue)
+    /// 4. push `(cf, expected_round)` to `pending_completions` (post-persist queue)
+    ///
+    /// Note: This method extracts data from manager before acquiring other locks
+    /// to avoid potential deadlock from holding multiple write locks.
+    async fn handle_finalization(
+        &self,
+        manager: &mut tokio::sync::RwLockWriteGuard<'_, ConsensusManager>,
+    ) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
+        // Extract data from manager first, before acquiring other locks
+        let cf_data = manager
+            .last_finalized_cf()
+            .map(|cf| (cf.id.clone(), cf.anchor.clone(), cf.clone()));
+
+        let finalized_anchor = if let Some((cf_id, anchor, cf)) = cf_data {
+            // Remove finalized events from Active DAG pending before any
+            // notification/broadcast awaits can interleave with a new event
+            // submission. The events remain in DAG.events for persistence.
             self.dag_manager.update_min_depth(anchor.depth + 1);
+            self.mark_anchor_events_finalized_in_active_dag(&anchor)
+                .await;
+
+            {
+                let mut pending = self.pending_persist_cfs.lock().await;
+                pending.push(cf.clone());
+            }
+
+            // Layer A: capture the round at which this CF finalized so
+            // `complete_pending_finalizations` can advance the round
+            // idempotently after the caller has durably persisted the anchor.
+            // We do NOT broadcast or advance here — those happen post-persist.
+            let expected_round = {
+                let vs = self.validator_set.read().await;
+                vs.current_round()
+            };
+            {
+                let mut q = self.pending_completions.lock().await;
+                q.push((cf.clone(), expected_round));
+            }
+
+            debug!(
+                cf_id = %cf_id,
+                expected_round = expected_round,
+                "CF finalized in-memory; queued for post-persist completion"
+            );
 
             Some(anchor)
         } else {
@@ -921,69 +1364,43 @@ impl ConsensusEngine {
         Ok((true, finalized_anchor))
     }
 
+    fn manager_last_finalized_matches(
+        manager: &ConsensusManager,
+        cf_id: &str,
+    ) -> bool {
+        manager
+            .last_finalized_cf()
+            .map(|cf| cf.id == cf_id)
+            .unwrap_or(false)
+    }
+
     /// Receive a vote from another validator
-    /// 
+    ///
     /// Returns (finalized, Option<Anchor>) - the anchor is returned when finalized
     /// so the caller can persist it to storage.
     pub async fn receive_vote(&self, vote: Vote) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
-        // Step 1: Verify voter is a valid validator
-        {
+        let validator = {
             let validator_set = self.validator_set.read().await;
             let all_validators = validator_set.all_validators();
-            if !all_validators.iter().any(|v| v.node.id == vote.validator_id) {
-                return Err(setu_types::SetuError::InvalidData(
-                    format!("Vote from non-validator: {}", vote.validator_id)
-                ));
-            }
-        }
-        
-        // Step 2: Verify vote signature
-        if !vote.signature.is_empty() {
-            // Get the public key for this validator
-            let public_key = {
-                let validator_set = self.validator_set.read().await;
-                let all_validators = validator_set.all_validators();
-                all_validators
-                    .iter()
-                    .find(|v| v.node.id == vote.validator_id)
-                    .map(|v| v.node.public_key.clone())
-            };
-            
-            if let Some(pub_key) = public_key {
-                if !pub_key.is_empty() {
-                    if !vote.verify_signature(&pub_key) {
-                        return Err(setu_types::SetuError::InvalidData(
-                            format!("Invalid vote signature from validator: {}", vote.validator_id)
-                        ));
-                    }
-                    debug!(
-                        cf_id = %vote.cf_id,
-                        voter = %vote.validator_id,
-                        "Vote signature verified successfully"
-                    );
-                } else {
-                    warn!(
-                        voter = %vote.validator_id,
-                        "Validator has no public key configured, skipping signature verification"
-                    );
-                }
-            } else {
-                // This shouldn't happen as we already checked validator existence
-                return Err(setu_types::SetuError::InvalidData(
-                    format!("Could not find public key for validator: {}", vote.validator_id)
-                ));
-            }
-        } else {
-            // Empty signature - for backward compatibility or testing
-            warn!(
-                cf_id = %vote.cf_id,
-                voter = %vote.validator_id,
-                "Vote has no signature - signature verification skipped (insecure in production)"
-            );
-        }
-        
+            all_validators
+                .into_iter()
+                .find(|candidate| candidate.node.id == vote.validator_id)
+                .cloned()
+        };
+
+        let Some(validator) = validator else {
+            return Err(setu_types::SetuError::InvalidData(format!(
+                "Vote from non-validator: {}",
+                vote.validator_id
+            )));
+        };
+
+        self.verify_vote_signature_policy(&vote, &validator.node.public_key, "vote")?;
+
+        let cf_id = vote.cf_id.clone();
         let mut manager = self.consensus_manager.write().await;
-        let finalized = manager.receive_vote(vote);
+        let finalized = manager.receive_vote(vote)
+            && Self::manager_last_finalized_matches(&manager, &cf_id);
 
         if finalized {
             self.handle_finalization(&mut manager).await
@@ -993,10 +1410,13 @@ impl ConsensusEngine {
     }
 
     /// Compute the state root from the DAG (legacy method)
-    /// 
+    ///
     /// This is a simple hash-based computation for backward compatibility.
     /// The real state root is now computed by AnchorBuilder using SMTs.
-    #[deprecated(since = "0.2.0", note = "State root is now computed internally by ConsensusManager/AnchorBuilder")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "State root is now computed internally by ConsensusManager/AnchorBuilder"
+    )]
     fn compute_state_root_internal(&self, dag: &Dag) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&dag.node_count().to_le_bytes());
@@ -1011,41 +1431,145 @@ impl ConsensusEngine {
         #[allow(deprecated)]
         self.compute_state_root_internal(&dag)
     }
-    
+
     /// Get the current global state root from AnchorBuilder
     pub async fn get_global_state_root(&self) -> [u8; 32] {
         let manager = self.consensus_manager.read().await;
         manager.get_global_root()
     }
-    
+
     /// Get a subnet's current state root
-    pub async fn get_subnet_state_root(&self, subnet_id: &setu_types::SubnetId) -> Option<[u8; 32]> {
+    pub async fn get_subnet_state_root(
+        &self,
+        subnet_id: &setu_types::SubnetId,
+    ) -> Option<[u8; 32]> {
         let manager = self.consensus_manager.read().await;
         manager.get_subnet_root(subnet_id)
     }
-    
+
     /// Get the current anchor chain root
-    /// 
+    ///
     /// This returns the cumulative chain root that commits to the entire anchor history.
     /// Used for verifying anchor chain consistency when receiving CFs from other validators.
     pub async fn get_anchor_chain_root(&self) -> [u8; 32] {
         let manager = self.consensus_manager.read().await;
         manager.anchor_builder().anchor_chain_root()
     }
-    
+
     /// Get the number of anchors created
     pub async fn get_anchor_count(&self) -> usize {
         let manager = self.consensus_manager.read().await;
         manager.anchor_count()
     }
-    
+
     /// Mark an anchor as successfully persisted to storage
-    /// 
+    ///
     /// Call this after successfully storing the anchor to AnchorStore.
     /// This enables safe garbage collection of finalized CFs from memory.
     pub async fn mark_anchor_persisted(&self, anchor_id: &str) {
         let mut manager = self.consensus_manager.write().await;
         manager.mark_anchor_persisted(anchor_id);
+    }
+
+    /// Heartbeat attempt to create a CF for low-frequency events.
+    ///
+    /// Uses relaxed VLC delta (>= 1 instead of >= vlc_delta_threshold) with a time guard.
+    /// Called by a background timer. No-op if not Leader or no stale events.
+    pub async fn try_create_cf_heartbeat(
+        &self,
+        heartbeat_interval: Duration,
+    ) -> SetuResult<Option<ConsensusFrame>> {
+        // Leader check
+        {
+            let validator_set = self.validator_set.read().await;
+            let round = validator_set.current_round();
+            if !validator_set.is_valid_proposer(&self.local_validator_id, round) {
+                return Ok(None);
+            }
+        }
+
+        let vlc = self.vlc.read().await;
+        let mut manager = self.consensus_manager.write().await;
+        let dag = self.dag.read().await;
+
+        let cf = manager.try_create_cf_heartbeat(&dag, &vlc, heartbeat_interval);
+        drop(dag);
+
+        if let Some(ref frame) = cf {
+            info!(
+                cf_id = %frame.id,
+                event_count = frame.anchor.event_ids.len(),
+                "Heartbeat: CF created for stale events"
+            );
+
+            // Leader self-vote + inline finalization (same logic as try_create_cf)
+            let private_key = self.private_key.read().await;
+            let key_ref = private_key.as_ref().map(|k| k.as_slice());
+
+            let self_vote = manager.vote_for_cf(&frame.id, true, key_ref);
+            if self_vote.is_some() {
+                if manager.check_finalization(&frame.id)
+                    && Self::manager_last_finalized_matches(&manager, &frame.id)
+                {
+                    let new_anchor_depth = manager.anchor_builder().anchor_depth();
+                    self.dag_manager.update_min_depth(new_anchor_depth);
+                    self.mark_anchor_events_finalized_in_active_dag(&frame.anchor)
+                        .await;
+                    info!(cf_id = %frame.id, "Heartbeat CF finalized (single-node)");
+
+                    let finalized_cf = manager.last_finalized_cf().cloned();
+                    if let Some(ref cf) = finalized_cf {
+                        {
+                            let mut pending = self.pending_persist_anchors.lock().await;
+                            pending.push(cf.anchor.clone());
+                        }
+                        {
+                            let mut pending = self.pending_persist_cfs.lock().await;
+                            pending.push(cf.clone());
+                        }
+                    }
+
+                    // Notify finalization subscribers
+                    {
+                        let tx_guard = self.finalization_tx.read();
+                        if let Some(ref tx) = *tx_guard {
+                            if let Some(cf) = finalized_cf {
+                                let _ = tx.send(cf);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Send to internal channel (legacy)
+            let _ = self
+                .message_tx
+                .send(ConsensusMessage::ProposeFrame(frame.clone()))
+                .await;
+
+            // Broadcast to network (multi-node: followers need to receive and vote)
+            let mut broadcast_frame = frame.clone();
+            if let Some(ref v) = self_vote {
+                broadcast_frame.add_vote(v.clone());
+            }
+            let broadcaster = self.broadcaster.read().await;
+            if let Some(ref b) = *broadcaster {
+                match b.broadcast_cf(&broadcast_frame).await {
+                    Ok(result) => {
+                        info!(
+                            cf_id = %frame.id,
+                            success = result.success_count,
+                            "Heartbeat CF broadcasted to peers"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(cf_id = %frame.id, error = %e, "Failed to broadcast heartbeat CF");
+                    }
+                }
+            }
+        }
+
+        Ok(cf)
     }
 
     /// Get the message sender for external communication
@@ -1070,15 +1594,15 @@ impl ConsensusEngine {
     }
 
     /// Allocate a logical time using lock-free atomic counter (FAST PATH)
-    /// 
+    ///
     /// This is the preferred method for local event creation where only
     /// the logical_time is needed. It avoids acquiring the VLC write lock
     /// and provides O(1) performance even under high concurrency.
-    /// 
+    ///
     /// Use this instead of `tick_and_get_vlc()` when:
     /// - Creating local events (submit_transfer)
     /// - Only logical_time is needed (not full VLCSnapshot)
-    /// 
+    ///
     /// The full VLC with `tick_and_get_vlc()` is still needed for:
     /// - Receiving events from other validators (merge operation)
     /// - Multi-validator consensus scenarios
@@ -1087,16 +1611,34 @@ impl ConsensusEngine {
         self.logical_time_counter.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    /// Restore the fast-path logical-time counter from durable consensus state.
+    ///
+    /// This must be called during startup recovery whenever `vlc` is restored,
+    /// otherwise locally-created events after restart can reuse low logical
+    /// times even though the full VLC snapshot was recovered.
+    pub fn restore_logical_time_counter(&self, logical_time: u64) {
+        self.logical_time_counter.store(logical_time, Ordering::SeqCst);
+    }
+
+    /// Read the current value of the fast-path logical-time counter without
+    /// incrementing it. Used by external components (e.g.
+    /// `ValidatorNetworkService`) to mirror the restored counter into their
+    /// own local state after `recover_from_storage`. See bug F1.
+    #[inline]
+    pub fn peek_logical_time(&self) -> u64 {
+        self.logical_time_counter.load(Ordering::SeqCst)
+    }
+
     /// Atomically increment VLC and return the new snapshot
-    /// 
+    ///
     /// This is the correct method to use when assigning VLC to events,
     /// as it ensures each event gets a unique logical time.
-    /// 
+    ///
     /// NOTE: For high-performance local event creation, prefer `allocate_logical_time()`
     /// which uses a lock-free atomic counter.
     pub async fn tick_and_get_vlc(&self) -> VLCSnapshot {
         let mut vlc = self.vlc.write().await;
-        vlc.tick();  // VLC::tick() uses the node_id internally
+        vlc.tick(); // VLC::tick() uses the node_id internally
         vlc.snapshot()
     }
 
@@ -1106,7 +1648,7 @@ impl ConsensusEngine {
     }
 
     /// Get events by their IDs from the DAG
-    /// 
+    ///
     /// This is used to retrieve events for persistence when a CF is finalized.
     /// Returns events that exist in the DAG.
     pub async fn get_events_by_ids(&self, event_ids: &[EventId]) -> Vec<Event> {
@@ -1116,17 +1658,17 @@ impl ConsensusEngine {
             .filter_map(|id| dag.get_event(id).cloned())
             .collect()
     }
-    
+
     /// Get events by their IDs using three-layer query (DAG → Store)
-    /// 
+    ///
     /// This method queries both the active DAG and the persistent EventStore,
     /// ensuring events can be found even after GC.
-    /// 
+    ///
     /// Used by: Network sync handlers when responding to event requests.
     pub async fn get_events_by_ids_three_layer(&self, event_ids: &[EventId]) -> Vec<Event> {
         let mut results = Vec::with_capacity(event_ids.len());
         let mut store_query_ids = Vec::new();
-        
+
         // Step 1: Query DAG (hot data)
         {
             let dag = self.dag.read().await;
@@ -1138,36 +1680,37 @@ impl ConsensusEngine {
                 }
             }
         }
-        
+
         // Step 2: Query EventStore for DAG misses (cold data)
         if !store_query_ids.is_empty() {
-            let store_events = self.dag_manager
+            let store_events = self
+                .dag_manager
                 .event_store()
                 .get_events_batch(&store_query_ids)
                 .await;
             results.extend(store_events);
         }
-        
+
         results
     }
-    
+
     /// Get the DagManager reference
-    /// 
+    ///
     /// Used for direct access to three-layer storage operations,
     /// such as GC triggering and cache warmup.
     pub fn dag_manager(&self) -> &Arc<DagManager> {
         &self.dag_manager
     }
-    
+
     /// Get the VLC reference (for recovery)
-    /// 
+    ///
     /// Used by ConsensusValidator for restoring VLC state after restart.
     pub fn vlc(&self) -> &Arc<RwLock<VLC>> {
         &self.vlc
     }
-    
+
     /// Get the ConsensusManager reference (for recovery)
-    /// 
+    ///
     /// Used by ConsensusValidator for restoring AnchorBuilder state after restart.
     pub fn consensus_manager(&self) -> &Arc<RwLock<ConsensusManager>> {
         &self.consensus_manager
@@ -1196,7 +1739,7 @@ pub struct DagStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_types::{NodeInfo, ValidatorInfo, Anchor, AnchorMerkleRoots};
+    use setu_types::{Anchor, AnchorMerkleRoots, EventType, NodeInfo, ValidatorInfo};
     use setu_vlc::VectorClock;
     use std::collections::HashMap;
 
@@ -1243,6 +1786,328 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_receive_finalized_cf_catches_up_and_is_idempotent() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v2".to_string(), create_validator_set());
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+
+        let (finalized, anchor) = engine.receive_finalized_cf(cf.clone()).await.unwrap();
+        assert!(finalized);
+        assert!(anchor.is_some());
+        // Layer A: round advance is deferred until complete_pending_finalizations.
+        assert_eq!(engine.current_round().await, 0);
+        engine.complete_pending_finalizations().await.unwrap();
+        assert_eq!(engine.current_round().await, 1);
+
+        let (finalized_again, anchor_again) = engine.receive_finalized_cf(cf).await.unwrap();
+        assert!(!finalized_again);
+        assert!(anchor_again.is_none());
+        // Idempotent: no new pending completion, round stays at 1.
+        engine.complete_pending_finalizations().await.unwrap();
+        assert_eq!(engine.current_round().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_receive_finalized_cf_allows_lagged_round_catch_up() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v2".to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+
+        let (finalized, anchor) = engine.receive_finalized_cf(cf).await.unwrap();
+
+        assert!(finalized);
+        assert!(anchor.is_some());
+        // Layer A: deferred until completion drains.
+        assert_eq!(engine.current_round().await, 0);
+        engine.complete_pending_finalizations().await.unwrap();
+        assert_eq!(engine.current_round().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_f4_receive_finalized_cf_rejects_unsigned_in_strict_mode() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        engine.enable_strict_vote_signatures();
+
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+
+        let result = engine.receive_finalized_cf(cf).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_f4_receive_vote_rejects_unsigned_in_strict_mode() {
+        let config = ConsensusConfig::default();
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        engine.enable_strict_vote_signatures();
+
+        let vote = Vote::new("v1".to_string(), "cf-unsigned".to_string(), true);
+        let result = engine.receive_vote(vote).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_f4_permissive_mode_keeps_legacy_unsigned_vote_compat() {
+        let config = ConsensusConfig::default();
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+
+        let vote = Vote::new("v1".to_string(), "cf-legacy".to_string(), true);
+        let result = engine.receive_vote(vote).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_f4_receive_cf_strict_mode_filters_bad_embedded_votes() {
+        let config = ConsensusConfig::default();
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        engine.enable_strict_vote_signatures();
+
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true).with_signature(vec![7; 64]));
+
+        engine.filter_embedded_votes_for_strict_mode(&mut cf).await;
+
+        assert!(cf.votes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_f6_strict_mode_rejection_does_not_buffer_pending() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        engine.enable_strict_vote_signatures();
+
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+
+        let result = engine.receive_finalized_cf(cf).await;
+        assert!(result.is_err());
+
+        let manager = engine.consensus_manager.read().await;
+        assert_eq!(manager.pending_counts_for_testing(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn test_receive_vote_timeout_does_not_report_finalized() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 1,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        cf.created_at = 0;
+        let cf_id = cf.id.clone();
+
+        {
+            let mut manager = engine.consensus_manager.write().await;
+            manager.receive_cf(cf);
+        }
+
+        let (finalized, anchor) = engine
+            .receive_vote(Vote::new("v2".to_string(), cf_id, true))
+            .await
+            .unwrap();
+
+        assert!(!finalized);
+        assert!(anchor.is_none());
+        assert_eq!(engine.current_round().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_inline_finalization_removes_events_from_pending_before_persistence() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 1,
+        };
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+
+        let event = Event::genesis(
+            "v1".to_string(),
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 0,
+                physical_time: 0,
+            },
+        );
+
+        let _event_id = engine.add_event(event).await.unwrap();
+
+        let stats = engine.get_dag_stats().await;
+        assert_eq!(stats.node_count, 1);
+        assert_eq!(
+            stats.pending_count, 0,
+            "inline-finalized events must leave DAG.pending before anchor persistence"
+        );
+
+        let anchors = engine.take_pending_anchors().await;
+        assert_eq!(anchors.len(), 1, "anchor still awaits durable persistence");
+
+        let cfs = engine.take_pending_finalized_cfs().await;
+        assert_eq!(cfs.len(), 1, "finalized CF still awaits durable indexing");
+        assert_eq!(cfs[0].anchor.id, anchors[0].id);
+    }
+
+    #[tokio::test]
+    async fn test_receive_cf_finalizes_with_buffered_vote_without_dag_lock_deadlock() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+
+        let leader = ConsensusEngine::new(config.clone(), "v1".to_string(), create_validator_set());
+        let follower = ConsensusEngine::new(config, "v2".to_string(), create_validator_set());
+
+        let event = Event::new(
+            EventType::System,
+            vec![],
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 1,
+                physical_time: 0,
+            },
+            "v1".to_string(),
+        );
+
+        {
+            let mut vlc = leader.vlc.write().await;
+            vlc.merge(&event.vlc_snapshot);
+            vlc.tick();
+        }
+        leader
+            .dag_manager
+            .add_event_with_retry(event.clone())
+            .await
+            .unwrap();
+        follower.receive_event_from_network(event).await.unwrap();
+
+        let mut cf = leader
+            .try_create_cf()
+            .await
+            .unwrap()
+            .expect("leader should have created a pending CF");
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+
+        follower
+            .receive_vote(Vote::new("v3".to_string(), cf.id.clone(), true))
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(500),
+            follower.receive_cf(cf),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "receive_cf must not self-deadlock when buffered votes make it finalize"
+        );
+
+        let (finalized, anchor) = result.unwrap().unwrap();
+        assert!(
+            finalized,
+            "buffered vote + leader vote + local vote should finalize"
+        );
+        assert!(
+            anchor.is_some(),
+            "finalized CF should return anchor for persistence"
+        );
+    }
+
+    #[tokio::test]
     async fn test_engine_leader_check() {
         let config = ConsensusConfig::default();
         let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
@@ -1280,25 +2145,28 @@ mod tests {
         // Proposers should rotate
         assert_ne!(proposer_0, proposer_1);
     }
-    
+
     #[tokio::test]
     async fn test_anchor_chain_root_verification() {
-        use setu_types::{Anchor, merkle::AnchorMerkleRoots};
-        
+        use setu_types::{merkle::AnchorMerkleRoots, Anchor};
+
         let config = ConsensusConfig::default();
         let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
-        
+
         // Get initial anchor chain root (should be all zeros for genesis)
         let initial_root = engine.get_anchor_chain_root().await;
-        assert_eq!(initial_root, [0u8; 32], "Initial anchor chain root should be all zeros");
-        
+        assert_eq!(
+            initial_root, [0u8; 32],
+            "Initial anchor chain root should be all zeros"
+        );
+
         // Create a CF with correct anchor_chain_root
         let correct_merkle_roots = AnchorMerkleRoots::with_roots(
-            [1u8; 32], // events_root
-            [2u8; 32], // global_state_root
+            [1u8; 32],    // events_root
+            [2u8; 32],    // global_state_root
             initial_root, // anchor_chain_root (matches current state)
         );
-        
+
         let anchor_correct = Anchor::with_merkle_roots(
             vec![],
             VLCSnapshot {
@@ -1310,26 +2178,29 @@ mod tests {
             None,
             0,
         );
-        
+
         let cf_correct = ConsensusFrame::new(anchor_correct, "v1".to_string());
-        
+
         // This should succeed (anchor_chain_root matches)
         let result = engine.receive_cf(cf_correct).await;
         // Note: Will fail at idempotency check or other steps, but should pass chain root verification
         // The error should NOT be about anchor chain root mismatch
         if let Err(e) = result {
             let error_msg = e.to_string();
-            assert!(!error_msg.contains("Anchor chain root mismatch"), 
-                "Should not fail on anchor chain root verification, got: {}", error_msg);
+            assert!(
+                !error_msg.contains("Anchor chain root mismatch"),
+                "Should not fail on anchor chain root verification, got: {}",
+                error_msg
+            );
         }
-        
+
         // Create a CF with WRONG anchor_chain_root
         let wrong_merkle_roots = AnchorMerkleRoots::with_roots(
-            [1u8; 32], // events_root
-            [2u8; 32], // global_state_root
+            [1u8; 32],  // events_root
+            [2u8; 32],  // global_state_root
             [99u8; 32], // anchor_chain_root (WRONG - doesn't match)
         );
-        
+
         let anchor_wrong = Anchor::with_merkle_roots(
             vec![],
             VLCSnapshot {
@@ -1341,43 +2212,43 @@ mod tests {
             None,
             0,
         );
-        
+
         let cf_wrong = ConsensusFrame::new(anchor_wrong, "v1".to_string());
-        
+
         // This should FAIL due to anchor chain root mismatch
         let result = engine.receive_cf(cf_wrong).await;
-        assert!(result.is_err(), "Should reject CF with wrong anchor_chain_root");
-        
+        assert!(
+            result.is_err(),
+            "Should reject CF with wrong anchor_chain_root"
+        );
+
         let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("Anchor chain root mismatch"), 
-            "Error should be about anchor chain root mismatch, got: {}", error_msg);
+        assert!(
+            error_msg.contains("Anchor chain root mismatch"),
+            "Error should be about anchor chain root mismatch, got: {}",
+            error_msg
+        );
     }
-    
+
     #[tokio::test]
     async fn test_follower_synchronizes_anchor_chain_root() {
-        use setu_types::{Anchor, merkle::AnchorMerkleRoots, EventType};
-        
+        use setu_types::{merkle::AnchorMerkleRoots, Anchor, EventType};
+
         let config = ConsensusConfig {
             vlc_delta_threshold: 5,
             min_events_per_cf: 1,
             validator_count: 3,
             ..Default::default()
         };
-        
+
         // Create leader engine
-        let leader_engine = ConsensusEngine::new(
-            config.clone(),
-            "v1".to_string(),
-            create_validator_set()
-        );
-        
+        let leader_engine =
+            ConsensusEngine::new(config.clone(), "v1".to_string(), create_validator_set());
+
         // Create follower engine
-        let follower_engine = ConsensusEngine::new(
-            config.clone(),
-            "v2".to_string(),
-            create_validator_set()
-        );
-        
+        let follower_engine =
+            ConsensusEngine::new(config.clone(), "v2".to_string(), create_validator_set());
+
         // Both start with same anchor_chain_root
         let initial_root = leader_engine.get_anchor_chain_root().await;
         assert_eq!(initial_root, [0u8; 32], "Initial root should be zero");
@@ -1386,7 +2257,7 @@ mod tests {
             initial_root,
             "Both nodes should start with same root"
         );
-        
+
         // Leader creates events and CF
         for i in 0..3 {
             let mut event = Event::new(
@@ -1403,7 +2274,7 @@ mod tests {
             event.execution_result = Some(setu_types::ExecutionResult::success());
             let _ = leader_engine.add_event(event).await;
         }
-        
+
         // Try to create CF (needs enough VLC delta)
         {
             let mut vlc = leader_engine.vlc.write().await;
@@ -1411,18 +2282,15 @@ mod tests {
                 vlc.tick();
             }
         }
-        
+
         let _cf_opt = leader_engine.try_create_cf().await;
         // CF creation might fail due to various reasons (min events, etc)
         // For this test, we simulate a CF manually
-        
+
         // Create a CF with correct merkle roots
-        let correct_merkle_roots = AnchorMerkleRoots::with_roots(
-            [1u8; 32],
-            [2u8; 32],
-            initial_root,
-        );
-        
+        let correct_merkle_roots =
+            AnchorMerkleRoots::with_roots([1u8; 32], [2u8; 32], initial_root);
+
         let anchor = Anchor::with_merkle_roots(
             vec![],
             VLCSnapshot {
@@ -1434,47 +2302,53 @@ mod tests {
             None,
             0,
         );
-        
+
         let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
-        
+
         // Follower receives and finalizes CF
         // Note: receive_cf will fail at various checks, but we can test the manager directly
         {
             let mut manager = follower_engine.consensus_manager.write().await;
             manager.receive_cf(cf.clone());
-            
+
             // Add votes to reach quorum (simulate 3 validators)
             let vote1 = Vote::new("v1".to_string(), cf.id.clone(), true);
             let vote2 = Vote::new("v2".to_string(), cf.id.clone(), true);
             let vote3 = Vote::new("v3".to_string(), cf.id.clone(), true);
-            
+
             manager.receive_vote(vote1);
             manager.receive_vote(vote2);
             let finalized = manager.receive_vote(vote3);
-            
+
             assert!(finalized, "CF should be finalized after quorum");
-            
+
             // Check that anchor_chain_root was updated
             let updated_root = manager.anchor_builder().anchor_chain_root();
-            assert_ne!(updated_root, initial_root, "Anchor chain root should have been updated");
-            
+            assert_ne!(
+                updated_root, initial_root,
+                "Anchor chain root should have been updated"
+            );
+
             // Verify it matches the expected computation
             let expected_root = {
                 let anchor_hash = anchor.compute_hash();
                 setu_types::hash_utils::chain_hash(&initial_root, &anchor_hash)
             };
-            
+
             assert_eq!(
                 updated_root, expected_root,
                 "Anchor chain root should match expected chain hash"
             );
         }
-        
+
         // Verify follower can now accept next CF with updated root
         let follower_root = follower_engine.get_anchor_chain_root().await;
-        assert_ne!(follower_root, initial_root, "Follower root should be updated");
+        assert_ne!(
+            follower_root, initial_root,
+            "Follower root should be updated"
+        );
     }
-    
+
     #[tokio::test]
     async fn test_cf_rejection_with_minority_reject_votes() {
         let config = ConsensusConfig {
@@ -1482,12 +2356,12 @@ mod tests {
             min_events_per_cf: 1,
             max_events_per_cf: 100,
             cf_timeout_ms: 5000,
-            validator_count: 4,  // 4 validators: need 2 rejects to reject (1/3+1)
+            validator_count: 4, // 4 validators: need 2 rejects to reject (1/3+1)
         };
-        
+
         let validator_set = create_validator_set();
         let engine = ConsensusEngine::new(config, "v1".to_string(), validator_set);
-        
+
         let anchor = Anchor::with_merkle_roots(
             vec![],
             VLCSnapshot {
@@ -1504,46 +2378,52 @@ mod tests {
             None,
             0,
         );
-        
+
         let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
         let cf_id = cf.id.clone();
-        
+
         let mut manager = engine.consensus_manager.write().await;
         manager.receive_cf(cf);
-        
+
         // Vote 1: approve (should not finalize yet)
         let vote1 = Vote::new("v1".to_string(), cf_id.clone(), true);
         let result1 = manager.receive_vote(vote1);
         assert!(!result1, "Should not finalize with 1 approve vote");
-        
+
         // Vote 2: reject (1 reject, not enough)
         let vote2 = Vote::new("v2".to_string(), cf_id.clone(), false);
         let result2 = manager.receive_vote(vote2);
         assert!(!result2, "Should not reject with only 1 reject vote");
-        
+
         // Vote 3: reject (2 rejects = 1/3+1, should reject)
         let vote3 = Vote::new("v3".to_string(), cf_id.clone(), false);
         let result3 = manager.receive_vote(vote3);
-        assert!(result3, "Should reject with 2 reject votes (1/3+1 threshold)");
-        
+        assert!(
+            result3,
+            "Should reject with 2 reject votes (1/3+1 threshold)"
+        );
+
         // Verify CF was removed from pending (can't directly access private field)
         // Instead verify it's not in last_finalized_cf
-        assert!(manager.last_finalized_cf().is_none(), "Rejected CF should not be finalized");
+        assert!(
+            manager.last_finalized_cf().is_none(),
+            "Rejected CF should not be finalized"
+        );
     }
-    
+
     #[tokio::test]
     async fn test_cf_timeout_cleanup() {
         let config = ConsensusConfig {
             vlc_delta_threshold: 10,
             min_events_per_cf: 1,
             max_events_per_cf: 100,
-            cf_timeout_ms: 100,  // 100ms timeout for testing
+            cf_timeout_ms: 100, // 100ms timeout for testing
             validator_count: 4,
         };
-        
+
         let validator_set = create_validator_set();
         let engine = ConsensusEngine::new(config, "v1".to_string(), validator_set);
-        
+
         let anchor = Anchor::with_merkle_roots(
             vec![],
             VLCSnapshot {
@@ -1560,44 +2440,44 @@ mod tests {
             None,
             0,
         );
-        
+
         let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
         let cf_id = cf.id.clone();
-        
+
         {
             let mut manager = engine.consensus_manager.write().await;
             manager.receive_cf(cf);
-            
+
             // Verify CF is pending (test by attempting to receive vote)
             let vote = Vote::new("v1".to_string(), cf_id.clone(), true);
             manager.receive_vote(vote);
         }
-        
+
         // Wait for timeout
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-        
+
         {
             let mut manager = engine.consensus_manager.write().await;
-            
+
             // Call cleanup
             let removed_count = manager.cleanup_timeout_cfs();
             assert_eq!(removed_count, 1, "Should remove 1 timeout CF");
         }
     }
-    
+
     #[tokio::test]
     async fn test_timeout_check_in_vote_processing() {
         let config = ConsensusConfig {
             vlc_delta_threshold: 10,
             min_events_per_cf: 1,
             max_events_per_cf: 100,
-            cf_timeout_ms: 100,  // 100ms timeout
+            cf_timeout_ms: 100, // 100ms timeout
             validator_count: 4,
         };
-        
+
         let validator_set = create_validator_set();
         let engine = ConsensusEngine::new(config, "v1".to_string(), validator_set);
-        
+
         let anchor = Anchor::with_merkle_roots(
             vec![],
             VLCSnapshot {
@@ -1614,24 +2494,27 @@ mod tests {
             None,
             0,
         );
-        
+
         let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
         let cf_id = cf.id.clone();
-        
+
         let mut manager = engine.consensus_manager.write().await;
         manager.receive_cf(cf);
-        
+
         // Wait for timeout
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-        
+
         // Receive a vote - should trigger timeout check and remove CF
         let vote = Vote::new("v1".to_string(), cf_id.clone(), true);
         let result = manager.receive_vote(vote);
-        
+
         // The vote processing should detect timeout and remove CF
-        assert!(result, "Should return true when CF is removed due to timeout");
+        assert!(
+            result,
+            "Should return true when CF is removed due to timeout"
+        );
     }
-    
+
     #[tokio::test]
     async fn test_leader_can_retry_after_cf_rejection() {
         // This test verifies that after a CF is rejected, the leader can
@@ -1643,10 +2526,10 @@ mod tests {
             cf_timeout_ms: 5000,
             validator_count: 4,
         };
-        
+
         let validator_set = create_validator_set();
         let engine = ConsensusEngine::new(config, "v1".to_string(), validator_set);
-        
+
         // Create first CF
         let anchor1 = Anchor::with_merkle_roots(
             vec![],
@@ -1664,34 +2547,33 @@ mod tests {
             None,
             0,
         );
-        
+
         let cf1 = ConsensusFrame::new(anchor1.clone(), "v1".to_string());
         let cf1_id = cf1.id.clone();
-        
+
         let mut manager = engine.consensus_manager.write().await;
-        
-        // Record state before receiving CF
-        let initial_vlc = manager.anchor_builder().last_fold_vlc();
-        let initial_depth = manager.anchor_builder().anchor_depth();
-        
+
         // Simulate: leader created this CF (receive it as if we proposed it)
         manager.receive_cf(cf1);
-        
+
         // Reject the CF with enough reject votes
         let vote1 = Vote::new("v2".to_string(), cf1_id.clone(), false);
         let vote2 = Vote::new("v3".to_string(), cf1_id.clone(), false);
         manager.receive_vote(vote1);
         let rejected = manager.receive_vote(vote2);
-        
+
         assert!(rejected, "CF should be rejected with 2 reject votes");
-        
+
         // Verify the CF is removed
-        assert!(manager.last_finalized_cf().is_none(), "No CF should be finalized");
-        
+        assert!(
+            manager.last_finalized_cf().is_none(),
+            "No CF should be finalized"
+        );
+
         // Key assertion: After rejection, leader's anchor_builder state should be
         // rolled back, allowing immediate retry. Since we received (not created) this CF,
         // the rollback won't apply (proposer check). But we can verify the mechanism exists.
-        
+
         // For a true test of rollback, we'd need to use try_create_cf which actually
         // modifies anchor_builder state. This test verifies the reject path works.
     }

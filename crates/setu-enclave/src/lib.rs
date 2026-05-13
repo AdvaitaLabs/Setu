@@ -87,27 +87,34 @@ pub mod nitro;
 
 // Re-export enclave-specific verification utilities
 pub use attestation::{
-    AttestationVerifier, AllowlistVerifier,
-    NitroAttestationDocument, NitroPcrs,
+    AllowlistVerifier, AttestationVerifier, NitroAttestationDocument, NitroPcrs,
 };
 pub use stf::{
-    StfInput, StfOutput, StfError, StfResult,
-    WriteSetEntry, StateDiff, ExecutionStats,
-    Hash, TaskId,
+    ExecutionStats, Hash, StateDiff, StfError, StfInput, StfOutput, StfResult, TaskId,
+    WriteSetEntry,
 };
-pub use traits::{EnclaveRuntime, EnclaveConfig, EnclaveInfo, EnclavePlatform};
+pub use traits::{EnclaveConfig, EnclaveInfo, EnclavePlatform, EnclaveRuntime};
 
 // === Re-export from setu-types (canonical source) ===
 // This allows setu-solver to still import from setu-enclave for backward compatibility
 pub use setu_types::task::{
     // Attestation types
-    Attestation, AttestationType, AttestationData,
-    AttestationError, AttestationResult, VerifiedAttestation,
-    // Solver task types
-    SolverTask, ResolvedInputs, OperationType, ResolvedObject,
-    ReadSetEntry, MerkleProof,
+    Attestation,
+    AttestationData,
+    AttestationError,
+    AttestationResult,
+    AttestationType,
     // Gas types
-    GasBudget, GasUsage,
+    GasBudget,
+    GasUsage,
+    MerkleProof,
+    OperationType,
+    ReadSetEntry,
+    ResolvedInputs,
+    ResolvedObject,
+    // Solver task types
+    SolverTask,
+    VerifiedAttestation,
 };
 
 // Re-export implementations based on features
@@ -116,6 +123,11 @@ pub use mock::MockEnclave;
 
 #[cfg(feature = "nitro")]
 pub use nitro::NitroEnclave;
+
+// Re-export Move stdlib sanity helper for binary entry points to use at startup.
+// See docs/bugs/20260421-deploy-stdlib-missing.md.
+#[cfg(feature = "move-vm")]
+pub use setu_move_vm::stdlib_module_count;
 
 /// Create the default enclave based on enabled features
 #[cfg(feature = "mock")]

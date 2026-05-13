@@ -69,6 +69,9 @@ pub struct PendingProposal {
     pub submitted_at: Instant,
     /// One-time callback token for Agent authentication (R1-ISSUE-8).
     pub callback_token: [u8; 32],
+    /// Original event timestamp (millis). Used for fallback proposal construction
+    /// so that resolve_proposal uses the true created_at instead of current time.
+    pub created_at: u64,
 }
 
 /// GovernanceService configuration.
@@ -115,6 +118,9 @@ pub struct GovernanceService {
     registry: SystemSubnetRegistry,
     /// Genesis validators for registration authorization.
     genesis_validators: Vec<GenesisValidator>,
+    /// Decided proposals cache: proposal_id → decision.
+    /// Filled when poll/callback consumes a pending proposal (before SMT finalization).
+    decided_proposals: DashMap<[u8; 32], GovernanceDecision>,
 }
 
 impl GovernanceService {
@@ -140,6 +146,7 @@ impl GovernanceService {
             nonce_counter: AtomicU64::new(0),
             registry: SystemSubnetRegistry::new(),
             genesis_validators,
+            decided_proposals: DashMap::new(),
         }
     }
 
@@ -177,6 +184,16 @@ impl GovernanceService {
     /// Look up pending proposal by proposal_id.
     pub fn get_pending(&self, proposal_id: &[u8; 32]) -> Option<PendingProposal> {
         self.pending_governance.get(proposal_id).map(|v| v.clone())
+    }
+
+    /// Record a decided (approved/rejected/timed-out) proposal for status queries.
+    pub fn record_decided(&self, proposal_id: [u8; 32], decision: GovernanceDecision) {
+        self.decided_proposals.insert(proposal_id, decision);
+    }
+
+    /// Look up a decided proposal by proposal_id.
+    pub fn get_decided(&self, proposal_id: &[u8; 32]) -> Option<GovernanceDecision> {
+        self.decided_proposals.get(proposal_id).map(|v| v.clone())
     }
 
     /// Validate a callback token against a pending proposal.
@@ -305,14 +322,15 @@ impl GovernanceService {
 
     /// Restore pending proposals from DAG replay stats.
     /// Called during startup after replay_all() completes.
-    pub fn restore_from_replay(&self, pending: Vec<([u8; 32], ProposalContent)>) {
-        for (proposal_id, content) in pending {
+    pub fn restore_from_replay(&self, pending: Vec<([u8; 32], ProposalContent, u64)>) {
+        for (proposal_id, content, created_at) in pending {
             let callback_token = Self::generate_callback_token();
             self.insert_pending(PendingProposal {
                 proposal_id,
                 content,
                 submitted_at: Instant::now(),
                 callback_token,
+                created_at,
             });
             info!(
                 proposal_id = %hex::encode(proposal_id),
@@ -491,6 +509,7 @@ mod tests {
             content: sample_content(),
             submitted_at: Instant::now(),
             callback_token: [2u8; 32],
+            created_at: 1000,
         };
         svc.insert_pending(proposal.clone());
         assert_eq!(svc.pending_count(), 1);
@@ -509,6 +528,7 @@ mod tests {
             content: sample_content(),
             submitted_at: Instant::now(),
             callback_token: token,
+            created_at: 1000,
         });
         assert!(svc.validate_callback_token(&[1u8; 32], &token));
     }
@@ -521,6 +541,7 @@ mod tests {
             content: sample_content(),
             submitted_at: Instant::now(),
             callback_token: [42u8; 32],
+            created_at: 1000,
         });
         assert!(!svc.validate_callback_token(&[1u8; 32], &[99u8; 32]));
     }
@@ -540,12 +561,14 @@ mod tests {
             content: sample_content(),
             submitted_at: Instant::now() - Duration::from_millis(200), // past timeout
             callback_token: [2u8; 32],
+            created_at: 1000,
         });
         svc.insert_pending(PendingProposal {
             proposal_id: [2u8; 32],
             content: sample_content(),
             submitted_at: Instant::now(), // not timed out
             callback_token: [3u8; 32],
+            created_at: 2000,
         });
 
         let timed_out = svc.check_timeouts();
@@ -589,8 +612,8 @@ mod tests {
     fn test_restore_from_replay() {
         let svc = GovernanceService::new(sample_config());
         let pending = vec![
-            ([1u8; 32], sample_content()),
-            ([2u8; 32], sample_content()),
+            ([1u8; 32], sample_content(), 1000u64),
+            ([2u8; 32], sample_content(), 2000u64),
         ];
         svc.restore_from_replay(pending);
         assert_eq!(svc.pending_count(), 2);
@@ -598,6 +621,9 @@ mod tests {
         let p1 = svc.get_pending(&[1u8; 32]).unwrap();
         let p2 = svc.get_pending(&[2u8; 32]).unwrap();
         assert_ne!(p1.callback_token, p2.callback_token);
+        // Verify created_at is preserved
+        assert_eq!(p1.created_at, 1000);
+        assert_eq!(p2.created_at, 2000);
     }
 
     #[tokio::test]
@@ -632,12 +658,14 @@ mod tests {
             content: sample_content(),
             submitted_at: Instant::now(),
             callback_token: [10u8; 32],
+            created_at: 1000,
         });
         svc.insert_pending(PendingProposal {
             proposal_id: [2u8; 32],
             content: sample_content(),
             submitted_at: Instant::now(),
             callback_token: [20u8; 32],
+            created_at: 2000,
         });
         let all = svc.all_pending();
         assert_eq!(all.len(), 2);

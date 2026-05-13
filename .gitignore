@@ -25,3 +25,30 @@ tests/
 *.py
 .VSCodeCounter/
 docs/
+deploy/
+*.key
+ai/
+
+# Move framework build output (Sui CLI)
+setu-framework/build/
+
+# Move compile tool build artifacts (independent Cargo project)
+tools/move-compile/target/
+.github/
+.env/
+.env
+deploy/.env
+keys/
+deploy/dev-mult/README.md
+deploy/dev-mult/ssh.sh
+deploy/dev-mult/tps-test*
+deploy/dev-mult/debug*
+.antigravity.yaml
+setu-framework/compiled/.gitkeep
+rustfmt.toml
+*.sh
+
+# Internal validation/process assets are intentionally kept out of the
+# open-source surface. Release-gate scripts, FDP docs, AI harness notes, and
+# deploy helpers should remain local/private unless they are explicitly
+# reviewed and promoted as public product code.

@@ -13,7 +13,7 @@ setu-core = { path = "../crates/setu-core" }
 setu-types = { path = "../types" }
 setu-vlc = { path = "../crates/setu-vlc" }
 setu-rpc = { path = "../setu-rpc" }
-setu-enclave = { path = "../crates/setu-enclave" }
+setu-enclave = { path = "../crates/setu-enclave", features = ["move-vm"] }
 setu-keys = { path = "../crates/setu-keys" }
 setu-transport = { path = "../crates/setu-transport" }
 

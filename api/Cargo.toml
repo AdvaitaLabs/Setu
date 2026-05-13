@@ -23,4 +23,6 @@ setu-types = { path = "../types" }
 
 [dev-dependencies]
 tokio-test = "0.4"
+bcs.workspace = true
+hex = "0.4"
 

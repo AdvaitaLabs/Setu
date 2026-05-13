@@ -10,6 +10,10 @@ pub mod object;
 pub mod subnet;          // Subnet (sub-application) types
 pub mod merkle;          // Merkle tree types for state commitment
 pub mod task;            // Task types for Validator → Solver communication
+pub mod envelope;        // ObjectEnvelope — unified storage for Move objects and legacy coins
+pub mod execution_outcome; // R5: on-chain apply verdict (Applied/ExecutionFailed/StaleRead)
+pub mod dynamic_field;   // Dynamic Fields — DfFieldValue, DfAccessMode, derive_df_oid (DF FDP M1)
+pub mod ptb;             // Programmable Transaction Block (PTB) — wire format only (B6a)
 
 // ========== Object Model ==========
 pub mod coin;           // Coin object (transferable asset)
@@ -39,10 +43,17 @@ pub use registration::{
 pub use event::{
     Event, EventId, EventStatus, EventType, EventPayload,
     ExecutionResult, StateChange,
+    MoveCallPayload, MovePublishPayload,
 };
 
 // State key format helpers
 pub use state_key::{object_key, parse_object_key, is_known_metadata_key};
+
+// R5: Execution outcome (apply-phase verdict)
+pub use execution_outcome::ExecutionOutcome;
+
+// Dynamic Fields (DF FDP M1)
+pub use dynamic_field::{DfAccessMode, DfFieldValue, derive_df_oid};
 
 // Export from consensus module
 pub use consensus::{Anchor, AnchorId, ConsensusFrame, CFId, CFStatus, Vote, ConsensusConfig};
@@ -103,6 +114,9 @@ pub use resource::{
     flux_state_object_id, power_state_object_id, resource_params_object_id,
     INITIAL_POWER, INITIAL_FLUX,
 };
+
+// Envelope types
+pub use envelope::{ObjectEnvelope, EnvelopeMetadata, StorageFormat, detect_and_parse, ENVELOPE_MAGIC};
 
 // Task types for Validator → Solver communication
 pub use task::{

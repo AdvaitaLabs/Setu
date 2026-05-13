@@ -9,4 +9,5 @@ pub mod validator;
 pub mod router;
 pub mod transfer;
 pub mod keygen;
+pub mod ptb_encode;
 

@@ -43,6 +43,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::peer_manager::AnemoPeerManager;
+
 /// Information about a node in the network
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeInfo {
@@ -125,13 +127,25 @@ impl SignedNodeInfo {
     }
 }
 
+/// Lightweight info about a directly connected peer.
+///
+/// Transport-layer mTLS already authenticates the connection, so no
+/// cryptographic signature is required for directly-connected peers
+/// (unlike gossip-learned `known_peers` which carry `SignedNodeInfo`).
+#[derive(Clone, Debug)]
+pub struct PeerNodeInfo {
+    pub node_id: String,
+    pub node_type: NodeType,
+    pub addresses: Vec<String>,
+}
+
 /// Shared state for the discovery system
 pub struct State {
     /// Our own signed node info
     pub our_info: Option<SignedNodeInfo>,
-    /// Currently connected peers with their info
-    pub connected_peers: HashMap<PeerId, SignedNodeInfo>,
-    /// All known peers (including disconnected)
+    /// Currently connected peers with their info (populated from PeerManager)
+    pub connected_peers: HashMap<PeerId, PeerNodeInfo>,
+    /// All known peers (including disconnected), learned via gossip
     pub known_peers: HashMap<PeerId, SignedNodeInfo>,
 }
 
@@ -140,7 +154,7 @@ impl State {
     pub fn connected_validators(&self) -> usize {
         self.connected_peers
             .values()
-            .filter(|info| info.info.node_type == NodeType::Validator)
+            .filter(|info| info.node_type == NodeType::Validator)
             .count()
     }
 
@@ -148,7 +162,7 @@ impl State {
     pub fn connected_solvers(&self) -> usize {
         self.connected_peers
             .values()
-            .filter(|info| info.info.node_type == NodeType::Solver)
+            .filter(|info| info.node_type == NodeType::Solver)
             .count()
     }
 }
@@ -194,6 +208,7 @@ pub struct DiscoveryEventLoop {
     config: DiscoveryConfig,
     state: Arc<RwLock<State>>,
     network: anemo::NetworkRef,
+    peer_manager: Option<Arc<AnemoPeerManager>>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 }
 
@@ -202,12 +217,14 @@ impl DiscoveryEventLoop {
         config: DiscoveryConfig,
         state: Arc<RwLock<State>>,
         network: anemo::NetworkRef,
+        peer_manager: Option<Arc<AnemoPeerManager>>,
         shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Self {
         Self {
             config,
             state,
             network,
+            peer_manager,
             shutdown_rx,
         }
     }
@@ -240,18 +257,43 @@ impl DiscoveryEventLoop {
             return;
         };
 
-        // Get current connected peers
-        let connected_peers: Vec<PeerId> = network.peers().into_iter().collect();
-        
-        // Update connected peers in state
-        {
+        // Get transport-level connected peer IDs
+        let transport_peers: Vec<PeerId> = network.peers().into_iter().collect();
+
+        // Sync connected_peers from PeerManager (source of truth for metadata)
+        // This is transient data — fully rebuilt each tick, no persistence/replay needed (G10).
+        if let Some(pm) = &self.peer_manager {
+            let pm_peers = pm.get_connected_peers();
             let mut state = self.state.write().unwrap();
-            state.connected_peers.retain(|peer_id, _| connected_peers.contains(peer_id));
+            state.connected_peers.clear();
+            for peer_info in pm_peers {
+                // Only include peers that are also connected at transport level
+                if transport_peers.contains(&peer_info.peer_id) {
+                    // G12 field mapping: PeerInfo.node_info (7 fields) → PeerNodeInfo (3 fields)
+                    //   kept:    id → node_id, role → node_type, endpoint() → addresses
+                    //   dropped: status (not relevant to discovery), public_key (mTLS handles auth),
+                    //            port (merged into addresses via endpoint())
+                    let node_type = match peer_info.node_info.role {
+                        crate::node_info::NodeRole::Validator => NodeType::Validator,
+                        crate::node_info::NodeRole::Solver => NodeType::Solver,
+                        crate::node_info::NodeRole::LightNode => NodeType::FullNode,
+                    };
+                    state.connected_peers.insert(peer_info.peer_id, PeerNodeInfo {
+                        node_id: peer_info.node_info.id.clone(),
+                        node_type,
+                        addresses: vec![peer_info.node_info.endpoint()],
+                    });
+                }
+            }
+        } else {
+            // No PeerManager — just prune disconnected peers
+            let mut state = self.state.write().unwrap();
+            state.connected_peers.retain(|peer_id, _| transport_peers.contains(peer_id));
         }
 
         // If peer exchange is enabled, query peers for their known peers
         if self.config.enable_peer_exchange {
-            self.exchange_peer_info(&network, &connected_peers).await;
+            self.exchange_peer_info(&network, &transport_peers).await;
         }
 
         // Log current state

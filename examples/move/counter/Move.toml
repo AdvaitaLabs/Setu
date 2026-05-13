@@ -1,0 +1,9 @@
+[package]
+name = "Counter"
+version = "0.1.0"
+
+[addresses]
+examples = "0xcafe"
+
+[dependencies]
+SetuFramework = { local = "../../../setu-framework" }

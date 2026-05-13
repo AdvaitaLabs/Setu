@@ -960,10 +960,17 @@ impl IncrementalSparseMerkleTree {
 
     /// Create a tree from existing leaves (for crash recovery).
     ///
-    /// This rebuilds the tree structure from persisted leaf data.
-    /// The dirty tracking is NOT set - recovered data is already persisted.
-    /// 
-    /// Accepts std::HashMap for compatibility with persistence layer.
+    /// Rebuilds the tree by replaying inserts. Dirty tracking is NOT set —
+    /// recovered data is already persisted.
+    ///
+    /// **Determinism contract**: the resulting `root_hash` is an invariant
+    /// of the input `(key, value)` set and MUST NOT depend on the
+    /// iteration order of `leaves`. Locked in by the unit test
+    /// `from_leaves_root_is_order_independent`. The implementation
+    /// internally sorts the entries before insertion to keep the call
+    /// graph free of `HashMap`-iterator non-determinism.
+    ///
+    /// Accepts std::HashMap for compatibility with the persistence layer.
     pub fn from_leaves(leaves: HashMap<HashValue, Vec<u8>>) -> Self {
         let mut tree = Self {
             root_hash: empty_hash(),
@@ -972,12 +979,19 @@ impl IncrementalSparseMerkleTree {
             dirty_leaves: std::collections::HashSet::new(),
             deleted_leaves: std::collections::HashSet::new(),
         };
-        
-        // Insert all leaves (this rebuilds the tree structure)
-        for (key, value) in leaves {
+
+        // Iterate in deterministic order (G1 / fix-smt-from-leaves-
+        // nondeterministic-iteration, 2026-04-28). The SMT root is
+        // mathematically order-independent — each leaf's slot is fixed
+        // by its key bit path — but sorting eliminates the audit
+        // burden and makes any future regression in `insert_at_node`
+        // / `split_leaf` immediately visible to the property test.
+        let mut sorted: Vec<(HashValue, Vec<u8>)> = leaves.into_iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        for (key, value) in sorted {
             tree.insert_without_tracking(key, value);
         }
-        
+
         tree
     }
 
@@ -1782,5 +1796,82 @@ mod incremental_tests {
             count += 1;
         }
         assert_eq!(count, 2);
+    }
+
+    /// fix-smt-from-leaves-nondeterministic-iteration (2026-04-28).
+    /// Locks the order-independence contract of `from_leaves`. Even though
+    /// the implementation now sorts before insertion, this test guards
+    /// against any future regression in `insert_at_node` / `split_leaf`
+    /// that would introduce path-dependent state into the SMT.
+    #[test]
+    fn from_leaves_root_is_order_independent() {
+        let n: u32 = 200;
+        let entries: Vec<(HashValue, Vec<u8>)> = (0..n)
+            .map(|i| {
+                let mut key_bytes = [0u8; 32];
+                key_bytes[..4].copy_from_slice(&i.to_be_bytes());
+                (
+                    HashValue::new(key_bytes),
+                    format!("value-{}", i).into_bytes(),
+                )
+            })
+            .collect();
+
+        // Re-collect into HashMap (RandomState-randomized iteration order).
+        let map_a: HashMap<HashValue, Vec<u8>> = entries.iter().cloned().collect();
+        let map_b: HashMap<HashValue, Vec<u8>> = entries.iter().rev().cloned().collect();
+        let mut entries_c = entries.clone();
+        entries_c.sort_by(|a, b| a.0.cmp(&b.0));
+        let map_c: HashMap<HashValue, Vec<u8>> = entries_c.into_iter().collect();
+        let mut entries_d = entries.clone();
+        entries_d.sort_by(|a, b| b.0.cmp(&a.0));
+        let map_d: HashMap<HashValue, Vec<u8>> = entries_d.into_iter().collect();
+
+        let r_a = IncrementalSparseMerkleTree::from_leaves(map_a).root();
+        let r_b = IncrementalSparseMerkleTree::from_leaves(map_b).root();
+        let r_c = IncrementalSparseMerkleTree::from_leaves(map_c).root();
+        let r_d = IncrementalSparseMerkleTree::from_leaves(map_d).root();
+
+        assert_eq!(r_a, r_b, "root must be invariant under reverse order");
+        assert_eq!(r_a, r_c, "root must be invariant under sorted order");
+        assert_eq!(
+            r_a, r_d,
+            "root must be invariant under reverse-sorted order"
+        );
+        assert_ne!(
+            r_a,
+            empty_hash(),
+            "non-empty tree should have non-empty root"
+        );
+    }
+
+    /// Companion to `from_leaves_root_is_order_independent`: the post-fix
+    /// `from_leaves` must produce the same root as a sequence of plain
+    /// `insert` calls in arbitrary order. This proves the sort is purely
+    /// internal — clients that build trees via `insert` are unaffected.
+    #[test]
+    fn from_leaves_matches_incremental_insert() {
+        let n: u32 = 50;
+        let entries: Vec<(HashValue, Vec<u8>)> = (0..n)
+            .map(|i| {
+                let mut key_bytes = [0u8; 32];
+                key_bytes[..4].copy_from_slice(&i.to_be_bytes());
+                (HashValue::new(key_bytes), format!("v-{}", i).into_bytes())
+            })
+            .collect();
+
+        let mut incremental = IncrementalSparseMerkleTree::new();
+        for (k, v) in entries.iter().rev() {
+            incremental.insert(*k, v.clone());
+        }
+
+        let from_leaves =
+            IncrementalSparseMerkleTree::from_leaves(entries.iter().cloned().collect());
+
+        assert_eq!(
+            incremental.root(),
+            from_leaves.root(),
+            "from_leaves must match incremental insert root for the same key set"
+        );
     }
 }

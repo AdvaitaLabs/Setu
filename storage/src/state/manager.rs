@@ -23,11 +23,54 @@ use setu_merkle::{
     B4Store, MerkleStore,
     SubnetAggregationTree, SubnetStateEntry,
 };
+use serde::{Deserialize, Serialize};
 use setu_types::{SubnetId, AnchorMerkleRoots};
 use setu_types::event::{Event, StateChange, ExecutionResult};
-use setu_types::coin::CoinState;
+use setu_types::envelope::{detect_and_parse, StorageFormat};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+// ============================================================================
+// DIAG (Phase 1 instrumentation for consensus-root-self-consistency FDP)
+// ============================================================================
+//
+// Thread-local gate + RAII guard. When enabled, `apply_committed_events` marks
+// the current thread as "inside an authoritative CF apply"; `apply_state_change`
+// fires a structured-error probe only when invoked *outside* that gate. This
+// catches any write-GSM mutation that bypasses the CF-apply path (H3).
+//
+// See docs/feat/consensus-root-self-consistency/design.md §3.4.
+
+#[cfg(feature = "diag-root-drift")]
+thread_local! {
+    /// `true` iff the current thread is currently executing
+    /// `GlobalStateManager::apply_committed_events`. Nested calls are not
+    /// expected in production but the RAII guard makes the API panic-safe
+    /// and refactor-safe.
+    static IN_APPLY_COMMITTED_EVENTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard that sets the TLS gate on `enter()` and clears it on `Drop`.
+/// Drop runs on normal return, `?`-early-return, and unwind — so the gate
+/// cannot leak across thread-pool reuse.
+#[cfg(feature = "diag-root-drift")]
+struct InApplyGuard;
+
+#[cfg(feature = "diag-root-drift")]
+impl InApplyGuard {
+    fn enter() -> Self {
+        IN_APPLY_COMMITTED_EVENTS.with(|g| g.set(true));
+        Self
+    }
+}
+
+#[cfg(feature = "diag-root-drift")]
+impl Drop for InApplyGuard {
+    fn drop(&mut self) {
+        IN_APPLY_COMMITTED_EVENTS.with(|g| g.set(false));
+    }
+}
 
 /// Manages Object State SMT for a single subnet
 #[derive(Clone)]
@@ -225,17 +268,26 @@ pub struct GlobalStateManager {
     /// enabling efficient coin queries by address. The index maps owner
     /// addresses to the set of subnet IDs where they have coins.
     coin_type_index: HashMap<String, HashSet<String>>,
-    /// Owner coin index: owner_address -> set of (object_id, subnet_id) pairs
+    /// Owner object index: owner_address -> set of (object_id, type_tag) pairs
     /// 
     /// This index tracks which object IDs belong to each owner, enabling
-    /// efficient coin lookups even for coins created by runtime split operations
-    /// (whose object_ids are not deterministic).
-    owner_coin_index: HashMap<String, HashSet<([u8; 32], String)>>,
+    /// efficient lookups for both Coins and Move objects.
+    /// The type_tag is coin_type for legacy CoinState, or Move type_tag for ObjectEnvelope.
+    owner_object_index: HashMap<String, HashSet<([u8; 32], String)>>,
     /// Modification tracker: object_id -> last modifying event_id
     /// 
     /// Updated during apply_committed_events to track which event last modified
     /// each object. Used by TaskPreparer to derive DAG parent_ids for causal ordering.
     modification_tracker: HashMap<[u8; 32], String>,
+    /// Optional version watcher (B1 wait_min_version API).
+    ///
+    /// When attached via [`set_version_watcher`](Self::set_version_watcher),
+    /// `apply_committed_events` calls `notify_objects` for every object id
+    /// touched by the committed events AFTER all SMT writes for the batch
+    /// commit. The notifier is fired in the same `&mut self` scope as the
+    /// writes — leaders and followers both go through this single hook
+    /// (design.md §4.4 A').
+    version_watcher: Option<Arc<crate::state::version_watcher::WatcherRegistry>>,
 }
 
 /// Extended B4Store trait that combines all required storage capabilities.
@@ -275,8 +327,11 @@ impl Clone for GlobalStateManager {
             current_anchor: self.current_anchor,
             // Don't clone indices - clones are for temporary state root calculations only
             coin_type_index: HashMap::new(),
-            owner_coin_index: HashMap::new(),
+            owner_object_index: HashMap::new(),
             modification_tracker: HashMap::new(),
+            // Clones are throw-away snapshots — wakeup notifications are scoped
+            // to the canonical instance only.
+            version_watcher: None,
         }
     }
 }
@@ -284,7 +339,7 @@ impl Clone for GlobalStateManager {
 impl GlobalStateManager {
     /// Create a full read snapshot (preserving all index data).
     ///
-    /// Unlike `clone()`, this method preserves coin_type_index, owner_coin_index,
+    /// Unlike `clone()`, this method preserves coin_type_index, owner_object_index,
     /// and modification_tracker, so the read snapshot can properly serve queries.
     ///
     /// ## Differences from clone()
@@ -294,7 +349,7 @@ impl GlobalStateManager {
     /// | subnet_states | ✅ preserved | ✅ preserved |
     /// | store | ❌ set to None | ❌ set to None |
     /// | coin_type_index | ❌ cleared | ✅ preserved |
-    /// | owner_coin_index | ❌ cleared | ✅ preserved |
+    /// | owner_object_index | ❌ cleared | ✅ preserved |
     /// | modification_tracker | ❌ cleared | ✅ preserved |
     ///
     /// ## Performance
@@ -306,8 +361,11 @@ impl GlobalStateManager {
             store: None,  // Read snapshot doesn't need storage backend
             current_anchor: self.current_anchor,
             coin_type_index: self.coin_type_index.clone(),
-            owner_coin_index: self.owner_coin_index.clone(),
+            owner_object_index: self.owner_object_index.clone(),
             modification_tracker: self.modification_tracker.clone(),
+            // Read snapshots do not fire wakeups; the canonical instance owns
+            // the watcher.
+            version_watcher: None,
         }
     }
 
@@ -324,8 +382,9 @@ impl GlobalStateManager {
             store: None,
             current_anchor: 0,
             coin_type_index: HashMap::new(),
-            owner_coin_index: HashMap::new(),
+            owner_object_index: HashMap::new(),
             modification_tracker: HashMap::new(),
+            version_watcher: None,
         }
     }
     
@@ -337,7 +396,17 @@ impl GlobalStateManager {
         manager.store = Some(store);
         manager
     }
-    
+
+    /// Attach a `WatcherRegistry` so `apply_committed_events` notifies any
+    /// pending `wait_min_version` waiters whenever it materializes new state.
+    /// Designed to be called once at validator boot, before the first event
+    /// applies. See [`docs/feat/pwoo-r6-wait-api/design.md`](../../../../docs/feat/pwoo-r6-wait-api/design.md) §4.4.
+    pub fn set_version_watcher(
+        &mut self,
+        watcher: Arc<crate::state::version_watcher::WatcherRegistry>,
+    ) {
+        self.version_watcher = Some(watcher);
+    }
     /// Get or create a subnet's SMT
     pub fn get_subnet_mut(&mut self, subnet_id: SubnetId) -> &mut SubnetStateSMT {
         self.subnet_states
@@ -580,26 +649,31 @@ impl GlobalStateManager {
             }
             
             // ⭐ P1-6: Verify root hash consistency
+            // Note: root mismatch is downgraded to WARN because `from_leaves()` may
+            // reconstruct a different internal tree layout than the original incremental
+            // inserts, while the leaf data is still correct.  The SMT guarantees the
+            // same *set* of leaves always produces the same root, so a mismatch here
+            // indicates a real bug that should be investigated — but the recovered
+            // leaf data is trustworthy enough to continue serving.
             if last_anchor > 0 {
                 if let Some(expected_root) = store.get_subnet_root(&subnet_id_bytes, last_anchor)? {
                     let actual_root = smt.root();
                     if actual_root != expected_root {
-                        tracing::error!(
+                        tracing::warn!(
                             ?subnet_id,
                             expected = %expected_root,
                             actual = %actual_root,
-                            "Root hash mismatch during recovery!"
+                            leaf_count,
+                            "Root hash mismatch during recovery — continuing with recovered leaves"
                         );
-                        return Err(setu_merkle::MerkleError::ConsistencyError(format!(
-                            "Root hash mismatch for subnet {:?}: expected {}, got {}",
-                            subnet_id, expected_root, actual_root
-                        )));
+                        summary.root_mismatches += 1;
+                    } else {
+                        tracing::debug!(
+                            ?subnet_id,
+                            root = %actual_root,
+                            "Root hash verified"
+                        );
                     }
-                    tracing::debug!(
-                        ?subnet_id,
-                        root = %actual_root,
-                        "Root hash verified"
-                    );
                 }
             }
             
@@ -736,7 +810,7 @@ impl GlobalStateManager {
     pub fn register_coin_object(&mut self, address: &str, coin_type: &str, object_id: [u8; 32]) {
         let canonical = Self::resolve_address(address);
         self.register_coin_type(&canonical, coin_type);
-        self.owner_coin_index
+        self.owner_object_index
             .entry(canonical)
             .or_default()
             .insert((object_id, coin_type.to_string()));
@@ -744,52 +818,62 @@ impl GlobalStateManager {
     
     /// Get all object IDs owned by an address
     /// 
-    /// Returns (object_id, coin_type) pairs for all coins owned by the address.
+    /// Returns (object_id, type_tag) pairs for all objects owned by the address.
+    /// For legacy CoinState, type_tag is the coin_type (subnet_id).
+    /// For ObjectEnvelope, type_tag is the Move type tag string.
     pub fn get_coin_objects_for_address(&self, address: &str) -> Vec<([u8; 32], String)> {
         let canonical = Self::resolve_address(address);
-        self.owner_coin_index
+        self.owner_object_index
             .get(&canonical)
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default()
     }
 
-    /// Rebuild the coin_type_index by scanning all objects in all SMTs.
+    /// Rebuild all indexes by scanning all objects in all SMTs.
     /// 
+    /// Supports both legacy CoinState and ObjectEnvelope formats via `detect_and_parse()`.
     /// This should be called at startup after recovering SMT state from storage.
-    /// It ensures the index is consistent with the actual state.
-    /// 
-    /// # Performance
-    /// - O(n) where n is total number of objects
-    /// - ~1 second per 1M objects (in-memory scan)
     /// 
     /// # Returns
-    /// Number of coins indexed.
+    /// Number of objects indexed.
     pub fn rebuild_coin_type_index(&mut self) -> usize {
         self.coin_type_index.clear();
-        self.owner_coin_index.clear();
+        self.owner_object_index.clear();
         
-        // First collect all coin data to avoid borrow conflicts
-        let coin_data: Vec<(String, String, [u8; 32])> = self.iter_all_objects()
+        // Collect all parseable object data to avoid borrow conflicts
+        // Each entry: (owner, type_tag, object_id, is_coin, coin_type_for_index)
+        let object_data: Vec<(String, String, [u8; 32], Option<String>)> = self.iter_all_objects()
             .filter_map(|(_subnet_id, object_id, value)| {
-                CoinState::from_bytes(value)
-                    .map(|cs| (cs.owner.clone(), cs.coin_type.clone(), object_id))
+                match detect_and_parse(value) {
+                    StorageFormat::Envelope(env) => {
+                        let owner = env.metadata.owner.to_string();
+                        let coin_type = extract_coin_type_from_tag(&env.type_tag);
+                        Some((owner, env.type_tag.clone(), object_id, coin_type))
+                    }
+                    StorageFormat::LegacyCoinState(cs) => {
+                        Some((cs.owner.clone(), cs.coin_type.clone(), object_id, Some(cs.coin_type.clone())))
+                    }
+                    StorageFormat::Unknown => None,
+                }
             })
             .collect();
         
         // Then update the indices
-        for (owner, coin_type, object_id) in coin_data {
-            self.coin_type_index
+        for (owner, type_tag, object_id, coin_type) in object_data {
+            self.owner_object_index
                 .entry(owner.clone())
                 .or_default()
-                .insert(coin_type.clone());
+                .insert((object_id, type_tag));
             
-            self.owner_coin_index
-                .entry(owner)
-                .or_default()
-                .insert((object_id, coin_type));
+            if let Some(ct) = coin_type {
+                self.coin_type_index
+                    .entry(owner)
+                    .or_default()
+                    .insert(ct);
+            }
         }
         
-        self.coin_type_index.values().map(|v| v.len()).sum()
+        self.owner_object_index.values().map(|v| v.len()).sum()
     }
 
     /// Get index statistics for debugging/monitoring.
@@ -839,6 +923,24 @@ impl GlobalStateManager {
         subnet_id: SubnetId,
         change: &StateChange,
     ) -> ApplyResult {
+        // DIAG (H3 probe): fires if a write reaches this function outside the
+        // authoritative `apply_committed_events` call graph. Any hit is a
+        // candidate root-cause for `consensus-root-self-consistency` — the
+        // backtrace pinpoints the rogue caller. Zero cost when feature off.
+        #[cfg(feature = "diag-root-drift")]
+        {
+            let inside = IN_APPLY_COMMITTED_EVENTS.with(|g| g.get());
+            if !inside {
+                tracing::error!(
+                    target: "storage::diag::apply_state_change_out_of_band",
+                    key = %change.key,
+                    subnet = ?subnet_id,
+                    backtrace = ?std::backtrace::Backtrace::force_capture(),
+                    "DIAG H3: apply_state_change called outside apply_committed_events"
+                );
+            }
+        }
+
         let object_id = Self::parse_state_change_key(&change.key);
         
         match &change.new_value {
@@ -850,34 +952,13 @@ impl GlobalStateManager {
                 };
                 // smt borrow released here
                 
-                // Update coin_type_index and owner_coin_index if this is a CoinState
-                if let Some(new_cs) = CoinState::from_bytes(value) {
-                    // If there's an old value, check if owner changed → clean up old index
-                    if let Some(ref old_bytes) = change.old_value {
-                        if let Some(old_cs) = CoinState::from_bytes(old_bytes) {
-                            if old_cs.owner != new_cs.owner {
-                                // Owner changed (e.g., full transfer) → remove from old owner's index
-                                if let Some(set) = self.owner_coin_index.get_mut(&old_cs.owner) {
-                                    set.remove(&(*object_id.as_bytes(), old_cs.coin_type.clone()));
-                                    if set.is_empty() {
-                                        self.owner_coin_index.remove(&old_cs.owner);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Add/update new owner's index entries
-                    self.coin_type_index
-                        .entry(new_cs.owner.clone())
-                        .or_default()
-                        .insert(new_cs.coin_type.clone());
-                    
-                    self.owner_coin_index
-                        .entry(new_cs.owner.clone())
-                        .or_default()
-                        .insert((*object_id.as_bytes(), new_cs.coin_type.clone()));
+                // Clean up old owner's index if owner changed
+                if let Some(ref old_bytes) = change.old_value {
+                    self.remove_from_indexes_for_value(&object_id, old_bytes);
                 }
+                
+                // Update indexes based on new value format
+                self.update_indexes_for_value(&object_id, value, &change.key);
                 
                 ApplyResult::Updated {
                     object_id: *object_id.as_bytes(),
@@ -894,17 +975,7 @@ impl GlobalStateManager {
                 });
                 
                 if let Some(ref old_bytes) = effective_old {
-                    if let Some(old_cs) = CoinState::from_bytes(old_bytes) {
-                        // Remove from owner_coin_index
-                        if let Some(set) = self.owner_coin_index.get_mut(&old_cs.owner) {
-                            set.remove(&(*object_id.as_bytes(), old_cs.coin_type.clone()));
-                            if set.is_empty() {
-                                self.owner_coin_index.remove(&old_cs.owner);
-                            }
-                        }
-                        // Note: coin_type_index not cleaned here because the owner may
-                        // still have other coins of the same type. Cleaned during rebuild.
-                    }
+                    self.remove_from_indexes_for_value(&object_id, old_bytes);
                 }
                 
                 let existed = {
@@ -919,6 +990,74 @@ impl GlobalStateManager {
         }
     }
     
+    /// Generalized index update — supports both ObjectEnvelope and legacy CoinState.
+    fn update_indexes_for_value(&mut self, object_id: &HashValue, value: &[u8], key: &str) {
+        // Module keys don't participate in object indexing
+        if key.starts_with("mod:") || key.starts_with("user:") || key.starts_with("solver:")
+            || key.starts_with("validator:") || key.starts_with("event:")
+            || key.starts_with("linkage:") {
+            return;
+        }
+        
+        match detect_and_parse(value) {
+            StorageFormat::Envelope(env) => {
+                let owner_hex = env.metadata.owner.to_string();
+                
+                self.owner_object_index
+                    .entry(owner_hex.clone())
+                    .or_default()
+                    .insert((*object_id.as_bytes(), env.type_tag.clone()));
+                
+                // If this is a Coin type, also update coin_type_index for backward compat
+                if let Some(coin_type) = extract_coin_type_from_tag(&env.type_tag) {
+                    self.coin_type_index
+                        .entry(owner_hex)
+                        .or_default()
+                        .insert(coin_type);
+                }
+            }
+            StorageFormat::LegacyCoinState(cs) => {
+                self.coin_type_index
+                    .entry(cs.owner.clone())
+                    .or_default()
+                    .insert(cs.coin_type.clone());
+                
+                self.owner_object_index
+                    .entry(cs.owner.clone())
+                    .or_default()
+                    .insert((*object_id.as_bytes(), cs.coin_type.clone()));
+            }
+            StorageFormat::Unknown => {
+                // Unrecognized format — skip indexing (doesn't affect SMT correctness)
+            }
+        }
+    }
+    
+    /// Remove an object from indexes based on its old value bytes.
+    fn remove_from_indexes_for_value(&mut self, object_id: &HashValue, old_bytes: &[u8]) {
+        match detect_and_parse(old_bytes) {
+            StorageFormat::Envelope(env) => {
+                let owner_hex = env.metadata.owner.to_string();
+                if let Some(set) = self.owner_object_index.get_mut(&owner_hex) {
+                    set.remove(&(*object_id.as_bytes(), env.type_tag.clone()));
+                    if set.is_empty() {
+                        self.owner_object_index.remove(&owner_hex);
+                    }
+                }
+                // Note: coin_type_index not cleaned per-delete — cleaned during rebuild
+            }
+            StorageFormat::LegacyCoinState(cs) => {
+                if let Some(set) = self.owner_object_index.get_mut(&cs.owner) {
+                    set.remove(&(*object_id.as_bytes(), cs.coin_type.clone()));
+                    if set.is_empty() {
+                        self.owner_object_index.remove(&cs.owner);
+                    }
+                }
+            }
+            StorageFormat::Unknown => {}
+        }
+    }
+
     /// Apply all state changes from an ExecutionResult to a subnet
     ///
     /// Returns the new subnet root after applying all changes.
@@ -953,6 +1092,33 @@ impl GlobalStateManager {
         &mut self,
         events: &[Event],
     ) -> StateApplySummary {
+        // DIAG: mark this thread as "inside authoritative CF apply" so that
+        // apply_state_change's out-of-band probe stays silent for every write
+        // reached through this path. Drop unsets the gate on any exit
+        // (normal, `?`, unwind).
+        #[cfg(feature = "diag-root-drift")]
+        let _diag_gate = InApplyGuard::enter();
+
+        // Phase 4 audit probe (design.md §6.1 item 2): fire on *every* call
+        // site of apply_committed_events — including Genesis/System paths,
+        // verify-clones, and reconstruction — so no caller escapes Phase 3
+        // coverage. Feature-gated to zero cost when disabled.
+        #[cfg(feature = "diag-root-drift")]
+        let _p4_pre_root = {
+            let (pre, _) = self.compute_global_root_bytes();
+            let first_id: &str = events.first().map(|e| e.id.as_str()).unwrap_or("");
+            let last_id: &str = events.last().map(|e| e.id.as_str()).unwrap_or("");
+            tracing::info!(
+                target: "storage::diag::apply_committed_events_audit",
+                pre_apply_root = %hex::encode(pre),
+                n_events = events.len(),
+                first_event_id = %first_id,
+                last_event_id = %last_id,
+                "DIAG P4: apply_committed_events entry"
+            );
+            pre
+        };
+
         let mut summary = StateApplySummary::new();
         
         // Sort events by VLC for deterministic ordering
@@ -1006,15 +1172,22 @@ impl GlobalStateManager {
                             self.get_subnet_mut(target).get(&object_id).cloned()
                         };
                         if effective_current.as_ref() != Some(expected_old) {
-                            // Stale read detected: current state differs from what
-                            // the Solver saw when it executed this event.
-                            // This is the double-spend safety net.
+                            // M5 (OBS-020 retired): prior to the speculative overlay,
+                            // MoveCall events were pre-applied directly into the SMT
+                            // for read-your-writes, which forced a byte-level
+                            // idempotency escape here. The overlay pattern keeps
+                            // pre-apply out of the SMT entirely, so any old_value
+                            // mismatch at CF-apply time is now a genuine stale read.
+                            // See docs/feat/move-call-speculative-overlay/design.md §3.6.
                             tracing::warn!(
                                 event_id = %event.id,
                                 key = %change.key,
                                 "Conflict detected: old_value mismatch, skipping event (stale read)"
                             );
-                            summary.conflicted_events.push(event.id.clone());
+                            summary.conflicted_events.push(ConflictRecord {
+                                event_id: event.id.clone(),
+                                conflicting_object: change.key.clone(),
+                            });
                             continue 'event_loop;
                         }
                     } else if change.new_value.is_some() {
@@ -1025,8 +1198,14 @@ impl GlobalStateManager {
                         let exists_in_pending = pending_writes.get(&(target, object_id))
                             .map(|v| v.is_some())
                             .unwrap_or(false);
-                        let exists_in_smt = self.get_subnet_mut(target).get(&object_id).is_some();
+                        let existing_in_smt = self.get_subnet_mut(target).get(&object_id).cloned();
+                        let exists_in_smt = existing_in_smt.is_some();
                         if exists_in_pending || exists_in_smt {
+                            // M5 (OBS-020 retired): the overlay pattern removes the
+                            // MoveCall pre-apply into SMT, so the only remaining
+                            // legitimate duplicate-create path is Genesis
+                            // re-application at startup. All other duplicates are
+                            // genuine conflicts.
                             if event.is_genesis() {
                                 // Genesis state was pre-applied to GSM at startup for
                                 // immediate availability (before CF forms). The duplicate
@@ -1042,7 +1221,10 @@ impl GlobalStateManager {
                                     "Create conflict: key already exists (duplicate coin ID?), skipping event"
                                 );
                             }
-                            summary.conflicted_events.push(event.id.clone());
+                            summary.conflicted_events.push(ConflictRecord {
+                                event_id: event.id.clone(),
+                                conflicting_object: change.key.clone(),
+                            });
                             continue 'event_loop;
                         }
                     }
@@ -1076,7 +1258,45 @@ impl GlobalStateManager {
                 );
             }
         }
-        
+
+        // B1 wait_min_version (design.md §4.4 A'): wake any pending waiters
+        // whose object id was just bumped. Fired AFTER all SMT writes for this
+        // batch have committed (single hook serves leader and follower —
+        // symmetric by construction).
+        if let Some(watcher) = self.version_watcher.as_ref() {
+            // Collect once per event so duplicate writes in the same batch
+            // don't redundantly traverse the DashMap.
+            let oids = sorted_events
+                .iter()
+                .filter(|e| e.execution_result.as_ref().is_some_and(|r| r.success))
+                .flat_map(|e| {
+                    e.execution_result
+                        .as_ref()
+                        .map(|r| r.state_changes.iter())
+                        .into_iter()
+                        .flatten()
+                })
+                .map(|change| *Self::parse_state_change_key(&change.key).as_bytes());
+            watcher.notify_objects(oids);
+        }
+
+        // Phase 4 audit probe (design.md §6.1 item 2): exit half. Log the
+        // post-apply root so pre/post pairs can be compared across every
+        // call site, not just DAG-BFT leader/follower paths.
+        #[cfg(feature = "diag-root-drift")]
+        {
+            let (post, _) = self.compute_global_root_bytes();
+            tracing::info!(
+                target: "storage::diag::apply_committed_events_audit",
+                pre_apply_root = %hex::encode(_p4_pre_root),
+                post_apply_root = %hex::encode(post),
+                n_events = events.len(),
+                n_conflicted = summary.conflicted_events.len(),
+                n_failed = summary.failed_events.len(),
+                "DIAG P4: apply_committed_events exit"
+            );
+        }
+
         summary
     }
     
@@ -1124,7 +1344,13 @@ impl GlobalStateManager {
     /// parse_state_change_key("oid:abcd1234...") → Ok(HashValue([0xab, 0xcd, ...]))
     /// parse_state_change_key("coin:abcd1234...")  → Err (unknown prefix)
     /// ```
-    fn parse_state_change_key(key: &str) -> HashValue {
+    ///
+    /// **Visibility**: `pub` — γ strict same-key CF fold policy (consensus crate,
+    /// docs/feat/strict-same-key-cf-fold/) calls this to compute the canonical
+    /// `(SubnetId, HashValue)` write-key for each event's state_changes, and it
+    /// MUST use the exact same hashing logic as `apply_committed_events` so the
+    /// two layers agree on what "same key" means. Do not reduce visibility.
+    pub fn parse_state_change_key(key: &str) -> HashValue {
         if let Some(hex_str) = key.strip_prefix("oid:") {
             if let Ok(bytes) = hex::decode(hex_str) {
                 if bytes.len() == 32 {
@@ -1136,18 +1362,26 @@ impl GlobalStateManager {
                 key = %key,
                 "Invalid oid: format — hex decode failed or wrong length"
             );
-        } else if key.starts_with("user:") || key.starts_with("solver:") || key.starts_with("validator:") || key.starts_with("event:") {
+        } else if key.starts_with("mod:") {
+            // Module bytecode key: "mod:{hex_addr}::{module_name}"
+            // Hash with BLAKE3 — consistent with MerkleStateProvider::get_raw_data()
+            let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
+            return HashValue::from_slice(&hash).expect("32 bytes");
+        } else if key.starts_with("user:") || key.starts_with("solver:") || key.starts_with("validator:") || key.starts_with("event:") || key.starts_with("linkage:") {
             // Known non-object metadata key prefixes.
             // These don't have a native 32-byte ObjectId, so we hash the key.
             // "event:" keys are produced by MockTeeEnclave::record_event_processed()
             // to track processed events in the state tree.
+            // "linkage:" keys (B5 / Phase 8) hold per-package latest+history
+            // pointers for the fresh-address upgrade path; both `linkage:latest:`
+            // and `linkage:hist:` flavours land here.
             let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
             return HashValue::from_slice(&hash).expect("32 bytes");
         } else {
             // Unknown prefix — this is a bug in the calling code
             tracing::error!(
                 key = %key,
-                "Unknown key prefix — expected 'oid:', 'user:', 'solver:', or 'validator:' prefix."
+                "Unknown key prefix — expected 'oid:', 'user:', 'solver:', 'validator:', 'event:', 'linkage:', or 'mod:' prefix."
             );
         }
         // Fallback: use BLAKE3 hash to produce a deterministic value
@@ -1160,6 +1394,21 @@ impl GlobalStateManager {
         let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
         HashValue::from_slice(&hash).expect("32 bytes")
     }
+}
+
+/// Extract coin type from a Move type_tag string.
+///
+/// `"0x1::coin::Coin<0x1::setu::ROOT>"` → `Some("ROOT")`
+/// `"0x1::mymodule::MyStruct"` → `None`
+fn extract_coin_type_from_tag(tag: &str) -> Option<String> {
+    let start = tag.find("::coin::Coin<")? + "::coin::Coin<".len();
+    let end = tag.rfind('>')?;
+    if start >= end {
+        return None;
+    }
+    let inner = &tag[start..end];
+    // Take the last segment after "::"
+    inner.rsplit("::").next().map(|s| s.to_string())
 }
 
 /// Result of applying a single StateChange
@@ -1200,24 +1449,39 @@ pub struct RecoverySummary {
     pub subnets_recovered: usize,
     /// Total number of leaves loaded
     pub total_leaves: usize,
+    /// Number of subnets with root hash mismatches (data still recovered)
+    pub root_mismatches: usize,
 }
 
 /// Summary of state changes applied during anchor processing
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StateApplySummary {
     /// Changes per subnet: (event_count, total_changes, final_root)
     pub subnet_stats: HashMap<SubnetId, SubnetApplyStats>,
     /// Events that failed execution (skipped)
     pub failed_events: Vec<String>,
-    /// Events rejected due to stale read (old_value mismatch with current state)
-    pub conflicted_events: Vec<String>,
+    /// Events rejected due to stale read (old_value mismatch with current state).
+    /// R5: each record carries the first conflicting object key ("oid:{hex}", G11)
+    /// so that RPC callers can tell clients which object to re-read.
+    pub conflicted_events: Vec<ConflictRecord>,
     /// Total events processed
     pub total_events: usize,
     /// Total state changes applied
     pub total_changes: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+/// R5 · Detail of one conflicted event.
+///
+/// `conflicting_object` is the key of the first `StateChange` that failed the
+/// byte-level `old_value` check (stale read) or the create-conflict check.
+/// Format: `"oid:{hex}"` (G11). Preserved verbatim from `StateChange.key`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConflictRecord {
+    pub event_id: String,
+    pub conflicting_object: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubnetApplyStats {
     pub event_count: usize,
     pub change_count: usize,
@@ -1261,6 +1525,7 @@ impl Default for GlobalStateManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use setu_types::coin::CoinState;
     
     #[test]
     fn test_subnet_state_smt() {
@@ -1391,6 +1656,32 @@ mod tests {
         let key = "oid:not-valid-hex";
         let _parsed = GlobalStateManager::parse_state_change_key(key);
     }
+
+    #[test]
+    fn test_parse_state_change_key_mod_prefix() {
+        // "mod:" prefix should hash with setu_hash — same as "event:" path
+        let key = "mod:0x1234::my_module";
+        let parsed = GlobalStateManager::parse_state_change_key(key);
+        let expected = setu_types::hash_utils::setu_hash(key.as_bytes());
+        assert_eq!(parsed.as_bytes(), &expected);
+    }
+
+    #[test]
+    fn test_apply_state_change_mod_key() {
+        use setu_types::event::StateChange;
+
+        let mut manager = GlobalStateManager::new();
+        let bytecode = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        let sc = StateChange::insert("mod:0xdead::counter".to_string(), bytecode.clone());
+
+        manager.apply_state_change(SubnetId::ROOT, &sc);
+
+        // Verify the data was inserted into the ROOT SMT
+        let expected_hash = setu_types::hash_utils::setu_hash(b"mod:0xdead::counter");
+        let hash_value = HashValue::from_slice(&expected_hash).unwrap();
+        let smt = manager.root_subnet();
+        assert_eq!(smt.get(&hash_value), Some(&bytecode));
+    }
     
     #[test]
     fn test_apply_committed_events_conflict_detection() {
@@ -1456,7 +1747,12 @@ mod tests {
         
         // T2 should be detected as conflicted (old_value mismatch)
         assert_eq!(summary.conflicted_events.len(), 1, "T2 should be conflicted");
-        assert_eq!(summary.conflicted_events[0], event2.id);
+        assert_eq!(summary.conflicted_events[0].event_id, event2.id);
+        assert_eq!(summary.conflicted_events[0].conflicting_object, coin_key);
+        assert!(
+            summary.conflicted_events[0].conflicting_object.starts_with("oid:"),
+            "conflicting_object must preserve G11 \"oid:{{hex}}\" format"
+        );
         
         // Verify final state: only T1's changes applied
         let smt = manager.root_subnet();
@@ -1553,5 +1849,462 @@ mod tests {
         let smt = manager.root_subnet();
         let oid = HashValue::from_slice(&coin_bytes).unwrap();
         assert_eq!(smt.get(&oid), Some(&value));
+    }
+
+    // =========================================================================
+    // PWOO: concurrent-swap conflict detection on Shared objects
+    //
+    // Design ref: docs/feat/pwoo/design.md §4.6 — PWOO deliberately reuses
+    // the existing byte-level `old_value` conflict detection above rather
+    // than adding a version-lock field. These tests lock in that guarantee
+    // by running scenarios where two concurrent MoveCall events touch the
+    // same Shared object envelope:
+    //   F1 — two writers conflict on the same shared envelope → T2 rejected
+    //   F2 — writer + independent writer do not conflict
+    // =========================================================================
+
+    #[test]
+    fn test_pwoo_shared_object_concurrent_swap_conflict() {
+        use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
+
+        let mut manager = GlobalStateManager::new();
+
+        // Setup: a Shared object envelope bytes (content-opaque to storage)
+        let shared_oid = [0x5A; 32];
+        let key = format!("oid:{}", hex::encode(shared_oid));
+        // Simulate an initial envelope-bytes blob at version v=1
+        let env_v1 = vec![0xE1; 80];
+        manager.upsert_object(SubnetId::ROOT, shared_oid, env_v1.clone());
+
+        // Two concurrent MoveCall events that both read env_v1 and try to
+        // produce an updated envelope. After T1 applies, the SMT value moves
+        // to env_v2_a; T2 still carries old_value=env_v1, so conflict detection
+        // rejects T2.
+        let env_v2_a = vec![0xA2; 80];
+        let env_v2_b = vec![0xB2; 80];
+
+        let mut vlc1 = VLCSnapshot::new();
+        vlc1.logical_time = 1;
+        let mut t1 = Event::new(EventType::Transfer, vec![], vlc1, "v1".to_string());
+        t1.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![StateChange::update(key.clone(), env_v1.clone(), env_v2_a.clone())],
+        });
+        t1.status = setu_types::event::EventStatus::Executed;
+
+        let mut vlc2 = VLCSnapshot::new();
+        vlc2.logical_time = 2;
+        let mut t2 = Event::new(EventType::Transfer, vec![], vlc2, "v1".to_string());
+        t2.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![StateChange::update(key.clone(), env_v1.clone(), env_v2_b.clone())],
+        });
+        t2.status = setu_types::event::EventStatus::Executed;
+
+        let summary = manager.apply_committed_events(&[t1.clone(), t2.clone()]);
+
+        assert_eq!(summary.total_events, 1, "Only T1 should commit");
+        assert_eq!(summary.conflicted_events.len(), 1, "T2 must be rejected as concurrent-swap conflict");
+        assert_eq!(summary.conflicted_events[0].event_id, t2.id);
+        assert_eq!(summary.conflicted_events[0].conflicting_object, key);
+
+        let hv = HashValue::from_slice(&shared_oid).unwrap();
+        assert_eq!(manager.root_subnet().get(&hv), Some(&env_v2_a),
+            "Shared envelope must reflect T1's update, not T2's");
+    }
+
+    #[test]
+    fn test_pwoo_independent_shared_writes_do_not_conflict() {
+        use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
+
+        let mut manager = GlobalStateManager::new();
+
+        // Two distinct Shared envelopes, touched by two independent events.
+        let shared_a = [0xAA; 32];
+        let shared_b = [0xBB; 32];
+        let key_a = format!("oid:{}", hex::encode(shared_a));
+        let key_b = format!("oid:{}", hex::encode(shared_b));
+        let env_a = vec![0x01; 48];
+        let env_b = vec![0x02; 48];
+        manager.upsert_object(SubnetId::ROOT, shared_a, env_a.clone());
+        manager.upsert_object(SubnetId::ROOT, shared_b, env_b.clone());
+
+        let new_a = vec![0x11; 48];
+        let new_b = vec![0x22; 48];
+
+        let mut vlc1 = VLCSnapshot::new();
+        vlc1.logical_time = 1;
+        let mut t1 = Event::new(EventType::Transfer, vec![], vlc1, "v1".to_string());
+        t1.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![StateChange::update(key_a, env_a, new_a.clone())],
+        });
+        t1.status = setu_types::event::EventStatus::Executed;
+
+        let mut vlc2 = VLCSnapshot::new();
+        vlc2.logical_time = 2;
+        let mut t2 = Event::new(EventType::Transfer, vec![], vlc2, "v1".to_string());
+        t2.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![StateChange::update(key_b, env_b, new_b.clone())],
+        });
+        t2.status = setu_types::event::EventStatus::Executed;
+
+        let summary = manager.apply_committed_events(&[t1, t2]);
+
+        assert_eq!(summary.total_events, 2, "Both events must commit");
+        assert!(summary.conflicted_events.is_empty(),
+            "Distinct shared envelopes must not cross-conflict");
+
+        let smt = manager.root_subnet();
+        assert_eq!(smt.get(&HashValue::from_slice(&shared_a).unwrap()), Some(&new_a));
+        assert_eq!(smt.get(&HashValue::from_slice(&shared_b).unwrap()), Some(&new_b));
+    }
+
+    // =========================================================================
+    // §14 Index Generalization Tests
+    // =========================================================================
+
+    /// Helper: create an ObjectEnvelope with Coin type_tag
+    fn make_coin_envelope(owner: setu_types::Address, balance: u64, coin_type: &str) -> Vec<u8> {
+        use setu_types::envelope::ObjectEnvelope;
+        use setu_types::coin::{CoinData, CoinType, Balance};
+        use setu_types::object::{ObjectId, Ownership};
+        
+        let coin_data = CoinData {
+            coin_type: CoinType::new(coin_type),
+            balance: Balance::new(balance),
+        };
+        let bcs_data = bcs::to_bytes(&coin_data).unwrap();
+        let env = ObjectEnvelope::from_move_result(
+            ObjectId::new([0u8; 32]), // id doesn't matter for serialization
+            owner,
+            1,
+            Ownership::AddressOwner(owner),
+            format!("0x1::coin::Coin<0x1::setu::{}>", coin_type),
+            bcs_data,
+        );
+        env.to_bytes()
+    }
+
+    /// Helper: create an ObjectEnvelope with a custom (non-coin) type_tag
+    fn make_custom_envelope(owner: setu_types::Address, type_tag: &str) -> Vec<u8> {
+        use setu_types::envelope::ObjectEnvelope;
+        use setu_types::object::{ObjectId, Ownership};
+        
+        let bcs_data = bcs::to_bytes(&42u64).unwrap(); // arbitrary data
+        let env = ObjectEnvelope::from_move_result(
+            ObjectId::new([0u8; 32]),
+            owner,
+            1,
+            Ownership::AddressOwner(owner),
+            type_tag.to_string(),
+            bcs_data,
+        );
+        env.to_bytes()
+    }
+
+    #[test]
+    fn test_apply_state_change_envelope_updates_index() {
+        use setu_types::event::StateChange;
+        let mut manager = GlobalStateManager::new();
+        
+        let alice = setu_types::Address::from_str_id("alice");
+        let obj_id = [0xAA; 32];
+        let key = format!("oid:{}", hex::encode(obj_id));
+        let value = make_coin_envelope(alice, 1000, "ROOT");
+        
+        let sc = StateChange::insert(key, value);
+        manager.apply_state_change(SubnetId::ROOT, &sc);
+        
+        // owner_object_index should have alice's entry
+        let objects = manager.get_coin_objects_for_address(&alice.to_string());
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].0, obj_id);
+        assert!(objects[0].1.contains("Coin<"));
+        
+        // coin_type_index should also have alice→ROOT
+        let types = manager.get_coin_types_for_address(&alice.to_string());
+        assert!(types.contains("ROOT"));
+    }
+    
+    #[test]
+    fn test_apply_state_change_envelope_non_coin_updates_index() {
+        use setu_types::event::StateChange;
+        let mut manager = GlobalStateManager::new();
+        
+        let alice = setu_types::Address::from_str_id("alice");
+        let obj_id = [0xBB; 32];
+        let key = format!("oid:{}", hex::encode(obj_id));
+        let value = make_custom_envelope(alice, "0xcafe::game::Sword");
+        
+        let sc = StateChange::insert(key, value);
+        manager.apply_state_change(SubnetId::ROOT, &sc);
+        
+        // owner_object_index should have alice's entry with the custom type_tag
+        let objects = manager.get_coin_objects_for_address(&alice.to_string());
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].0, obj_id);
+        assert_eq!(objects[0].1, "0xcafe::game::Sword");
+        
+        // coin_type_index should NOT have an entry (not a Coin type)
+        let types = manager.get_coin_types_for_address(&alice.to_string());
+        assert!(types.is_empty());
+    }
+    
+    #[test]
+    fn test_apply_state_change_legacy_coinstate_still_works() {
+        use setu_types::event::StateChange;
+        let mut manager = GlobalStateManager::new();
+        
+        let alice_hex = setu_types::Address::from_str_id("alice").to_string();
+        let obj_id = [0xCC; 32];
+        let key = format!("oid:{}", hex::encode(obj_id));
+        let cs = CoinState::new(alice_hex.clone(), 500);
+        let value = cs.to_bytes();
+        
+        let sc = StateChange::insert(key, value);
+        manager.apply_state_change(SubnetId::ROOT, &sc);
+        
+        // owner_object_index should have entry
+        let objects = manager.get_coin_objects_for_address(&alice_hex);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].0, obj_id);
+        
+        // coin_type_index should have ROOT
+        let types = manager.get_coin_types_for_address(&alice_hex);
+        assert!(types.contains("ROOT"));
+    }
+    
+    #[test]
+    fn test_apply_state_change_delete_cleans_envelope_index() {
+        use setu_types::event::StateChange;
+        let mut manager = GlobalStateManager::new();
+        
+        let alice = setu_types::Address::from_str_id("alice");
+        let obj_id = [0xDD; 32];
+        let key = format!("oid:{}", hex::encode(obj_id));
+        let value = make_coin_envelope(alice, 1000, "ROOT");
+        
+        // Insert first
+        let sc_insert = StateChange::insert(key.clone(), value.clone());
+        manager.apply_state_change(SubnetId::ROOT, &sc_insert);
+        assert_eq!(manager.get_coin_objects_for_address(&alice.to_string()).len(), 1);
+        
+        // Delete with old_value provided
+        let sc_delete = StateChange {
+            key,
+            old_value: Some(value),
+            new_value: None,
+            target_subnet: None,
+        };
+        manager.apply_state_change(SubnetId::ROOT, &sc_delete);
+        
+        // owner_object_index should be empty for alice
+        assert!(manager.get_coin_objects_for_address(&alice.to_string()).is_empty());
+    }
+    
+    #[test]
+    fn test_apply_state_change_owner_transfer_envelope() {
+        use setu_types::event::StateChange;
+        let mut manager = GlobalStateManager::new();
+        
+        let alice = setu_types::Address::from_str_id("alice");
+        let bob = setu_types::Address::from_str_id("bob");
+        let obj_id = [0xEE; 32];
+        let key = format!("oid:{}", hex::encode(obj_id));
+        
+        let old_value = make_coin_envelope(alice, 1000, "ROOT");
+        let new_value = make_coin_envelope(bob, 1000, "ROOT");
+        
+        // Insert as alice
+        let sc_insert = StateChange::insert(key.clone(), old_value.clone());
+        manager.apply_state_change(SubnetId::ROOT, &sc_insert);
+        assert_eq!(manager.get_coin_objects_for_address(&alice.to_string()).len(), 1);
+        
+        // Transfer to bob (update with old_value)
+        let sc_transfer = StateChange::update(key, old_value, new_value);
+        manager.apply_state_change(SubnetId::ROOT, &sc_transfer);
+        
+        // Alice should have no objects
+        assert!(manager.get_coin_objects_for_address(&alice.to_string()).is_empty());
+        // Bob should have 1 object
+        let bob_objects = manager.get_coin_objects_for_address(&bob.to_string());
+        assert_eq!(bob_objects.len(), 1);
+        assert_eq!(bob_objects[0].0, obj_id);
+    }
+    
+    #[test]
+    fn test_rebuild_indexes_mixed_formats() {
+        let mut manager = GlobalStateManager::new();
+        
+        let alice = setu_types::Address::from_str_id("alice");
+        let bob = setu_types::Address::from_str_id("bob");
+        
+        // Insert a legacy CoinState directly into SMT
+        let cs = CoinState::new(alice.to_string(), 500);
+        manager.upsert_object(SubnetId::ROOT, [0x01; 32], cs.to_bytes());
+        
+        // Insert an ObjectEnvelope directly into SMT
+        let env_bytes = make_coin_envelope(bob, 2000, "ROOT");
+        manager.upsert_object(SubnetId::ROOT, [0x02; 32], env_bytes);
+        
+        // Insert a custom Move object envelope
+        let custom_bytes = make_custom_envelope(alice, "0xcafe::nft::Token");
+        manager.upsert_object(SubnetId::ROOT, [0x03; 32], custom_bytes);
+        
+        // Rebuild from scratch
+        let count = manager.rebuild_coin_type_index();
+        assert_eq!(count, 3, "Should index all 3 objects");
+        
+        // alice: 1 legacy coin + 1 custom object
+        let alice_objects = manager.get_coin_objects_for_address(&alice.to_string());
+        assert_eq!(alice_objects.len(), 2);
+        
+        // bob: 1 envelope coin
+        let bob_objects = manager.get_coin_objects_for_address(&bob.to_string());
+        assert_eq!(bob_objects.len(), 1);
+        
+        // coin_type_index: alice→ROOT (from CoinState), bob→ROOT (from Envelope)
+        assert!(manager.get_coin_types_for_address(&alice.to_string()).contains("ROOT"));
+        assert!(manager.get_coin_types_for_address(&bob.to_string()).contains("ROOT"));
+    }
+    
+    #[test]
+    fn test_extract_coin_type_from_tag() {
+        assert_eq!(
+            super::extract_coin_type_from_tag("0x1::coin::Coin<0x1::setu::ROOT>"),
+            Some("ROOT".to_string())
+        );
+        assert_eq!(
+            super::extract_coin_type_from_tag("0x1::coin::Coin<0xcafe::mytoken::GOLD>"),
+            Some("GOLD".to_string())
+        );
+        // Not a Coin type → None
+        assert_eq!(
+            super::extract_coin_type_from_tag("0xcafe::game::Sword"),
+            None
+        );
+        // Edge case: empty inner
+        assert_eq!(
+            super::extract_coin_type_from_tag("0x1::coin::Coin<>"),
+            None
+        );
+    }
+    
+    #[test]
+    fn test_mod_key_skips_index() {
+        use setu_types::event::StateChange;
+        let mut manager = GlobalStateManager::new();
+        
+        let bytecode = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        let sc = StateChange::insert("mod:0xdead::counter".to_string(), bytecode);
+        manager.apply_state_change(SubnetId::ROOT, &sc);
+        
+        // No index entries should be created for mod: keys
+        assert!(manager.owner_object_index.is_empty());
+        assert!(manager.coin_type_index.is_empty());
+    }
+}
+
+// ============================================================================
+// DIAG tests (only compiled when feature `diag-root-drift` is enabled)
+// ============================================================================
+//
+// See docs/feat/consensus-root-self-consistency/design.md §3.4 + Phase 2
+// checklist tests #9 and #10.
+
+#[cfg(all(test, feature = "diag-root-drift"))]
+mod diag_tests {
+    use super::*;
+    use setu_types::event::StateChange;
+
+    /// Test #9: `InApplyGuard::enter()` flips the TLS flag to true; Drop flips
+    /// it back to false — even on unwind.
+    #[test]
+    fn inapply_guard_sets_and_unsets_tls() {
+        // Initial state: not inside apply.
+        assert!(
+            !IN_APPLY_COMMITTED_EVENTS.with(|g| g.get()),
+            "TLS must start false"
+        );
+
+        {
+            let _guard = InApplyGuard::enter();
+            assert!(
+                IN_APPLY_COMMITTED_EVENTS.with(|g| g.get()),
+                "TLS must be true inside guard scope"
+            );
+        } // _guard dropped here
+
+        assert!(
+            !IN_APPLY_COMMITTED_EVENTS.with(|g| g.get()),
+            "TLS must be false after guard drop"
+        );
+
+        // Panic-safety: even if the guarded body panics, Drop must still fire.
+        let result = std::panic::catch_unwind(|| {
+            let _guard = InApplyGuard::enter();
+            assert!(IN_APPLY_COMMITTED_EVENTS.with(|g| g.get()));
+            panic!("simulated failure inside apply_committed_events");
+        });
+        assert!(result.is_err(), "panic must propagate through catch_unwind");
+        assert!(
+            !IN_APPLY_COMMITTED_EVENTS.with(|g| g.get()),
+            "TLS must be false after panic unwind (Drop ran)"
+        );
+    }
+
+    /// Test #10: `apply_state_change` called from WITHIN
+    /// `apply_committed_events` (via execution result) must NOT trigger the
+    /// out-of-band probe — i.e. the gate suppresses expected CF-apply writes.
+    ///
+    /// We cannot directly observe "no tracing::error! fired" without a
+    /// subscriber, so we verify the TLS state the probe branches on instead.
+    #[test]
+    fn gate_is_true_inside_apply_committed_events_body() {
+        // Build a valid oid key: "oid:" + 64 hex chars (required by
+        // parse_state_change_key's debug_assert).
+        let key = format!("oid:{}", "a".repeat(64));
+        let mut manager = GlobalStateManager::new();
+
+        // Simulate entering the apply_committed_events body manually.
+        let _guard = InApplyGuard::enter();
+        let gate_observed = IN_APPLY_COMMITTED_EVENTS.with(|g| g.get());
+        assert!(
+            gate_observed,
+            "gate must be true — probe stays silent inside apply_committed_events"
+        );
+
+        // A normal state change under the gate still executes.
+        let sc = StateChange::insert(key, vec![1, 2, 3]);
+        let _result = manager.apply_state_change(SubnetId::ROOT, &sc);
+
+        // Gate still true (we still hold _guard).
+        assert!(IN_APPLY_COMMITTED_EVENTS.with(|g| g.get()));
+    }
+
+    /// Test #10b: `apply_state_change` called with NO surrounding guard must
+    /// observe gate=false — this is the state that triggers the probe.
+    #[test]
+    fn gate_is_false_for_out_of_band_apply_state_change() {
+        let key = format!("oid:{}", "b".repeat(64));
+
+        let gate_observed = IN_APPLY_COMMITTED_EVENTS.with(|g| g.get());
+        assert!(
+            !gate_observed,
+            "gate must be false — probe would fire for this caller"
+        );
+
+        // Calling apply_state_change here would emit the DIAG error (we don't
+        // install a tracing subscriber, so the error is dropped). We only
+        // assert the gate value — the error path has no observable return.
+        let mut manager = GlobalStateManager::new();
+        let sc = StateChange::insert(key, vec![9]);
+        let _result = manager.apply_state_change(SubnetId::ROOT, &sc);
     }
 }

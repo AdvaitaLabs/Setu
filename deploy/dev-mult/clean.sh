@@ -30,11 +30,13 @@ clean_server() {
 
     # 停止进程
     remote_exec "$host" "
-        pkill -f setu-validator 2>/dev/null || true
-        pkill -f setu-solver 2>/dev/null || true
+        VPID=\$(pidof setu-validator 2>/dev/null || true)
+        SPID=\$(pidof setu-solver 2>/dev/null || true)
+        [ -n \"\$SPID\" ] && kill \$SPID 2>/dev/null || true
+        [ -n \"\$VPID\" ] && kill \$VPID 2>/dev/null || true
         sleep 1
-        pkill -9 -f setu-validator 2>/dev/null || true
-        pkill -9 -f setu-solver 2>/dev/null || true
+        [ -n \"\$SPID\" ] && kill -9 \$SPID 2>/dev/null || true
+        [ -n \"\$VPID\" ] && kill -9 \$VPID 2>/dev/null || true
     "
 
     # 删除数据

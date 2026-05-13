@@ -7,6 +7,7 @@ use super::{
     DiscoveryConfig, DiscoveryEventLoop, Handle, Server, State, SignedNodeInfo,
     metrics::DiscoveryMetrics,
 };
+use crate::peer_manager::AnemoPeerManager;
 use anemo::NetworkRef;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -32,6 +33,7 @@ pub struct Builder {
     config: Option<DiscoveryConfig>,
     metrics: Option<DiscoveryMetrics>,
     our_info: Option<SignedNodeInfo>,
+    peer_manager: Option<Arc<AnemoPeerManager>>,
 }
 
 impl Default for Builder {
@@ -47,6 +49,7 @@ impl Builder {
             config: None,
             metrics: None,
             our_info: None,
+            peer_manager: None,
         }
     }
 
@@ -65,6 +68,12 @@ impl Builder {
     /// Set our own node info
     pub fn our_info(mut self, info: SignedNodeInfo) -> Self {
         self.our_info = Some(info);
+        self
+    }
+
+    /// Set the peer manager for bridging transport-level peer state
+    pub fn peer_manager(mut self, pm: Arc<AnemoPeerManager>) -> Self {
+        self.peer_manager = Some(pm);
         self
     }
 
@@ -100,6 +109,7 @@ impl Builder {
                 config,
                 metrics,
                 state,
+                peer_manager: self.peer_manager,
                 shutdown_rx,
             },
             server,
@@ -117,6 +127,7 @@ pub struct UnstartedDiscovery {
     #[allow(dead_code)]
     metrics: DiscoveryMetrics,
     state: Arc<RwLock<State>>,
+    peer_manager: Option<Arc<AnemoPeerManager>>,
     shutdown_rx: oneshot::Receiver<()>,
 }
 
@@ -130,6 +141,7 @@ impl UnstartedDiscovery {
             self.config,
             self.state,
             network,
+            self.peer_manager,
             self.shutdown_rx,
         );
 

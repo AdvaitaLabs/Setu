@@ -1,0 +1,9 @@
+[package]
+name = "Lightning"
+version = "0.1.0"
+
+[addresses]
+lightning = "0xcafe"
+
+[dependencies]
+SetuFramework = { local = "../../../setu-framework" }

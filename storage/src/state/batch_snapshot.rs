@@ -245,29 +245,16 @@ impl MerkleStateProvider {
         &self,
         sender_subnet_pairs: &[(&str, &SubnetId)],
     ) -> BatchStateSnapshot {
-        // ══════════════════════════════════════════════════════════════════
-        // Pre-compute ALL coin object IDs (NO LOCK - pure computation)
-        //
-        // coin_namespace = subnet_id directly (ROOT or subnet name)
-        // coin_object_id = BLAKE3("SETU_COIN_ID:" + canonical_address + ":" + coin_namespace)
-        // ══════════════════════════════════════════════════════════════════
-        let coin_queries: Vec<CoinQuery> = sender_subnet_pairs
+        let sender_queries: Vec<(String, String, SubnetId, String)> = sender_subnet_pairs
             .iter()
             .map(|(sender, subnet_id)| {
-                // Canonicalize sender to hex address format
                 let canonical_sender = crate::state::provider::resolve_owner_address(sender);
-                // Use coin_namespace_string to get the correct namespace for ALL subnets
                 let coin_namespace = Self::coin_namespace_string(subnet_id);
-                let object_id_bytes = Self::coin_object_id_with_type(&canonical_sender, &coin_namespace);
-                CoinQuery {
-                    sender: sender.to_string(),
-                    subnet_id: (*subnet_id).clone(),
-                    object_id: ObjectId::new(object_id_bytes),
-                }
+                (sender.to_string(), canonical_sender, (*subnet_id).clone(), coin_namespace)
             })
             .collect();
 
-        let all_object_ids: Vec<&ObjectId> = coin_queries.iter().map(|q| &q.object_id).collect();
+        let mut all_object_ids: Vec<ObjectId> = Vec::new();
 
         // ══════════════════════════════════════════════════════════════════
         // SINGLE SNAPSHOT: state_manager - Get coins, objects, proofs, state_root
@@ -284,8 +271,54 @@ impl MerkleStateProvider {
 
             let mut builder = BatchStateSnapshotBuilder::new(state_root, snapshot_version);
 
+            let mut coin_queries: Vec<CoinQuery> = Vec::new();
+            for (sender, canonical_sender, subnet_id, coin_namespace) in &sender_queries {
+                let registered = snapshot.get_coin_objects_for_address(canonical_sender);
+                let mut matched_registered_coin = false;
+
+                for (object_id_bytes, coin_type) in registered {
+                    // Bug F3: write side stores `coin_type` as the raw
+                    // subnet_id string (e.g. "gaming-subnet"), while the
+                    // read-side `coin_namespace_string` returns
+                    // `subnet_id.to_string()` (short hex Display) for
+                    // non-ROOT subnets. Compare via the canonical
+                    // `MerkleStateProvider::resolve_subnet_id` so both
+                    // representations map back to the same SubnetId.
+                    if MerkleStateProvider::resolve_subnet_id(&coin_type) != *subnet_id {
+                        continue;
+                    }
+                    matched_registered_coin = true;
+                    coin_queries.push(CoinQuery {
+                        sender: sender.clone(),
+                        canonical_sender: canonical_sender.clone(),
+                        subnet_id: subnet_id.clone(),
+                        object_id: ObjectId::new(object_id_bytes),
+                    });
+                }
+
+                if !matched_registered_coin {
+                    // Legacy deterministic-coin-id fallback. Only meaningful
+                    // for ROOT (pre-registration legacy path covered by
+                    // existing tests). For non-ROOT subnets, if the
+                    // owner_object_index has no entry there is genuinely no
+                    // coin — match the canonical `get_coins_for_address`
+                    // semantics and skip the synthesized lookup.
+                    if *subnet_id != SubnetId::ROOT {
+                        continue;
+                    }
+                    let object_id_bytes = Self::coin_object_id_with_type(canonical_sender, coin_namespace);
+                    coin_queries.push(CoinQuery {
+                        sender: sender.clone(),
+                        canonical_sender: canonical_sender.clone(),
+                        subnet_id: subnet_id.clone(),
+                        object_id: ObjectId::new(object_id_bytes),
+                    });
+                }
+            }
+
             // 2. Batch fetch all coins from their respective subnet SMTs
             for query in &coin_queries {
+                all_object_ids.push(query.object_id.clone());
                 let hash = match HashValue::from_slice(query.object_id.as_bytes()) {
                     Ok(h) => h,
                     Err(_) => continue,
@@ -295,6 +328,9 @@ impl MerkleStateProvider {
                 if let Some(smt) = snapshot.get_subnet(&query.subnet_id) {
                     if let Some(data) = smt.get(&hash).cloned() {
                         if let Some(coin_state) = CoinState::from_bytes(&data) {
+                            if coin_state.owner != query.canonical_sender {
+                                continue;
+                            }
                             let coin_info = CoinInfo {
                                 object_id: query.object_id.clone(),
                                 owner: coin_state.owner,
@@ -338,9 +374,9 @@ impl MerkleStateProvider {
             let tracker_arc = self.modification_tracker();
             let tracker = tracker_arc.read()
                 .expect("Failed to acquire read lock on modification_tracker for batch snapshot");
-            for object_id in all_object_ids {
+            for object_id in &all_object_ids {
                 // Only add if not already found in GSM snapshot
-                if !builder.has_last_modifying_event(&object_id) {
+                if !builder.has_last_modifying_event(object_id) {
                     if let Some(event_id) = tracker.get(object_id.as_bytes()) {
                         builder.add_last_modifying_event(object_id.clone(), event_id.clone());
                     }
@@ -387,6 +423,7 @@ impl MerkleStateProvider {
 /// Internal struct for tracking coin queries during snapshot creation
 struct CoinQuery {
     sender: String,
+    canonical_sender: String,
     subnet_id: SubnetId,
     object_id: ObjectId,
 }
@@ -431,7 +468,7 @@ mod tests {
     use super::*;
     use crate::state::manager::GlobalStateManager;
     use crate::state::shared::SharedStateManager;
-    use crate::state::provider::init_coin_with_type;
+    use crate::state::provider::{init_coin_with_type, init_coins_split};
     use std::sync::Arc;
 
     fn setup_test_provider() -> (Arc<SharedStateManager>, MerkleStateProvider) {
@@ -474,6 +511,27 @@ mod tests {
         let coins = alice_coins.unwrap();
         assert_eq!(coins.len(), 1);
         assert_eq!(coins[0].balance, 1000);
+    }
+
+    #[test]
+    fn test_create_batch_snapshot_includes_registered_split_coins() {
+        let mut gsm = GlobalStateManager::new();
+        let ids = init_coins_split(&mut gsm, "alice", 1_000_000_000, 5, "ROOT");
+        let shared = Arc::new(SharedStateManager::new(gsm));
+        let provider = MerkleStateProvider::new(Arc::clone(&shared));
+
+        let pairs = vec![("alice", &SubnetId::ROOT)];
+        let snapshot = provider.create_batch_snapshot(&pairs);
+        let coins = snapshot
+            .get_coins_for_sender_subnet("alice", &SubnetId::ROOT)
+            .expect("alice split coins should be indexed");
+
+        assert_eq!(coins.len(), 5);
+        assert_eq!(coins.iter().map(|coin| coin.balance).sum::<u64>(), 1_000_000_000);
+        assert_eq!(snapshot.object_count(), 5);
+        for id in ids {
+            assert!(coins.iter().any(|coin| coin.object_id == id));
+        }
     }
 
     #[test]
@@ -521,8 +579,15 @@ mod tests {
         assert!(alice_root.is_some());
         assert_eq!(alice_root.unwrap()[0].balance, 1000);
 
-        // Note: gaming-subnet lookup depends on how SubnetId::from_str_id hashes
-        // This test verifies the multi-subnet query mechanism works
+        // Bug F3: alice's gaming-subnet coin must also be discoverable on
+        // the batch path. Before the fix, the batch path compared the
+        // persisted `coin_type = "gaming-subnet"` against
+        // `subnet_id.to_string()` (short hex Display) and never matched.
+        let alice_gaming = snapshot
+            .get_coins_for_sender_subnet("alice", &gaming_subnet)
+            .expect("alice gaming-subnet coin must be discoverable");
+        assert_eq!(alice_gaming.len(), 1);
+        assert_eq!(alice_gaming[0].balance, 500);
     }
 
     #[test]

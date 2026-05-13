@@ -28,7 +28,7 @@ use setu_storage::{
     MerkleStateProvider,
 };
 use setu_types::{
-    NodeInfo, ConsensusConfig,
+    NodeInfo, ConsensusConfig, ConsensusFrame,
     GenesisConfig, Event, EventPayload, ExecutionResult, StateChange,
     CoinState, Address, VLCSnapshot,
 };
@@ -38,6 +38,63 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::{info, error, warn, Level};
 use tracing_subscriber;
+
+type ProjectionWatermark = (u64, u64, String);
+
+#[derive(Debug, Default)]
+struct ProjectionStats {
+    projected: usize,
+    skipped: usize,
+}
+
+impl ProjectionStats {
+    fn complete(&self) -> bool {
+        self.skipped == 0
+    }
+}
+
+fn cf_projection_key(cf: &ConsensusFrame) -> ProjectionWatermark {
+    (cf.anchor.depth, cf.created_at, cf.id.clone())
+}
+
+async fn project_cf_for_http(
+    consensus_validator: &ConsensusValidator,
+    network_service: &ValidatorNetworkService,
+    cf: &ConsensusFrame,
+    live_side_effects: bool,
+) -> ProjectionStats {
+    let mut stats = ProjectionStats::default();
+
+    for event_id in &cf.anchor.event_ids {
+        match consensus_validator.event_for_http_projection(event_id).await {
+            Some(event) => {
+                let outcome = if live_side_effects {
+                    None
+                } else {
+                    ValidatorNetworkService::startup_projection_outcome(&event, &cf.id)
+                };
+                network_service.cache_finalized_event_for_query_with_outcome(
+                    event.clone(),
+                    outcome,
+                );
+                if live_side_effects {
+                    network_service.apply_live_finalized_side_effects(&event);
+                }
+                stats.projected += 1;
+            }
+            None => {
+                stats.skipped += 1;
+                warn!(
+                    cf_id = %cf.id,
+                    event_id = %event_id,
+                    "Finalized event missing from DAG and event store; HTTP projection skipped"
+                );
+            }
+        }
+    }
+
+    stats
+}
 
 /// Validator configuration from environment
 #[derive(Debug, Clone)]
@@ -225,18 +282,25 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create SHARED GlobalStateManager (used by both TaskPreparer and ConsensusValidator)
-    let shared_state_manager: Arc<SharedStateManager> = if let Some(ref db) = db {
+    let (shared_state_manager, gsm_recovered) = if let Some(ref db) = db {
         let merkle_store: Arc<dyn B4StoreExt> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
         let mut manager = GlobalStateManager::with_store(merkle_store);
         // Recover all subnet SMT trees from persisted state (B4 commit data)
-        match manager.recover() {
-            Ok(summary) => info!("✓ GSM recovered: {} subnets, {} leaves",
-                summary.subnets_recovered, summary.total_leaves),
-            Err(e) => warn!("GSM recovery failed: {}, starting fresh: {}", e, e),
-        }
-        Arc::new(SharedStateManager::new(manager))
+        let recovered = match manager.recover() {
+            Ok(summary) => {
+                let has_data = summary.total_leaves > 0;
+                info!("✓ GSM recovered: {} subnets, {} leaves, {} root mismatches",
+                    summary.subnets_recovered, summary.total_leaves, summary.root_mismatches);
+                has_data
+            }
+            Err(e) => {
+                warn!("GSM recovery failed: {}, starting fresh", e);
+                false
+            }
+        };
+        (Arc::new(SharedStateManager::new(manager)), recovered)
     } else {
-        Arc::new(SharedStateManager::new(GlobalStateManager::new()))
+        (Arc::new(SharedStateManager::new(GlobalStateManager::new())), false)
     };
     
     // Create task preparer with the SHARED state manager
@@ -319,6 +383,9 @@ async fn main() -> anyhow::Result<()> {
         info!("✓ Private key injected for vote signing");
     }
 
+    consensus_validator.engine().enable_strict_vote_signatures();
+    info!("✓ Strict consensus vote signature verification enabled");
+
     // Attempt to recover state from storage (if any)
     // This is safe to call even with empty storage (fresh start)
     if let Err(e) = consensus_validator.recover_from_storage().await {
@@ -328,7 +395,16 @@ async fn main() -> anyhow::Result<()> {
     // ========================================
     // Genesis Event: Initialize seed accounts
     // ========================================
-    {
+    if gsm_recovered {
+        info!("✓ Skipping genesis — state recovered from persistent storage");
+        // Rebuild indexes from recovered SMT data so balance/coin queries work
+        {
+            let mut gsm = shared_state_manager.lock_write();
+            let indexed = gsm.rebuild_coin_type_index();
+            shared_state_manager.publish_snapshot(&gsm);
+            info!("✓ Indexes rebuilt from recovered state: {} objects indexed", indexed);
+        }
+    } else {
         match &genesis_result {
             Ok(genesis_config) => {
                 info!(
@@ -504,8 +580,27 @@ async fn main() -> anyhow::Result<()> {
                 warn!("No genesis config loaded ({}), starting with empty state", e);
             }
         }
+    } // end else (fresh genesis)
+
+    // Phase 4 startup_root probe (consensus-root-self-consistency design.md §6.1):
+    // one-shot log of the post-genesis (or post-recovery) global state root so
+    // we can detect cross-node divergence BEFORE any DAG-BFT CF fires. This is
+    // the single check that distinguishes genesis non-determinism from
+    // pre-stress CF asymmetry. Feature-gated; zero cost when disabled.
+    #[cfg(feature = "diag-root-drift")]
+    {
+        let gsm = shared_state_manager.lock_write();
+        let (startup_root, subnet_roots) = (*gsm).compute_global_root_bytes();
+        tracing::info!(
+            target: "consensus::diag::startup_root",
+            node_id = %config.node_config.node_id,
+            source = if gsm_recovered { "recovered" } else { "genesis" },
+            startup_root = %hex::encode(startup_root),
+            subnet_count = subnet_roots.len(),
+            "DIAG P4: startup_root captured post-boot"
+        );
     }
-    
+
     // ========================================
     // Phase 2: P2P Network Startup
     // ========================================
@@ -630,6 +725,19 @@ async fn main() -> anyhow::Result<()> {
         network_config,
     );
 
+    // B1 · attach a shared `WatcherRegistry` so the storage layer's
+    // `apply_committed_events` (single canonical write site) can wake any
+    // pending `wait_min_version` long-poll handlers. See
+    // `docs/feat/pwoo-r6-wait-api/design.md` §4.4.
+    {
+        let watcher = setu_storage::WatcherRegistry::new(setu_storage::WatcherCaps::default());
+        shared_state_manager
+            .lock_write()
+            .set_version_watcher(Arc::clone(&watcher));
+        network_service.set_version_watcher(Arc::clone(&watcher));
+        info!("✓ B1 wait_min_version WatcherRegistry attached (per-object cap=32, global cap=1024)");
+    }
+
     // ========================================
     // Governance Subsystem
     // ========================================
@@ -637,10 +745,24 @@ async fn main() -> anyhow::Result<()> {
         let callback_addr = std::env::var("VALIDATOR_CALLBACK_ADDR")
             .unwrap_or_else(|_| config.http_addr.to_string());
 
-        let gov_config = GovernanceServiceConfig {
+        let mut gov_config = GovernanceServiceConfig {
             callback_addr,
             ..Default::default()
         };
+        if let Ok(raw_timeout) = std::env::var("GOVERNANCE_TIMEOUT_SECS") {
+            match raw_timeout.parse::<u64>() {
+                Ok(0) => warn!("GOVERNANCE_TIMEOUT_SECS=0 ignored; keeping default governance timeout"),
+                Ok(timeout_secs) => {
+                    gov_config.timeout = Duration::from_secs(timeout_secs);
+                    info!(timeout_secs, "Governance timeout override applied");
+                }
+                Err(e) => warn!(
+                    value = %raw_timeout,
+                    error = %e,
+                    "Invalid GOVERNANCE_TIMEOUT_SECS; keeping default governance timeout"
+                ),
+            }
+        }
         let genesis_validators = match &genesis_result {
             Ok(gc) => gc.validators.clone(),
             Err(_) => Vec::new(),
@@ -652,6 +774,21 @@ async fn main() -> anyhow::Result<()> {
     network_service.set_governance_service(Arc::clone(&governance_service));
     let network_service = Arc::new(network_service);
     info!("✓ GovernanceService initialized");
+
+    // Bug F1: mirror the engine's restored logical-time counter into the
+    // service-level `vlc_counter` so Move/PTB/Publish/Upgrade handlers
+    // (which still bypass `get_vlc_time()` and call `vlc_counter.fetch_add`
+    // directly) do not reuse low logical times after a restart.
+    {
+        let restored_vlc = consensus_validator.engine().peek_logical_time();
+        if restored_vlc > 0 {
+            network_service.restore_vlc_counter(restored_vlc);
+            info!(
+                "✓ Service VLC counter restored from consensus engine: {}",
+                restored_vlc
+            );
+        }
+    }
 
     // ========================================
     // Components Status
@@ -749,59 +886,116 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ========================================
-    // Phase 3.5: Governance Background Tasks
+    // Phase 3.24: Restart finalized event HTTP projection
+    // ========================================
+    let mut startup_projection_watermark: Option<ProjectionWatermark> = None;
+    {
+        let cf_store = consensus_validator.cf_store();
+        let anchor_store = consensus_validator.anchor_store();
+        let mut finalized_cfs = cf_store.get_finalized().await;
+        finalized_cfs.sort_by_key(|cf| (cf.anchor.depth, cf.created_at));
+
+        let mut projected = 0usize;
+        let mut skipped = 0usize;
+
+        for cf in finalized_cfs {
+            if anchor_store.get(&cf.anchor.id).await.is_none() {
+                skipped += cf.anchor.event_ids.len();
+                continue;
+            }
+
+            let stats = project_cf_for_http(
+                &consensus_validator,
+                &network_service,
+                &cf,
+                false,
+            ).await;
+            projected += stats.projected;
+            skipped += stats.skipped;
+
+            if stats.complete() {
+                startup_projection_watermark = Some(cf_projection_key(&cf));
+            }
+        }
+
+        if projected > 0 || skipped > 0 {
+            info!(
+                projected = projected,
+                skipped = skipped,
+                "✓ Restart finalized event HTTP projection complete"
+            );
+        } else {
+            info!("✓ Restart finalized event HTTP projection: no finalized CFs to replay");
+        }
+    }
+
+    // ========================================
+    // Phase 3.25: Live finalized event HTTP projection
     // ========================================
     {
-        // Task A: subscribe_finalization → proposal_tracker
-        let gov_svc_tracker = Arc::clone(&governance_service);
         let mut finalization_rx = consensus_validator.subscribe_finalization();
-        let tracker_events = Arc::clone(&network_service.events_map());
-        let _governance_tracker_handle = tokio::spawn(async move {
+        let projection_consensus = Arc::clone(&consensus_validator);
+        let projection_service = Arc::clone(&network_service);
+        let mut projection_watermark = startup_projection_watermark;
+        let _finalized_event_projection_handle = tokio::spawn(async move {
             loop {
                 match finalization_rx.recv().await {
                     Ok(cf) => {
-                        for event_id in &cf.anchor.event_ids {
-                            let event_id_str = event_id.to_string();
-                            if let Some(event) = tracker_events.get(&event_id_str) {
-                                if let setu_types::event::EventPayload::Governance(payload) = &event.payload {
-                                    match &payload.action {
-                                        setu_types::governance::GovernanceAction::Propose(_) => {
-                                            gov_svc_tracker.track_proposal(
-                                                payload.proposal_id,
-                                                event.timestamp,
-                                            );
-                                        }
-                                        setu_types::governance::GovernanceAction::Execute(_) => {
-                                            gov_svc_tracker.untrack_proposal(&payload.proposal_id);
-                                        }
-                                        setu_types::governance::GovernanceAction::RegisterSystemSubnet(reg) => {
-                                            // Side effect: update SystemSubnetRegistry
-                                            use setu_validator::governance::service::{SystemSubnetConfig, ConfigSource};
-                                            gov_svc_tracker.register_system_endpoint(
-                                                reg.subnet_id,
-                                                SystemSubnetConfig {
-                                                    agent_endpoint: reg.agent_endpoint.clone(),
-                                                    callback_addr: reg.callback_addr.clone(),
-                                                    timeout: std::time::Duration::from_secs(
-                                                        reg.timeout_secs.unwrap_or(300),
-                                                    ),
-                                                    source: ConfigSource::OnChain,
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            }
+                        let stats = project_cf_for_http(
+                            &projection_consensus,
+                            &projection_service,
+                            &cf,
+                            true,
+                        ).await;
+                        if stats.complete() {
+                            projection_watermark = Some(cf_projection_key(&cf));
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Governance tracker lagged {n} CFs");
+                        warn!(lagged = n, "Finalized event HTTP projector lagged CF notifications");
+                        let mut finalized_cfs = projection_consensus.cf_store().get_finalized().await;
+                        finalized_cfs.sort_by_key(|cf| (cf.anchor.depth, cf.created_at, cf.id.clone()));
+
+                        for cf in finalized_cfs {
+                            let key = cf_projection_key(&cf);
+                            if projection_watermark
+                                .as_ref()
+                                .map(|watermark| key <= *watermark)
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
+
+                            let stats = project_cf_for_http(
+                                &projection_consensus,
+                                &projection_service,
+                                &cf,
+                                true,
+                            ).await;
+                            if stats.complete() {
+                                projection_watermark = Some(key);
+                            } else {
+                                warn!(
+                                    cf_id = %cf.id,
+                                    skipped = stats.skipped,
+                                    "Lag catch-up stopped before advancing HTTP projection watermark"
+                                );
+                                break;
+                            }
+                        }
                     }
-                    Err(_) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
-        info!("✓ Governance finalization tracker started");
+        info!("✓ Finalized event HTTP projector started");
+    }
+
+    // ========================================
+    // Phase 3.5: Governance Background Tasks
+    // ========================================
+    {
+        info!("✓ Governance finalized side effects handled by HTTP projector");
 
         // Task B: poll Agent results + timeout detection (every 10s)
         let gov_svc_poll = Arc::clone(&governance_service);
@@ -811,49 +1005,88 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 interval.tick().await;
 
+                // Helper: read proposal from SMT, or construct from PendingProposal
+                // (fallback needed because finalization_tx.send() is not yet wired,
+                //  so CF state changes never apply and SMT may not have the proposal)
+                let resolve_proposal = |net_svc: &ValidatorNetworkService,
+                                        pending: &setu_validator::governance::service::PendingProposal|
+                    -> Option<setu_types::governance::GovernanceProposal>
+                {
+                    if let Some(bytes) = net_svc
+                        .get_subnet_object(&setu_types::SubnetId::GOVERNANCE, &pending.proposal_id)
+                    {
+                        if let Ok(p) = serde_json::from_slice::<
+                            setu_types::governance::GovernanceProposal,
+                        >(&bytes) {
+                            return Some(p);
+                        }
+                    }
+                    // Fallback: construct from pending data
+                    Some(setu_types::governance::GovernanceProposal {
+                        proposal_id: pending.proposal_id,
+                        content: pending.content.clone(),
+                        status: setu_types::governance::ProposalStatus::Pending,
+                        decision: None,
+                        created_at: pending.created_at,
+                        decided_at: None,
+                    })
+                };
+
                 // Poll for completed Agent results
                 for pending in gov_svc_poll.all_pending() {
                     // Check timeout first
                     if std::time::Instant::now().duration_since(pending.submitted_at)
                         > gov_svc_poll.config().timeout
                     {
-                        // Timeout: read proposal from SMT and create rejection event
-                        if let Some(bytes) = poll_network_svc
-                            .get_subnet_object(&setu_types::SubnetId::GOVERNANCE, &pending.proposal_id)
-                        {
-                            if let Ok(proposal) = serde_json::from_slice::<
-                                setu_types::governance::GovernanceProposal,
-                            >(&bytes)
+                        if let Some(proposal) = resolve_proposal(&poll_network_svc, &pending) {
+                            let vlc_time = poll_network_svc.get_vlc_time();
+                            let vlc_snapshot = setu_vlc::VLCSnapshot {
+                                vector_clock: setu_vlc::VectorClock::new(),
+                                logical_time: vlc_time,
+                                physical_time: setu_validator::current_timestamp_secs(),
+                            };
+                            let ts = setu_validator::current_timestamp_secs();
+                            let resource_params = poll_network_svc
+                                .get_subnet_object(
+                                    &setu_types::SubnetId::GOVERNANCE,
+                                    setu_types::resource_params_object_id().as_bytes(),
+                                )
+                                .and_then(|b| serde_json::from_slice::<setu_types::ResourceParams>(&b).ok());
+                            if let Ok(event) =
+                                GovernanceHandler::prepare_timeout_execute(
+                                    &gov_svc_poll,
+                                    pending.proposal_id,
+                                    ts,
+                                    vlc_snapshot,
+                                    &proposal,
+                                    poll_network_svc.validator_id(),
+                                    resource_params.as_ref(),
+                                )
                             {
-                                let vlc_time = poll_network_svc.get_vlc_time();
-                                let vlc_snapshot = setu_vlc::VLCSnapshot {
-                                    vector_clock: setu_vlc::VectorClock::new(),
-                                    logical_time: vlc_time,
-                                    physical_time: setu_validator::current_timestamp_secs(),
-                                };
-                                let ts = setu_validator::current_timestamp_secs();
-                                // Read current ResourceParams from GOVERNANCE SMT
-                                let resource_params = poll_network_svc
-                                    .get_subnet_object(
-                                        &setu_types::SubnetId::GOVERNANCE,
-                                        setu_types::resource_params_object_id().as_bytes(),
-                                    )
-                                    .and_then(|b| serde_json::from_slice::<setu_types::ResourceParams>(&b).ok());
-                                if let Ok(event) =
-                                    GovernanceHandler::prepare_timeout_execute(
-                                        &gov_svc_poll,
+                                let submit_response = poll_network_svc.add_event_to_dag(event.clone()).await;
+                                if submit_response.success {
+                                    let timeout_decision = setu_types::governance::GovernanceDecision {
+                                        approved: false,
+                                        reasoning: "Proposal timed out".into(),
+                                        conditions: vec![],
+                                    };
+                                    gov_svc_poll.remove_pending(&pending.proposal_id);
+                                    gov_svc_poll.record_decided(
                                         pending.proposal_id,
-                                        ts,
-                                        vlc_snapshot,
-                                        &proposal,
-                                        poll_network_svc.validator_id(),
-                                        resource_params.as_ref(),
-                                    )
-                                {
-                                    poll_network_svc.add_event_to_dag(event).await;
+                                        timeout_decision,
+                                    );
+                                    poll_network_svc.apply_event_state_changes_eager(
+                                        &setu_types::SubnetId::GOVERNANCE, &event,
+                                    );
                                     info!(
                                         proposal_id = %hex::encode(pending.proposal_id),
                                         "Governance proposal timed out, rejected"
+                                    );
+                                } else {
+                                    warn!(
+                                        proposal_id = %hex::encode(pending.proposal_id),
+                                        error = %submit_response.message,
+                                        "Governance timeout execute submission failed"
                                     );
                                 }
                             }
@@ -864,44 +1097,49 @@ async fn main() -> anyhow::Result<()> {
                     // Poll Agent for result
                     match gov_svc_poll.poll_agent_result(&setu_types::SubnetId::GOVERNANCE, pending.proposal_id).await {
                         Ok(Some(decision)) => {
-                            if let Some(bytes) = poll_network_svc
-                                .get_subnet_object(&setu_types::SubnetId::GOVERNANCE, &pending.proposal_id)
-                            {
-                                if let Ok(proposal) = serde_json::from_slice::<
-                                    setu_types::governance::GovernanceProposal,
-                                >(&bytes)
+                            if let Some(proposal) = resolve_proposal(&poll_network_svc, &pending) {
+                                let vlc_time = poll_network_svc.get_vlc_time();
+                                let vlc_snapshot = setu_vlc::VLCSnapshot {
+                                    vector_clock: setu_vlc::VectorClock::new(),
+                                    logical_time: vlc_time,
+                                    physical_time: setu_validator::current_timestamp_secs(),
+                                };
+                                let ts = setu_validator::current_timestamp_secs();
+                                let resource_params = poll_network_svc
+                                    .get_subnet_object(
+                                        &setu_types::SubnetId::GOVERNANCE,
+                                        setu_types::resource_params_object_id().as_bytes(),
+                                    )
+                                    .and_then(|b| serde_json::from_slice::<setu_types::ResourceParams>(&b).ok());
+                                if let Ok(event) =
+                                    GovernanceHandler::prepare_execute(
+                                        &gov_svc_poll,
+                                        pending.proposal_id,
+                                        pending.callback_token,
+                                        decision.clone(),
+                                        ts,
+                                        vlc_snapshot,
+                                        &proposal,
+                                        poll_network_svc.validator_id(),
+                                        resource_params.as_ref(),
+                                    )
                                 {
-                                    let vlc_time = poll_network_svc.get_vlc_time();
-                                    let vlc_snapshot = setu_vlc::VLCSnapshot {
-                                        vector_clock: setu_vlc::VectorClock::new(),
-                                        logical_time: vlc_time,
-                                        physical_time: setu_validator::current_timestamp_secs(),
-                                    };
-                                    let ts = setu_validator::current_timestamp_secs();
-                                    // Read current ResourceParams for governance execution
-                                    let resource_params = poll_network_svc
-                                        .get_subnet_object(
-                                            &setu_types::SubnetId::GOVERNANCE,
-                                            setu_types::resource_params_object_id().as_bytes(),
-                                        )
-                                        .and_then(|b| serde_json::from_slice::<setu_types::ResourceParams>(&b).ok());
-                                    if let Ok(event) =
-                                        GovernanceHandler::prepare_execute(
-                                            &gov_svc_poll,
-                                            pending.proposal_id,
-                                            pending.callback_token,
-                                            decision,
-                                            ts,
-                                            vlc_snapshot,
-                                            &proposal,
-                                            poll_network_svc.validator_id(),
-                                            resource_params.as_ref(),
-                                        )
-                                    {
-                                        poll_network_svc.add_event_to_dag(event).await;
+                                    let submit_response = poll_network_svc.add_event_to_dag(event.clone()).await;
+                                    if submit_response.success {
+                                        gov_svc_poll.remove_pending(&pending.proposal_id);
+                                        gov_svc_poll.record_decided(pending.proposal_id, decision);
+                                        poll_network_svc.apply_event_state_changes_eager(
+                                            &setu_types::SubnetId::GOVERNANCE, &event,
+                                        );
                                         info!(
                                             proposal_id = %hex::encode(pending.proposal_id),
                                             "Governance decision received via polling"
+                                        );
+                                    } else {
+                                        warn!(
+                                            proposal_id = %hex::encode(pending.proposal_id),
+                                            error = %submit_response.message,
+                                            "Governance decision submission failed"
                                         );
                                     }
                                 }
@@ -920,6 +1158,22 @@ async fn main() -> anyhow::Result<()> {
             }
         });
         info!("✓ Governance poll + timeout task started (10s interval)");
+
+        // Task C — Heartbeat: periodically flush stale events below vlc_delta_threshold.
+        // Ensures governance events (low-frequency) are folded into CFs within bounded time.
+        let heartbeat_cv = Arc::clone(&consensus_validator);
+        let heartbeat_interval = Duration::from_secs(5);
+        let _heartbeat_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(heartbeat_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(e) = heartbeat_cv.try_heartbeat(heartbeat_interval).await {
+                    tracing::debug!(error = %e, "Heartbeat CF attempt failed");
+                }
+            }
+        });
+        info!("✓ Heartbeat CF task started (5s interval)");
     }
 
     // Spawn HTTP server

@@ -39,6 +39,7 @@ pub mod engine;
 pub mod folder;
 pub mod liveness;
 pub mod merkle_integration;
+pub mod outcome_sink;
 pub mod recent_cache;
 pub mod root_executor;
 pub mod router;
@@ -66,6 +67,7 @@ pub use merkle_integration::{
     compute_events_root, compute_anchor_chain_root, compute_global_state_root,
     AnchorMerkleRootsBuilder,
 };
+pub use outcome_sink::OutcomeSink;
 pub use root_executor::{RootSubnetExecutor, RootExecutorError, RootExecutionResult};
 pub use router::{EventRouter, RoutedEvents, SubnetExecutionBatch, create_execution_batches};
 pub use recent_cache::{RecentEventCache, FinalizedEventMeta, CacheStats, CacheStatsSnapshot};

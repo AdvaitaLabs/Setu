@@ -1,7 +1,7 @@
 //! Benchmark runner implementation
 
-use crate::client::{generate_transfer, generate_transfer_with_n_accounts, load_seed_addresses_from_genesis, name_to_hex_address, BenchClient, BenchTransferRequest};
-use crate::config::{BenchmarkConfig, BenchmarkMode};
+use crate::client::{generate_move_call, generate_transfer, generate_transfer_with_n_accounts, load_seed_addresses_from_genesis, name_to_hex_address, BenchClient, BenchTransferRequest};
+use crate::config::{BenchmarkConfig, BenchmarkMode, WorkloadType};
 use crate::metrics::{BenchmarkSummary, MetricsCollector, RequestMetrics};
 use anyhow::{bail, Result};
 use futures::stream::{self, StreamExt};
@@ -105,6 +105,35 @@ async fn execute_transfer_with_retry(
     None
 }
 
+/// Execute a Move call request (no retry for coin reservation — not applicable)
+async fn execute_move_call_request(
+    client: &BenchClient,
+    config: &BenchmarkConfig,
+    seq: u64,
+    seed_addresses: &[String],
+) -> RequestMetrics {
+    let request = generate_move_call(config, seq, seed_addresses);
+    client.submit_move_call(request).await
+}
+
+/// Execute a single request based on workload type
+async fn execute_request(
+    client: &BenchClient,
+    config: &BenchmarkConfig,
+    seq: u64,
+    seed_addresses: &[String],
+    subnet_ids: &[String],
+) -> Option<RequestMetrics> {
+    match config.workload {
+        WorkloadType::Transfer => {
+            execute_transfer_with_retry(client, config, seq, seed_addresses, subnet_ids).await
+        }
+        WorkloadType::MoveCall => {
+            Some(execute_move_call_request(client, config, seq, seed_addresses).await)
+        }
+    }
+}
+
 /// Benchmark runner
 pub struct BenchmarkRunner {
     config: BenchmarkConfig,
@@ -191,8 +220,18 @@ impl BenchmarkRunner {
             }
         }
 
-        // Initialize test accounts if requested
-        if self.config.init_accounts > 0 {
+        // Validate Move call config
+        if matches!(self.config.workload, WorkloadType::MoveCall) {
+            if self.config.move_package.is_empty()
+                || self.config.move_module.is_empty()
+                || self.config.move_function.is_empty()
+            {
+                bail!("--move-package, --move-module, and --move-function are required for move-call workload");
+            }
+        }
+
+        // Initialize test accounts if requested (transfers only)
+        if self.config.init_accounts > 0 && matches!(self.config.workload, WorkloadType::Transfer) {
             info!("");
             info!("Initializing {} test accounts...", self.config.init_accounts);
             self.init_test_accounts(&client).await?;
@@ -259,7 +298,7 @@ impl BenchmarkRunner {
                 let subnet_ids = self.subnet_ids.clone();
                 async move {
                     let _permit = sem.acquire().await.unwrap();
-                    let _ = execute_transfer_with_retry(&client, &config, warmup_seq_offset + i, &seed_addrs, &subnet_ids).await;
+                    let _ = execute_request(&client, &config, warmup_seq_offset + i, &seed_addrs, &subnet_ids).await;
                 }
             })
             .collect();
@@ -573,7 +612,7 @@ impl BenchmarkRunner {
                 let counter = counter.clone();
                 async move {
                     let _permit = sem.acquire().await.unwrap();
-                    if let Some(result) = execute_transfer_with_retry(&client, &config, i, &seed_addrs, &subnet_ids).await {
+                    if let Some(result) = execute_request(&client, &config, i, &seed_addrs, &subnet_ids).await {
                         metrics.record(result).await;
                     }
                     counter.fetch_add(1, Ordering::Relaxed);
@@ -662,7 +701,7 @@ impl BenchmarkRunner {
 
             tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                if let Some(result) = execute_transfer_with_retry(&client, &config, current_seq, &seed_addrs, &subnet_ids).await {
+                if let Some(result) = execute_request(&client, &config, current_seq, &seed_addrs, &subnet_ids).await {
                     metrics_clone.record(result).await;
                 }
                 counter_clone.fetch_add(1, Ordering::Relaxed);
@@ -718,7 +757,7 @@ impl BenchmarkRunner {
 
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-                    if let Some(result) = execute_transfer_with_retry(&client, &config, s, &seed_addrs, &subnet_ids).await {
+                    if let Some(result) = execute_request(&client, &config, s, &seed_addrs, &subnet_ids).await {
                         metrics_clone.record(result).await;
                     }
                     counter_clone.fetch_add(1, Ordering::Relaxed);

@@ -20,12 +20,13 @@
 use consensus::{
     ConsensusEngine, ConsensusMessage, DagStats as ConsensusDagStats,
     ValidatorSet, TeeVerifier, VerificationResult,
-    liveness::Round, ConsensusBroadcaster,
+    liveness::Round, ConsensusBroadcaster, OutcomeSink,
 };
+use crate::outcome_sink::DashMapOutcomeSink;
 use crate::protocol::NetworkEvent;
 use setu_types::{
     Anchor, ConsensusConfig, ConsensusFrame, Event, EventId, Vote,
-    NodeInfo, ValidatorInfo, SetuResult, SetuError, SubnetId,
+    NodeInfo, ValidatorInfo, SetuResult, SetuError, SubnetId, ExecutionOutcome,
 };
 use setu_storage::SharedStateManager;
 use setu_storage::subnet_state::GlobalStateManager;
@@ -89,6 +90,8 @@ pub struct ConsensusValidator {
     cf_store: Arc<dyn CFStoreBackend>,
     /// Persistent store for anchors (supports both in-memory and RocksDB backends)
     anchor_store: Arc<dyn AnchorStoreBackend>,
+    /// Per-CF index-persistence retry counter (Layer D, retry-then-escalate).
+    cf_index_retries: Arc<parking_lot::Mutex<std::collections::HashMap<setu_types::CFId, u32>>>,
 
     /// Channel for sending consensus messages to network
     message_tx: mpsc::Sender<ConsensusMessage>,
@@ -97,6 +100,9 @@ pub struct ConsensusValidator {
     message_rx: Arc<Mutex<mpsc::Receiver<ConsensusMessage>>>,
     /// Broadcast channel for CF finalization notifications
     finalization_tx: broadcast::Sender<ConsensusFrame>,
+    /// R5: shared map of per-event apply outcomes (Applied / StaleRead / ExecutionFailed).
+    /// Written by consensus via `DashMapOutcomeSink`, read by RPC handlers.
+    execution_outcomes: Arc<dashmap::DashMap<String, ExecutionOutcome>>,
     /// Pending votes awaiting quorum (reserved for future use)
     #[allow(dead_code)]
     pending_votes: Arc<RwLock<HashMap<String, Vec<Vote>>>>,
@@ -137,7 +143,15 @@ impl ConsensusValidator {
             Arc::new(SharedStateManager::new(GlobalStateManager::default())),  // Use default state manager
             Arc::clone(&event_store),        // Share the same EventStore!
         ));
-        
+
+        // Wire finalization broadcast channel into engine
+        engine.set_finalization_tx(finalization_tx.clone());
+
+        // R5: wire outcome sink (shared between consensus writer and RPC reader).
+        let outcomes_sink = Arc::new(DashMapOutcomeSink::new());
+        let execution_outcomes = outcomes_sink.map();
+        engine.set_outcomes_sink(outcomes_sink as Arc<dyn OutcomeSink>);
+
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
         
@@ -148,10 +162,12 @@ impl ConsensusValidator {
             tee_verifier,
             event_store,  // Use the shared instance
             cf_store,
+            cf_index_retries: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             anchor_store,
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
             finalization_tx,
+            execution_outcomes,
             pending_votes: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(RwLock::new(false)),
         }
@@ -189,7 +205,15 @@ impl ConsensusValidator {
             state_manager,
             Arc::clone(&event_store),  // Share the same EventStore!
         ));
-        
+
+        // Wire finalization broadcast channel into engine
+        engine.set_finalization_tx(finalization_tx.clone());
+
+        // R5: wire outcome sink (shared between consensus writer and RPC reader).
+        let outcomes_sink = Arc::new(DashMapOutcomeSink::new());
+        let execution_outcomes = outcomes_sink.map();
+        engine.set_outcomes_sink(outcomes_sink as Arc<dyn OutcomeSink>);
+
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
         
@@ -200,10 +224,12 @@ impl ConsensusValidator {
             tee_verifier,
             event_store,  // Use the shared instance
             cf_store,
+            cf_index_retries: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             anchor_store,
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
             finalization_tx,
+            execution_outcomes,
             pending_votes: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(RwLock::new(false)),
         }
@@ -243,7 +269,15 @@ impl ConsensusValidator {
             state_manager,
             Arc::clone(&event_store),  // Share the same EventStore!
         ));
-        
+
+        // Wire finalization broadcast channel into engine
+        engine.set_finalization_tx(finalization_tx.clone());
+
+        // R5: wire outcome sink (shared between consensus writer and RPC reader).
+        let outcomes_sink = Arc::new(DashMapOutcomeSink::new());
+        let execution_outcomes = outcomes_sink.map();
+        engine.set_outcomes_sink(outcomes_sink as Arc<dyn OutcomeSink>);
+
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
         
@@ -254,10 +288,12 @@ impl ConsensusValidator {
             tee_verifier,
             event_store,
             cf_store,
+            cf_index_retries: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             anchor_store,
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
             finalization_tx,
+            execution_outcomes,
             pending_votes: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(RwLock::new(false)),
         }
@@ -312,7 +348,15 @@ impl ConsensusValidator {
             state_manager,
             Arc::clone(&event_store),  // Share the same EventStore!
         ));
-        
+
+        // Wire finalization broadcast channel into engine
+        engine.set_finalization_tx(finalization_tx.clone());
+
+        // R5: wire outcome sink (shared between consensus writer and RPC reader).
+        let outcomes_sink = Arc::new(DashMapOutcomeSink::new());
+        let execution_outcomes = outcomes_sink.map();
+        engine.set_outcomes_sink(outcomes_sink as Arc<dyn OutcomeSink>);
+
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
         
@@ -323,10 +367,12 @@ impl ConsensusValidator {
             tee_verifier,
             event_store,
             cf_store,
+            cf_index_retries: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             anchor_store,
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
             finalization_tx,
+            execution_outcomes,
             pending_votes: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(RwLock::new(false)),
         }
@@ -365,6 +411,7 @@ impl ConsensusValidator {
             self.engine.clone(),
             self.event_store.clone(),
             self.anchor_store.clone(),
+            self.cf_store.clone(),
         ));
         
         info!(
@@ -384,10 +431,41 @@ impl ConsensusValidator {
     pub fn event_store(&self) -> Arc<dyn EventStoreBackend> {
         Arc::clone(&self.event_store)
     }
+
+    /// Resolve an event for post-finalization HTTP projection.
+    ///
+    /// Finalization notifications are emitted before persistence/GC completes,
+    /// so the event is usually still in the active DAG. If this subscriber runs
+    /// after persistence and GC, fall back to the shared event store.
+    pub async fn event_for_http_projection(&self, event_id: &str) -> Option<Event> {
+        let event_id = event_id.to_string();
+        {
+            let dag = self.engine.dag_manager().dag().read().await;
+            if let Some(event) = dag.get_event(&event_id) {
+                return Some(event.clone());
+            }
+        }
+
+        self.event_store.get(&event_id).await
+    }
     
     /// Get the anchor store (for queries of finalized anchors)
     pub fn anchor_store(&self) -> Arc<dyn AnchorStoreBackend> {
         Arc::clone(&self.anchor_store)
+    }
+
+    pub fn cf_store(&self) -> Arc<dyn CFStoreBackend> {
+        Arc::clone(&self.cf_store)
+    }
+
+    /// R5 · Get the shared execution-outcome map for RPC reads.
+    ///
+    /// The validator's consensus writer (via `DashMapOutcomeSink`) and the
+    /// network service share this same `Arc<DashMap>`, so the service can
+    /// look up `(event_id → ExecutionOutcome)` synchronously during
+    /// `GET /api/v1/event/:id` handling.
+    pub fn execution_outcomes(&self) -> Arc<dashmap::DashMap<String, ExecutionOutcome>> {
+        Arc::clone(&self.execution_outcomes)
     }
 
     /// Add a remote validator to the consensus set.
@@ -445,9 +523,29 @@ impl ConsensusValidator {
         {
             let mut cm = self.engine.consensus_manager().write().await;
             cm.anchor_builder_mut().restore_state(chain_root, depth, count, vlc_time);
+            drop(cm);
+
+            let recovery_round = count as Round;
+            {
+                let mut engine_vs = self.engine.validator_set_ref().write().await;
+                engine_vs.set_round(recovery_round);
+            }
+            {
+                let mut local_vs = self.validator_set.write().await;
+                local_vs.set_round(recovery_round);
+            }
+
+            self.engine.dag_manager().update_min_depth(depth + 1);
+            self.engine.restore_logical_time_counter(vlc_time);
             info!(
                 "AnchorBuilder restored: depth={}, anchor_count={}, vlc_time={}",
                 depth, count, vlc_time
+            );
+            info!(
+                "Consensus progress restored: round={}, min_depth={}, logical_time_counter={}",
+                recovery_round,
+                depth + 1,
+                vlc_time
             );
         }
         
@@ -518,13 +616,26 @@ impl ConsensusValidator {
         // In single-node mode, add_event() → try_create_cf() → check_finalization()
         // may finalize a CF immediately. The internal message channel is not consumed
         // in production, so we must persist here synchronously.
+        let mut any_persisted = false;
         for anchor in self.engine.take_pending_anchors().await {
-            if let Err(e) = self.persist_finalized_anchor(&anchor).await {
-                warn!(
-                    anchor_id = %anchor.id,
-                    error = %e,
-                    "Failed to persist inline-finalized anchor"
-                );
+            match self.persist_finalized_anchor(&anchor).await {
+                Ok(()) => { any_persisted = true; }
+                Err(e) => {
+                    warn!(
+                        anchor_id = %anchor.id,
+                        error = %e,
+                        "Failed to persist inline-finalized anchor"
+                    );
+                }
+            }
+        }
+        // Layer A: only run post-persist completion (broadcast + advance round)
+        // after at least one anchor durably persisted. If all persists failed,
+        // the queued completions stay in the engine and will be retried by the
+        // next caller invocation.
+        if any_persisted {
+            if let Err(e) = self.engine.complete_pending_finalizations().await {
+                warn!(error = %e, "complete_pending_finalizations failed after submit_event persist");
             }
         }
         
@@ -571,12 +682,20 @@ impl ConsensusValidator {
                     event_count = a.event_ids.len(),
                     "CF finalized after local vote, persisting"
                 );
-                if let Err(e) = self.persist_finalized_anchor(a).await {
-                    warn!(
-                        anchor_id = %a.id,
-                        error = %e,
-                        "Failed to persist finalized anchor (will retry)"
-                    );
+                match self.persist_finalized_anchor(a).await {
+                    Ok(()) => {
+                        // Layer A: trigger post-persist broadcast + round advance.
+                        if let Err(e) = self.engine.complete_pending_finalizations().await {
+                            warn!(error = %e, "complete_pending_finalizations failed after receive_cf persist");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            anchor_id = %a.id,
+                            error = %e,
+                            "Failed to persist finalized anchor (will retry)"
+                        );
+                    }
                 }
             }
         }
@@ -606,12 +725,19 @@ impl ConsensusValidator {
                     event_count = a.event_ids.len(),
                     "CF finalized via vote, persisting"
                 );
-                if let Err(e) = self.persist_finalized_anchor(a).await {
-                    warn!(
-                        anchor_id = %a.id,
-                        error = %e,
-                        "Failed to persist finalized anchor (will retry)"
-                    );
+                match self.persist_finalized_anchor(a).await {
+                    Ok(()) => {
+                        if let Err(e) = self.engine.complete_pending_finalizations().await {
+                            warn!(error = %e, "complete_pending_finalizations failed after receive_vote persist");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            anchor_id = %a.id,
+                            error = %e,
+                            "Failed to persist finalized anchor (will retry)"
+                        );
+                    }
                 }
             }
         }
@@ -773,6 +899,39 @@ impl ConsensusValidator {
     pub fn subscribe_finalization(&self) -> broadcast::Receiver<ConsensusFrame> {
         self.finalization_tx.subscribe()
     }
+
+    /// Rebuild the finalization broadcast channel with a caller-provided capacity.
+    ///
+    /// This is primarily for lag/catch-up tests that need a tiny buffer. It is a
+    /// consuming builder and should be called before the validator is wrapped in
+    /// `Arc` or any subscribers are created.
+    pub fn with_finalization_capacity(mut self, capacity: usize) -> Self {
+        let (finalization_tx, _) = broadcast::channel(capacity.max(1));
+        self.engine.set_finalization_tx(finalization_tx.clone());
+        self.finalization_tx = finalization_tx;
+        self
+    }
+
+    /// Heartbeat: periodically try to create CF for events stuck below vlc_delta_threshold.
+    /// Called by background timer in main.rs. No-op if not Leader or no stale events.
+    pub async fn try_heartbeat(&self, heartbeat_interval: std::time::Duration) -> SetuResult<()> {
+        let result = self.engine.try_create_cf_heartbeat(heartbeat_interval).await?;
+
+        if result.is_some() {
+            // Persist any inline-finalized anchors (same as submit_event)
+            let mut any_persisted = false;
+            for anchor in self.engine.take_pending_anchors().await {
+                if self.persist_finalized_anchor(&anchor).await.is_ok() {
+                    any_persisted = true;
+                }
+            }
+            if any_persisted {
+                let _ = self.engine.complete_pending_finalizations().await;
+            }
+        }
+
+        Ok(())
+    }
     
     /// Get the local validator ID
     pub fn validator_id(&self) -> &str {
@@ -834,6 +993,14 @@ impl FinalizationPersister for ConsensusValidator {
     
     fn anchor_store(&self) -> &Arc<dyn AnchorStoreBackend> {
         &self.anchor_store
+    }
+
+    fn cf_store(&self) -> &Arc<dyn CFStoreBackend> {
+        &self.cf_store
+    }
+
+    fn cf_index_retries(&self) -> &Arc<parking_lot::Mutex<std::collections::HashMap<setu_types::CFId, u32>>> {
+        &self.cf_index_retries
     }
 }
 
@@ -933,7 +1100,8 @@ impl ConsensusMessageHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_types::EventType;
+    use setu_storage::{AnchorStore, CFStore, EventStore};
+    use setu_types::{Anchor, AnchorMerkleRoots};
     use setu_vlc::VectorClock;
 
     fn create_test_config() -> ConsensusValidatorConfig {
@@ -1009,6 +1177,70 @@ mod tests {
         assert!(stats.is_leader);
         assert_eq!(stats.current_round, 0);
     }
+
+    #[tokio::test]
+    async fn test_f3_with_finalization_capacity_rewires_engine_sender() {
+        let config = create_test_config();
+        let validator = ConsensusValidator::new(config);
+        let mut old_rx = validator.subscribe_finalization();
+
+        let validator = validator.with_finalization_capacity(1);
+
+        let old_result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(50),
+            old_rx.recv(),
+        )
+        .await
+        .expect("old receiver should close after channel rewrite");
+        assert!(matches!(old_result, Err(tokio::sync::broadcast::error::RecvError::Closed)));
+
+        let _new_rx = validator.subscribe_finalization();
+    }
+
+    #[tokio::test]
+    async fn test_recover_from_storage_restores_consensus_progress() {
+        let config = create_test_config();
+        let event_store: Arc<dyn EventStoreBackend> = Arc::new(EventStore::new());
+        let cf_store: Arc<dyn CFStoreBackend> = Arc::new(CFStore::new());
+        let anchor_store = Arc::new(AnchorStore::new());
+        let anchor_store_backend: Arc<dyn AnchorStoreBackend> = anchor_store.clone();
+        let state_manager = Arc::new(SharedStateManager::new(GlobalStateManager::default()));
+        let validator = ConsensusValidator::with_all_backends(
+            config,
+            state_manager,
+            event_store,
+            cf_store,
+            anchor_store_backend,
+        );
+
+        for idx in 0..3u64 {
+            let roots = AnchorMerkleRoots::with_roots(
+                [idx as u8; 32],
+                [idx as u8 + 1; 32],
+                [idx as u8 + 2; 32],
+            );
+            let mut anchor = Anchor::with_merkle_roots(
+                vec![format!("event-{idx}")],
+                setu_vlc::VLCSnapshot {
+                    vector_clock: VectorClock::new(),
+                    logical_time: 70 + idx,
+                    physical_time: 0,
+                },
+                roots,
+                if idx == 0 { None } else { Some(format!("anchor-{}", idx - 1)) },
+                35 + idx,
+            );
+            anchor.id = format!("anchor-{idx}");
+            anchor.timestamp = idx;
+            anchor_store.store(anchor).await.unwrap();
+        }
+
+        validator.recover_from_storage().await.unwrap();
+
+        assert_eq!(validator.current_round().await, 3);
+        assert_eq!(validator.engine().dag_manager().min_depth(), 38);
+        assert_eq!(validator.allocate_logical_time(), 73);
+    }
     
     #[tokio::test]
     async fn test_network_event_handler_integration() {
@@ -1046,5 +1278,168 @@ mod tests {
             tokio::time::Duration::from_millis(100),
             handle
         ).await;
+    }
+
+    // ---- fix-post-restart-finality-stall-v2 (Layer A + Layer D) ----
+
+    use async_trait::async_trait;
+    use setu_types::{CFId, SetuError, SetuResult};
+
+    /// CFStore stub that always fails on store(); used by F9 / Layer D test.
+    #[derive(Debug)]
+    struct AlwaysFailCFStore;
+
+    #[async_trait]
+    impl CFStoreBackend for AlwaysFailCFStore {
+        async fn store(&self, _cf: ConsensusFrame) -> SetuResult<()> {
+            Err(SetuError::InvalidData("simulated CFStore disk error".into()))
+        }
+        async fn get(&self, _cf_id: &CFId) -> Option<ConsensusFrame> { None }
+        async fn mark_finalized(&self, _cf_id: &CFId) -> SetuResult<()> { Ok(()) }
+        async fn get_pending(&self) -> Vec<ConsensusFrame> { Vec::new() }
+        async fn get_finalized(&self) -> Vec<ConsensusFrame> { Vec::new() }
+        async fn latest_finalized(&self) -> Option<ConsensusFrame> { None }
+        async fn finalized_count(&self) -> usize { 0 }
+        async fn pending_count(&self) -> usize { 0 }
+    }
+
+    /// Helper: build a finalized CF with a single-validator quorum (validator
+    /// id "test-validator") matching the default `create_test_config()`.
+    fn build_solo_quorum_cf() -> ConsensusFrame {
+        use setu_types::{Vote, VLCSnapshot};
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "test-validator".to_string());
+        cf.add_vote(Vote::new("test-validator".to_string(), cf.id.clone(), true));
+        cf.finalize();
+        cf
+    }
+
+    /// Helper: build a finalized CF with a 3-validator quorum.
+    fn build_quorum_cf(leader: &str) -> ConsensusFrame {
+        use setu_types::{Vote, VLCSnapshot};
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, leader.to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+        cf
+    }
+
+    fn three_validator_set() -> consensus::ValidatorSet {
+        use consensus::ValidatorSet;
+        use setu_types::ValidatorInfo;
+        let mut vs = ValidatorSet::new();
+        for id in ["v1", "v2", "v3"] {
+            let node = NodeInfo::new_validator(
+                id.to_string(),
+                "127.0.0.1".to_string(),
+                8080,
+            );
+            vs.add_validator(ValidatorInfo::new(node, false));
+        }
+        vs
+    }
+
+    /// F8: Layer A — `handle_finalization` enqueues the CF in
+    /// `pending_completions` but does NOT advance round or broadcast until
+    /// `complete_pending_finalizations()` is called.
+    #[tokio::test]
+    async fn test_f8_finalization_defers_broadcast_until_complete() {
+        let mut config = create_test_config();
+        config.consensus.validator_count = 3;
+        config.node_info = NodeInfo::new_validator("v1".to_string(), "127.0.0.1".to_string(), 8080);
+        let engine = consensus::ConsensusEngine::new(
+            config.consensus.clone(),
+            "v1".to_string(),
+            three_validator_set(),
+        );
+
+        let cf = build_quorum_cf("v1");
+        assert_eq!(engine.current_round().await, 0);
+        let (finalized, anchor) = engine.receive_finalized_cf(cf).await.unwrap();
+        assert!(finalized);
+        assert!(anchor.is_some());
+        // Layer A: round must NOT advance pre-completion.
+        assert_eq!(engine.current_round().await, 0);
+
+        engine.complete_pending_finalizations().await.unwrap();
+        // After completion: round advances exactly once.
+        assert_eq!(engine.current_round().await, 1);
+    }
+
+    /// F9 + Layer D: `persist_pending_finalized_cfs` retries on CFStore
+    /// failure for `MAX_CF_INDEX_RETRIES - 1` calls, then escalates with
+    /// `PersistenceError::CFIndexEscalated`. The CF stays in the engine
+    /// queue across all retries (peek-only semantics).
+    #[tokio::test]
+    async fn test_f9_cf_index_persistence_retries_then_escalates() {
+        use crate::persistence::{FinalizationPersister, MAX_CF_INDEX_RETRIES, PersistenceError};
+
+        // Single-validator config so the validator's own engine accepts the
+        // CF without quorum/identity mismatches.
+        let config = create_test_config();
+
+        let event_store: Arc<dyn EventStoreBackend> = Arc::new(EventStore::new());
+        let failing_cf_store: Arc<dyn CFStoreBackend> = Arc::new(AlwaysFailCFStore);
+        let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(AnchorStore::new());
+        let state_manager = Arc::new(SharedStateManager::new(GlobalStateManager::default()));
+        let validator = ConsensusValidator::with_all_backends(
+            config,
+            state_manager,
+            event_store,
+            failing_cf_store.clone(),
+            anchor_store,
+        );
+
+        let cf = build_solo_quorum_cf();
+        let (finalized, _) = validator.engine().receive_finalized_cf(cf.clone()).await.unwrap();
+        assert!(finalized);
+        assert_eq!(
+            validator.engine().peek_pending_finalized_cfs().await.len(),
+            1,
+            "engine queues CF for index persistence"
+        );
+
+        // Calls 1..MAX-1 stay under the retry budget and return Ok(()).
+        for attempt in 1..MAX_CF_INDEX_RETRIES {
+            let res = validator.persist_pending_finalized_cfs().await;
+            assert!(res.is_ok(), "attempt {} should be under budget: {:?}", attempt, res);
+            assert_eq!(
+                validator.engine().peek_pending_finalized_cfs().await.len(),
+                1,
+                "CF must remain queued after attempt {}",
+                attempt
+            );
+        }
+
+        // The MAX-th call escalates.
+        let final_res = validator.persist_pending_finalized_cfs().await;
+        match final_res {
+            Err(PersistenceError::CFIndexEscalated { retries, cf_id, .. }) => {
+                assert_eq!(retries, MAX_CF_INDEX_RETRIES);
+                assert_eq!(cf_id, cf.id.to_string());
+            }
+            other => panic!("expected CFIndexEscalated, got {:?}", other),
+        }
+        // Even after escalation, the CF stays queued so a future heal cycle
+        // can retry it once the underlying store recovers.
+        assert_eq!(
+            validator.engine().peek_pending_finalized_cfs().await.len(),
+            1,
+            "escalated CF must NOT be drained"
+        );
     }
 }

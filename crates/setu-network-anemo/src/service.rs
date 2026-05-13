@@ -91,10 +91,12 @@ impl AnemoNetworkService {
         // Create peer manager
         let peer_manager = Arc::new(AnemoPeerManager::new(transport.clone())?);
 
-        // Build and start discovery
+        // Build and start discovery (with PeerManager bridge so discovery
+        // reflects actual transport-level connections and their node roles)
         let discovery_config = DiscoveryConfig::default();
         let (unstarted_discovery, _discovery_server) = discovery::Builder::new()
             .config(discovery_config)
+            .peer_manager(peer_manager.clone())
             .build();
         let network_ref = transport.network().downgrade();
         let (discovery_handle, _join_handle) = unstarted_discovery.start(network_ref);

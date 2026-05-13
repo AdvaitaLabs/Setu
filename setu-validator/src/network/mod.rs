@@ -16,6 +16,7 @@ mod solver_client;
 mod transfer_handler;
 mod tee_executor;
 mod event_handler;
+pub(crate) mod move_handler;
 
 pub use types::*;
 pub use service::*;

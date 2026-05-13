@@ -5,7 +5,7 @@
 
 use consensus::ConsensusEngine;
 use crate::protocol::NetworkEvent;
-use setu_storage::{EventStoreBackend, AnchorStoreBackend};
+use setu_storage::{AnchorStoreBackend, CFStoreBackend, EventStoreBackend};
 use setu_types::{ConsensusFrame, Event, Vote};
 use crate::persistence::FinalizationPersister;
 use std::sync::Arc;
@@ -53,6 +53,11 @@ pub struct MessageRouter {
     event_store: Arc<dyn EventStoreBackend>,
     /// Anchor store for persisting finalized anchors
     anchor_store: Arc<dyn AnchorStoreBackend>,
+    /// CF store for persisting finalized CF indexes
+    cf_store: Arc<dyn CFStoreBackend>,
+    /// Per-CF index-persistence retry counter (Layer D, retry-then-escalate).
+    /// Initialized empty; entries are added on failure and removed on success.
+    cf_index_retries: Arc<parking_lot::Mutex<std::collections::HashMap<setu_types::CFId, u32>>>,
 
 }
 
@@ -62,11 +67,14 @@ impl MessageRouter {
         engine: Arc<ConsensusEngine>,
         event_store: Arc<dyn EventStoreBackend>,
         anchor_store: Arc<dyn AnchorStoreBackend>,
+        cf_store: Arc<dyn CFStoreBackend>,
     ) -> Self {
         Self {
             engine,
             event_store,
             anchor_store,
+            cf_store,
+            cf_index_retries: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         }
     }
     
@@ -131,6 +139,14 @@ impl FinalizationPersister for MessageRouter {
     
     fn anchor_store(&self) -> &Arc<dyn AnchorStoreBackend> {
         &self.anchor_store
+    }
+
+    fn cf_store(&self) -> &Arc<dyn CFStoreBackend> {
+        &self.cf_store
+    }
+
+    fn cf_index_retries(&self) -> &Arc<parking_lot::Mutex<std::collections::HashMap<setu_types::CFId, u32>>> {
+        &self.cf_index_retries
     }
 }
 
@@ -248,12 +264,19 @@ impl NetworkEventHandler for MessageRouter {
                     
                     // Persist finalized data (same logic as handle_vote)
                     if let Some(anchor) = anchor {
-                        if let Err(e) = self.persist_finalized_anchor(&anchor).await {
-                            warn!(
-                                anchor_id = %anchor.id,
-                                error = %e,
-                                "Failed to persist finalized anchor (will retry)"
-                            );
+                        match self.persist_finalized_anchor(&anchor).await {
+                            Ok(()) => {
+                                if let Err(e) = self.engine.complete_pending_finalizations().await {
+                                    warn!(error = %e, "complete_pending_finalizations failed after handle_cf_proposal persist");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    anchor_id = %anchor.id,
+                                    error = %e,
+                                    "Failed to persist finalized anchor (will retry)"
+                                );
+                            }
                         }
                     }
                 } else {
@@ -289,12 +312,19 @@ impl NetworkEventHandler for MessageRouter {
                     
                     // Persist finalized data
                     if let Some(anchor) = anchor {
-                        if let Err(e) = self.persist_finalized_anchor(&anchor).await {
-                            warn!(
-                                anchor_id = %anchor.id,
-                                error = %e,
-                                "Failed to persist finalized anchor (will retry)"
-                            );
+                        match self.persist_finalized_anchor(&anchor).await {
+                            Ok(()) => {
+                                if let Err(e) = self.engine.complete_pending_finalizations().await {
+                                    warn!(error = %e, "complete_pending_finalizations failed after handle_vote persist");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    anchor_id = %anchor.id,
+                                    error = %e,
+                                    "Failed to persist finalized anchor (will retry)"
+                                );
+                            }
                         }
                     }
                 }
@@ -315,8 +345,44 @@ impl NetworkEventHandler for MessageRouter {
             from = %peer_id,
             "Received CF finalized notification"
         );
-        // The engine already handles finalization through vote quorum
-        // This notification is for state sync purposes
+        let cf_id = cf.id.clone();
+        match self.engine.receive_finalized_cf(cf).await {
+            Ok((finalized, anchor)) => {
+                if finalized {
+                    info!(
+                        cf_id = %cf_id,
+                        anchor = ?anchor.as_ref().map(|a| &a.id),
+                        "CF finalized after peer notification"
+                    );
+
+                    if let Some(anchor) = anchor {
+                        match self.persist_finalized_anchor(&anchor).await {
+                            Ok(()) => {
+                                if let Err(e) = self.engine.complete_pending_finalizations().await {
+                                    warn!(error = %e, "complete_pending_finalizations failed after handle_cf_finalized persist");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    anchor_id = %anchor.id,
+                                    error = %e,
+                                    "Failed to persist finalized anchor from peer notification"
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    debug!(cf_id = %cf_id, "Finalized CF notification was already applied or pending");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    cf_id = %cf_id,
+                    error = %e,
+                    "Failed to process finalized CF notification"
+                );
+            }
+        }
     }
     
     async fn handle_peer_connected(&self, peer_id: String) {
@@ -334,14 +400,15 @@ impl NetworkEventHandler for MessageRouter {
 mod tests {
     use super::*;
     use consensus::{ConsensusEngine, ValidatorSet};
-    use setu_storage::{EventStore, AnchorStore};
+    use setu_storage::{AnchorStore, CFStore, EventStore};
     use setu_types::{ConsensusConfig, ValidatorInfo, NodeInfo, VLCSnapshot};
     use setu_vlc::VectorClock;
     
-    fn create_test_stores() -> (Arc<dyn EventStoreBackend>, Arc<dyn AnchorStoreBackend>) {
+    fn create_test_stores() -> (Arc<dyn EventStoreBackend>, Arc<dyn AnchorStoreBackend>, Arc<dyn CFStoreBackend>) {
         let event_store: Arc<dyn EventStoreBackend> = Arc::new(EventStore::new());
         let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(AnchorStore::new());
-        (event_store, anchor_store)
+        let cf_store: Arc<dyn CFStoreBackend> = Arc::new(CFStore::new());
+        (event_store, anchor_store, cf_store)
     }
     
     fn create_test_engine() -> Arc<ConsensusEngine> {
@@ -370,16 +437,16 @@ mod tests {
     #[tokio::test]
     async fn test_router_creation() {
         let engine = create_test_engine();
-        let (event_store, anchor_store) = create_test_stores();
-        let _router = MessageRouter::new(engine, event_store, anchor_store);
+        let (event_store, anchor_store, cf_store) = create_test_stores();
+        let _router = MessageRouter::new(engine, event_store, anchor_store, cf_store);
         // Router created successfully
     }
     
     #[tokio::test]
     async fn test_handle_event_adds_to_dag() {
         let engine = create_test_engine();
-        let (event_store, anchor_store) = create_test_stores();
-        let router = MessageRouter::new(engine.clone(), event_store, anchor_store);
+        let (event_store, anchor_store, cf_store) = create_test_stores();
+        let router = MessageRouter::new(engine.clone(), event_store, anchor_store, cf_store);
         
         let event = create_test_event();
         let event_id = event.id.clone();

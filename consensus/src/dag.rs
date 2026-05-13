@@ -135,6 +135,25 @@ impl Dag {
         self.pending.len()
     }
 
+    /// Snapshot all currently-pending event references.
+    ///
+    /// An event is "pending" iff it has been added to this DAG but has not
+    /// yet been marked Finalized via `finalize_events` (nor GC'd via
+    /// `remove_event`). Order is unspecified — callers that need
+    /// determinism must sort.
+    ///
+    /// Primary consumer: `AnchorBuilder::prepare_build` (D1 fix,
+    /// docs/feat/anchor-builder-fold-policy/design.md). Replaces
+    /// depth-range selection so that events stranded below the current
+    /// `anchor_depth` (e.g. via TOCTOU between `resolve_parents` and
+    /// `add_event_with_depth` across a finalization) still get folded.
+    pub fn get_pending_events(&self) -> Vec<&Event> {
+        self.pending
+            .iter()
+            .filter_map(|id| self.events.get(id))
+            .collect()
+    }
+
     /// Get events in a depth range [from_depth, to_depth]
     pub fn get_events_in_range(&self, from_depth: u64, to_depth: u64) -> Vec<&Event> {
         self.events
@@ -578,5 +597,64 @@ mod tests {
         
         let events = dag.get_events_in_range(1, 2);
         assert_eq!(events.len(), 2);
+    }
+
+    // ========================================================================
+    // D1 (docs/feat/anchor-builder-fold-policy): pending-status selection
+    // ========================================================================
+
+    #[test]
+    fn d1_get_pending_events_returns_added() {
+        let mut dag = Dag::new();
+        dag.add_event(create_event("g", vec![], "n1")).unwrap();
+        dag.add_event(create_event("e1", vec!["g"], "n1")).unwrap();
+        dag.add_event(create_event("e2", vec!["e1"], "n1")).unwrap();
+
+        let pending = dag.get_pending_events();
+        let ids: HashSet<String> = pending.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains("g"));
+        assert!(ids.contains("e1"));
+        assert!(ids.contains("e2"));
+    }
+
+    #[test]
+    fn d1_get_pending_events_excludes_finalized() {
+        let mut dag = Dag::new();
+        dag.add_event(create_event("g", vec![], "n1")).unwrap();
+        dag.add_event(create_event("e1", vec!["g"], "n1")).unwrap();
+        dag.add_event(create_event("e2", vec!["e1"], "n1")).unwrap();
+
+        dag.finalize_events(&["g".to_string(), "e1".to_string()]);
+
+        let ids: HashSet<String> = dag
+            .get_pending_events()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("e2"));
+    }
+
+    #[test]
+    fn d1_get_pending_events_excludes_removed() {
+        let mut dag = Dag::new();
+        dag.add_event(create_event("g", vec![], "n1")).unwrap();
+        dag.add_event(create_event("e1", vec!["g"], "n1")).unwrap();
+
+        // remove_event refuses if there are active children → finalize e1 first
+        // so g (which only has e1 as child) can then be evaluated. Simplest
+        // path: remove e1 (has no children), then verify it's gone.
+        let parents = dag.remove_event(&"e1".to_string());
+        assert!(parents.is_some(), "e1 should be removable (no children)");
+
+        let ids: HashSet<String> = dag
+            .get_pending_events()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("g"));
+        assert!(!ids.contains("e1"));
     }
 }

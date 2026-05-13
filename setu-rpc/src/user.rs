@@ -33,18 +33,15 @@ pub struct RegisterUserRequest {
     
     /// Optional: Nostr public key (32 bytes, Schnorr x-only public key)
     /// Only present for Nostr-based registrations
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub nostr_pubkey: Option<Vec<u8>>,
     
     /// Optional: Signature proving ownership
     /// - For MetaMask: ECDSA signature (65 bytes)
     /// - For Nostr: Schnorr signature (64 bytes)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<Vec<u8>>,
     
     /// Optional: Signed message (for verification)
     /// Format: "Register to Setu: {timestamp}"
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     
     /// Timestamp (for replay attack prevention)
@@ -64,7 +61,6 @@ pub struct RegisterUserRequest {
 
     /// Setu-native users: Base64-encoded PublicKey (flag || pk_bytes).
     /// MetaMask and Nostr users do not need this.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
 }
 
@@ -297,8 +293,16 @@ pub struct TransferRequest {
     pub coin_type: Option<String>,
     /// Optional memo/note
     pub memo: Option<String>,
+    /// Canonical signed transfer message
+    pub message: Option<String>,
+    /// Request timestamp in milliseconds since epoch
+    pub timestamp: u64,
     /// Signature for authentication
-    pub signature: Vec<u8>,
+    pub signature: Option<Vec<u8>>,
+    /// Setu native: Base64-encoded PublicKey (flag || pk_bytes)
+    pub public_key: Option<String>,
+    /// Nostr: 32-byte x-only public key
+    pub nostr_pubkey: Option<Vec<u8>>,
 }
 
 /// Response to transfer request
@@ -330,10 +334,8 @@ pub struct UpdateProfileRequest {
     pub message: String,
     pub timestamp: u64,
     /// Setu native: Base64-encoded PublicKey (flag || pk_bytes)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
     /// Nostr: 32-byte x-only public key
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub nostr_pubkey: Option<Vec<u8>>,
 }
 
@@ -371,9 +373,7 @@ pub struct JoinSubnetRequest {
     pub signature: Vec<u8>,
     pub message: String,
     pub timestamp: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub nostr_pubkey: Option<Vec<u8>>,
 }
 
@@ -393,9 +393,7 @@ pub struct LeaveSubnetRequest {
     pub signature: Vec<u8>,
     pub message: String,
     pub timestamp: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub nostr_pubkey: Option<Vec<u8>>,
 }
 

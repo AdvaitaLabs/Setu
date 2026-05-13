@@ -139,6 +139,21 @@ async fn main() -> anyhow::Result<()> {
         .with_thread_ids(true)
         .init();
 
+    // Sanity: Move stdlib must be embedded. Empty STDLIB_MODULES means this binary
+    // was built without setu-framework/compiled/*.mv (e.g. stale rsync exclude in
+    // the deploy pipeline) — every MoveCall would later fail with LINKER_ERROR.
+    // Fail fast at startup instead. See docs/bugs/20260421-deploy-stdlib-missing.md.
+    let stdlib_count = setu_enclave::stdlib_module_count();
+    if stdlib_count == 0 {
+        eprintln!(
+            "FATAL: setu-solver binary was built without Move stdlib modules.\n\
+             Run: bash scripts/build_stdlib.sh && cargo build --release -p setu-solver\n\
+             (or for remote deploys: bash deploy/dev-mult/build.sh — Step 2 regenerates stdlib)"
+        );
+        std::process::exit(2);
+    }
+    info!("Move stdlib loaded: {} modules", stdlib_count);
+
     // Load configuration
     let config = SolverConfig::from_env();
     
@@ -194,6 +209,7 @@ async fn main() -> anyhow::Result<()> {
         port: config.port,
         capacity: config.capacity,
         shard_id: config.shard_id.clone(),
+        assigned_shard: None, // Auto-assigned by validator
         resources: config.resources.clone(),
         validator_address: config.validator_address.clone(),
         validator_port: config.validator_port,

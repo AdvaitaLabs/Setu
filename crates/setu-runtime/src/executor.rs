@@ -39,6 +39,9 @@ pub struct ExecutionContext {
     /// Output counter — tracks number of objects created in this tx.
     /// Uses Cell for interior mutability (single-threaded execution context).
     output_counter: std::cell::Cell<u32>,
+    /// Gas budget (instruction count limit) for Move VM execution.
+    /// None = use default (10M instructions). Ignored by native Transfer path.
+    pub gas_budget: Option<u64>,
 }
 
 impl ExecutionContext {
@@ -59,7 +62,14 @@ impl ExecutionContext {
             in_tee,
             tx_hash,
             output_counter: std::cell::Cell::new(0),
+            gas_budget: None,
         }
+    }
+
+    /// Set gas budget (builder pattern, does not break existing callers).
+    pub fn with_gas_budget(mut self, budget: u64) -> Self {
+        self.gas_budget = Some(budget);
+        self
     }
 
     /// Get the next output index and increment counter.
@@ -1690,5 +1700,15 @@ mod tests {
         // Same ObjectIds for forward and reverse
         assert_eq!(join_out.state_changes[0].object_id, leave_out.state_changes[0].object_id);
         assert_eq!(join_out.state_changes[1].object_id, leave_out.state_changes[1].object_id);
+    }
+
+    #[test]
+    fn test_execution_context_gas_budget() {
+        let ctx = ExecutionContext::new("solver".to_string(), 100, false, [0u8; 32]);
+        assert!(ctx.gas_budget.is_none());
+
+        let ctx2 = ExecutionContext::new("solver".to_string(), 100, false, [0u8; 32])
+            .with_gas_budget(10_000_000);
+        assert_eq!(ctx2.gas_budget, Some(10_000_000));
     }
 }

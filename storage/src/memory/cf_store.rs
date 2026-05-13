@@ -4,7 +4,7 @@
 //! supporting pending and finalized frame tracking with concurrent access.
 
 use dashmap::DashMap;
-use setu_types::{CFId, CFStatus, ConsensusFrame, SetuResult};
+use setu_types::{CFId, CFStatus, ConsensusFrame, SetuError, SetuResult};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -65,18 +65,24 @@ impl CFStore {
     ///
     /// This updates the frame's status and moves it from the pending
     /// list to the finalized list.
-    pub async fn mark_finalized(&self, cf_id: &CFId) {
+    pub async fn mark_finalized(&self, cf_id: &CFId) -> SetuResult<()> {
         // Update frame status in DashMap
-        if let Some(mut cf) = self.frames.get_mut(cf_id) {
-            cf.finalize();
-        }
+        let Some(mut cf) = self.frames.get_mut(cf_id) else {
+            return Err(SetuError::InvalidData(format!("CF not found: {}", cf_id)));
+        };
+        cf.finalize();
+        drop(cf);
 
         // Move from pending to finalized
         let mut pending = self.pending.write().await;
         pending.retain(|id| id != cf_id);
+        drop(pending);
 
         let mut finalized = self.finalized.write().await;
-        finalized.push(cf_id.clone());
+        if !finalized.iter().any(|id| id == cf_id) {
+            finalized.push(cf_id.clone());
+        }
+        Ok(())
     }
 
     /// Get all pending consensus frames
@@ -179,8 +185,11 @@ mod tests {
         store.store(cf).await.unwrap();
         assert_eq!(store.pending_count().await, 1);
 
-        store.mark_finalized(&cf_id).await;
+        store.mark_finalized(&cf_id).await.unwrap();
         assert_eq!(store.pending_count().await, 0);
+        assert_eq!(store.finalized_count().await, 1);
+
+        store.mark_finalized(&cf_id).await.unwrap();
         assert_eq!(store.finalized_count().await, 1);
 
         let latest = store.latest_finalized().await;
@@ -201,7 +210,7 @@ mod tests {
         store.store(cf2).await.unwrap();
         assert_eq!(store.pending_count().await, 2);
 
-        store.mark_finalized(&cf1_id).await;
+        store.mark_finalized(&cf1_id).await.unwrap();
         assert_eq!(store.pending_count().await, 1);
         assert_eq!(store.finalized_count().await, 1);
 
@@ -212,5 +221,12 @@ mod tests {
         let finalized = store.get_finalized().await;
         assert_eq!(finalized.len(), 1);
         assert_eq!(finalized[0].id, cf1_id);
+    }
+
+    #[tokio::test]
+    async fn test_f1_cf_store_mark_finalized_missing_cf_returns_error() {
+        let store = CFStore::new();
+        let result = store.mark_finalized(&"missing-cf".to_string()).await;
+        assert!(result.is_err());
     }
 }

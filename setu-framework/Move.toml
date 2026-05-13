@@ -1,0 +1,11 @@
+[package]
+name = "SetuFramework"
+version = "0.1.0"
+# edition = "2024"  # Uncomment when Sui CLI supports it; switches public(friend) → public(package)
+
+[addresses]
+setu = "0x1"
+std = "0x1"
+
+# No external dependencies — self-contained stdlib.
+# Does NOT depend on Sui framework (avoids Shared Object and other unsupported modules).

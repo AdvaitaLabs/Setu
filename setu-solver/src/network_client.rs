@@ -52,8 +52,10 @@ pub struct SolverNetworkConfig {
     pub port: u16,
     /// Maximum capacity (concurrent tasks)
     pub capacity: u32,
-    /// Shard assignment
+    /// Shard assignment (legacy, string-based)
     pub shard_id: Option<String>,
+    /// Assigned shard ID (numeric, for shard-based routing)
+    pub assigned_shard: Option<u16>,
     /// Resource types this solver handles
     pub resources: Vec<String>,
     /// Validator address to connect to
@@ -78,6 +80,7 @@ impl Default for SolverNetworkConfig {
             port: 9001,
             capacity: 100,
             shard_id: None,
+            assigned_shard: None,
             resources: vec![],
             validator_address: "127.0.0.1".to_string(),
             validator_port: 8080,
@@ -147,7 +150,9 @@ impl SolverNetworkClient {
             signature: self.config.signature.clone(),
             capacity: self.config.capacity,
             shard_id: self.config.shard_id.clone(),
+            assigned_shard: self.config.assigned_shard,
             resources: self.config.resources.clone(),
+            permitted_subnets: vec![], // Universal solver by default
         };
         
         let response = self.http_client.register_solver(request).await?;
@@ -396,6 +401,7 @@ mod tests {
             port: 9001,
             capacity: 50,
             shard_id: Some("shard-0".to_string()),
+            assigned_shard: None,
             resources: vec!["ETH".to_string()],
             validator_address: "127.0.0.1".to_string(),
             validator_port: 8080,

@@ -56,10 +56,17 @@ pub struct RegisterSolverRequest {
     pub signature: Vec<u8>,
     /// Maximum capacity (concurrent transfers)
     pub capacity: u32,
-    /// Optional shard assignment
+    /// Optional shard assignment (legacy, string-based)
     pub shard_id: Option<String>,
+    /// Assigned shard ID (numeric, for shard-based routing)
+    #[serde(default)]
+    pub assigned_shard: Option<u16>,
     /// Resource types this solver can handle
     pub resources: Vec<String>,
+    /// Subnets this solver is permitted to serve (hex-encoded).
+    /// Empty = universal solver (can serve any subnet).
+    #[serde(default)]
+    pub permitted_subnets: Vec<String>,
 }
 
 /// Response to solver registration
@@ -246,6 +253,8 @@ pub struct SubmitTransferResponse {
     pub message: String,
     /// Assigned transfer ID
     pub transfer_id: Option<String>,
+    /// DAG event ID, available after solver execution succeeds
+    pub event_id: Option<String>,
     /// Assigned solver ID
     pub solver_id: Option<String>,
     /// Processing steps (for debugging/visualization)

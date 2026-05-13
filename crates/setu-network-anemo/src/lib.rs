@@ -98,6 +98,7 @@ pub use discovery::{
     Handle as DiscoveryHandle,
     NodeInfo,
     NodeType,
+    PeerNodeInfo,
     SignedNodeInfo,
     State as DiscoveryState,
     UnstartedDiscovery,

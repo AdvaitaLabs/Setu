@@ -4,7 +4,7 @@
 
 use crate::metrics::RequestMetrics;
 use anyhow::Result;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
@@ -125,6 +125,13 @@ pub struct BenchClient {
 }
 
 impl BenchClient {
+    fn with_raw_transfer_token(builder: RequestBuilder) -> RequestBuilder {
+        match std::env::var("SETU_RAW_TRANSFER_API_TOKEN") {
+            Ok(token) if !token.is_empty() => builder.header("X-Setu-Admin-Token", token),
+            _ => builder,
+        }
+    }
+
     /// Create a new benchmark client
     pub fn new(base_url: String, timeout_secs: u64, keep_alive: bool) -> Result<Self> {
         let mut builder = Client::builder()
@@ -150,10 +157,7 @@ impl BenchClient {
         let url = format!("{}/api/v1/transfer", self.base_url);
         let start = Instant::now();
 
-        let result = self
-            .client
-            .post(&url)
-            .json(&request)
+        let result = Self::with_raw_transfer_token(self.client.post(&url).json(&request))
             .send()
             .await;
 
@@ -225,10 +229,7 @@ impl BenchClient {
 
         let batch_request = BenchBatchRequest { transfers: requests };
 
-        let result = self
-            .client
-            .post(&url)
-            .json(&batch_request)
+        let result = Self::with_raw_transfer_token(self.client.post(&url).json(&batch_request))
             .send()
             .await;
 
@@ -402,6 +403,37 @@ pub struct GetBalanceResponse {
     pub exists: bool,
 }
 
+/// Move call request for benchmark (mirrors api::types::MoveCallRequest)
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchMoveCallRequest {
+    pub sender: String,
+    pub package: String,
+    pub module: String,
+    pub function: String,
+    #[serde(default)]
+    pub type_args: Vec<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub input_object_ids: Vec<String>,
+    #[serde(default)]
+    pub mutable_indices: Vec<usize>,
+    #[serde(default)]
+    pub consumed_indices: Vec<usize>,
+    pub needs_tx_context: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subnet_id: Option<String>,
+}
+
+/// Move call response for benchmark (mirrors api::types::MoveCallResponse)
+#[derive(Debug, Deserialize)]
+pub struct BenchMoveCallResponse {
+    pub success: bool,
+    pub event_id: String,
+    pub state_changes: usize,
+    pub error: Option<String>,
+}
+
 impl BenchClient {
     /// Query account balance
     /// 
@@ -420,5 +452,82 @@ impl BenchClient {
             }
             _ => None,
         }
+    }
+
+    /// Submit a Move call and measure latency
+    pub async fn submit_move_call(&self, request: BenchMoveCallRequest) -> RequestMetrics {
+        let url = format!("{}/api/v1/move/call", self.base_url);
+        let start = Instant::now();
+
+        let result = self.client.post(&url).json(&request).send().await;
+        let latency = start.elapsed();
+
+        match result {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    match response.json::<BenchMoveCallResponse>().await {
+                        Ok(resp) => {
+                            if resp.success {
+                                debug!(
+                                    event_id = %resp.event_id,
+                                    state_changes = resp.state_changes,
+                                    latency_ms = latency.as_millis(),
+                                    "Move call succeeded"
+                                );
+                                RequestMetrics::success(latency)
+                            } else {
+                                warn!(error = ?resp.error, "Move call failed (application error)");
+                                RequestMetrics::failure(
+                                    latency,
+                                    resp.error.unwrap_or_else(|| "Unknown error".to_string()),
+                                )
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to parse Move call response");
+                            RequestMetrics::failure(latency, format!("Parse error: {}", e))
+                        }
+                    }
+                } else {
+                    let body = response.text().await.unwrap_or_default();
+                    warn!(status = %status, body = %body, "HTTP error on Move call");
+                    RequestMetrics::failure(latency, format!("HTTP {}: {}", status, body))
+                }
+            }
+            Err(e) => {
+                if e.is_timeout() {
+                    warn!(timeout_ms = self.timeout.as_millis(), "Move call request timeout");
+                    RequestMetrics::timeout(latency)
+                } else {
+                    warn!(error = %e, "Move call request error");
+                    RequestMetrics::failure(latency, format!("Request error: {}", e))
+                }
+            }
+        }
+    }
+}
+
+/// Generate a Move call request from benchmark config
+pub fn generate_move_call(
+    config: &crate::config::BenchmarkConfig,
+    seq: u64,
+    seed_addresses: &[String],
+) -> BenchMoveCallRequest {
+    // Use round-robin sender across seed accounts
+    let sender = &seed_addresses[seq as usize % seed_addresses.len()];
+
+    BenchMoveCallRequest {
+        sender: sender.clone(),
+        package: config.move_package.clone(),
+        module: config.move_module.clone(),
+        function: config.move_function.clone(),
+        type_args: config.get_move_type_args(),
+        args: config.get_move_args(),
+        input_object_ids: vec![],
+        mutable_indices: vec![],
+        consumed_indices: vec![],
+        needs_tx_context: true,
+        subnet_id: None,
     }
 }

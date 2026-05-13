@@ -14,12 +14,27 @@ fi
 
 _read_env() { grep "^$1" "$_ENV_FILE" | cut -d'=' -f2 | tr -d ' '; }
 
+_fail_if_env_placeholder() {
+    local key="$1"
+    local value="$2"
+    case "$value" in
+        ""|"1.2.3.4"|"5.6.7.8"|"9.10.11.12"|"your-ssh-password-here")
+            echo "ERROR: deploy/.env contains placeholder or empty value for ${key}. Restore real dev-mult credentials before running remote scripts."
+            exit 2
+            ;;
+    esac
+}
+
 # ── 服务器列表 (从 .env 读取) ───────────────────────────────────────────────
 SERVERS=(
     "$(_read_env 'VALIDATOR-NODE-IP-01')"
     "$(_read_env 'VALIDATOR-NODE-IP-02')"
     "$(_read_env 'VALIDATOR-NODE-IP-03')"
 )
+
+_fail_if_env_placeholder 'VALIDATOR-NODE-IP-01' "${SERVERS[0]}"
+_fail_if_env_placeholder 'VALIDATOR-NODE-IP-02' "${SERVERS[1]}"
+_fail_if_env_placeholder 'VALIDATOR-NODE-IP-03' "${SERVERS[2]}"
 
 VALIDATOR_IDS=(
     "validator-1"
@@ -31,6 +46,7 @@ VALIDATOR_IDS=(
 SSH_USER=$(_read_env 'VALIDATOR-NODE-USERNAME')
 SSH_PWD=$(_read_env 'VALIDATOR-NODE-PWD')
 SSH_USER="${SSH_USER:-root}"
+_fail_if_env_placeholder 'VALIDATOR-NODE-PWD' "$SSH_PWD"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o LogLevel=ERROR"
 
 # 构建服务器 (默认使用第一台)

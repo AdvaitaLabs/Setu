@@ -15,6 +15,16 @@ pub enum BenchmarkMode {
     Ramp,
 }
 
+/// Workload type
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+pub enum WorkloadType {
+    /// Native transfer workload (default)
+    #[default]
+    Transfer,
+    /// Move VM call workload (requires a deployed contract)
+    MoveCall,
+}
+
 /// Setu TPS Benchmark Configuration
 #[derive(Parser, Debug, Clone)]
 #[command(name = "setu-benchmark")]
@@ -148,6 +158,32 @@ pub struct BenchmarkConfig {
     /// Batch size (number of transfers per batch request)
     #[arg(long, default_value = "50")]
     pub batch_size: u64,
+
+    // ── Move call workload options ──────────────────────────
+
+    /// Workload type: transfer (default) or move-call
+    #[arg(long, value_enum, default_value = "transfer")]
+    pub workload: WorkloadType,
+
+    /// Move package address (hex, e.g. "0xcafe"). Required for move-call workload.
+    #[arg(long, default_value = "")]
+    pub move_package: String,
+
+    /// Move module name (e.g. "counter"). Required for move-call workload.
+    #[arg(long, default_value = "")]
+    pub move_module: String,
+
+    /// Move function name (e.g. "create"). Required for move-call workload.
+    #[arg(long, default_value = "")]
+    pub move_function: String,
+
+    /// Move type arguments (comma-separated, e.g. "0x1::setu::SETU")
+    #[arg(long, default_value = "")]
+    pub move_type_args: String,
+
+    /// Move pure arguments (comma-separated hex-encoded BCS values)
+    #[arg(long, default_value = "")]
+    pub move_args: String,
 }
 
 impl BenchmarkConfig {
@@ -168,6 +204,30 @@ impl BenchmarkConfig {
     pub fn get_subnet_ids(&self) -> Vec<String> {
         if !self.subnets.is_empty() {
             self.subnets.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Parse Move type arguments from comma-separated string.
+    pub fn get_move_type_args(&self) -> Vec<String> {
+        if !self.move_type_args.is_empty() {
+            self.move_type_args.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Parse Move pure arguments from comma-separated string.
+    pub fn get_move_args(&self) -> Vec<String> {
+        if !self.move_args.is_empty() {
+            self.move_args.split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect()
@@ -212,14 +272,30 @@ impl BenchmarkConfig {
         
         info!("  Warmup Txns:      {}", self.warmup);
         info!("  Timeout:          {}s", self.timeout);
-        if self.init_accounts > 0 {
-            info!("  Init Accounts:    {} (balance: {} each, {} coins/account)", self.init_accounts, self.init_account_balance, self.coins_per_account);
-        }
-        if self.use_batch {
-            info!("  Batch Mode:       ENABLED");
-            info!("  Batch Size:       {}", self.batch_size);
-        } else {
-            info!("  Batch Mode:       disabled (single transfer API)");
+        match self.workload {
+            WorkloadType::Transfer => {
+                if self.init_accounts > 0 {
+                    info!("  Init Accounts:    {} (balance: {} each, {} coins/account)", self.init_accounts, self.init_account_balance, self.coins_per_account);
+                }
+                if self.use_batch {
+                    info!("  Batch Mode:       ENABLED");
+                    info!("  Batch Size:       {}", self.batch_size);
+                } else {
+                    info!("  Batch Mode:       disabled (single transfer API)");
+                }
+            }
+            WorkloadType::MoveCall => {
+                info!("  Workload:         Move Call");
+                info!("  Package:          {}", self.move_package);
+                info!("  Module:           {}", self.move_module);
+                info!("  Function:         {}", self.move_function);
+                if !self.move_type_args.is_empty() {
+                    info!("  Type Args:        {}", self.move_type_args);
+                }
+                if !self.move_args.is_empty() {
+                    info!("  Args:             {}", self.move_args);
+                }
+            }
         }
         info!("");
     }

@@ -10,6 +10,7 @@ members = [
     "crates/setu-network-anemo", # Anemo-based P2P network (production)
     "crates/setu-router-core", # Core routing strategies
     "crates/setu-runtime",    # Simple runtime executor (pre-Move VM)
+    "crates/setu-move-vm",    # Move VM execution engine (Sui fork integration)
     "crates/setu-enclave",    # TEE Enclave abstraction (Mock + Nitro)
     "crates/setu-transport",  # HTTP/WS/gRPC transport for Validator↔Solver
     "crates/setu-governance", # Governance module (proposal lifecycle)
@@ -21,6 +22,9 @@ members = [
     "setu-cli",               # CLI tool
     "setu-benchmark",         # TPS benchmark tool
 ]
+exclude = [
+    "tools/move-compile",     # Independent project with Sui move-compiler deps
+]
 resolver = "2"
 
 [workspace.package]
@@ -29,6 +33,26 @@ edition = "2021"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
+
+# BCS — exact pin for cross-validator determinism (G1).
+# DO NOT bump without coordinated state migration: any encoding change splits consensus.
+# All workspace crates MUST use `bcs.workspace = true`; never declare `bcs = "..."` directly.
+bcs = "=0.1.6"
+
+# Hash & crypto natives (B3 / Phase 6).
+sha2 = "0.10"
+sha3 = "0.10"
+tiny-keccak = { version = "2", features = ["keccak"] }
+ed25519-dalek = "2"
+k256 = { version = "0.13", features = ["ecdsa"] }
+
+# Move VM core (from Sui fork, 5 crates — Phase 1)
+move-core-types        = { git = "https://github.com/MystenLabs/sui.git", tag = "mainnet-v1.66.2" }
+move-vm-runtime        = { git = "https://github.com/MystenLabs/sui.git", tag = "mainnet-v1.66.2" }
+move-vm-types          = { git = "https://github.com/MystenLabs/sui.git", tag = "mainnet-v1.66.2" }
+move-binary-format     = { git = "https://github.com/MystenLabs/sui.git", tag = "mainnet-v1.66.2" }
+move-bytecode-verifier = { git = "https://github.com/MystenLabs/sui.git", tag = "mainnet-v1.66.2" }
+move-stdlib-natives    = { git = "https://github.com/MystenLabs/sui.git", tag = "mainnet-v1.66.2" }
 
 # anemo dependencies
 anemo = { git = "https://github.com/mystenlabs/anemo.git", rev = "4b5f0f1d06a31c8ef78ec2e5b446bc633e4e2f77" }

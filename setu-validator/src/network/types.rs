@@ -73,7 +73,7 @@ pub struct TransferTracker {
 ///
 /// G12: Built from `SolverRegistration`. Dropped fields:
 ///   - account_address, public_key, signature (crypto — not needed for API display)
-/// Retained capability fields (capacity, shard_id, resources) are used for routing.
+/// Retained capability fields (capacity, shard_id, assigned_shard, resources) are used for routing.
 #[derive(Debug, Clone)]
 pub struct SolverInfo {
     pub solver_id: String,
@@ -81,6 +81,8 @@ pub struct SolverInfo {
     pub port: u16,
     pub capacity: u32,
     pub shard_id: Option<String>,
+    /// Assigned shard ID (numeric, for shard-based routing)
+    pub assigned_shard: Option<u16>,
     pub resources: Vec<String>,
     pub status: String,
     pub registered_at: u64,
@@ -102,6 +104,7 @@ impl SolverInfo {
             port: reg.port,
             capacity: reg.capacity,
             shard_id: reg.shard_id.clone(),
+            assigned_shard: reg.assigned_shard,
             resources: reg.resources.clone(),
             status: status.to_string(),
             registered_at: timestamp_ms / 1000,

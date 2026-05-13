@@ -86,7 +86,7 @@ const LATEST_SUBNET_PREFIX: u8 = 0x01;
 const LATEST_GLOBAL_PREFIX: u8 = 0x02;
 
 /// Key for storing leaf data: (subnet_id, object_id) - B4 scheme
-#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode, serde::Serialize, serde::Deserialize)]
 struct LeafKey {
     subnet_id: [u8; 32],
     object_id: [u8; 32],
@@ -459,30 +459,26 @@ impl MerkleLeafStore for RocksDBMerkleStore {
     }
 
     fn load_all_leaves(&self, subnet_id: &SubnetId) -> MerkleResult<HashMap<HashValue, Vec<u8>>> {
-        // Use prefix iteration to load all leaves for a subnet
-        // The key format is (subnet_id, object_id), so we iterate with subnet_id prefix
+        // Use typed prefix iteration: keys are bincode-decoded to LeafKey,
+        // values are BCS-decoded (matching the write path via `batch_put`/`encode_value`).
+        // `prefix_iter` internally enforces the prefix boundary via `take_while`.
         let mut result = HashMap::new();
 
-        // Get an iterator with prefix matching subnet_id
-        let prefix = subnet_id.as_slice();
         let iter = self
             .db
-            .prefix_iterator(ColumnFamily::MerkleLeaves, prefix)
+            .prefix_iter::<_, LeafKey, Vec<u8>>(ColumnFamily::MerkleLeaves, subnet_id)
             .map_err(Self::to_merkle_error)?;
 
         for item in iter {
-            let (key_bytes, value_bytes) = item.map_err(|e| {
-                MerkleError::StorageError(format!("Iterator error: {}", e))
-            })?;
-
-            // Decode the key to extract object_id
-            if key_bytes.len() >= 64 {
-                // 32 bytes subnet_id + 32 bytes object_id
-                let mut object_id_bytes = [0u8; 32];
-                object_id_bytes.copy_from_slice(&key_bytes[32..64]);
-                let object_id = Self::bytes_to_hash(object_id_bytes);
-                result.insert(object_id, value_bytes.to_vec());
+            let (leaf_key, value) = item.map_err(Self::to_merkle_error)?;
+            // Defensive check: prefix_iter's take_while should already guarantee
+            // this, but verify subnet_id to guard against bincode field reordering
+            // or any future layout change.
+            debug_assert_eq!(&leaf_key.subnet_id, subnet_id);
+            if &leaf_key.subnet_id != subnet_id {
+                continue;
             }
+            result.insert(Self::bytes_to_hash(leaf_key.object_id), value);
         }
 
         Ok(result)
@@ -966,5 +962,19 @@ mod tests {
 
         let anchors = store.list_anchors(&subnet_id, 15, 45).unwrap();
         assert_eq!(anchors, vec![20, 30, 40]);
+    }
+
+    #[test]
+    fn test_list_registered_subnets_ignores_last_anchor_metadata() {
+        let (store, _temp_dir) = create_test_store();
+        let registered = test_subnet(0x11);
+        let anchor_only = test_subnet(0x22);
+
+        store.register_subnet(&registered).unwrap();
+        store.set_last_anchor(&anchor_only, 99).unwrap();
+
+        let subnets = store.list_registered_subnets().unwrap();
+        assert_eq!(subnets, vec![registered]);
+        assert!(!subnets.contains(&anchor_only));
     }
 }

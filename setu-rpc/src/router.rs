@@ -17,6 +17,8 @@ pub struct RegisterSolverRequest {
     pub capacity: u32,
     pub shard_id: Option<String>,
     pub resources: Vec<String>,
+    #[serde(default)]
+    pub permitted_subnets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +75,7 @@ impl RouterClient {
             capacity,
             shard_id,
             resources,
+            permitted_subnets: vec![],
         };
         
         let bytes = bincode::serialize(&request)?;

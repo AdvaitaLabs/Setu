@@ -92,6 +92,10 @@ fi
 # ============================================
 echo -e "${YELLOW}[1/2] Starting Validator...${NC}"
 
+# Disable proxy for localhost connections (reqwest reads system proxy)
+export no_proxy="localhost,127.0.0.1"
+export NO_PROXY="localhost,127.0.0.1"
+
 export VALIDATOR_ID=${VALIDATOR_ID:-validator-1}
 export VALIDATOR_HTTP_PORT=${VALIDATOR_HTTP_PORT:-8080}
 export VALIDATOR_P2P_PORT=${VALIDATOR_P2P_PORT:-8081}

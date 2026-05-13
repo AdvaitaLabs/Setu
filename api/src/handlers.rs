@@ -4,7 +4,11 @@
 //! These handlers are designed to work with Axum web framework.
 
 use crate::types::*;
-use axum::{extract::State, Json};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use serde::Deserialize;
 use setu_rpc::{
     GetSolverListRequest, GetSolverListResponse, GetTransferStatusRequest,
@@ -27,7 +31,228 @@ use setu_rpc::{
     LeaveSubnetRequest, LeaveSubnetResponse,
     CheckMembershipResponse, GetUserSubnetsResponse,
 };
+use setu_types::event::{EventPayload, EventType};
 use std::sync::Arc;
+
+const RAW_TRANSFER_TOKEN_ENV: &str = "SETU_RAW_TRANSFER_API_TOKEN";
+const RAW_EVENT_TOKEN_ENV: &str = "SETU_RAW_EVENT_API_TOKEN";
+const RAW_TRANSFER_TOKEN_HEADER: &str = "x-setu-admin-token";
+
+fn raw_admin_auth_error(headers: &HeaderMap, token_env: &str, surface: &str) -> Option<String> {
+    let expected = std::env::var(token_env).unwrap_or_default();
+    if expected.is_empty() {
+        return Some(format!(
+            "{} API disabled: set {} to enable internal/admin use",
+            surface, token_env
+        ));
+    }
+
+    let observed = headers
+        .get(RAW_TRANSFER_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if observed != expected {
+        return Some(format!(
+            "{} API requires a valid X-Setu-Admin-Token",
+            surface
+        ));
+    }
+
+    None
+}
+
+fn raw_transfer_auth_error(headers: &HeaderMap) -> Option<String> {
+    raw_admin_auth_error(headers, RAW_TRANSFER_TOKEN_ENV, "Raw transfer")
+}
+
+fn raw_event_auth_error(headers: &HeaderMap) -> Option<String> {
+    raw_admin_auth_error(headers, RAW_EVENT_TOKEN_ENV, "Raw event")
+}
+
+fn infra_admission_error(detail: impl AsRef<str>) -> String {
+    stable_error("INFRA_ADMISSION", detail)
+}
+
+fn raw_event_admission_error(
+    headers: &HeaderMap,
+    request: &SubmitEventRequest,
+) -> Option<(StatusCode, String)> {
+    if let Some(message) = raw_event_auth_error(headers) {
+        return Some((StatusCode::UNAUTHORIZED, message));
+    }
+
+    let event = &request.event;
+    if event.event_type != EventType::System {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            infra_admission_error(format!(
+                "raw event admission allows only System diagnostic events, got {}",
+                event.event_type.name()
+            )),
+        ));
+    }
+
+    if !matches!(event.payload, EventPayload::None) {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            infra_admission_error("raw diagnostic event payload must be None"),
+        ));
+    }
+
+    let Some(result) = event.execution_result.as_ref() else {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            infra_admission_error("raw diagnostic event requires execution_result"),
+        ));
+    };
+
+    if !result.success {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            infra_admission_error("raw diagnostic event execution_result must be success"),
+        ));
+    }
+
+    if !result.state_changes.is_empty() {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            infra_admission_error("raw diagnostic event must not contain state changes"),
+        ));
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        raw_event_admission_error, raw_transfer_auth_error, RAW_EVENT_TOKEN_ENV,
+        RAW_TRANSFER_TOKEN_ENV, RAW_TRANSFER_TOKEN_HEADER,
+    };
+    use crate::types::SubmitEventRequest;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use setu_types::event::{
+        Event, EventPayload, EventType, ExecutionResult, StateChange, VLCSnapshot,
+    };
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn raw_transfer_auth_rejects_when_token_unset() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::remove_var(RAW_TRANSFER_TOKEN_ENV);
+        let headers = HeaderMap::new();
+
+        let error = raw_transfer_auth_error(&headers).expect("unset token must reject raw transfer");
+
+        assert!(error.contains("Raw transfer API disabled"));
+    }
+
+    #[test]
+    fn raw_transfer_auth_rejects_wrong_token() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::set_var(RAW_TRANSFER_TOKEN_ENV, "expected-token");
+        let mut headers = HeaderMap::new();
+        headers.insert(RAW_TRANSFER_TOKEN_HEADER, HeaderValue::from_static("wrong-token"));
+
+        let error = raw_transfer_auth_error(&headers).expect("wrong token must reject raw transfer");
+
+        assert!(error.contains("valid X-Setu-Admin-Token"));
+        std::env::remove_var(RAW_TRANSFER_TOKEN_ENV);
+    }
+
+    #[test]
+    fn raw_transfer_auth_accepts_matching_token() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::set_var(RAW_TRANSFER_TOKEN_ENV, "expected-token");
+        let mut headers = HeaderMap::new();
+        headers.insert(RAW_TRANSFER_TOKEN_HEADER, HeaderValue::from_static("expected-token"));
+
+        assert!(raw_transfer_auth_error(&headers).is_none());
+        std::env::remove_var(RAW_TRANSFER_TOKEN_ENV);
+    }
+
+    fn diagnostic_event_request() -> SubmitEventRequest {
+        let mut event = Event::new(
+            EventType::System,
+            vec![],
+            VLCSnapshot::new(),
+            "operator".to_string(),
+        );
+        event.payload = EventPayload::None;
+        event.set_execution_result(ExecutionResult::success());
+        SubmitEventRequest { event }
+    }
+
+    fn raw_event_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(RAW_TRANSFER_TOKEN_HEADER, HeaderValue::from_static("expected-token"));
+        headers
+    }
+
+    #[test]
+    fn raw_event_admission_rejects_when_token_unset() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::remove_var(RAW_EVENT_TOKEN_ENV);
+        let headers = HeaderMap::new();
+        let request = diagnostic_event_request();
+
+        let (status, message) = raw_event_admission_error(&headers, &request)
+            .expect("unset raw event token must reject");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(message.contains("Raw event API disabled"));
+    }
+
+    #[test]
+    fn raw_event_admission_accepts_empty_system_diagnostic() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::set_var(RAW_EVENT_TOKEN_ENV, "expected-token");
+        let headers = raw_event_headers();
+        let request = diagnostic_event_request();
+
+        assert!(raw_event_admission_error(&headers, &request).is_none());
+        std::env::remove_var(RAW_EVENT_TOKEN_ENV);
+    }
+
+    #[test]
+    fn raw_event_admission_rejects_state_changes() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::set_var(RAW_EVENT_TOKEN_ENV, "expected-token");
+        let headers = raw_event_headers();
+        let mut request = diagnostic_event_request();
+        request.event.set_execution_result(
+            ExecutionResult::success().with_changes(vec![StateChange::insert(
+                "oid:0000000000000000000000000000000000000000000000000000000000000000",
+                vec![1],
+            )]),
+        );
+
+        let (status, message) = raw_event_admission_error(&headers, &request)
+            .expect("state-changing raw event must reject");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("INFRA_ADMISSION"));
+        std::env::remove_var(RAW_EVENT_TOKEN_ENV);
+    }
+
+    #[test]
+    fn raw_event_admission_rejects_non_system_event() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::set_var(RAW_EVENT_TOKEN_ENV, "expected-token");
+        let headers = raw_event_headers();
+        let mut request = diagnostic_event_request();
+        request.event.event_type = EventType::Transfer;
+
+        let (status, message) = raw_event_admission_error(&headers, &request)
+            .expect("non-system raw event must reject");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("System diagnostic"));
+        std::env::remove_var(RAW_EVENT_TOKEN_ENV);
+    }
+}
 
 /// Trait that the validator service must implement to work with these handlers
 pub trait ValidatorService: Send + Sync {
@@ -69,12 +294,62 @@ pub trait ValidatorService: Send + Sync {
     
     /// Get events
     fn get_events(&self) -> Vec<setu_types::event::Event>;
+
+    /// R5 · Get a single event's full status (execution + on-chain verdict).
+    /// Returns `None` if the event is not known to this validator.
+    fn get_event_by_id(&self, event_id: &str) -> Option<GetEventResponse>;
     
     /// Get balance (state query)
     fn get_balance(&self, account: &str) -> GetBalanceResponse;
     
     /// Get object (state query)
     fn get_object(&self, key: &str) -> GetObjectResponse;
+
+    /// Submit a Move function call
+    fn submit_move_call(&self, request: MoveCallRequest) -> impl std::future::Future<Output = MoveCallResponse> + Send;
+
+    /// Submit a Move module publish
+    fn submit_move_publish(&self, request: MovePublishRequest) -> impl std::future::Future<Output = MovePublishResponse> + Send;
+
+    /// Submit a Move package upgrade (B5).
+    fn submit_move_upgrade(&self, request: MoveUpgradeRequest) -> impl std::future::Future<Output = MoveUpgradeResponse> + Send;
+
+    /// Submit a Programmable Transaction Block (PTB).
+    ///
+    /// `Ok(resp)` → HTTP 200 with execution result;
+    /// `Err(resp)` → HTTP 400 with the wire/domain error explained in
+    /// `resp.error`. See `docs/feat/move-vm-phase9-ptb-event-wire/design.md`.
+    fn submit_move_ptb(
+        &self,
+        request: MovePtbRequest,
+    ) -> impl std::future::Future<Output = Result<MovePtbResponse, MovePtbResponse>> + Send;
+
+    /// Query a Move object by object ID (hex).
+    ///
+    /// When `finalized` is true, bypass the speculative overlay and read the
+    /// committed SMT only. Required for cross-validator state comparisons
+    /// (see docs/bugs/20260424-state-get-overlay-leak-cross-node.md).
+    fn get_move_object(&self, object_id: &str, finalized: bool) -> GetMoveObjectResponse;
+
+    /// B1 · Long-poll variant of [`get_move_object`](Self::get_move_object).
+    ///
+    /// Blocks until the object's `version` field is `>= min_version`, the
+    /// caller-specified `timeout_ms` elapses, or the per-object / global
+    /// waiter cap is exceeded. See
+    /// [`docs/feat/pwoo-r6-wait-api/design.md`](../../docs/feat/pwoo-r6-wait-api/design.md).
+    fn wait_move_object_min_version(
+        &self,
+        object_id: &str,
+        finalized: bool,
+        min_version: u64,
+        timeout_ms: u64,
+    ) -> impl std::future::Future<Output = WaitMoveObjectOutcome> + Send;
+
+    /// Query module ABI (function list)
+    fn get_module_abi(&self, address: &str, name: &str) -> GetModuleAbiResponse;
+
+    /// List all modules at an address
+    fn list_modules(&self, address: &str) -> ListModulesResponse;
 }
 
 // ============================================
@@ -171,8 +446,20 @@ pub async fn http_get_subnets<S: ValidatorService>(
 /// Submit a transfer
 pub async fn http_submit_transfer<S: ValidatorService>(
     State(service): State<Arc<S>>,
+    headers: HeaderMap,
     Json(request): Json<SubmitTransferRequest>,
 ) -> Json<SubmitTransferResponse> {
+    if let Some(message) = raw_transfer_auth_error(&headers) {
+        return Json(SubmitTransferResponse {
+            success: false,
+            message,
+            transfer_id: None,
+            event_id: None,
+            solver_id: None,
+            processing_steps: vec![],
+        });
+    }
+
     Json(service.submit_transfer(request).await)
 }
 
@@ -196,8 +483,20 @@ pub async fn http_submit_transfer<S: ValidatorService>(
 /// - Warning threshold: 100 transfers
 pub async fn http_submit_transfers_batch<S: ValidatorService>(
     State(service): State<Arc<S>>,
+    headers: HeaderMap,
     Json(request): Json<SubmitTransfersBatchRequest>,
 ) -> Json<SubmitTransfersBatchResponse> {
+    if let Some(message) = raw_transfer_auth_error(&headers) {
+        return Json(SubmitTransfersBatchResponse {
+            success: false,
+            message,
+            submitted: 0,
+            failed: request.transfers.len(),
+            results: vec![],
+            stats: Default::default(),
+        });
+    }
+
     Json(service.submit_transfers_batch(request).await)
 }
 
@@ -216,9 +515,23 @@ pub async fn http_get_transfer_status<S: ValidatorService>(
 /// Submit an event
 pub async fn http_submit_event<S: ValidatorService>(
     State(service): State<Arc<S>>,
-    Json(request): Json<SubmitEventRequest>,
-) -> Json<SubmitEventResponse> {
-    Json(service.submit_event(request).await)
+    headers: HeaderMap,
+    Json(mut request): Json<SubmitEventRequest>,
+) -> Result<Json<SubmitEventResponse>, (StatusCode, Json<SubmitEventResponse>)> {
+    if let Some((status, message)) = raw_event_admission_error(&headers, &request) {
+        return Err((
+            status,
+            Json(SubmitEventResponse {
+                success: false,
+                message,
+                event_id: None,
+                vlc_time: None,
+            }),
+        ));
+    }
+
+    request.event.recompute_id();
+    Ok(Json(service.submit_event(request).await))
 }
 
 /// Get all events
@@ -242,6 +555,27 @@ pub async fn http_get_events<S: ValidatorService>(
             "parent_count": e.parent_ids.len(),
         })).collect::<Vec<_>>()
     }))
+}
+
+/// R5 · Get a single event by id.
+///
+/// Returns 404 when the validator has never seen the event.  When the event
+/// exists but has not yet been applied in a finalized CF, `on_chain` is
+/// `null` — callers should poll.
+pub async fn http_get_event_by_id<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    axum::extract::Path(event_id): axum::extract::Path<String>,
+) -> Result<Json<GetEventResponse>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    match service.get_event_by_id(&event_id) {
+        Some(resp) => Ok(Json(resp)),
+        None => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "event not found",
+                "event_id": event_id,
+            })),
+        )),
+    }
 }
 
 // ============================================
@@ -290,10 +624,187 @@ pub async fn http_get_balance<S: ValidatorService>(
 
 /// Query object by key
 pub async fn http_get_object<S: ValidatorService>(
-    State(service): State<Arc<S>>,
+    State(_service): State<Arc<S>>,
     axum::extract::Path(key): axum::extract::Path<String>,
-) -> Json<GetObjectResponse> {
-    Json(service.get_object(&key))
+) -> Result<Json<GetObjectResponse>, (StatusCode, Json<serde_json::Value>)> {
+    Err((
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "key": key,
+            "supported": false,
+            "error": stable_error(ERROR_CONSENSUS_STORAGE, "unsupported raw object query"),
+        })),
+    ))
+}
+
+// ============================================
+// Move VM Handlers (Phase 4)
+// ============================================
+
+/// Submit a Move function call
+pub async fn http_submit_move_call<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<MoveCallRequest>,
+) -> Json<MoveCallResponse> {
+    Json(service.submit_move_call(request).await)
+}
+
+/// Submit Move module publish
+pub async fn http_submit_move_publish<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<MovePublishRequest>,
+) -> Json<MovePublishResponse> {
+    Json(service.submit_move_publish(request).await)
+}
+
+/// Submit Move package upgrade (B5)
+pub async fn http_submit_move_upgrade<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<MoveUpgradeRequest>,
+) -> Json<MoveUpgradeResponse> {
+    Json(service.submit_move_upgrade(request).await)
+}
+
+/// Submit a Programmable Transaction Block (PTB).
+///
+/// HTTP status mapping (post move-vm-phase9-ptb-event-wire):
+/// - **200 OK** — PTB executed successfully (`success = true`).
+/// - **400 Bad Request** — wire-format failure (hex / BCS / `validate_wire`)
+///   OR domain-level execution failure (NotOwnedBySender, ObjectNotFound,
+///   StaleObjectVersion, ObjectDigestMismatch, SharedObjectsNotYetSupported,
+///   …). The response body's `error` / `code` fields describe which.
+///
+/// See `docs/feat/move-vm-phase9-ptb-event-wire/design.md` §10.
+pub async fn http_submit_move_ptb<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<MovePtbRequest>,
+) -> (axum::http::StatusCode, Json<MovePtbResponse>) {
+    match service.submit_move_ptb(request).await {
+        Ok(resp) => (axum::http::StatusCode::OK, Json(resp)),
+        Err(resp) => (axum::http::StatusCode::BAD_REQUEST, Json(resp)),
+    }
+}
+
+/// Query parameters for Move object lookup.
+#[derive(Debug, Deserialize, Default)]
+pub struct GetMoveObjectQuery {
+    /// If true, read committed SMT only (bypass speculative overlay).
+    /// Default false preserves read-your-writes semantics for clients on the
+    /// same node that submitted a write.
+    pub finalized: Option<bool>,
+    /// B1: long-poll until the object's `version` reaches at least this value.
+    /// Treated as 0 if absent (non-blocking GET, the legacy semantics).
+    pub wait_min_version: Option<u64>,
+    /// B1: max wait time in milliseconds. Defaults to
+    /// [`DEFAULT_WAIT_TIMEOUT_MS`] when `wait_min_version` is set.
+    pub timeout_ms: Option<u64>,
+}
+
+/// B1 default long-poll timeout. Picked under the assumption that most
+/// reverse proxies idle-cut at 60s; clients can shorten via `?timeout_ms=`.
+pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
+
+/// B1 outcome returned by
+/// [`ValidatorService::wait_move_object_min_version`]. The HTTP handler maps
+/// each variant to an appropriate status code.
+#[derive(Debug)]
+pub enum WaitMoveObjectOutcome {
+    /// Object materialized at `version >= min_version`. → HTTP 200.
+    Resolved(GetMoveObjectResponse),
+    /// Timeout elapsed before the version target was reached. → HTTP 408.
+    /// Carries the most recently observed state for diagnostics.
+    Timeout(GetMoveObjectResponse),
+    /// Per-object or global waiter cap exceeded. → HTTP 429.
+    CapExceeded { reason: String },
+    /// Validator service has no watcher attached (mis-configured node). → HTTP 503.
+    Unavailable,
+}
+
+/// Query a Move object by object ID (hex)
+pub async fn http_get_move_object<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    axum::extract::Path(object_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<GetMoveObjectQuery>,
+) -> (axum::http::StatusCode, Json<GetMoveObjectResponse>) {
+    let finalized = q.finalized.unwrap_or(false);
+    match q.wait_min_version {
+        // No wait requested → preserve legacy non-blocking 200 path.
+        None | Some(0) => (
+            axum::http::StatusCode::OK,
+            Json(service.get_move_object(&object_id, finalized)),
+        ),
+        Some(min_version) => {
+            let timeout_ms = q.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
+            match service
+                .wait_move_object_min_version(&object_id, finalized, min_version, timeout_ms)
+                .await
+            {
+                WaitMoveObjectOutcome::Resolved(resp) => (axum::http::StatusCode::OK, Json(resp)),
+                WaitMoveObjectOutcome::Timeout(resp) => {
+                    (axum::http::StatusCode::REQUEST_TIMEOUT, Json(resp))
+                }
+                WaitMoveObjectOutcome::CapExceeded { reason } => (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    Json(GetMoveObjectResponse {
+                        key: format!("oid:{}", object_id.strip_prefix("0x").unwrap_or(&object_id)),
+                        object_id,
+                        owner: String::new(),
+                        ownership: String::new(),
+                        type_tag: String::new(),
+                        version: 0,
+                        data_hex: String::new(),
+                        exists: false,
+                        digest_hex: String::new(),
+                        // v1 contract: object query failures that are NOT a
+                        // normal not-found must carry a stable class marker.
+                        // Backpressure is not directly listed in the v1 marker
+                        // table; classify under SOLVER_UNAVAILABLE because
+                        // both surface to clients as "validator cannot serve
+                        // this request right now, retry later".
+                        error: Some(stable_error(ERROR_SOLVER_UNAVAILABLE, reason)),
+                    }),
+                ),
+                WaitMoveObjectOutcome::Unavailable => (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(GetMoveObjectResponse {
+                        key: format!("oid:{}", object_id.strip_prefix("0x").unwrap_or(&object_id)),
+                        object_id,
+                        owner: String::new(),
+                        ownership: String::new(),
+                        type_tag: String::new(),
+                        version: 0,
+                        data_hex: String::new(),
+                        exists: false,
+                        digest_hex: String::new(),
+                        // v1 contract: a watcher-less validator is an
+                        // infrastructure/wiring failure, classify as
+                        // CONSENSUS_STORAGE so cross-validator scripts can
+                        // assert the marker rather than the raw string.
+                        error: Some(stable_error(
+                            ERROR_CONSENSUS_STORAGE,
+                            "wait_min_version not supported on this validator",
+                        )),
+                    }),
+                ),
+            }
+        }
+    }
+}
+
+/// Query a module's ABI (function list)
+pub async fn http_get_module_abi<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    axum::extract::Path((address, name)): axum::extract::Path<(String, String)>,
+) -> Json<GetModuleAbiResponse> {
+    Json(service.get_module_abi(&address, &name))
+}
+
+/// List all modules published at an address
+pub async fn http_list_modules<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+) -> Json<ListModulesResponse> {
+    Json(service.list_modules(&address))
 }
 
 // ============================================

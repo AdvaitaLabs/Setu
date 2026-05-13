@@ -21,7 +21,7 @@ mod gas;
 // Re-export all types
 pub use solver_task::{
     SolverTask, ResolvedInputs, OperationType, ResolvedObject,
-    ReadSetEntry, MerkleProof,
+    ReadSetEntry, MerkleProof, ResolvedDynamicField,
 };
 pub use attestation::{
     Attestation, AttestationType, AttestationData,

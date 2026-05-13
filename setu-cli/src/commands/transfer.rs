@@ -105,11 +105,13 @@ pub async fn handle(action: crate::TransferAction, _config: &Config) -> Result<(
             println!();
             
             let client = reqwest::Client::new();
-            let response = client
-                .post(&url)
-                .json(&request)
-                .send()
-                .await;
+            let mut request_builder = client.post(&url).json(&request);
+            if let Ok(token) = std::env::var("SETU_RAW_TRANSFER_API_TOKEN") {
+                if !token.is_empty() {
+                    request_builder = request_builder.header("X-Setu-Admin-Token", token);
+                }
+            }
+            let response = request_builder.send().await;
             
             match response {
                 Ok(resp) => {

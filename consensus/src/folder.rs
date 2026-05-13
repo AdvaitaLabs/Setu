@@ -3,6 +3,7 @@ use setu_types::{
 };
 use crate::anchor_builder::{AnchorBuilder, AnchorBuildResult, AnchorBuildError, PendingAnchorBuild};
 use crate::dag::Dag;
+use crate::outcome_sink::OutcomeSink;
 use crate::vlc::VLC;
 use setu_storage::SharedStateManager;
 use setu_storage::subnet_state::GlobalStateManager;
@@ -168,6 +169,14 @@ impl ConsensusManager {
         }
     }
 
+    /// R5 · Inject an outcome sink; forwarded to the underlying AnchorBuilder.
+    ///
+    /// Default = no sink (`ingest_outcomes` short-circuits). Called once by
+    /// `ConsensusEngine::set_outcomes_sink` during validator initialization.
+    pub fn set_outcomes_sink(&mut self, sink: Arc<dyn OutcomeSink>) {
+        self.anchor_builder.set_outcomes_sink(sink);
+    }
+
     /// Try to create a ConsensusFrame with full Merkle tree computation
     /// 
     /// Uses deferred commit mode:
@@ -179,25 +188,13 @@ impl ConsensusManager {
         dag: &Dag,
         vlc: &VLC,
     ) -> Option<ConsensusFrame> {
+        // D1: compute the set of event-ids already referenced by in-flight CFs
+        // (leader's pending_builds + follower's pending_cf_events). Passed to
+        // prepare_build so the pending-status selection excludes them.
+        let in_flight = self.collect_in_flight_event_ids();
         // Use AnchorBuilder.prepare_build (deferred commit mode)
-        match self.anchor_builder.prepare_build(dag, vlc) {
-            Ok(pending_build) => {
-                let anchor = pending_build.anchor.clone();
-                tracing::info!(
-                    anchor_id = %anchor.id,
-                    event_count = anchor.event_ids.len(),
-                    "CF created with anchor"
-                );
-                
-                // Create ConsensusFrame from anchor
-                let cf = ConsensusFrame::new(anchor, self.local_validator_id.clone());
-                
-                // Store pending_build for later commit (keyed by cf_id)
-                self.pending_builds.insert(cf.id.clone(), pending_build);
-                self.pending_cfs.insert(cf.id.clone(), cf.clone());
-                
-                Some(cf)
-            }
+        match self.anchor_builder.prepare_build(dag, vlc, &in_flight) {
+            Ok(pending_build) => self.finalize_pending_build(pending_build),
             Err(AnchorBuildError::DeltaNotReached { required, current }) => {
                 tracing::debug!(required, current, "CF not created: DeltaNotReached");
                 None
@@ -218,10 +215,69 @@ impl ConsensusManager {
         }
     }
 
+    /// Common post-build logic: create CF from anchor, store pending_build.
+    fn finalize_pending_build(&mut self, pending_build: PendingAnchorBuild) -> Option<ConsensusFrame> {
+        let anchor = pending_build.anchor.clone();
+        tracing::info!(
+            anchor_id = %anchor.id,
+            event_count = anchor.event_ids.len(),
+            "CF created with anchor"
+        );
+        let cf = ConsensusFrame::new(anchor, self.local_validator_id.clone());
+        self.pending_builds.insert(cf.id.clone(), pending_build);
+        self.pending_cfs.insert(cf.id.clone(), cf.clone());
+        Some(cf)
+    }
+
+    /// Heartbeat: try to create CF with relaxed delta (delta >= 1 + time guard).
+    /// Returns None if conditions not met.
+    pub fn try_create_cf_heartbeat(
+        &mut self,
+        dag: &Dag,
+        vlc: &VLC,
+        heartbeat_interval: std::time::Duration,
+    ) -> Option<ConsensusFrame> {
+        let in_flight = self.collect_in_flight_event_ids();
+        match self.anchor_builder.prepare_build_heartbeat(dag, vlc, heartbeat_interval, &in_flight) {
+            Ok(pending_build) => self.finalize_pending_build(pending_build),
+            Err(_) => None,
+        }
+    }
+
+    /// D1: event-ids already referenced by in-flight CFs, to be excluded
+    /// from the next fold. Combines `pending_builds` (leader path, Anchor
+    /// event_ids already committed to a not-yet-finalized CF) and
+    /// `pending_cf_events` (follower path, deferred events for a received
+    /// CF that hasn't finalized yet).
+    fn collect_in_flight_event_ids(&self) -> std::collections::HashSet<setu_types::EventId> {
+        let mut set: std::collections::HashSet<setu_types::EventId> =
+            std::collections::HashSet::new();
+        for build in self.pending_builds.values() {
+            for id in &build.anchor.event_ids {
+                set.insert(id.clone());
+            }
+        }
+        for events in self.pending_cf_events.values() {
+            for ev in events {
+                set.insert(ev.id.clone());
+            }
+        }
+        set
+    }
+
     /// Check if a CF (pending or finalized) already exists
     pub fn has_cf(&self, cf_id: &str) -> bool {
         self.pending_cfs.contains_key(cf_id) ||
             self.finalized_cfs.iter().any(|cf| cf.id == cf_id)
+    }
+
+    pub fn is_finalized_cf(&self, cf_id: &str) -> bool {
+        self.finalized_cfs.iter().any(|cf| cf.id == cf_id)
+    }
+
+    #[cfg(test)]
+    pub fn pending_counts_for_testing(&self) -> (usize, usize) {
+        (self.pending_cfs.len(), self.pending_cf_events.len())
     }
 
     pub fn receive_cf(&mut self, cf: ConsensusFrame) {
@@ -240,6 +296,25 @@ impl ConsensusManager {
                 }
             }
         }
+    }
+
+    pub fn receive_finalized_cf(&mut self, cf: ConsensusFrame) -> bool {
+        let cf_id = cf.id.clone();
+        if self.is_finalized_cf(&cf_id) {
+            return false;
+        }
+
+        if let Some(existing) = self.pending_cfs.get_mut(&cf_id) {
+            for vote in cf.votes.values() {
+                if !existing.votes.contains_key(&vote.validator_id) {
+                    existing.add_vote(vote.clone());
+                }
+            }
+        } else {
+            self.receive_cf(cf);
+        }
+
+        self.check_finalization(&cf_id)
     }
 
     /// Vote for a ConsensusFrame
@@ -284,8 +359,11 @@ impl ConsensusManager {
 
     /// Receive a vote from another validator
     /// 
-    /// Returns true if the CF is finalized after this vote.
-    /// Duplicate votes from the same validator are ignored (idempotent).
+    /// Returns true if this vote changes the CF lifecycle by finalizing,
+    /// rejecting, or timing out the pending CF. Duplicate votes from the same
+    /// validator are ignored (idempotent). Engine callers must verify the
+    /// target CF is actually the last finalized CF before running finalization
+    /// side effects such as broadcast, persistence, or round advance.
     pub fn receive_vote(&mut self, vote: Vote) -> bool {
         let cf_id = vote.cf_id.clone();
         let voter_id = vote.validator_id.clone();
@@ -310,7 +388,9 @@ impl ConsensusManager {
     /// This is called after adding a vote to check if finalization/rejection should occur.
     /// Public because engine.receive_cf() needs to check after vote_for_cf().
     /// 
-    /// Returns true if CF was finalized or rejected (removed from pending).
+    /// Returns true if CF was finalized or rejected/timed out (removed from pending).
+    /// Engine callers must check the last finalized CF id before treating this
+    /// as a finalized outcome.
     pub fn check_finalization(&mut self, cf_id: &str) -> bool {
         let decision = {
             let cf = match self.pending_cfs.get(cf_id) {
@@ -662,7 +742,7 @@ impl ConsensusManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_types::{Event, EventType};
+    use setu_types::{Event, EventType, VLCSnapshot};
 
     fn create_vlc(node_id: &str, time: u64) -> VLC {
         let mut vlc = VLC::new(node_id.to_string());
@@ -757,5 +837,37 @@ mod tests {
         // Global root should be computed
         let global_root = manager.get_global_root();
         assert_ne!(global_root, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_receive_finalized_cf_merges_votes_into_pending_cf() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 5,
+            min_events_per_cf: 1,
+            validator_count: 3,
+            ..Default::default()
+        };
+        let mut manager = ConsensusManager::new(config, "validator1".to_string());
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut pending_cf = ConsensusFrame::new(anchor, "validator1".to_string());
+        let cf_id = pending_cf.id.clone();
+        pending_cf.add_vote(Vote::new("validator1".to_string(), cf_id.clone(), true));
+        manager.receive_cf(pending_cf.clone());
+
+        let mut finalized_cf = pending_cf;
+        finalized_cf.add_vote(Vote::new("validator2".to_string(), cf_id.clone(), true));
+        finalized_cf.add_vote(Vote::new("validator3".to_string(), cf_id.clone(), true));
+        finalized_cf.finalize();
+        let duplicate_finalized_cf = finalized_cf.clone();
+
+        assert!(manager.receive_finalized_cf(finalized_cf));
+        assert!(manager.is_finalized_cf(&cf_id));
+        assert!(!manager.receive_finalized_cf(duplicate_finalized_cf));
     }
 }

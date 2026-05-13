@@ -173,6 +173,133 @@ impl EventType {
 
 use crate::genesis::GenesisConfig;
 use crate::governance::GovernancePayload;
+use crate::object::ObjectId;
+
+// ========== Move-specific Payload Types ==========
+
+fn default_true() -> bool { true }
+
+/// Move function call payload (paired with EventType::ContractCall)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveCallPayload {
+    /// Transaction sender address (hex).
+    /// Validator MUST verify: sender == Event signer public key derived address.
+    pub sender: String,
+    /// Target module address (hex), e.g. "0x1"
+    pub package: String,
+    /// Module name, e.g. "coin"
+    pub module: String,
+    /// Function name, e.g. "transfer"
+    pub function: String,
+    /// Type arguments (Move TypeTag string representation)
+    pub type_args: Vec<String>,
+    /// Pure arguments — BCS serialized, no object references.
+    /// Mapped to `pure_args` in OperationType::MoveCall.
+    pub args: Vec<Vec<u8>>,
+    /// Input object IDs (referenced or consumed)
+    pub input_object_ids: Vec<ObjectId>,
+    /// Shared object IDs (Phase 0-4: must be empty — ADR-1)
+    pub shared_object_ids: Vec<ObjectId>,
+    /// Mutable reference indices into input_object_ids (&mut T params)
+    #[serde(default)]
+    pub mutable_indices: Option<Vec<usize>>,
+    /// Consumed object indices into input_object_ids (by-value T params)
+    #[serde(default)]
+    pub consumed_indices: Option<Vec<usize>>,
+    /// Whether the target function takes a `&mut TxContext` last parameter.
+    /// When true, engine.execute() auto-appends BCS(TxContext) to args.
+    #[serde(default = "default_true")]
+    pub needs_tx_context: bool,
+    /// Dynamic-field accesses declared by the client (DF FDP M4).
+    ///
+    /// Each entry is resolved by `TaskPreparer` against the pre-execution SMT
+    /// and becomes a `ResolvedDynamicField` in `ResolvedInputs.dynamic_fields`,
+    /// from which the VM builds the `SetuObjectRuntime.df_cache`. `#[serde(default)]`
+    /// keeps payloads written before M4 wire-compatible.
+    #[serde(default)]
+    pub dynamic_field_accesses: Vec<DynamicFieldAccess>,
+}
+
+/// Client-declared dynamic-field access (DF FDP M4, see
+/// `docs/feat/dynamic-fields/design.md` §3.3).
+///
+/// `parent_object_id` and `key_bcs_hex` are plain hex strings (optional
+/// `"oid:"` prefix on the parent is tolerated). `key_type` / `value_type`
+/// are canonical Move `TypeTag` strings (e.g. `"u64"`, `"address"`,
+/// `"0xcafe::pool::Pair"`).
+///
+/// `value_type` is `Some` and required when `mode == Create` (the DF entry
+/// does not yet exist so the type cannot be inferred from on-disk bytes);
+/// it may be `None` for Read/Mutate/Delete since the value type is recovered
+/// from the parent DF envelope at prepare time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicFieldAccess {
+    pub parent_object_id: String,
+    pub key_type: String,
+    pub key_bcs_hex: String,
+    pub mode: crate::dynamic_field::DfAccessMode,
+    #[serde(default)]
+    pub value_type: Option<String>,
+}
+
+/// Move module publish payload (paired with EventType::ContractPublish)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MovePublishPayload {
+    /// Compiled module bytecode (one package may contain multiple modules)
+    pub modules: Vec<Vec<u8>>,
+}
+
+/// Move package upgrade payload (B5 — paired with EventType::ContractPublish
+/// umbrella, distinguished from publish via `EventPayload::MoveUpgrade`).
+///
+/// **BCS field order is LOCKED** (design.md §3 R1g) — appending fields is fine,
+/// re-ordering or inserting silently invalidates every upgrade event in storage
+/// and all historical hashes (G1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MoveUpgradePayload {
+    /// EOA submitting the upgrade (cap holder).
+    pub sender: crate::object::Address,
+    /// Family root = v0 package address (immutable).
+    pub family_id: crate::object::ObjectId,
+    /// Current latest package being superseded (= prev package address).
+    pub prev_package: crate::object::ObjectId,
+    /// Post-relink, deterministically derived (design.md §4.5).
+    pub new_package_addr: crate::object::Address,
+    /// = prev_version + 1; replay-asserted.
+    pub new_version: u64,
+    /// Post-relink BCS bytes for each module in the bundle.
+    pub modules: Vec<Vec<u8>>,
+    /// Dependency package IDs (matches `Command::Publish.deps` shape).
+    pub deps: Vec<crate::object::ObjectId>,
+    /// Ticket-supplied digest = bcs(modules || deps); validator re-derives
+    /// and asserts equality at apply time.
+    pub digest: Vec<u8>,
+    /// Owned object ID of the UpgradeCap consumed by this upgrade. Used at
+    /// replay for mutation-order assertion.
+    pub upgrade_cap_id: crate::object::ObjectId,
+    /// Compatibility policy copied from the ticket (0=Compatible, 1=Additive,
+    /// 2=DepOnly).
+    pub policy: u8,
+}
+
+/// Programmable Transaction Block payload (paired with EventType::ContractCall).
+///
+/// PTB is the "many commands, one atomic effect" Move execution mode.
+/// Compared to [`MoveCallPayload`], all input-object metadata (ID, version,
+/// digest, mutable flag) lives inside `ptb.inputs[].ObjectArg` — there is no
+/// parallel `input_object_ids` / `mutable_indices` / `consumed_indices` list.
+///
+/// EventType reuse: PTB rides on `EventType::ContractCall` (not a new
+/// EventType variant). See `docs/feat/move-vm-phase9-ptb-event-wire/design.md`
+/// §4 for the rationale.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MovePtbPayload {
+    /// Transaction sender (hex address). Validator MUST verify equality
+    /// against the Event signer's derived address (mirror of MoveCallPayload).
+    pub sender: String,
+    /// Programmable transaction body. Its BCS encoding is what consensus hashes.
+    pub ptb: crate::ptb::ProgrammableTransaction,
+}
 
 // ========== Event Payload ==========
 
@@ -240,6 +367,23 @@ pub enum EventPayload {
     },
     /// Governance action (propose or execute)
     Governance(GovernancePayload),
+    /// Move function call (paired with EventType::ContractCall)
+    MoveCall(MoveCallPayload),
+    /// Move module publish (paired with EventType::ContractPublish)
+    MovePublish(MovePublishPayload),
+    /// Programmable transaction block (paired with EventType::ContractCall).
+    ///
+    /// **BCS discriminant order is load-bearing.** This MUST stay the tail
+    /// variant of `EventPayload`; appending future variants is fine, mid-enum
+    /// insertion silently invalidates every PTB event already in storage.
+    MovePtb(MovePtbPayload),
+    /// Move package upgrade (B5 — paired with `EventType::ContractPublish`
+    /// umbrella, see design.md §4 path 乙').
+    ///
+    /// **MUST stay the tail variant.** Inserting variants between `MovePtb`
+    /// and `MoveUpgrade` is forbidden — it would shift the BCS discriminant
+    /// for every previously-stored event payload (G1).
+    MoveUpgrade(MoveUpgradePayload),
 }
 
 impl Default for EventPayload {
@@ -287,7 +431,8 @@ pub struct StateChange {
     pub new_value: Option<Vec<u8>>,
     /// Target subnet for this state change. None = use the Event's own subnet_id.
     /// Enables cross-subnet effects (e.g., Governance event writing to ROOT subnet).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Note: must NOT use skip_serializing_if — bincode requires all fields present.
+    #[serde(default)]
     pub target_subnet: Option<crate::subnet::SubnetId>,
 }
 
@@ -515,6 +660,72 @@ impl Event {
         event
     }
 
+    /// Create a Move function call event (ContractCall)
+    pub fn move_call(
+        payload: MoveCallPayload,
+        parent_ids: Vec<EventId>,
+        vlc_snapshot: VLCSnapshot,
+        creator: String,
+    ) -> Self {
+        let mut event = Self::new(EventType::ContractCall, parent_ids, vlc_snapshot, creator);
+        event.payload = EventPayload::MoveCall(payload);
+        event
+    }
+
+    /// Create a Move PTB event (reuses `EventType::ContractCall`).
+    ///
+    /// EventType reuse: PTB shares the ContractCall umbrella with MoveCall.
+    /// See `docs/feat/move-vm-phase9-ptb-event-wire/design.md` §4.
+    pub fn move_ptb(
+        payload: MovePtbPayload,
+        parent_ids: Vec<EventId>,
+        vlc_snapshot: VLCSnapshot,
+        creator: String,
+    ) -> Self {
+        let mut event = Self::new(EventType::ContractCall, parent_ids, vlc_snapshot, creator);
+        event.payload = EventPayload::MovePtb(payload);
+        event
+    }
+
+    /// Create a contract publish event (Move module deployment)
+    pub fn contract_publish(
+        sender: String,
+        modules: Vec<Vec<u8>>,
+        parent_ids: Vec<EventId>,
+        vlc_snapshot: VLCSnapshot,
+        creator: String,
+    ) -> Self {
+        let mut event = Self::new(EventType::ContractPublish, parent_ids, vlc_snapshot, creator);
+        event.payload = EventPayload::MovePublish(MovePublishPayload { modules });
+        event.creator = sender;
+        // Self::new() sealed event.id against the `creator` argument. We just
+        // overwrote `event.creator` with `sender`, which invalidates the ID.
+        // Must recompute so `verify_id()` (anti-tampering check in
+        // consensus_integration::submit_event) accepts the event.
+        event.recompute_id();
+        event
+    }
+
+    /// Create a Move package upgrade event (B5).
+    ///
+    /// Reuses the `EventType::ContractPublish` umbrella per design.md §4
+    /// path 乙' so the EventType variant count stays at 19 (G13). The
+    /// payload's `MoveUpgrade` discriminant distinguishes it from
+    /// `MovePublish` at apply / replay time.
+    pub fn move_upgrade(
+        payload: MoveUpgradePayload,
+        parent_ids: Vec<EventId>,
+        vlc_snapshot: VLCSnapshot,
+        creator: String,
+    ) -> Self {
+        let sender_hex = format!("0x{}", hex::encode(payload.sender.as_bytes()));
+        let mut event = Self::new(EventType::ContractPublish, parent_ids, vlc_snapshot, creator);
+        event.payload = EventPayload::MoveUpgrade(payload);
+        event.creator = sender_hex;
+        event.recompute_id();
+        event
+    }
+
     fn compute_id(
         parent_ids: &[EventId],
         vlc_snapshot: &VLCSnapshot,
@@ -700,6 +911,51 @@ impl Event {
             EventPayload::Governance(g) => {
                 vec![format!("governance:{}", hex::encode(g.proposal_id))]
             }
+            EventPayload::MoveCall(payload) => {
+                let mut resources: Vec<String> = payload.input_object_ids.iter()
+                    .map(|id| format!("oid:{}", hex::encode(id.as_bytes())))
+                    .collect();
+                resources.push(format!("contract:{}::{}::{}", payload.package, payload.module, payload.function));
+                resources
+            }
+            EventPayload::MovePublish(_) => {
+                vec![]
+            }
+            EventPayload::MovePtb(payload) => {
+                // Resources: every Object input + every (package, module, function)
+                // touched by Command::MoveCall in the PTB.
+                let mut resources: Vec<String> = Vec::new();
+                for arg in &payload.ptb.inputs {
+                    if let crate::ptb::CallArg::Object(obj) = arg {
+                        let id = match obj {
+                            crate::ptb::ObjectArg::ImmOrOwnedObject(id, _, _) => id,
+                            crate::ptb::ObjectArg::SharedObject { id, .. } => id,
+                        };
+                        resources.push(format!("oid:{}", hex::encode(id.as_bytes())));
+                    }
+                }
+                for cmd in &payload.ptb.commands {
+                    if let crate::ptb::Command::MoveCall(mc) = cmd {
+                        resources.push(format!(
+                            "contract:{}::{}::{}",
+                            hex::encode(mc.package.as_bytes()),
+                            mc.module,
+                            mc.function,
+                        ));
+                    }
+                }
+                resources
+            }
+            EventPayload::MoveUpgrade(payload) => {
+                // Resources: the cap object, the prev package, plus a
+                // contract:* marker so concurrent upgrades on the same
+                // family serialize through the dependency scheduler.
+                vec![
+                    format!("oid:{}", hex::encode(payload.upgrade_cap_id.as_bytes())),
+                    format!("oid:{}", hex::encode(payload.prev_package.as_bytes())),
+                    format!("contract:{}", hex::encode(payload.family_id.as_bytes())),
+                ]
+            }
             EventPayload::None => vec![],
             EventPayload::Genesis(g) => {
                 g.accounts.iter()
@@ -740,6 +996,26 @@ mod tests {
         let event = Event::genesis("node1".to_string(), create_vlc_snapshot());
         assert!(event.is_genesis());
         assert!(!event.has_parents());
+    }
+
+    /// Regression test for docs/bugs/20260424-contract-publish-event-id-tampering.md:
+    /// `Event::contract_publish` overwrites `event.creator` after `Self::new`
+    /// seals the id. Must call `recompute_id()` or consensus rejects the event
+    /// with "Event ID verification failed - possible tampering".
+    #[test]
+    fn test_contract_publish_event_id_is_self_consistent() {
+        let event = Event::contract_publish(
+            "alice".to_string(),
+            vec![vec![0xCA, 0xFE, 0xBA, 0xBE]],
+            vec![],
+            create_vlc_snapshot(),
+            "validator-1".to_string(),
+        );
+        assert_eq!(event.creator, "alice", "creator should be overwritten to sender");
+        assert!(
+            event.verify_id(),
+            "publish event id must verify after creator overwrite (recompute_id must be called)"
+        );
     }
     
     #[test]
@@ -924,5 +1200,198 @@ mod tests {
             "validator1".to_string(),
         );
         assert_eq!(event.get_subnet_id(), crate::subnet::SubnetId::GOVERNANCE);
+    }
+
+    // ── DF FDP M4 — MoveCallPayload.dynamic_field_accesses ──
+
+    #[test]
+    fn test_dynamic_field_access_serde_default() {
+        // T1: payloads written before M4 must still deserialize; the new
+        // `dynamic_field_accesses` field defaults to an empty Vec.
+        let json = r#"{
+            "sender": "alice",
+            "package": "0x1",
+            "module": "counter",
+            "function": "inc",
+            "type_args": [],
+            "args": [],
+            "input_object_ids": [],
+            "shared_object_ids": []
+        }"#;
+        let p: MoveCallPayload = serde_json::from_str(json).expect("legacy payload");
+        assert!(p.dynamic_field_accesses.is_empty());
+        assert!(p.needs_tx_context, "default_true applies");
+    }
+
+    #[test]
+    fn test_dynamic_field_access_roundtrip() {
+        let payload = MoveCallPayload {
+            sender: "alice".to_string(),
+            package: "0x1".to_string(),
+            module: "m".to_string(),
+            function: "f".to_string(),
+            type_args: vec![],
+            args: vec![],
+            input_object_ids: vec![],
+            shared_object_ids: vec![],
+            mutable_indices: None,
+            consumed_indices: None,
+            needs_tx_context: false,
+            dynamic_field_accesses: vec![DynamicFieldAccess {
+                parent_object_id: "oid:00".repeat(32),
+                key_type: "u64".to_string(),
+                key_bcs_hex: "2a00000000000000".to_string(),
+                mode: crate::dynamic_field::DfAccessMode::Read,
+                value_type: None,
+            }],
+        };
+        let s = serde_json::to_string(&payload).unwrap();
+        let back: MoveCallPayload = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.dynamic_field_accesses.len(), 1);
+        assert_eq!(
+            back.dynamic_field_accesses[0].mode,
+            crate::dynamic_field::DfAccessMode::Read
+        );
+    }
+
+    // ===== PTB event-wire tests (B6b 收尾 / FDP move-vm-phase9-ptb-event-wire) =====
+
+    /// U1 — `MovePtbPayload` survives BCS round-trip without field loss.
+    #[test]
+    fn move_ptb_payload_round_trips_bcs() {
+        use crate::ptb::{CallArg, Command, ProgrammableTransaction};
+
+        let payload = MovePtbPayload {
+            sender: "0xabcd".to_string(),
+            ptb: ProgrammableTransaction {
+                inputs: vec![CallArg::Pure(vec![1, 2, 3])],
+                commands: vec![Command::TransferObjects(
+                    vec![],
+                    crate::ptb::Argument::Input(0),
+                )],
+                dynamic_field_accesses: vec![],
+            },
+        };
+        let bytes = bcs::to_bytes(&payload).expect("bcs encode");
+        let back: MovePtbPayload = bcs::from_bytes(&bytes).expect("bcs decode");
+        assert_eq!(back.sender, payload.sender);
+        assert_eq!(back.ptb.inputs.len(), 1);
+        assert_eq!(back.ptb.commands.len(), 1);
+    }
+
+    /// U2 — `Event::move_ptb` constructor sets `EventType::ContractCall` and
+    /// stores the payload under `EventPayload::MovePtb`.
+    #[test]
+    fn event_move_ptb_constructor_sets_contract_call_type() {
+        use crate::ptb::ProgrammableTransaction;
+
+        let payload = MovePtbPayload {
+            sender: "0xabcd".to_string(),
+            ptb: ProgrammableTransaction {
+                inputs: vec![],
+                commands: vec![],
+                dynamic_field_accesses: vec![],
+            },
+        };
+        let event = Event::move_ptb(
+            payload,
+            vec![],
+            VLCSnapshot::default(),
+            "validator-1".to_string(),
+        );
+        assert_eq!(event.event_type, EventType::ContractCall);
+        assert!(matches!(event.payload, EventPayload::MovePtb(_)));
+    }
+
+    /// U3 — `EventPayload::MoveUpgrade` is the **tail** variant (BCS
+    /// discriminant stability). Adding mid-enum variants in the future
+    /// would silently break every Move event already in storage.
+    #[test]
+    fn event_payload_move_ptb_is_tail_variant() {
+        let move_publish = EventPayload::MovePublish(MovePublishPayload { modules: vec![] });
+        let move_ptb = EventPayload::MovePtb(MovePtbPayload {
+            sender: String::new(),
+            ptb: crate::ptb::ProgrammableTransaction {
+                inputs: vec![],
+                commands: vec![],
+                dynamic_field_accesses: vec![],
+            },
+        });
+        let move_upgrade = EventPayload::MoveUpgrade(MoveUpgradePayload {
+            sender: crate::object::Address::ZERO,
+            family_id: crate::object::ObjectId::new([0u8; 32]),
+            prev_package: crate::object::ObjectId::new([0u8; 32]),
+            new_package_addr: crate::object::Address::ZERO,
+            new_version: 0,
+            modules: vec![],
+            deps: vec![],
+            digest: vec![],
+            upgrade_cap_id: crate::object::ObjectId::new([0u8; 32]),
+            policy: 0,
+        });
+        let publish_bytes = bcs::to_bytes(&move_publish).unwrap();
+        let ptb_bytes = bcs::to_bytes(&move_ptb).unwrap();
+        let upgrade_bytes = bcs::to_bytes(&move_upgrade).unwrap();
+        // BCS encodes enum discriminants as ULEB128. Variant counts stay
+        // < 128, so the discriminant byte is the first byte.
+        assert!(ptb_bytes[0] > publish_bytes[0], "MovePtb must be after MovePublish");
+        assert!(
+            upgrade_bytes[0] > ptb_bytes[0],
+            "MoveUpgrade must be the tail variant (upgrade={} ptb={})",
+            upgrade_bytes[0],
+            ptb_bytes[0]
+        );
+    }
+
+    /// U4 — `MoveUpgradePayload` BCS field-order **golden vector**
+    /// (design.md §3 R1g, §12 acceptance gate; G1 historical-hash safety).
+    ///
+    /// Re-orders or insertions of fields silently invalidate every upgrade
+    /// event already stored in the DAG. To prevent this, we serialize a
+    /// fixed instance and compare against a hex snapshot committed to the
+    /// repo at `tests/golden/move_upgrade_payload_v1.hex`. If the field
+    /// layout ever changes, this test fails — the diff is then a code-review
+    /// gate, not a silent storage corruption.
+    ///
+    /// To regenerate after an *intentional* layout change (which itself
+    /// requires a new tail variant per §3 LOCKED rule), run with
+    /// `UPDATE_GOLDENS=1 cargo test -p setu-types u4_move_upgrade_payload_golden`.
+    #[test]
+    fn u4_move_upgrade_payload_golden() {
+        let payload = MoveUpgradePayload {
+            sender: crate::object::Address::new([0x11; 32]),
+            family_id: crate::object::ObjectId::new([0x22; 32]),
+            prev_package: crate::object::ObjectId::new([0x33; 32]),
+            new_package_addr: crate::object::Address::new([0x44; 32]),
+            new_version: 7,
+            modules: vec![vec![0xAA, 0xBB, 0xCC], vec![0xDD]],
+            deps: vec![crate::object::ObjectId::new([0x55; 32])],
+            digest: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            upgrade_cap_id: crate::object::ObjectId::new([0x66; 32]),
+            policy: 1,
+        };
+        let bytes = bcs::to_bytes(&payload).expect("BCS encode");
+        let actual_hex = hex::encode(&bytes);
+
+        let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/golden/move_upgrade_payload_v1.hex");
+
+        if std::env::var("UPDATE_GOLDENS").is_ok() {
+            std::fs::create_dir_all(golden_path.parent().unwrap()).unwrap();
+            std::fs::write(&golden_path, format!("{}\n", actual_hex)).unwrap();
+            eprintln!("UPDATED golden at {}", golden_path.display());
+            return;
+        }
+
+        let expected_hex = std::fs::read_to_string(&golden_path)
+            .unwrap_or_else(|e| panic!("read {}: {}", golden_path.display(), e));
+        let expected_hex = expected_hex.trim();
+        assert_eq!(
+            actual_hex, expected_hex,
+            "MoveUpgradePayload BCS layout drift detected — field order changed since v1.\n\
+             If this change is intentional, you MUST instead add a new tail variant to \
+             EventPayload (see design.md §3 R1g LOCKED rule). Do NOT regenerate the golden \
+             unless you are creating a fresh payload type."
+        );
     }
 }

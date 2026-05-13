@@ -1,0 +1,14 @@
+[package]
+name = "move-compile"
+version = "0.1.0"
+edition = "2021"
+
+# NOTE: This is an independent project, NOT a workspace member of Setu.
+# It depends on Sui's move-compiler which has a completely separate dependency tree.
+# Build separately: cd tools/move-compile && cargo build --release
+
+[dependencies]
+move-compiler = { git = "https://github.com/MystenLabs/sui.git", tag = "mainnet-v1.66.2" }
+move-core-types = { git = "https://github.com/MystenLabs/sui.git", tag = "mainnet-v1.66.2" }
+move-binary-format = { git = "https://github.com/MystenLabs/sui.git", tag = "mainnet-v1.66.2" }
+move-symbol-pool = { git = "https://github.com/MystenLabs/sui.git", tag = "mainnet-v1.66.2" }

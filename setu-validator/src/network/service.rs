@@ -23,9 +23,10 @@ use super::types::*;
 use super::transfer_handler::TransferHandler;
 use super::tee_executor::TeeExecutor;
 use super::event_handler::EventHandler;
+use super::move_handler;
 use crate::{RouterManager, TaskPreparer, BatchTaskPreparer, ConsensusValidator, InfraExecutor};
 use crate::coin_reservation::CoinReservationManager;
-use crate::governance::service::GovernanceService;
+use crate::governance::service::{ConfigSource, GovernanceService, SystemSubnetConfig};
 use crate::governance::handler::{
     GovernanceHandler, ProposeRequest, ProposeResponse, CallbackRequest,
     CallbackResponse, StatusResponse, RegisterSystemSubnetRequest, RegisterSystemSubnetResponse,
@@ -39,13 +40,15 @@ use axum::{
 };
 use dashmap::DashMap;
 use setu_types::Transfer;
+use setu_types::governance::SystemSubnetRegistration;
 use parking_lot::RwLock;
 use setu_rpc::{
     GetTransferStatusResponse, RegisterSolverRequest,
     SubmitTransferRequest, SubmitTransferResponse, ValidatorListItem,
     SubmitTransfersBatchRequest, SubmitTransfersBatchResponse,
 };
-use setu_types::event::{Event, EventPayload};
+use setu_types::event::{Event, EventPayload, EventStatus};
+use setu_types::ExecutionOutcome;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -131,6 +134,20 @@ pub struct ValidatorNetworkService {
 
     /// Governance service for Agent subnet integration (optional)
     governance_service: Option<Arc<GovernanceService>>,
+
+    /// R5 · Shared map of per-event apply outcomes, written by consensus layer
+    /// (`DashMapOutcomeSink`) and read by `GET /api/v1/event/:id`.
+    /// Empty (and forever so) when constructed without consensus.
+    execution_outcomes: Arc<DashMap<String, ExecutionOutcome>>,
+
+    /// B1 · Per-object version watcher for `wait_min_version` long-poll.
+    /// Set during boot via [`set_version_watcher`] so it shares the same
+    /// `Arc` with `GlobalStateManager::set_version_watcher`. `None` until
+    /// then → `wait_move_object_min_version` returns `Unavailable`.
+    version_watcher: parking_lot::RwLock<Option<Arc<setu_storage::WatcherRegistry>>>,
+
+    #[cfg(test)]
+    forced_add_event_response: Arc<RwLock<Option<SubmitEventResponse>>>,
 }
 
 impl ValidatorNetworkService {
@@ -152,11 +169,13 @@ impl ValidatorNetworkService {
         );
 
         // Create HTTP client for sync Solver calls
+        // .no_proxy() prevents macOS system proxy from intercepting localhost calls
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .connect_timeout(std::time::Duration::from_secs(2))
             .pool_max_idle_per_host(200)
             .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .no_proxy()
             .build()
             .expect("Failed to create HTTP client");
 
@@ -209,6 +228,10 @@ impl ValidatorNetworkService {
             coin_reservation_manager,
             tee_executor,
             governance_service: None,
+            execution_outcomes: Arc::new(DashMap::new()),
+            version_watcher: parking_lot::RwLock::new(None),
+            #[cfg(test)]
+            forced_add_event_response: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -232,11 +255,13 @@ impl ValidatorNetworkService {
         );
 
         // Create HTTP client for sync Solver calls
+        // .no_proxy() prevents macOS system proxy from intercepting localhost calls
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .connect_timeout(std::time::Duration::from_secs(2))
             .pool_max_idle_per_host(200)
             .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .no_proxy()
             .build()
             .expect("Failed to create HTTP client");
 
@@ -264,6 +289,9 @@ impl ValidatorNetworkService {
         // Use the passed-in batch_task_preparer (shares state with TaskPreparer)
         let batch_task_preparer = batch_task_preparer;
 
+        // R5: share the consensus validator's outcome map so RPC can read it.
+        let execution_outcomes = consensus_validator.execution_outcomes();
+
         Self {
             validator_id,
             router_manager,
@@ -288,6 +316,10 @@ impl ValidatorNetworkService {
             coin_reservation_manager,
             tee_executor,
             governance_service: None,
+            execution_outcomes,
+            version_watcher: parking_lot::RwLock::new(None),
+            #[cfg(test)]
+            forced_add_event_response: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -330,12 +362,21 @@ impl ValidatorNetworkService {
         self.governance_service = Some(service);
     }
 
+    /// B1 · Attach the shared `WatcherRegistry` for `wait_min_version` long-poll.
+    /// Boot calls this after constructing the service so the network layer and
+    /// `GlobalStateManager` share the same Arc — otherwise CF-finalized writes
+    /// wake nobody. Uses `&self` so tests can hot-swap the registry without
+    /// re-constructing the service.
+    pub fn set_version_watcher(&self, watcher: Arc<setu_storage::WatcherRegistry>) {
+        *self.version_watcher.write() = Some(watcher);
+    }
+
     /// Get the governance service (if enabled).
     pub fn governance_service(&self) -> Option<&Arc<GovernanceService>> {
         self.governance_service.as_ref()
     }
 
-    /// Get a reference to the events DashMap (for governance background tasks).
+    /// Get a reference to the finalized/query-visible events DashMap.
     pub fn events_map(&self) -> &Arc<DashMap<String, Event>> {
         &self.events
     }
@@ -345,6 +386,46 @@ impl ValidatorNetworkService {
     pub fn get_subnet_object(&self, subnet_id: &setu_types::SubnetId, object_id_bytes: &[u8; 32]) -> Option<Vec<u8>> {
         self.batch_task_preparer.merkle_state_provider()
             .get_object_from_subnet(object_id_bytes, subnet_id)
+    }
+
+    /// Read an object from a specific subnet's finalized SMT snapshot, bypassing
+    /// the speculative overlay.
+    pub fn get_subnet_object_finalized(&self, subnet_id: &setu_types::SubnetId, object_id_bytes: &[u8; 32]) -> Option<Vec<u8>> {
+        self.batch_task_preparer.merkle_state_provider()
+            .get_object_from_subnet_finalized(object_id_bytes, subnet_id)
+    }
+
+    /// Stage governance state changes for immediate local visibility without
+    /// mutating the canonical SMT before CF finalization.
+    ///
+    /// The read path merges the speculative overlay with the SMT snapshot, so
+    /// governance callbacks can read their own freshly submitted proposal while
+    /// the CF-finalized apply path remains the sole canonical writer.
+    pub fn apply_event_state_changes_eager(&self, subnet_id: &setu_types::SubnetId, event: &setu_types::Event) {
+        if let Some(ref exec) = event.execution_result {
+            if !exec.success || exec.state_changes.is_empty() {
+                return;
+            }
+            let shared = self.batch_task_preparer.merkle_state_provider().shared_state_manager();
+            match shared.stage_overlay(&event.id, *subnet_id, &exec.state_changes) {
+                Ok(()) => {
+                    tracing::info!(
+                        subnet_id = %subnet_id,
+                        event_id = %event.id,
+                        n_changes = exec.state_changes.len(),
+                        "Staged governance state changes to speculative overlay"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        subnet_id = %subnet_id,
+                        event_id = %event.id,
+                        error = %e,
+                        "Governance overlay stage skipped"
+                    );
+                }
+            }
+        }
     }
 
     pub fn start_time(&self) -> u64 {
@@ -378,6 +459,17 @@ impl ValidatorNetworkService {
         } else {
             self.vlc_counter.fetch_add(1, Ordering::SeqCst)
         }
+    }
+
+    /// Restore the service-level `vlc_counter` after consensus recovery.
+    ///
+    /// Bug F1: the Move/PTB/Publish/Upgrade handlers consume `self.vlc_counter`
+    /// directly via `fetch_add`, bypassing `get_vlc_time()`. After
+    /// `ConsensusValidator::recover_from_storage()` restores the engine's
+    /// `logical_time_counter`, callers must mirror that value into this
+    /// counter so post-restart Move events do not reuse low logical times.
+    pub fn restore_vlc_counter(&self, logical_time: u64) {
+        self.vlc_counter.store(logical_time, Ordering::SeqCst);
     }
 
     /// Get count of pending TEE tasks
@@ -469,6 +561,7 @@ impl ValidatorNetworkService {
             // Event endpoints
             .route("/api/v1/event", post(setu_api::http_submit_event::<ValidatorNetworkService>))
             .route("/api/v1/events", get(setu_api::http_get_events::<ValidatorNetworkService>))
+            .route("/api/v1/event/:id", get(setu_api::http_get_event_by_id::<ValidatorNetworkService>))
             // Heartbeat
             .route("/api/v1/heartbeat", post(setu_api::http_heartbeat::<ValidatorNetworkService>))
             // User RPC endpoints
@@ -492,6 +585,17 @@ impl ValidatorNetworkService {
             .route("/api/v1/governance/status/:proposal_id", get(governance_status_handler))
             .route("/api/v1/governance/register-system-subnet", post(governance_register_system_subnet_handler))
             .route("/api/v1/governance/resource-params", get(governance_resource_params_handler))
+            // Phase 4: Move VM endpoints
+            .route("/api/v1/move/call", post(setu_api::http_submit_move_call::<ValidatorNetworkService>))
+            .route("/api/v1/move/publish", post(setu_api::http_submit_move_publish::<ValidatorNetworkService>))
+            // B5: Move package upgrade (legacy single-event entry).
+            .route("/api/v1/move/upgrade", post(setu_api::http_submit_move_upgrade::<ValidatorNetworkService>))
+            // Phase 9 / B6a: Programmable Transaction Block (wire-only stub).
+            .route("/api/v1/move/ptb", post(setu_api::http_submit_move_ptb::<ValidatorNetworkService>))
+            // Phase 5b: Move object/module query endpoints
+            .route("/api/v1/move/objects/:object_id", get(setu_api::http_get_move_object::<ValidatorNetworkService>))
+            .route("/api/v1/move/modules/:address/:name", get(setu_api::http_get_module_abi::<ValidatorNetworkService>))
+            .route("/api/v1/move/modules/:address", get(setu_api::http_list_modules::<ValidatorNetworkService>))
             .with_state(service);
 
         let listener = tokio::net::TcpListener::bind(self.config.http_listen_addr).await?;
@@ -585,7 +689,63 @@ impl ValidatorNetworkService {
         EventHandler::get_events(&self.events)
     }
 
-    pub async fn add_event_to_dag(&self, event: Event) {
+    /// R5 · Build `GetEventResponse` for a single event, merging execution
+    /// report (from `events` map) and on-chain outcome (from shared sink map).
+    ///
+    /// Returns `None` if the validator has no record of this event.
+    pub fn get_event_by_id(&self, event_id: &str) -> Option<setu_api::GetEventResponse> {
+        let event = self.events.get(event_id)?.clone();
+        let outcome = self.execution_outcomes.get(event_id).map(|v| v.clone());
+
+        let execution = event.execution_result.as_ref().map(|r| {
+            setu_api::ExecutionReport {
+                success: r.success,
+                message: r.message.clone(),
+                state_changes_count: r.state_changes.len(),
+            }
+        });
+
+        let on_chain = outcome.map(|o| match o {
+            ExecutionOutcome::Applied { cf_id } => {
+                setu_api::OnChainOutcome::Applied { cf_id }
+            }
+            ExecutionOutcome::ExecutionFailed { cf_id, reason } => {
+                setu_api::OnChainOutcome::ExecutionFailed { cf_id, reason }
+            }
+            ExecutionOutcome::StaleRead {
+                cf_id,
+                conflicting_object,
+                retry_hint,
+            } => setu_api::OnChainOutcome::StaleRead {
+                cf_id,
+                conflicting_object,
+                retry_hint,
+            },
+        });
+
+        let metadata = setu_api::EventMetadata {
+            event_type: event.event_type.name().to_string(),
+            creator: event.creator.clone(),
+            timestamp: event.timestamp,
+            vlc_time: event.vlc_snapshot.logical_time,
+            parent_count: event.parent_ids.len(),
+        };
+
+        Some(setu_api::GetEventResponse {
+            event_id: event.id.clone(),
+            status: format!("{:?}", event.status),
+            execution,
+            on_chain,
+            metadata,
+        })
+    }
+
+    pub async fn add_event_to_dag(&self, event: Event) -> SubmitEventResponse {
+        #[cfg(test)]
+        if let Some(response) = self.forced_add_event_response.write().take() {
+            return response;
+        }
+
         EventHandler::add_event_to_dag(
             &self.events,
             &self.dag_events,
@@ -593,6 +753,11 @@ impl ValidatorNetworkService {
             event,
         )
         .await
+    }
+
+    #[cfg(test)]
+    pub fn force_next_add_event_to_dag_response(&self, response: SubmitEventResponse) {
+        *self.forced_add_event_response.write() = Some(response);
     }
 
     // ============================================
@@ -622,6 +787,374 @@ impl ValidatorNetworkService {
 
     pub fn get_object(&self, key: &str) -> GetObjectResponse {
         EventHandler::get_object(key)
+    }
+
+    // ============================================
+    // Move VM (Phase 4)
+    // ============================================
+
+    pub async fn submit_move_call(&self, request: setu_api::MoveCallRequest) -> setu_api::MoveCallResponse {
+        let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst);
+        let state_provider = Arc::clone(self.batch_task_preparer.merkle_state_provider());
+        let response = move_handler::MoveCallHandler::submit_move_call(
+            &self.validator_id,
+            &self.task_preparer,
+            &self.router_manager,
+            &self.tee_executor,
+            &state_provider,
+            vlc_time,
+            request,
+        ).await;
+        response
+    }
+
+    pub async fn submit_move_publish(&self, request: setu_api::MovePublishRequest) -> setu_api::MovePublishResponse {
+        let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst);
+        let executor = self.infra_executor();
+        let (response, event) = move_handler::MovePublishHandler::submit_move_publish(
+            &executor, vlc_time, request,
+        ).await;
+
+        // If successful, submit event to DAG (same as SubnetRegister flow)
+        if let Some(event) = event {
+            let submit_response = self.add_event_to_dag(event).await;
+            if !submit_response.success {
+                return setu_api::MovePublishResponse {
+                    event_id: String::new(),
+                    module_count: response.module_count,
+                    success: false,
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_CONSENSUS_STORAGE,
+                        submit_response.message,
+                    )),
+                    package_addr: None,
+                };
+            }
+        }
+
+        response
+    }
+
+    /// Submit a Programmable Transaction Block (PTB).
+    ///
+    /// Decodes + wire-validates the BCS-encoded PTB, then delegates to
+    /// `MovePtbHandler` for prepare → solver routing → TEE execution.
+    /// See `docs/feat/move-vm-phase9-ptb-event-wire/design.md`.
+    pub async fn submit_move_ptb(
+        &self,
+        request: setu_api::MovePtbRequest,
+    ) -> Result<setu_api::MovePtbResponse, setu_api::MovePtbResponse> {
+        // 1. Hex-decode the BCS-encoded PTB.
+        let hex_str = request.ptb.trim_start_matches("0x");
+        let bcs_bytes = match hex::decode(hex_str) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(setu_api::MovePtbResponse {
+                    event_id: String::new(),
+                    success: false,
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_PTB_WIRE,
+                        format!("Invalid hex in `ptb` field: {}", e),
+                    )),
+                    code: Some(setu_api::ERROR_PTB_WIRE.to_string()),
+                    cap_ids: vec![],
+                    gas_used: None,
+                });
+            }
+        };
+
+        // 2. BCS-deserialize.
+        let ptb: setu_types::ptb::ProgrammableTransaction = match bcs::from_bytes(&bcs_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(setu_api::MovePtbResponse {
+                    event_id: String::new(),
+                    success: false,
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_PTB_WIRE,
+                        format!("BCS deserialize failed: {}", e),
+                    )),
+                    code: Some(setu_api::ERROR_PTB_WIRE.to_string()),
+                    cap_ids: vec![],
+                    gas_used: None,
+                });
+            }
+        };
+
+        // 3. Wire-level validation (DoS bounds, forward-ref, type-tag, etc.).
+        if let Err(e) = ptb.validate_wire() {
+            return Err(setu_api::MovePtbResponse {
+                event_id: String::new(),
+                success: false,
+                error: Some(setu_api::stable_error(
+                    setu_api::ERROR_PTB_WIRE,
+                    format!("PTB validation failed: {}", e),
+                )),
+                code: Some(setu_api::ERROR_PTB_WIRE.to_string()),
+                cap_ids: vec![],
+                gas_used: None,
+            });
+        }
+
+        // 4. Delegate to MovePtbHandler (FDP move-vm-phase9-ptb-event-wire).
+        let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst);
+        let state_provider = Arc::clone(self.batch_task_preparer.merkle_state_provider());
+        let response = move_handler::MovePtbHandler::submit_move_ptb(
+            &self.validator_id,
+            &self.task_preparer,
+            &self.router_manager,
+            &self.tee_executor,
+            &state_provider,
+            vlc_time,
+            request.sender.clone(),
+            ptb,
+            request.subnet_id.clone(),
+            request.gas_budget,
+        )
+        .await;
+
+        if response.success {
+            Ok(response)
+        } else {
+            Err(response)
+        }
+    }
+
+    /// Query a Move object by its hex object ID.
+    ///
+    /// When `finalized` is true, read the committed SMT only (bypass the
+    /// speculative overlay). This is required for cross-validator state
+    /// comparisons because the overlay is only populated on the node that
+    /// staged the write. See docs/bugs/20260424-state-get-overlay-leak-cross-node.md.
+    pub fn get_move_object(&self, object_id_hex: &str, finalized: bool) -> setu_api::GetMoveObjectResponse {
+        let stripped = object_id_hex.strip_prefix("0x").unwrap_or(object_id_hex);
+        let key = format!("oid:{}", stripped);
+
+        // Parse hex → ObjectId, then use get_object() which looks up by raw bytes.
+        // NOTE: get_raw() would BLAKE3-hash the key string, but "oid:" objects are
+        // stored under raw ObjectId bytes in the SMT (see parse_state_change_key).
+        let object_id = match setu_types::object::ObjectId::from_hex(stripped) {
+            Ok(id) => id,
+            Err(_) => {
+                return setu_api::GetMoveObjectResponse {
+                    key, object_id: stripped.to_string(),
+                    owner: String::new(), ownership: String::new(),
+                    type_tag: String::new(), version: 0,
+                    data_hex: String::new(), exists: false,
+                    digest_hex: String::new(),
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_PREPARE_INPUT,
+                        format!("Invalid object ID hex: {}", stripped),
+                    )),
+                };
+            }
+        };
+        let provider = self.task_preparer.state_provider();
+        let data = match if finalized {
+            provider.get_object_finalized(&object_id)
+        } else {
+            provider.get_object(&object_id)
+        } {
+            Some(d) => d,
+            None => {
+                return setu_api::GetMoveObjectResponse {
+                    key, object_id: stripped.to_string(),
+                    owner: String::new(), ownership: String::new(),
+                    type_tag: String::new(), version: 0,
+                    data_hex: String::new(), exists: false,
+                    digest_hex: String::new(),
+                    error: None,
+                };
+            }
+        };
+
+        match setu_types::envelope::detect_and_parse(&data) {
+            setu_types::envelope::StorageFormat::Envelope(env) => {
+                let envelope_bytes = env.to_bytes();
+                let digest_hex = hex::encode(blake3::hash(&envelope_bytes).as_bytes());
+                setu_api::GetMoveObjectResponse {
+                    key,
+                    object_id: hex::encode(env.metadata.id.as_bytes()),
+                    owner: env.metadata.owner.to_string(),
+                    ownership: format!("{:?}", env.metadata.ownership),
+                    type_tag: env.type_tag.clone(),
+                    version: env.metadata.version,
+                    data_hex: hex::encode(&env.data),
+                    exists: true,
+                    digest_hex,
+                    error: None,
+                }
+            }
+            setu_types::envelope::StorageFormat::LegacyCoinState(cs) => {
+                setu_api::GetMoveObjectResponse {
+                    key, object_id: stripped.to_string(),
+                    owner: cs.owner.clone(),
+                    ownership: "AddressOwner".to_string(),
+                    type_tag: format!("LegacyCoinState({})", cs.coin_type),
+                    version: cs.version,
+                    data_hex: hex::encode(&data),
+                    exists: true,
+                    digest_hex: String::new(),
+                    error: None,
+                }
+            }
+            setu_types::envelope::StorageFormat::Unknown => {
+                setu_api::GetMoveObjectResponse {
+                    key, object_id: stripped.to_string(),
+                    owner: String::new(), ownership: String::new(),
+                    type_tag: String::new(), version: 0,
+                    data_hex: hex::encode(&data),
+                    exists: true,
+                    digest_hex: String::new(),
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_CONSENSUS_STORAGE,
+                        "Unknown storage format",
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Query module ABI (function list) by address and name
+    pub fn get_module_abi(&self, address: &str, name: &str) -> setu_api::GetModuleAbiResponse {
+        let not_found = setu_api::GetModuleAbiResponse {
+            address: address.to_string(),
+            name: name.to_string(),
+            functions: vec![],
+            exists: false,
+            error: None,
+        };
+
+        // v1 contract: distinguish "invalid address" (PREPARE_INPUT) from
+        // "address valid but module absent" (plain not-found). Without this
+        // probe `canonical_addr_hex` silently returns the input unchanged on
+        // parse failure, collapsing both cases into `error: None` not-found
+        // and breaking cross-validator marker assertions.
+        use move_core_types::account_address::AccountAddress;
+        if AccountAddress::from_hex_literal(address).is_err() {
+            return setu_api::GetModuleAbiResponse {
+                address: address.to_string(),
+                name: name.to_string(),
+                functions: vec![],
+                exists: false,
+                error: Some(setu_api::stable_error(
+                    setu_api::ERROR_PREPARE_INPUT,
+                    format!("invalid module address: {}", address),
+                )),
+            };
+        }
+
+        // Normalize the URL-supplied address so both padded 64-hex and
+        // zero-stripped forms reach the same SMT key. Writers use
+        // `AccountAddress::to_hex_literal()` (zero-stripped).
+        let canonical = move_handler::canonical_addr_hex(address);
+        let stripped = canonical.strip_prefix("0x").unwrap_or(&canonical);
+        let module_key = format!("mod:{}::{}", canonical, name);
+        let bytecode = self.task_preparer.state_provider().get_raw(&module_key)
+            .or_else(|| {
+                if stripped == "1" {
+                    setu_move_vm::engine::STDLIB_MODULES.iter()
+                        .find(|(n, _)| *n == name)
+                        .map(|(_, bytes)| bytes.to_vec())
+                } else {
+                    None
+                }
+            });
+
+        let bytecode = match bytecode {
+            Some(b) => b,
+            None => return not_found,
+        };
+
+        // Deserialize the module to extract function signatures
+        use move_binary_format::CompiledModule;
+        let module = match CompiledModule::deserialize_with_defaults(&bytecode) {
+            Ok(m) => m,
+            Err(e) => {
+                return setu_api::GetModuleAbiResponse {
+                    address: address.to_string(),
+                    name: name.to_string(),
+                    functions: vec![],
+                    exists: true,
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_CONSENSUS_STORAGE,
+                        format!("Failed to deserialize module: {}", e),
+                    )),
+                };
+            }
+        };
+
+        let functions: Vec<setu_api::FunctionAbi> = module.function_defs.iter()
+            .filter_map(|func_def| {
+                let func_handle = &module.function_handles[func_def.function.0 as usize];
+                let func_name = module.identifier_at(func_handle.name).to_string();
+                let sig = &module.signatures[func_handle.parameters.0 as usize];
+                let params: Vec<String> = sig.0.iter()
+                    .map(|tok| format!("{:?}", tok))
+                    .collect();
+                let is_entry = func_def.is_entry;
+                let type_param_count = func_handle.type_parameters.len();
+                Some(setu_api::FunctionAbi {
+                    name: func_name,
+                    type_param_count,
+                    parameters: params,
+                    is_entry,
+                })
+            })
+            .collect();
+
+        setu_api::GetModuleAbiResponse {
+            address: address.to_string(),
+            name: name.to_string(),
+            functions,
+            exists: true,
+            error: None,
+        }
+    }
+
+    /// List all modules published at an address
+    pub fn list_modules(&self, address: &str) -> setu_api::ListModulesResponse {
+        // v1 contract: invalid address must surface as PREPARE_INPUT, not be
+        // bucketed with the "enumeration not implemented" case below.
+        use move_core_types::account_address::AccountAddress;
+        if AccountAddress::from_hex_literal(address).is_err() {
+            return setu_api::ListModulesResponse {
+                address: address.to_string(),
+                modules: vec![],
+                error: Some(setu_api::stable_error(
+                    setu_api::ERROR_PREPARE_INPUT,
+                    format!("invalid module address: {}", address),
+                )),
+            };
+        }
+
+        // Normalize first (see `get_module_abi` rationale).
+        let canonical = move_handler::canonical_addr_hex(address);
+        let stripped = canonical.strip_prefix("0x").unwrap_or(&canonical);
+
+        // For stdlib (0x1), return embedded module names
+        if stripped == "1" {
+            let modules: Vec<String> = setu_move_vm::engine::STDLIB_MODULES.iter()
+                .map(|(name, _)| name.to_string())
+                .collect();
+            return setu_api::ListModulesResponse {
+                address: address.to_string(),
+                modules,
+                error: None,
+            };
+        }
+
+        // For user-published modules, scan storage with "mod:{addr}::" prefix
+        // This is a limitation: we can't efficiently enumerate all modules at an address
+        // from an SMT (which uses hashed keys). Return empty with a note.
+        setu_api::ListModulesResponse {
+            address: address.to_string(),
+            modules: vec![],
+            error: Some(setu_api::stable_error(
+                setu_api::ERROR_PREPARE_INPUT,
+                "Module enumeration for user addresses requires index (not yet implemented)",
+            )),
+        }
     }
 
     // ============================================
@@ -709,6 +1242,7 @@ impl ValidatorNetworkService {
             port: request.port,
             capacity: request.capacity,
             shard_id: request.shard_id.clone(),
+            assigned_shard: request.assigned_shard,
             resources: request.resources.clone(),
             status: "active".to_string(),
             registered_at: current_timestamp_secs(),
@@ -722,13 +1256,22 @@ impl ValidatorNetworkService {
 
         // RouterManager still needs Transfer channel for routing decisions
         let (router_tx, _router_rx) = mpsc::unbounded_channel::<Transfer>();
+        
+        // Parse permitted_subnets from hex strings
+        let permitted_subnets: Vec<setu_types::SubnetId> = request.permitted_subnets
+            .iter()
+            .filter_map(|hex_str| setu_types::SubnetId::from_hex(hex_str).ok())
+            .collect();
+        
         self.router_manager.register_solver_with_affinity(
             request.solver_id.clone(),
             format!("{}:{}", request.address, request.port),
             request.capacity,
             router_tx,
             request.shard_id.clone(),
+            request.assigned_shard,
             request.resources.clone(),
+            permitted_subnets,
         );
 
         // Consume channel to avoid memory leak (sync HTTP doesn't use it)
@@ -754,6 +1297,72 @@ impl ValidatorNetworkService {
         self.solver_channels.write().remove(node_id);
         self.solver_info.remove(node_id);
         info!(solver_id = %node_id, "Solver unregistered");
+    }
+
+    fn system_subnet_config_from_registration(reg: &SystemSubnetRegistration) -> SystemSubnetConfig {
+        SystemSubnetConfig {
+            agent_endpoint: reg.agent_endpoint.clone(),
+            callback_addr: reg.callback_addr.clone(),
+            timeout: Duration::from_secs(reg.timeout_secs.unwrap_or(300)),
+            source: ConfigSource::OnChain,
+        }
+    }
+
+    fn finalized_registration_matches_payload(&self, reg: &SystemSubnetRegistration) -> bool {
+        let Some(bytes) = self.get_subnet_object_finalized(
+            &setu_types::SubnetId::GOVERNANCE,
+            reg.subnet_id.as_bytes(),
+        ) else {
+            tracing::warn!(
+                subnet_id = %reg.subnet_id,
+                "Skipping replayed system subnet registry update: finalized SMT object missing"
+            );
+            return false;
+        };
+
+        let stored = match serde_json::from_slice::<SystemSubnetRegistration>(&bytes) {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::warn!(
+                    subnet_id = %reg.subnet_id,
+                    error = %e,
+                    "Skipping replayed system subnet registry update: finalized SMT object is not a registration"
+                );
+                return false;
+            }
+        };
+
+        let matches = stored.agent_endpoint == reg.agent_endpoint
+            && stored.callback_addr == reg.callback_addr
+            && stored.timeout_secs == reg.timeout_secs;
+        if !matches {
+            tracing::warn!(
+                subnet_id = %reg.subnet_id,
+                "Skipping replayed system subnet registry update: payload differs from finalized SMT"
+            );
+        }
+        matches
+    }
+
+    fn live_governance_event_applied(&self, event: &Event) -> bool {
+        match self.execution_outcomes.get(&event.id).map(|entry| entry.clone()) {
+            Some(ExecutionOutcome::Applied { .. }) => true,
+            Some(outcome) => {
+                tracing::warn!(
+                    event_id = %event.id,
+                    outcome = outcome.kind(),
+                    "Skipping live governance side effect for non-applied event"
+                );
+                false
+            }
+            None => {
+                tracing::warn!(
+                    event_id = %event.id,
+                    "Skipping live governance side effect: execution outcome missing"
+                );
+                false
+            }
+        }
     }
 
     // ============================================
@@ -807,13 +1416,13 @@ impl ValidatorNetworkService {
             EventPayload::Governance(payload) => {
                 // During replay, governance events are tracked for Propose→Execute matching.
                 // Unmatched Propose events become pending governance for re-dispatch.
-                // RegisterSystemSubnet events directly update the SystemSubnetRegistry.
                 use setu_types::governance::GovernanceAction;
                 match &payload.action {
                     GovernanceAction::Propose(content) => {
                         ReplayAction::Applied(ReplayKind::GovernancePropose(
                             payload.proposal_id,
                             content.clone(),
+                            event.timestamp,
                         ))
                     }
                     GovernanceAction::Execute(_) => {
@@ -822,26 +1431,112 @@ impl ValidatorNetworkService {
                         ))
                     }
                     GovernanceAction::RegisterSystemSubnet(reg) => {
-                        // Direct modification pattern (R3-ISSUE-2): write to DashMap directly
-                        if let Some(gov_svc) = &self.governance_service {
-                            use crate::governance::service::{SystemSubnetConfig, ConfigSource};
-                            gov_svc.register_system_endpoint(
-                                reg.subnet_id,
-                                SystemSubnetConfig {
-                                    agent_endpoint: reg.agent_endpoint.clone(),
-                                    callback_addr: reg.callback_addr.clone(),
-                                    timeout: std::time::Duration::from_secs(
-                                        reg.timeout_secs.unwrap_or(300),
-                                    ),
-                                    source: ConfigSource::OnChain,
-                                },
-                            );
+                        if self.finalized_registration_matches_payload(reg) {
+                            if let Some(gov_svc) = &self.governance_service {
+                                gov_svc.register_system_endpoint(
+                                    reg.subnet_id,
+                                    Self::system_subnet_config_from_registration(reg),
+                                );
+                                ReplayAction::Applied(ReplayKind::SystemSubnetRegister)
+                            } else {
+                                ReplayAction::Skipped
+                            }
+                        } else {
+                            ReplayAction::Skipped
                         }
-                        ReplayAction::Applied(ReplayKind::SystemSubnetRegister)
                     }
                 }
             }
             _ => ReplayAction::Skipped,
+        }
+    }
+
+    pub fn cache_finalized_event_for_query(&self, event: Event) {
+        self.cache_finalized_event_for_query_with_outcome(event, None);
+    }
+
+    pub fn cache_finalized_event_for_query_with_outcome(
+        &self,
+        mut event: Event,
+        outcome: Option<ExecutionOutcome>,
+    ) {
+        let event_id = event.id.clone();
+        if let Some(outcome) = outcome {
+            self.execution_outcomes.insert(event_id.clone(), outcome);
+        }
+
+        event.set_status(EventStatus::Finalized);
+        self.events.insert(event_id.clone(), event.clone());
+
+        let mut dag_events = self.dag_events.write();
+        if !dag_events.iter().any(|id| id == &event_id) {
+            dag_events.push(event_id.clone());
+        }
+    }
+
+    pub fn apply_live_finalized_side_effects(&self, event: &Event) {
+        match &event.payload {
+            EventPayload::ValidatorRegister(reg) => {
+                self.validators.write().insert(
+                    reg.validator_id.clone(),
+                    ValidatorInfo::from_registration(reg, "online", event.timestamp),
+                );
+            }
+            EventPayload::ValidatorUnregister(unreg) => {
+                self.validators.write().remove(&unreg.node_id);
+            }
+            EventPayload::SolverRegister(reg) => {
+                self.solver_info.insert(
+                    reg.solver_id.clone(),
+                    SolverInfo::from_registration(reg, "active", event.timestamp),
+                );
+            }
+            EventPayload::SolverUnregister(unreg) => {
+                self.solver_info.remove(&unreg.node_id);
+            }
+            EventPayload::SubnetRegister(reg) => {
+                self.registered_subnets.insert(
+                    reg.subnet_id.clone(),
+                    SubnetInfo::from_registration(reg, event.timestamp),
+                );
+            }
+            EventPayload::Governance(payload) => {
+                if !self.live_governance_event_applied(event) {
+                    return;
+                }
+                let Some(gov_svc) = &self.governance_service else {
+                    return;
+                };
+                use setu_types::governance::GovernanceAction;
+                match &payload.action {
+                    GovernanceAction::Propose(_) => {
+                        gov_svc.track_proposal(payload.proposal_id, event.timestamp);
+                    }
+                    GovernanceAction::Execute(_) => {
+                        gov_svc.untrack_proposal(&payload.proposal_id);
+                    }
+                    GovernanceAction::RegisterSystemSubnet(reg) => {
+                        gov_svc.register_system_endpoint(
+                            reg.subnet_id,
+                            Self::system_subnet_config_from_registration(reg),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn startup_projection_outcome(event: &Event, cf_id: &str) -> Option<ExecutionOutcome> {
+        match event.execution_result.as_ref() {
+            Some(result) if result.success => Some(ExecutionOutcome::Applied {
+                cf_id: cf_id.to_string(),
+            }),
+            Some(result) => Some(ExecutionOutcome::ExecutionFailed {
+                cf_id: cf_id.to_string(),
+                reason: result.message.clone(),
+            }),
+            None => None,
         }
     }
 
@@ -885,7 +1580,11 @@ impl ValidatorNetworkService {
                     signature: reg.signature.clone(),
                     capacity: reg.capacity,
                     shard_id: reg.shard_id.clone(),
+                    assigned_shard: reg.assigned_shard,
                     resources: reg.resources.clone(),
+                    permitted_subnets: reg.permitted_subnets.iter()
+                        .map(|s| hex::encode(s.as_bytes()))
+                        .collect(),
                 };
                 self.register_solver_internal(&request);
             }
@@ -962,12 +1661,141 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
         self.get_events()
     }
 
+    fn get_event_by_id(&self, event_id: &str) -> Option<setu_api::GetEventResponse> {
+        self.get_event_by_id(event_id)
+    }
+
     fn get_balance(&self, account: &str) -> setu_api::GetBalanceResponse {
         self.get_balance(account)
     }
 
     fn get_object(&self, key: &str) -> setu_api::GetObjectResponse {
         self.get_object(key)
+    }
+
+    async fn submit_move_call(&self, request: setu_api::MoveCallRequest) -> setu_api::MoveCallResponse {
+        self.submit_move_call(request).await
+    }
+
+    async fn submit_move_publish(&self, request: setu_api::MovePublishRequest) -> setu_api::MovePublishResponse {
+        self.submit_move_publish(request).await
+    }
+
+    async fn submit_move_upgrade(&self, request: setu_api::MoveUpgradeRequest) -> setu_api::MoveUpgradeResponse {
+        let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst);
+        let executor = self.infra_executor();
+        let (response, event) = move_handler::MoveUpgradeHandler::submit_move_upgrade(
+            &executor, vlc_time, request,
+        ).await;
+        if let Some(event) = event {
+            let submit_response = self.add_event_to_dag(event).await;
+            if !submit_response.success {
+                return setu_api::MoveUpgradeResponse {
+                    event_id: String::new(),
+                    module_count: response.module_count,
+                    new_package_addr: None,
+                    new_version: None,
+                    success: false,
+                    error: Some(setu_api::stable_error(
+                        setu_api::ERROR_CONSENSUS_STORAGE,
+                        submit_response.message,
+                    )),
+                };
+            }
+        }
+        response
+    }
+
+    async fn wait_move_object_min_version(
+        &self,
+        object_id_hex: &str,
+        finalized: bool,
+        min_version: u64,
+        timeout_ms: u64,
+    ) -> setu_api::WaitMoveObjectOutcome {
+        // B1 long-poll loop. Uses the canonical pre-arm pattern documented
+        // on `setu_storage::WatcherRegistry`.
+        let watcher: Arc<setu_storage::WatcherRegistry> = match self
+            .version_watcher
+            .read()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            Some(w) => w,
+            None => return setu_api::WaitMoveObjectOutcome::Unavailable,
+        };
+
+        // Parse oid hex → 32-byte key (same shape as `parse_state_change_key`
+        // for the `oid:` prefix used everywhere else).
+        let stripped = object_id_hex.strip_prefix("0x").unwrap_or(object_id_hex);
+        let oid_key: [u8; 32] = match hex::decode(stripped)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        {
+            Some(k) => k,
+            None => {
+                // Invalid id — return as a normal Resolved with the existing
+                // error path (matches the legacy non-blocking shape).
+                let mut resp = self.get_move_object(object_id_hex, finalized);
+                resp.error.get_or_insert_with(|| {
+                    "wait_min_version: invalid object id hex".to_string()
+                });
+                return setu_api::WaitMoveObjectOutcome::Resolved(resp);
+            }
+        };
+
+        // Register with caps; RAII `WaitGuard::Drop` decrements counters on
+        // success, timeout, AND client-disconnect (axum cancels the future).
+        let guard = match watcher.register(oid_key) {
+            Ok(g) => g,
+            Err(e) => {
+                return setu_api::WaitMoveObjectOutcome::CapExceeded {
+                    reason: e.to_string(),
+                };
+            }
+        };
+
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(timeout_ms);
+
+        loop {
+            // Pre-arm BEFORE re-reading state — eliminates lost-wakeup race.
+            let notified = guard.notified();
+
+            let resp = self.get_move_object(object_id_hex, finalized);
+            if resp.exists && resp.version >= min_version {
+                return setu_api::WaitMoveObjectOutcome::Resolved(resp);
+            }
+
+            tokio::select! {
+                _ = notified => {
+                    // Spurious or successful wake — re-loop to recheck version.
+                    continue;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return setu_api::WaitMoveObjectOutcome::Timeout(resp);
+                }
+            }
+        }
+    }
+
+    async fn submit_move_ptb(
+        &self,
+        request: setu_api::MovePtbRequest,
+    ) -> Result<setu_api::MovePtbResponse, setu_api::MovePtbResponse> {
+        self.submit_move_ptb(request).await
+    }
+
+    fn get_move_object(&self, object_id: &str, finalized: bool) -> setu_api::GetMoveObjectResponse {
+        self.get_move_object(object_id, finalized)
+    }
+
+    fn get_module_abi(&self, address: &str, name: &str) -> setu_api::GetModuleAbiResponse {
+        self.get_module_abi(address, name)
+    }
+
+    fn list_modules(&self, address: &str) -> setu_api::ListModulesResponse {
+        self.list_modules(address)
     }
 }
 
@@ -988,6 +1816,7 @@ async fn governance_propose_handler(
                 Json(ProposeResponse {
                     success: false,
                     proposal_id: None,
+                    event_id: None,
                     message: "Governance not enabled".into(),
                 }),
             );
@@ -1004,24 +1833,47 @@ async fn governance_propose_handler(
 
     match GovernanceHandler::prepare_propose(&governance_svc, req.content.clone(), timestamp, vlc_snapshot, service.validator_id()) {
         Ok(prepared) => {
-            // Submit event to DAG
-            service.add_event_to_dag(prepared.event).await;
-            // Async dispatch to Agent (fire-and-forget)
+            let event = prepared.event.clone();
+            let submit_response = service.add_event_to_dag(event.clone()).await;
+            if !submit_response.success {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ProposeResponse {
+                        success: false,
+                        proposal_id: None,
+                        event_id: submit_response.event_id,
+                        message: submit_response.message,
+                    }),
+                );
+            }
+
+            let event_id = event.id.to_string();
+            governance_svc.insert_pending(prepared.pending.clone());
+            service.apply_event_state_changes_eager(
+                &setu_types::SubnetId::GOVERNANCE, &event,
+            );
             let svc = governance_svc.clone();
-            let content = req.content;
+            let content = prepared.pending.content.clone();
             let pid = prepared.proposal_id;
             let token = prepared.callback_token;
             let sys_ctx = serde_json::json!({
                 "validator_id": service.validator_id(),
             });
             tokio::spawn(async move {
-                let _ = svc.dispatch_to_agent(&setu_types::SubnetId::GOVERNANCE, pid, &content, token, sys_ctx).await;
+                if let Err(e) = svc.dispatch_to_agent(&setu_types::SubnetId::GOVERNANCE, pid, &content, token, sys_ctx).await {
+                    tracing::warn!(
+                        proposal_id = %hex::encode(pid),
+                        error = %e,
+                        "Failed to dispatch proposal to Agent subnet"
+                    );
+                }
             });
             (
                 StatusCode::OK,
                 Json(ProposeResponse {
                     success: true,
                     proposal_id: Some(hex::encode(prepared.proposal_id)),
+                    event_id: Some(event_id),
                     message: "Proposal submitted".into(),
                 }),
             )
@@ -1031,6 +1883,7 @@ async fn governance_propose_handler(
             Json(ProposeResponse {
                 success: false,
                 proposal_id: None,
+                event_id: None,
                 message: e.to_string(),
             }),
         ),
@@ -1049,6 +1902,7 @@ async fn governance_callback_handler(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(CallbackResponse {
                     success: false,
+                    event_id: None,
                     message: "Governance not enabled".into(),
                 }),
             );
@@ -1067,6 +1921,7 @@ async fn governance_callback_handler(
                 StatusCode::BAD_REQUEST,
                 Json(CallbackResponse {
                     success: false,
+                    event_id: None,
                     message: "Invalid proposal_id hex".into(),
                 }),
             );
@@ -1085,13 +1940,14 @@ async fn governance_callback_handler(
                 StatusCode::BAD_REQUEST,
                 Json(CallbackResponse {
                     success: false,
+                    event_id: None,
                     message: "Invalid callback_token hex".into(),
                 }),
             );
         }
     };
 
-    // Read current proposal from GOVERNANCE SMT
+    // Read current proposal from GOVERNANCE SMT, or construct from pending
     let proposal = match service
         .get_subnet_object(&setu_types::SubnetId::GOVERNANCE, &proposal_id_bytes)
     {
@@ -1102,19 +1958,34 @@ async fn governance_callback_handler(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(CallbackResponse {
                         success: false,
+                        event_id: None,
                         message: format!("Failed to deserialize proposal: {}", e),
                     }),
                 );
             }
         },
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(CallbackResponse {
-                    success: false,
-                    message: "Proposal not found in SMT".into(),
-                }),
-            );
+            // Fallback: construct from pending proposal (SMT may not have it yet)
+            match governance_svc.get_pending(&proposal_id_bytes) {
+                Some(pending) => setu_types::governance::GovernanceProposal {
+                    proposal_id: proposal_id_bytes,
+                    content: pending.content,
+                    status: setu_types::governance::ProposalStatus::Pending,
+                    decision: None,
+                    created_at: pending.created_at,
+                    decided_at: None,
+                },
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(CallbackResponse {
+                            success: false,
+                            event_id: None,
+                            message: "Proposal not found".into(),
+                        }),
+                    );
+                }
+            }
         }
     };
 
@@ -1138,7 +2009,7 @@ async fn governance_callback_handler(
         &governance_svc,
         proposal_id_bytes,
         callback_token,
-        req.decision,
+        req.decision.clone(),
         timestamp,
         vlc_snapshot,
         &proposal,
@@ -1146,11 +2017,29 @@ async fn governance_callback_handler(
         resource_params.as_ref(),
     ) {
         Ok(event) => {
-            service.add_event_to_dag(event).await;
+            let event_id = event.id.to_string();
+            let submit_response = service.add_event_to_dag(event.clone()).await;
+            if !submit_response.success {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(CallbackResponse {
+                        success: false,
+                        event_id: submit_response.event_id,
+                        message: submit_response.message,
+                    }),
+                );
+            }
+
+            governance_svc.remove_pending(&proposal_id_bytes);
+            governance_svc.record_decided(proposal_id_bytes, req.decision);
+            service.apply_event_state_changes_eager(
+                &setu_types::SubnetId::GOVERNANCE, &event,
+            );
             (
                 StatusCode::OK,
                 Json(CallbackResponse {
                     success: true,
+                    event_id: Some(event_id),
                     message: "Decision executed".into(),
                 }),
             )
@@ -1159,6 +2048,7 @@ async fn governance_callback_handler(
             StatusCode::FORBIDDEN,
             Json(CallbackResponse {
                 success: false,
+                event_id: None,
                 message: msg,
             }),
         ),
@@ -1166,6 +2056,7 @@ async fn governance_callback_handler(
             StatusCode::BAD_REQUEST,
             Json(CallbackResponse {
                 success: false,
+                event_id: None,
                 message: e.to_string(),
             }),
         ),
@@ -1212,6 +2103,17 @@ async fn governance_status_handler(
             pending: true,
             proposal_id: proposal_id_hex,
             message: "Awaiting Agent decision".into(),
+        });
+    }
+
+    // Check decided proposals cache (before SMT, since finalization may lag)
+    if let Some(decision) = governance_svc.get_decided(&proposal_id_bytes) {
+        let status = if decision.approved { "Approved" } else { "Rejected" };
+        return Json(StatusResponse {
+            found: true,
+            pending: false,
+            proposal_id: proposal_id_hex,
+            message: format!("{}: {}", status, decision.reasoning),
         });
     }
 
@@ -1262,17 +2164,40 @@ async fn governance_register_system_subnet_handler(
 
     let gov_svc = service.governance_service().unwrap();
     let genesis_validators = gov_svc.genesis_validators();
+    let existing_registration_bytes = setu_types::SubnetId::from_hex(&req.subnet_id)
+        .ok()
+        .and_then(|subnet_id| {
+            service.get_subnet_object_finalized(
+                &setu_types::SubnetId::GOVERNANCE,
+                subnet_id.as_bytes(),
+            )
+        });
     let prepare_result = GovernanceHandler::prepare_register_system_subnet(
         req,
         timestamp,
         vlc_snapshot,
         service.validator_id(),
+        existing_registration_bytes,
         genesis_validators,
     );
     match prepare_result {
         Ok(event) => {
             let event_id = event.id.to_string();
-            service.add_event_to_dag(event).await;
+            let submit_response = service.add_event_to_dag(event.clone()).await;
+            if !submit_response.success {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(RegisterSystemSubnetResponse {
+                        success: false,
+                        event_id: submit_response.event_id,
+                        message: submit_response.message,
+                    }),
+                );
+            }
+
+            service.apply_event_state_changes_eager(
+                &setu_types::SubnetId::GOVERNANCE, &event,
+            );
             (
                 StatusCode::OK,
                 Json(RegisterSystemSubnetResponse {
@@ -1320,7 +2245,8 @@ async fn governance_resource_params_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_rpc::RegistrationHandler;
+    use crate::governance::service::GovernanceServiceConfig;
+    use setu_rpc::{RegistrationHandler, UserRpcHandler};
 
     fn create_test_service() -> Arc<ValidatorNetworkService> {
         let router_manager = Arc::new(RouterManager::new());
@@ -1337,13 +2263,57 @@ mod tests {
         ))
     }
 
-    #[tokio::test]
-    async fn test_register_solver() {
-        let service = create_test_service();
-        let handler = service.registration_handler();
+    fn create_test_service_with_governance() -> Arc<ValidatorNetworkService> {
+        let router_manager = Arc::new(RouterManager::new());
+        let task_preparer = Arc::new(TaskPreparer::new_for_testing("test-validator".to_string()));
+        let batch_task_preparer = Arc::new(BatchTaskPreparer::new_for_testing("test-validator".to_string()));
+        let config = NetworkServiceConfig::default();
+        let mut service = ValidatorNetworkService::new(
+            "test-validator".to_string(),
+            router_manager,
+            task_preparer,
+            batch_task_preparer,
+            config,
+        );
+        service.set_governance_service(Arc::new(GovernanceService::new(
+            GovernanceServiceConfig::default(),
+        )));
+        Arc::new(service)
+    }
 
-        let request = setu_rpc::RegisterSolverRequest {
-            solver_id: "solver-1".to_string(),
+    fn test_vlc_snapshot() -> setu_vlc::VLCSnapshot {
+        setu_vlc::VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1,
+        }
+    }
+
+    fn forced_submit_failure() -> SubmitEventResponse {
+        SubmitEventResponse {
+            success: false,
+            message: "forced submit failure".to_string(),
+            event_id: Some("forced-event-id".to_string()),
+            vlc_time: None,
+        }
+    }
+
+    fn signed_fields() -> (String, Vec<u8>, String) {
+        let keypair = setu_keys::SetuKeyPair::generate(setu_keys::SignatureScheme::ED25519);
+        let message = "setu test write".to_string();
+        let signature = keypair.sign(message.as_bytes());
+        let mut signature_bytes = vec![signature.scheme().flag()];
+        signature_bytes.extend(signature.as_bytes());
+        (keypair.address().to_hex(), signature_bytes, keypair.public().encode_base64())
+    }
+
+    fn now_millis() -> u64 {
+        current_timestamp_millis()
+    }
+
+    fn sample_solver_request(solver_id: &str) -> setu_rpc::RegisterSolverRequest {
+        setu_rpc::RegisterSolverRequest {
+            solver_id: solver_id.to_string(),
             address: "127.0.0.1".to_string(),
             port: 9001,
             account_address: "0xtest".to_string(),
@@ -1351,8 +2321,165 @@ mod tests {
             signature: vec![],
             capacity: 100,
             shard_id: Some("shard-0".to_string()),
+            assigned_shard: None,
             resources: vec!["ETH".to_string()],
-        };
+            permitted_subnets: vec![],
+        }
+    }
+
+    fn sample_validator_request(validator_id: &str) -> setu_rpc::RegisterValidatorRequest {
+        setu_rpc::RegisterValidatorRequest {
+            validator_id: validator_id.to_string(),
+            address: "127.0.0.1".to_string(),
+            port: 9002,
+            account_address: "0xtest".to_string(),
+            public_key: vec![],
+            signature: vec![],
+            stake_amount: 1000,
+            commission_rate: 10,
+        }
+    }
+
+    fn sample_subnet_request(subnet_id: &str) -> setu_rpc::RegisterSubnetRequest {
+        setu_rpc::RegisterSubnetRequest {
+            subnet_id: subnet_id.to_string(),
+            name: "Test Subnet".to_string(),
+            description: None,
+            owner: "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf".to_string(),
+            subnet_type: Some("app".to_string()),
+            parent_subnet_id: None,
+            max_users: None,
+            max_tps: None,
+            max_storage_bytes: None,
+            token_symbol: "TST".to_string(),
+            initial_token_supply: None,
+            token_decimals: None,
+            token_max_supply: None,
+            token_mintable: None,
+            token_burnable: None,
+            user_airdrop_amount: None,
+            assigned_solvers: vec![],
+        }
+    }
+
+    fn add_test_subnet(service: &ValidatorNetworkService, subnet_id: &str) {
+        service.add_subnet(SubnetInfo {
+            subnet_id: subnet_id.to_string(),
+            name: "Test Subnet".to_string(),
+            owner: "owner".to_string(),
+            subnet_type: "App".to_string(),
+            token_symbol: "TST".to_string(),
+            status: "active".to_string(),
+            registered_at: 1,
+        });
+    }
+
+    fn seed_membership(service: &ValidatorNetworkService, address: &str, subnet_id: &str) {
+        let membership_key = format!("user:{}:subnet:{}", address, subnet_id);
+        let membership_oid = setu_types::ObjectId::new(
+            setu_types::hash_utils::setu_hash_with_domain(
+                b"SETU_MEMBERSHIP:",
+                membership_key.as_bytes(),
+            ),
+        );
+        let value = serde_json::to_vec(&serde_json::json!({
+            "address": address,
+            "subnet_id": subnet_id,
+            "joined_at": 1u64,
+        })).expect("membership json encode");
+        let change = setu_types::StateChange::insert(
+            format!("oid:{}", hex::encode(membership_oid.as_bytes())),
+            value,
+        );
+        let shared = service.batch_task_preparer.merkle_state_provider().shared_state_manager();
+        let mut gsm = shared.lock_write();
+        gsm.apply_state_change(setu_types::SubnetId::ROOT, &change);
+        shared.publish_snapshot(&gsm);
+    }
+
+    fn make_module_bytes(addr: move_core_types::account_address::AccountAddress, name: &str) -> Vec<u8> {
+        use move_binary_format::file_format::*;
+        let mut module = empty_module();
+        module.address_identifiers[0] = addr;
+        module.identifiers[0] = move_core_types::identifier::Identifier::new(name).unwrap();
+        let mut buf = Vec::new();
+        module.serialize_with_version(move_binary_format::file_format_common::VERSION_MAX, &mut buf)
+            .expect("serialize empty module");
+        buf
+    }
+
+    fn seed_published_v0(
+        service: &ValidatorNetworkService,
+        addr: move_core_types::account_address::AccountAddress,
+        module_name: &str,
+        module_bytes: &[u8],
+    ) {
+        let addr_bytes = addr.into_bytes();
+        let setu_addr = setu_types::object::Address::new(addr_bytes);
+        let mod_key = format!("mod:{}::{}", addr.to_hex_literal(), module_name);
+        let linkage_key = format!("linkage:latest:{}", hex::encode(addr_bytes));
+        let linkage_payload = bcs::to_bytes(&(setu_addr, 0u64)).expect("bcs encode");
+        let shared = service.batch_task_preparer.merkle_state_provider().shared_state_manager();
+        let mut gsm = shared.lock_write();
+        gsm.apply_state_change(
+            setu_types::SubnetId::ROOT,
+            &setu_types::StateChange::insert(mod_key, module_bytes.to_vec()),
+        );
+        gsm.apply_state_change(
+            setu_types::SubnetId::ROOT,
+            &setu_types::StateChange::insert(linkage_key, linkage_payload),
+        );
+        shared.publish_snapshot(&gsm);
+    }
+
+    fn sample_system_registration() -> SystemSubnetRegistration {
+        SystemSubnetRegistration {
+            subnet_id: setu_types::SubnetId::new_system(0x20),
+            agent_endpoint: "http://oracle:8091".to_string(),
+            callback_addr: Some("127.0.0.1:8080".to_string()),
+            timeout_secs: Some(60),
+            registrant: "validator-1".to_string(),
+            public_key: "pk".to_string(),
+            signature: "sig".to_string(),
+        }
+    }
+
+    fn register_system_subnet_event(registration: SystemSubnetRegistration) -> Event {
+        let proposal_id = registration.subnet_id.to_bytes();
+        let mut event = Event::new(
+            setu_types::EventType::Governance,
+            vec![],
+            test_vlc_snapshot(),
+            "validator-1".to_string(),
+        );
+        event.payload = EventPayload::Governance(setu_types::governance::GovernancePayload {
+            proposal_id,
+            action: setu_types::governance::GovernanceAction::RegisterSystemSubnet(registration),
+        });
+        event.set_execution_result(setu_types::ExecutionResult::success());
+        event
+    }
+
+    fn commit_registration_to_governance_smt(
+        service: &ValidatorNetworkService,
+        registration: &SystemSubnetRegistration,
+    ) {
+        let value = serde_json::to_vec(registration).unwrap();
+        let change = setu_types::StateChange::insert(
+            format!("oid:{}", hex::encode(registration.subnet_id.as_bytes())),
+            value,
+        );
+        let shared = service.batch_task_preparer.merkle_state_provider().shared_state_manager();
+        let mut gsm = shared.lock_write();
+        gsm.apply_state_change(setu_types::SubnetId::GOVERNANCE, &change);
+        shared.publish_snapshot(&gsm);
+    }
+
+    #[tokio::test]
+    async fn test_register_solver() {
+        let service = create_test_service();
+        let handler = service.registration_handler();
+        let request = sample_solver_request("solver-1");
 
         let response = handler.register_solver(request).await;
 
@@ -1364,21 +2491,520 @@ mod tests {
     async fn test_register_validator() {
         let service = create_test_service();
         let handler = service.registration_handler();
-
-        let request = setu_rpc::RegisterValidatorRequest {
-            validator_id: "validator-2".to_string(),
-            address: "127.0.0.1".to_string(),
-            port: 9002,
-            account_address: "0xtest".to_string(),
-            public_key: vec![],
-            signature: vec![],
-            stake_amount: 1000,
-            commission_rate: 10,
-        };
+        let request = sample_validator_request("validator-2");
 
         let response = handler.register_validator(request).await;
 
         assert!(response.success);
         assert_eq!(service.validator_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_solver_submit_failure_does_not_activate_solver() {
+        let service = create_test_service();
+        let handler = service.registration_handler();
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler.register_solver(sample_solver_request("solver-fail")).await;
+
+        assert!(!response.success);
+        assert_eq!(response.assigned_id, None);
+        assert!(response.message.contains("forced submit failure"));
+        assert_eq!(service.router_manager().solver_count(), 0);
+        assert!(service.get_all_solvers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn register_validator_submit_failure_does_not_activate_validator() {
+        let service = create_test_service();
+        let handler = service.registration_handler();
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler
+            .register_validator(sample_validator_request("validator-fail"))
+            .await;
+
+        assert!(!response.success);
+        assert!(response.message.contains("forced submit failure"));
+        assert_eq!(service.validator_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn register_subnet_submit_failure_does_not_activate_subnet() {
+        let service = create_test_service();
+        let handler = service.registration_handler();
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler
+            .register_subnet(sample_subnet_request("subnet-fail"))
+            .await;
+
+        assert!(!response.success);
+        assert_eq!(response.subnet_id, None);
+        assert_eq!(response.event_id, None);
+        assert!(response.message.contains("forced submit failure"));
+        assert!(service.get_subnet_info("subnet-fail").is_none());
+    }
+
+    #[tokio::test]
+    async fn user_register_submit_failure_returns_no_event_id() {
+        let service = create_test_service();
+        let handler = service.user_handler();
+        let (address, signature, public_key) = signed_fields();
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler
+            .register_user(setu_rpc::RegisterUserRequest {
+                address: address.clone(),
+                nostr_pubkey: None,
+                signature: Some(signature),
+                message: Some("setu test write".to_string()),
+                timestamp: now_millis(),
+                subnet_id: Some("subnet-0".to_string()),
+                display_name: None,
+                metadata: None,
+                invite_code: None,
+                public_key: Some(public_key),
+            })
+            .await;
+
+        assert!(!response.success);
+        assert_eq!(response.address, address);
+        assert_eq!(response.event_id, None);
+        assert_eq!(response.initial_power, 0);
+        assert!(response.message.contains("forced submit failure"));
+    }
+
+    #[tokio::test]
+    async fn update_profile_submit_failure_returns_no_event_id() {
+        let service = create_test_service();
+        let handler = service.user_handler();
+        let (address, signature, public_key) = signed_fields();
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler
+            .update_profile(setu_rpc::UpdateProfileRequest {
+                address,
+                display_name: Some("Alice".to_string()),
+                avatar_url: None,
+                bio: None,
+                attributes: None,
+                signature,
+                message: "setu test write".to_string(),
+                timestamp: now_millis(),
+                public_key: Some(public_key),
+                nostr_pubkey: None,
+            })
+            .await;
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, None);
+        assert!(response.message.contains("forced submit failure"));
+    }
+
+    #[tokio::test]
+    async fn join_subnet_submit_failure_returns_no_event_id() {
+        let service = create_test_service();
+        add_test_subnet(&service, "subnet-join-fail");
+        let handler = service.user_handler();
+        let (address, signature, public_key) = signed_fields();
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler
+            .join_subnet(setu_rpc::JoinSubnetRequest {
+                address,
+                subnet_id: "subnet-join-fail".to_string(),
+                signature,
+                message: "setu test write".to_string(),
+                timestamp: now_millis(),
+                public_key: Some(public_key),
+                nostr_pubkey: None,
+            })
+            .await;
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, None);
+        assert!(response.message.contains("forced submit failure"));
+    }
+
+    #[tokio::test]
+    async fn leave_subnet_submit_failure_returns_no_event_id() {
+        let service = create_test_service();
+        let handler = service.user_handler();
+        let (address, signature, public_key) = signed_fields();
+        seed_membership(&service, &address, "subnet-leave-fail");
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler
+            .leave_subnet(setu_rpc::LeaveSubnetRequest {
+                address,
+                subnet_id: "subnet-leave-fail".to_string(),
+                signature,
+                message: "setu test write".to_string(),
+                timestamp: now_millis(),
+                public_key: Some(public_key),
+                nostr_pubkey: None,
+            })
+            .await;
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, None);
+        assert!(response.message.contains("forced submit failure"));
+    }
+
+    #[tokio::test]
+    async fn move_publish_submit_failure_returns_consensus_storage_error() {
+        let service = create_test_service();
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+        )
+            .expect("valid address");
+        let module_hex = hex::encode(make_module_bytes(addr, "counter"));
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = service
+            .submit_move_publish(setu_api::MovePublishRequest {
+                sender: "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf".to_string(),
+                modules: vec![module_hex],
+            })
+            .await;
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, "");
+        assert_eq!(response.package_addr, None);
+        assert!(response.error.as_deref().unwrap_or("").contains(setu_api::ERROR_CONSENSUS_STORAGE));
+    }
+
+    #[tokio::test]
+    async fn move_upgrade_submit_failure_returns_consensus_storage_error() {
+        let service = create_test_service();
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal(
+            "0x2222222222222222222222222222222222222222222222222222222222222222",
+        )
+            .expect("valid address");
+        let module_bytes = make_module_bytes(addr, "counter");
+        seed_published_v0(&service, addr, "counter", &module_bytes);
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = setu_api::ValidatorService::submit_move_upgrade(
+            &*service,
+            setu_api::MoveUpgradeRequest {
+                sender: "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf".to_string(),
+                current_package: "0x2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+                modules: vec![hex::encode(module_bytes)],
+                deps: vec![],
+            },
+        )
+        .await;
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, "");
+        assert_eq!(response.new_package_addr, None);
+        assert_eq!(response.new_version, None);
+        assert!(response.error.as_deref().unwrap_or("").contains(setu_api::ERROR_CONSENSUS_STORAGE));
+    }
+
+    #[tokio::test]
+    async fn add_event_to_dag_surfaces_quick_check_failure() {
+        let service = create_test_service();
+        let event = Event::new(
+            setu_types::EventType::System,
+            vec![],
+            test_vlc_snapshot(),
+            "validator-1".to_string(),
+        );
+
+        let response = service.add_event_to_dag(event).await;
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, None);
+        assert!(response.message.contains("Quick check failed"));
+    }
+
+    #[tokio::test]
+    async fn submit_event_quick_check_failure_returns_no_event_id_or_pending_entry() {
+        let service = create_test_service();
+        let event = Event::new(
+            setu_types::EventType::System,
+            vec![],
+            test_vlc_snapshot(),
+            "validator-1".to_string(),
+        );
+
+        let response = service.submit_event(SubmitEventRequest { event }).await;
+
+        assert!(!response.success);
+        assert_eq!(response.event_id, None);
+        assert!(response.message.contains("Quick check failed"));
+        assert!(service.pending_events.read().is_empty());
+    }
+
+    #[test]
+    fn finalized_applied_subnet_event_is_query_visible() {
+        let service = create_test_service();
+        let vlc_snapshot = setu_vlc::VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1,
+        };
+        let mut event = Event::subnet_register(
+            setu_types::SubnetRegistration::new("subnet-live", "Live", "owner", "LIVE"),
+            vec![],
+            vlc_snapshot,
+            "validator-1".to_string(),
+        );
+        event.set_execution_result(setu_types::ExecutionResult::success());
+        let event_id = event.id.clone();
+
+        service.cache_finalized_event_for_query_with_outcome(
+            event.clone(),
+            Some(ExecutionOutcome::Applied {
+                cf_id: "cf-1".to_string(),
+            }),
+        );
+        service.apply_live_finalized_side_effects(&event);
+
+        let response = service
+            .get_event_by_id(&event_id)
+            .expect("finalized event should be query visible");
+        assert_eq!(response.status, "Finalized");
+        assert!(matches!(
+            response.on_chain,
+            Some(setu_api::OnChainOutcome::Applied { ref cf_id }) if cf_id == "cf-1"
+        ));
+        assert!(service.get_subnet_info("subnet-live").is_some());
+    }
+
+    #[test]
+    fn finalized_stale_subnet_event_does_not_update_subnet_list() {
+        let service = create_test_service();
+        let vlc_snapshot = setu_vlc::VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1,
+        };
+        let mut event = Event::subnet_register(
+            setu_types::SubnetRegistration::new("subnet-stale", "Stale", "owner", "STL"),
+            vec![],
+            vlc_snapshot,
+            "validator-1".to_string(),
+        );
+        event.set_execution_result(setu_types::ExecutionResult::success());
+        let event_id = event.id.clone();
+
+        service.execution_outcomes.insert(
+            event_id.clone(),
+            ExecutionOutcome::StaleRead {
+                cf_id: "cf-1".to_string(),
+                conflicting_object: "oid:abc".to_string(),
+                retry_hint: "retry".to_string(),
+            },
+        );
+        service.cache_finalized_event_for_query(event);
+
+        let response = service
+            .get_event_by_id(&event_id)
+            .expect("finalized stale event should still be query visible");
+        assert!(matches!(
+            response.on_chain,
+            Some(setu_api::OnChainOutcome::StaleRead { ref cf_id, .. }) if cf_id == "cf-1"
+        ));
+        assert!(service.get_subnet_info("subnet-stale").is_none());
+    }
+
+    #[test]
+    fn live_governance_projection_skips_non_applied_registration() {
+        let service = create_test_service_with_governance();
+        let registration = sample_system_registration();
+        let event = register_system_subnet_event(registration.clone());
+
+        service.execution_outcomes.insert(
+            event.id.clone(),
+            ExecutionOutcome::StaleRead {
+                cf_id: "cf-1".to_string(),
+                conflicting_object: "oid:abc".to_string(),
+                retry_hint: "retry".to_string(),
+            },
+        );
+        service.apply_live_finalized_side_effects(&event);
+
+        let governance = service.governance_service().unwrap();
+        assert!(governance.resolve_endpoint(&registration.subnet_id).is_none());
+    }
+
+    #[test]
+    fn live_governance_projection_registers_applied_registration() {
+        let service = create_test_service_with_governance();
+        let registration = sample_system_registration();
+        let event = register_system_subnet_event(registration.clone());
+
+        service.execution_outcomes.insert(
+            event.id.clone(),
+            ExecutionOutcome::Applied {
+                cf_id: "cf-1".to_string(),
+            },
+        );
+        service.apply_live_finalized_side_effects(&event);
+
+        let governance = service.governance_service().unwrap();
+        let config = governance.resolve_endpoint(&registration.subnet_id).unwrap();
+        assert_eq!(config.agent_endpoint, registration.agent_endpoint);
+        assert_eq!(config.callback_addr, registration.callback_addr);
+        assert_eq!(config.timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn replay_register_system_subnet_requires_smt_match() {
+        let service = create_test_service_with_governance();
+        let registration = sample_system_registration();
+        let event = register_system_subnet_event(registration.clone());
+
+        let missing = service.apply_replay_event(&event);
+        assert!(matches!(missing, crate::dag_replay::ReplayAction::Skipped));
+        let governance = service.governance_service().unwrap();
+        assert!(governance.resolve_endpoint(&registration.subnet_id).is_none());
+
+        let mut mismatched = registration.clone();
+        mismatched.agent_endpoint = "http://other:8091".to_string();
+        commit_registration_to_governance_smt(&service, &mismatched);
+        let mismatch = service.apply_replay_event(&event);
+        assert!(matches!(mismatch, crate::dag_replay::ReplayAction::Skipped));
+        assert!(governance.resolve_endpoint(&registration.subnet_id).is_none());
+
+        commit_registration_to_governance_smt(&service, &registration);
+        let applied = service.apply_replay_event(&event);
+        assert!(matches!(
+            applied,
+            crate::dag_replay::ReplayAction::Applied(
+                crate::dag_replay::ReplayKind::SystemSubnetRegister
+            )
+        ));
+        let config = governance.resolve_endpoint(&registration.subnet_id).unwrap();
+        assert_eq!(config.agent_endpoint, registration.agent_endpoint);
+    }
+
+    /// F2 regression: startup query projection must not run live side effects.
+    /// Replay tags solver as "replayed" without registering a router channel;
+    /// HTTP projection may make the event queryable, but must not promote the
+    /// solver to "active" without a real live registration path.
+    #[test]
+    fn test_f2_startup_projection_preserves_replayed_solver_status() {
+        let service = create_test_service();
+        let vlc_snapshot = setu_vlc::VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1,
+        };
+        let registration = setu_types::SolverRegistration::new(
+            "solver-phantom",
+            "127.0.0.1",
+            9999,
+            "0xdead",
+            vec![],
+            vec![],
+        );
+        let mut event = Event::solver_register(
+            registration,
+            vec![],
+            vlc_snapshot,
+            "validator-1".to_string(),
+        );
+        event.set_execution_result(setu_types::ExecutionResult::success());
+
+        // Step 1: replay path (mirrors DAG replay in main.rs)
+        let action = service.apply_replay_event(&event);
+        assert!(matches!(action, crate::dag_replay::ReplayAction::Applied(_)));
+        let post_replay_status = service
+            .solver_info
+            .get("solver-phantom")
+            .map(|r| r.value().status.clone())
+            .expect("solver_info populated by replay");
+        assert_eq!(
+            post_replay_status, "replayed",
+            "replay must keep status=replayed (no router channel)"
+        );
+        assert_eq!(
+            service.router_manager().solver_count(),
+            0,
+            "replay must NOT register a router channel"
+        );
+
+        // Step 2: startup HTTP projection (mirrors main.rs Phase 3.24)
+        let outcome = ValidatorNetworkService::startup_projection_outcome(&event, "cf-startup");
+        service.cache_finalized_event_for_query_with_outcome(
+            event,
+            outcome,
+        );
+
+        let post_projection_status = service
+            .solver_info
+            .get("solver-phantom")
+            .map(|r| r.value().status.clone())
+            .expect("solver_info still populated after projection");
+        assert_eq!(
+            post_projection_status, "replayed",
+            "startup projection must not promote replayed solver to active"
+        );
+        assert_eq!(
+            service.router_manager().solver_count(),
+            0,
+            "startup projection must not register a router channel"
+        );
+    }
+
+    /// F5 regression: startup projection must not synthesize Applied for an
+    /// event whose execution_result is None.
+    #[test]
+    fn test_f5_startup_projection_does_not_promote_none_result_to_applied() {
+        let vlc_snapshot = setu_vlc::VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1,
+        };
+        let event_no_result = Event::subnet_register(
+            setu_types::SubnetRegistration::new("subnet-failed-apply", "X", "owner", "FAIL"),
+            vec![],
+            vlc_snapshot,
+            "validator-2".to_string(),
+        );
+        // Critical: do NOT call set_execution_result. This mirrors the
+        // follower-apply error path where execution_result remains None.
+        assert!(event_no_result.execution_result.is_none());
+
+        let outcome = ValidatorNetworkService::startup_projection_outcome(&event_no_result, "cf-restart");
+        assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn test_f5_startup_projection_maps_explicit_results_only() {
+        let vlc_snapshot = setu_vlc::VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1,
+        };
+        let mut success_event = Event::subnet_register(
+            setu_types::SubnetRegistration::new("subnet-success", "S", "owner", "S"),
+            vec![],
+            vlc_snapshot.clone(),
+            "validator-2".to_string(),
+        );
+        success_event.set_execution_result(setu_types::ExecutionResult::success());
+        assert!(matches!(
+            ValidatorNetworkService::startup_projection_outcome(&success_event, "cf-ok"),
+            Some(ExecutionOutcome::Applied { ref cf_id }) if cf_id == "cf-ok"
+        ));
+
+        let mut failed_event = Event::subnet_register(
+            setu_types::SubnetRegistration::new("subnet-failed", "F", "owner", "F"),
+            vec![],
+            vlc_snapshot,
+            "validator-2".to_string(),
+        );
+        failed_event.set_execution_result(setu_types::ExecutionResult::failure("boom"));
+        assert!(matches!(
+            ValidatorNetworkService::startup_projection_outcome(&failed_event, "cf-fail"),
+            Some(ExecutionOutcome::ExecutionFailed { ref cf_id, ref reason })
+                if cf_id == "cf-fail" && Option::as_deref(reason) == Some("boom")
+        ));
     }
 }

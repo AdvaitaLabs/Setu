@@ -99,6 +99,119 @@ pub enum TaskPrepareError {
     
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("Module not found: {0}")]
+    ModuleNotFound(String),
+
+    #[error("Invalid module bytecode: {0}")]
+    InvalidModule(String),
+
+    #[error("Too many module dependencies (max {max}): found {found}")]
+    TooManyDependencies { max: usize, found: usize },
+
+    #[error("Shared objects not supported (ADR-1)")]
+    SharedObjectNotSupported,
+
+    #[error("Object {object_id} not owned by sender {sender}")]
+    NotOwnedBySender { object_id: String, sender: String },
+
+    /// Caller declared an `Immutable` object at `index` of `input_object_ids`
+    /// but the same index appears in `mutable_indices`. Frozen objects
+    /// must not be bound to `&mut T` Move parameters.
+    /// See `docs/feat/fix-immutable-mutable-ref-not-blocked/design.md` §2.
+    #[error("Object {object_id} is Immutable and cannot be passed as &mut at index {index}")]
+    ImmutableObjectCannotBeMutated { object_id: String, index: usize },
+
+    /// Caller declared an `Immutable` object at `index` of `input_object_ids`
+    /// but the same index appears in `consumed_indices`. Frozen objects
+    /// must not be consumed by-value.
+    #[error("Object {object_id} is Immutable and cannot be consumed by-value at index {index}")]
+    ImmutableObjectCannotBeConsumed { object_id: String, index: usize },
+
+    /// Caller passed an `ObjectOwner`-owned object (i.e. a dynamic-field
+    /// entry) directly through `input_object_ids`. DF entries must be
+    /// accessed via `dynamic_field_accesses[]`, never as a raw input —
+    /// otherwise the parent's authorisation is bypassed.
+    /// See `docs/feat/fix-objectowner-mutable-ref-not-blocked/design.md` §2.
+    #[error(
+        "Object {object_id} is ObjectOwner(parent={parent_object_id}) at index {index}; \
+         dynamic-field entries must be accessed via dynamic_field_accesses, \
+         not input_object_ids"
+    )]
+    ObjectOwnerNotAllowedInInputs {
+        object_id: String,
+        parent_object_id: String,
+        index: usize,
+    },
+
+    // ---- PWOO (Phase-1 Writable Owned Objects) errors ----
+    /// Caller passed a shared object through `input_object_ids`. Shared objects
+    /// must be declared via `shared_object_ids` so the preparer can mark them
+    /// appropriately for concurrent access detection.
+    #[error("Object {object_id} is Shared; pass it via shared_object_ids")]
+    UseSharedObjectIdsInstead { object_id: String },
+
+    /// Caller passed a non-Shared object through `shared_object_ids`.
+    #[error("Object {object_id} is not Shared; pass it via input_object_ids")]
+    NotShared { object_id: String },
+
+    /// Same object id appears in both `input_object_ids` and `shared_object_ids`.
+    #[error("Object {object_id} appears in both input_object_ids and shared_object_ids")]
+    DuplicateObjectInLists { object_id: String },
+
+    // ---- Dynamic Field (DF FDP M4) errors ----
+    /// A declared DF's `parent_object_id` was not also declared in
+    /// `input_object_ids` or `shared_object_ids`.
+    #[error("Dynamic field parent {parent} not declared in input_object_ids or shared_object_ids")]
+    DynamicFieldParentNotDeclared { parent: String },
+
+    /// Read/Mutate/Delete declared against a DF that does not exist.
+    #[error("Dynamic field not found: parent={parent}, key_type={key_type}")]
+    DynamicFieldNotFound { parent: String, key_type: String },
+
+    /// Create declared against a DF that already exists (early rejection
+    /// so the TEE doesn't waste execution time only to abort).
+    #[error("Dynamic field already exists: parent={parent}, key_type={key_type}")]
+    DynamicFieldAlreadyExists { parent: String, key_type: String },
+
+    /// The on-disk DF envelope's `ObjectOwner` does not match the declared
+    /// parent (defence-in-depth against crafted `df_oid` → foreign DF).
+    #[error("Dynamic field parent mismatch")]
+    DynamicFieldParentMismatch,
+
+    /// Mutate/Create/Delete declared on a DF whose parent is Immutable.
+    #[error("Dynamic field on Immutable parent can only be accessed read-only")]
+    DynamicFieldOnImmutableParent,
+
+    /// Declared parent is itself a DF entry (ownership = ObjectOwner).
+    /// Nested DF is out of scope for this phase.
+    #[error("Dynamic field parent must be a root object (nested DF not supported)")]
+    DynamicFieldParentNotRoot,
+
+    /// Storage returned bytes that do not decode as any known envelope
+    /// format (corrupted blob or unknown future format).
+    #[error("Failed to decode envelope: {0}")]
+    EnvelopeDecode(String),
+
+    // ---- PTB event-wire errors (FDP move-vm-phase9-ptb-event-wire) ----
+    /// PTB `ObjectArg::SharedObject` rejected — Phase-1 only supports
+    /// owned/immutable inputs in PTB. See design.md §7 D5.
+    #[error("Shared object {object_id} not yet supported in PTB (Phase-1 limitation)")]
+    SharedObjectsNotYetSupported { object_id: String },
+
+    /// PTB stale-read defense: client-supplied version does not match the
+    /// on-chain envelope version. See design.md §7 D4.
+    #[error("Object {object_id} version mismatch: expected {expected}, actual {actual}")]
+    StaleObjectVersion {
+        object_id: String,
+        expected: u64,
+        actual: u64,
+    },
+
+    /// PTB stale-read defense: blake3(envelope_bytes) does not match the
+    /// client-supplied digest. See design.md §7 D4.
+    #[error("Object {object_id} digest mismatch")]
+    ObjectDigestMismatch { object_id: String },
 }
 
 /// Convert SimpleMerkleProof to MerkleProof (for TEE)

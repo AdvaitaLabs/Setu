@@ -114,6 +114,117 @@ impl ValidatorUserHandler {
         }
         Ok(())
     }
+
+    fn transfer_err(message: &str) -> TransferResponse {
+        TransferResponse {
+            success: false,
+            message: message.to_string(),
+            event_id: None,
+            estimated_confirmation: None,
+        }
+    }
+
+    fn is_user_address(address: &str) -> bool {
+        address.starts_with("0x") && (address.len() == 66 || address.len() == 42)
+    }
+
+    fn canonical_transfer_message(
+        from: &str,
+        to: &str,
+        amount: u64,
+        coin_type: &str,
+        timestamp: u64,
+    ) -> String {
+        format!(
+            "Transfer SETU: from={};to={};amount={};coin_type={};timestamp={}",
+            from,
+            to,
+            amount,
+            coin_type,
+            timestamp
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ValidatorUserHandler;
+    use setu_keys::{SetuKeyPair, SignatureScheme};
+
+    fn sign_for(
+        keypair: &SetuKeyPair,
+        from: &str,
+        to: &str,
+        amount: u64,
+        coin_type: &str,
+        timestamp: u64,
+    ) -> (String, Vec<u8>) {
+        let message = ValidatorUserHandler::canonical_transfer_message(
+            from,
+            to,
+            amount,
+            coin_type,
+            timestamp,
+        );
+        let signature = keypair.sign(message.as_bytes());
+        let mut signature_bytes = vec![signature.scheme().flag()];
+        signature_bytes.extend(signature.as_bytes());
+        (message, signature_bytes)
+    }
+
+    #[test]
+    fn transfer_canonical_message_binds_request_fields() {
+        let message = ValidatorUserHandler::canonical_transfer_message(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            42,
+            "setu",
+            1778390000000,
+        );
+
+        assert_eq!(
+            message,
+            "Transfer SETU: from=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;to=0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb;amount=42;coin_type=setu;timestamp=1778390000000"
+        );
+    }
+
+    #[test]
+    fn transfer_setu_native_signature_accepts_matching_address() {
+        std::env::remove_var("SETU_SKIP_SIG_VERIFY");
+        let keypair = SetuKeyPair::generate(SignatureScheme::ED25519);
+        let from = keypair.address().to_hex();
+        let to = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let (message, signature) = sign_for(&keypair, &from, to, 7, "setu", 1778390000000);
+
+        let result = ValidatorUserHandler::verify_signature(
+            &from,
+            &signature,
+            &message,
+            None,
+            Some(&keypair.public().encode_base64()),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn transfer_setu_native_signature_rejects_wrong_address() {
+        std::env::remove_var("SETU_SKIP_SIG_VERIFY");
+        let keypair = SetuKeyPair::generate(SignatureScheme::ED25519);
+        let wrong_from = "0x3333333333333333333333333333333333333333333333333333333333333333";
+        let to = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let (message, signature) = sign_for(&keypair, wrong_from, to, 7, "setu", 1778390000000);
+
+        let result = ValidatorUserHandler::verify_signature(
+            wrong_from,
+            &signature,
+            &message,
+            None,
+            Some(&keypair.public().encode_base64()),
+        );
+
+        assert!(result.is_err());
+    }
 }
 
 #[async_trait::async_trait]
@@ -287,8 +398,7 @@ impl UserRpcHandler for ValidatorUserHandler {
         // ── Step 7: Delegate to InfraExecutor (路径 B) ──────────────
         // InfraExecutor:
         //   → RuntimeExecutor::execute_user_register()  (G11-compliant "oid:{hex}" state keys)
-        //   → apply_state_changes() to MerkleStateProvider
-        //   → returns Event with execution_result set
+        //   → returns Event with execution_result set; CF finalization applies state
         let event = match self
             .network_service
             .infra_executor()
@@ -304,7 +414,15 @@ impl UserRpcHandler for ValidatorUserHandler {
         let event_id = event.id.clone();
 
         // ── Step 8: Add event to DAG ────────────────────────────────
-        self.network_service.add_event_to_dag(event).await;
+        let submit_response = self.network_service.add_event_to_dag(event).await;
+        if !submit_response.success {
+            warn!(
+                address = %request.address,
+                message = %submit_response.message,
+                "User registration DAG submission failed"
+            );
+            return Self::reg_err(&submit_response.message, &request.address);
+        }
 
         info!(
             address = %request.address,
@@ -457,13 +575,69 @@ impl UserRpcHandler for ValidatorUserHandler {
             amount = request.amount,
             "Processing transfer request"
         );
+
+        if !Self::is_user_address(&request.from) {
+            return Self::transfer_err(
+                "Invalid from address format: expected 0x + 64 hex (Setu) or 0x + 40 hex (Ethereum)",
+            );
+        }
+
+        if !Self::is_user_address(&request.to) {
+            return Self::transfer_err(
+                "Invalid to address format: expected 0x + 64 hex (Setu) or 0x + 40 hex (Ethereum)",
+            );
+        }
+
+        if request.amount == 0 {
+            return Self::transfer_err("Transfer amount must be greater than zero");
+        }
+
+        if let Err(e) = Self::check_timestamp(request.timestamp) {
+            return Self::transfer_err(&e);
+        }
+
+        let coin_type = request
+            .coin_type
+            .clone()
+            .unwrap_or_else(|| "setu".to_string())
+            .to_lowercase();
+        let expected_message = Self::canonical_transfer_message(
+            &request.from,
+            &request.to,
+            request.amount,
+            &coin_type,
+            request.timestamp,
+        );
+        let message = match request.message.as_deref() {
+            Some(message) if !message.is_empty() => message,
+            _ => return Self::transfer_err("Signed message is required for transfer"),
+        };
+        if message != expected_message {
+            return Self::transfer_err("Transfer signed message does not match request fields");
+        }
+
+        let signature = match request.signature.as_deref() {
+            Some(signature) if !signature.is_empty() => signature,
+            _ => return Self::transfer_err("Signature is required for transfer"),
+        };
+
+        if let Err(e) = Self::verify_signature(
+            &request.from,
+            signature,
+            message,
+            request.nostr_pubkey.as_deref(),
+            request.public_key.as_deref(),
+        ) {
+            warn!(from = %request.from, error = %e, "Transfer signature verification failed");
+            return Self::transfer_err(&e);
+        }
         
         // Convert to SubmitTransferRequest
         let submit_request = SubmitTransferRequest {
             from: request.from,
             to: request.to,
             amount: request.amount,
-            transfer_type: request.coin_type.unwrap_or_else(|| "setu".to_string()),
+            transfer_type: coin_type,
             resources: vec![],
             preferred_solver: None,
             shard_id: None,
@@ -476,7 +650,7 @@ impl UserRpcHandler for ValidatorUserHandler {
         TransferResponse {
             success: response.success,
             message: response.message,
-            event_id: response.transfer_id,
+            event_id: response.event_id,
             estimated_confirmation: Some(2), // ~2 seconds
         }
     }
@@ -532,7 +706,19 @@ impl UserRpcHandler for ValidatorUserHandler {
         };
 
         let event_id = event.id.clone();
-        self.network_service.add_event_to_dag(event).await;
+        let submit_response = self.network_service.add_event_to_dag(event).await;
+        if !submit_response.success {
+            warn!(
+                address = %request.address,
+                message = %submit_response.message,
+                "Profile update DAG submission failed"
+            );
+            return UpdateProfileResponse {
+                success: false,
+                message: submit_response.message,
+                event_id: None,
+            };
+        }
 
         info!(address = %request.address, event_id = %event_id, "Profile updated");
         UpdateProfileResponse { success: true, message: "Profile updated".to_string(), event_id: Some(event_id) }
@@ -589,6 +775,14 @@ impl UserRpcHandler for ValidatorUserHandler {
             return JoinSubnetResponse { success: false, message: e, event_id: None };
         }
 
+        if self.network_service.get_subnet_info(&request.subnet_id).is_none() {
+            return JoinSubnetResponse {
+                success: false,
+                message: format!("INFRA_SUBNET: Subnet '{}' is not registered", request.subnet_id),
+                event_id: None,
+            };
+        }
+
         // Duplicate join detection
         let membership_key = format!("user:{}:subnet:{}", request.address, request.subnet_id);
         let membership_oid = ObjectId::new(
@@ -616,7 +810,20 @@ impl UserRpcHandler for ValidatorUserHandler {
         };
 
         let event_id = event.id.clone();
-        self.network_service.add_event_to_dag(event).await;
+        let submit_response = self.network_service.add_event_to_dag(event).await;
+        if !submit_response.success {
+            warn!(
+                address = %request.address,
+                subnet_id = %request.subnet_id,
+                message = %submit_response.message,
+                "Subnet join DAG submission failed"
+            );
+            return JoinSubnetResponse {
+                success: false,
+                message: submit_response.message,
+                event_id: None,
+            };
+        }
 
         info!(address = %request.address, subnet_id = %request.subnet_id, event_id = %event_id, "Joined subnet");
         JoinSubnetResponse { success: true, message: "Joined subnet".to_string(), event_id: Some(event_id) }
@@ -672,7 +879,20 @@ impl UserRpcHandler for ValidatorUserHandler {
         };
 
         let event_id = event.id.clone();
-        self.network_service.add_event_to_dag(event).await;
+        let submit_response = self.network_service.add_event_to_dag(event).await;
+        if !submit_response.success {
+            warn!(
+                address = %request.address,
+                subnet_id = %request.subnet_id,
+                message = %submit_response.message,
+                "Subnet leave DAG submission failed"
+            );
+            return LeaveSubnetResponse {
+                success: false,
+                message: submit_response.message,
+                event_id: None,
+            };
+        }
 
         info!(address = %request.address, subnet_id = %request.subnet_id, event_id = %event_id, "Left subnet");
         LeaveSubnetResponse { success: true, message: "Left subnet".to_string(), event_id: Some(event_id) }

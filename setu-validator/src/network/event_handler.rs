@@ -51,7 +51,7 @@ impl EventHandler {
             return SubmitEventResponse {
                 success: false,
                 message: format!("Quick check failed: {}", e),
-                event_id: Some(event.id),
+                event_id: None,
                 vlc_time: None,
             };
         }
@@ -105,10 +105,11 @@ impl EventHandler {
                 }
                 Err(e) => {
                     error!(event_id = %event_id, error = %e, "Failed to submit event to consensus");
+                    pending_events.write().retain(|id| id != &event_id);
                     return SubmitEventResponse {
                         success: false,
                         message: format!("Consensus submission failed: {}", e),
-                        event_id: Some(event_id),
+                        event_id: None,
                         vlc_time: None,
                     };
                 }
@@ -215,38 +216,64 @@ impl EventHandler {
     ///
     /// This is the unified entry point for adding events to the DAG.
     /// It ensures events are:
-    /// 1. Stored locally for queries
+    /// 1. Quick-checked locally
     /// 2. Submitted to consensus engine (if enabled)
+    /// 3. Stored locally for queries only after acceptance
     pub async fn add_event_to_dag(
         events: &Arc<DashMap<String, Event>>,
         dag_events: &Arc<RwLock<Vec<String>>>,
         consensus: Option<&Arc<ConsensusValidator>>,
         event: Event,
-    ) {
+    ) -> SubmitEventResponse {
         let event_id = event.id.clone();
 
+        if let Err(e) = Self::quick_check(&event) {
+            return SubmitEventResponse {
+                success: false,
+                message: format!("Quick check failed: {}", e),
+                event_id: None,
+                vlc_time: None,
+            };
+        }
+
         // If consensus is enabled, submit to consensus engine
-        if let Some(consensus_validator) = consensus {
+        let vlc_time = if let Some(consensus_validator) = consensus {
             match consensus_validator.submit_event(event.clone()).await {
                 Ok(_) => {
+                    let vlc = consensus_validator.vlc_snapshot().await;
                     info!(
                         event_id = %&event_id[..20.min(event_id.len())],
                         "Event submitted to consensus DAG"
                     );
+                    Some(vlc.logical_time)
                 }
                 Err(e) => {
                     error!(
                         event_id = %&event_id[..20.min(event_id.len())],
                         error = %e,
-                        "Failed to submit event to consensus, storing locally only"
+                        "Failed to submit event to consensus"
                     );
+                    return SubmitEventResponse {
+                        success: false,
+                        message: format!("Consensus submission failed: {}", e),
+                        event_id: None,
+                        vlc_time: None,
+                    };
                 }
             }
-        }
+        } else {
+            None
+        };
 
-        // Always store locally for queries
+        // Store locally only after validation/consensus acceptance.
         events.insert(event_id.clone(), event);
-        dag_events.write().push(event_id);
+        dag_events.write().push(event_id.clone());
+        SubmitEventResponse {
+            success: true,
+            message: "Event verified and added to DAG".to_string(),
+            event_id: Some(event_id),
+            vlc_time,
+        }
     }
 
     /// Synchronous version for backward compatibility (legacy mode only)

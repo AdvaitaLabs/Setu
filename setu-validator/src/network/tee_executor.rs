@@ -105,6 +105,28 @@ impl Drop for ReservationGuard {
     }
 }
 
+fn solver_execution_message(
+    events_processed: usize,
+    events_failed: usize,
+    execution_time_us: u64,
+    solver_message: &str,
+    suffix: &str,
+) -> String {
+    if events_failed == 0 {
+        format!(
+            "TEE executed: {} events in {}μs{}",
+            events_processed, execution_time_us, suffix
+        )
+    } else if !solver_message.trim().is_empty() {
+        solver_message.to_string()
+    } else {
+        format!(
+            "TEE executed: {} events in {}μs{} ({} failed)",
+            events_processed, execution_time_us, suffix, events_failed
+        )
+    }
+}
+
 // ============================================
 // Batch Collection Types
 // ============================================
@@ -124,7 +146,7 @@ struct BatchEntry {
     /// RAII-guarded reservation handles — auto-release on drop
     reservations: ReservationGuard,
     /// Channel to send result back to caller
-    result_tx: oneshot::Sender<Result<(Event, u64, usize), String>>,
+    result_tx: oneshot::Sender<Result<(Event, u64, usize, u64), String>>,
 }
 
 /// Configuration for batch collection
@@ -153,6 +175,8 @@ pub struct TeeExecutor {
     dag_events: Arc<RwLock<Vec<String>>>,
     /// Consensus validator (optional)
     consensus: Option<Arc<ConsensusValidator>>,
+    /// Test seam for forcing direct consensus submission failure.
+    forced_consensus_submit_failure: Arc<RwLock<Option<String>>>,
     /// Validator ID
     validator_id: String,
     /// Concurrency limiter (default: 100 concurrent TEE calls)
@@ -252,6 +276,7 @@ impl TeeExecutor {
             events,
             dag_events,
             consensus,
+            forced_consensus_submit_failure: Arc::new(RwLock::new(None)),
             validator_id,
             semaphore,
             pending_count: Arc::new(AtomicU64::new(0)),
@@ -275,6 +300,11 @@ impl TeeExecutor {
         self.coin_reservation_manager.as_ref()
     }
 
+    #[cfg(test)]
+    pub fn force_next_consensus_submit_failure(&self, message: impl Into<String>) {
+        *self.forced_consensus_submit_failure.write() = Some(message.into());
+    }
+
     // ============================================
     // Inline Solver Execution (TPS-optimized)
     // ============================================
@@ -288,7 +318,7 @@ impl TeeExecutor {
     /// 2. No tokio runtime starvation (no background tasks competing for CPU)
     /// 3. Natural backpressure: each HTTP connection handles one transfer at a time
     ///
-    /// Returns `(Event, execution_time_us, events_processed)` on success.
+    /// Returns `(Event, execution_time_us, events_processed, gas_used)` on success.
     /// The coin reservation is released before returning on success.
     /// On error, the RAII guard releases the reservation on drop.
     pub async fn execute_solver_inline(
@@ -297,7 +327,7 @@ impl TeeExecutor {
         solver_id: &str,
         task: SolverTask,
         reservation: Option<ReservationHandle>,
-    ) -> Result<(Event, u64, usize), String> {
+    ) -> Result<(Event, u64, usize, u64), String> {
         self.execute_solver_inline_batch(
             transfer_id,
             solver_id,
@@ -319,7 +349,7 @@ impl TeeExecutor {
         solver_id: &str,
         task: SolverTask,
         reservations: Vec<ReservationHandle>,
-    ) -> Result<(Event, u64, usize), String> {
+    ) -> Result<(Event, u64, usize, u64), String> {
         // Check if batch path is available
         let use_batch = self.batch_tx.is_some()
             && self.batch_collector_alive.load(Ordering::Acquire);
@@ -393,7 +423,7 @@ impl TeeExecutor {
         solver_id: &str,
         task: SolverTask,
         reservations: Vec<ReservationHandle>,
-    ) -> Result<(Event, u64, usize), String> {
+    ) -> Result<(Event, u64, usize, u64), String> {
         let task_id_hex = hex::encode(&task.task_id[..8]);
 
         // RAII guard for panic-safe reservation release
@@ -453,9 +483,12 @@ impl TeeExecutor {
                             // 5. Build ExecutionResult
                             let execution_result = setu_types::event::ExecutionResult {
                                 success: result_dto.events_failed == 0,
-                                message: Some(format!(
-                                    "TEE executed: {} events in {}μs",
-                                    result_dto.events_processed, result_dto.execution_time_us
+                                message: Some(solver_execution_message(
+                                    result_dto.events_processed,
+                                    result_dto.events_failed,
+                                    result_dto.execution_time_us,
+                                    &exec_resp.message,
+                                    "",
                                 )),
                                 state_changes: result_dto
                                     .state_changes
@@ -477,8 +510,9 @@ impl TeeExecutor {
 
                             let exec_time = result_dto.execution_time_us;
                             let events_proc = result_dto.events_processed;
+                            let gas_used = result_dto.gas_used;
 
-                            Ok((event, exec_time, events_proc))
+                            Ok((event, exec_time, events_proc, gas_used))
                         } else {
                             Err("No result in response".to_string())
                         }
@@ -499,9 +533,9 @@ impl TeeExecutor {
 
     /// Spawn post-execution work (consensus + storage) as background task
     ///
-    /// This is fire-and-forget: consensus submission and local storage
-    /// don't hold any coin reservations, so starvation is not an issue.
-    /// Used after `execute_solver_inline()` returns successfully.
+    /// Public stable paths should prefer awaited `submit_executed_event()` so
+    /// they can return submit failure synchronously. This legacy background
+    /// helper still shares the same submit-before-store failure contract.
     pub fn spawn_post_execution(
         &self,
         transfer_id: String,
@@ -514,52 +548,110 @@ impl TeeExecutor {
         let dag_events = Arc::clone(&self.dag_events);
         let transfer_status = Arc::clone(&self.transfer_status);
         let pending_count = Arc::clone(&self.pending_count);
+        let forced_consensus_submit_failure = Arc::clone(&self.forced_consensus_submit_failure);
 
         pending_count.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
             let event_id = event.id.clone();
-
-            // Submit to consensus (if enabled)
-            if let Some(ref consensus_validator) = consensus {
-                match consensus_validator.submit_event(event.clone()).await {
-                    Ok(_) => {
-                        info!(
-                            event_id = %&event_id[..20.min(event_id.len())],
-                            "Event submitted to consensus DAG"
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            event_id = %&event_id[..20.min(event_id.len())],
-                            error = %e,
-                            "Failed to submit event to consensus"
-                        );
-                    }
+            match Self::submit_executed_event_inner(
+                &transfer_id,
+                &event,
+                execution_time_us,
+                events_processed,
+                consensus.as_ref(),
+                &events_store,
+                &dag_events,
+                &transfer_status,
+                &forced_consensus_submit_failure,
+            ).await {
+                Ok(_) => {
+                    info!(
+                        transfer_id = %transfer_id,
+                        event_id = %&event_id[..20.min(event_id.len())],
+                        "TEE task completed successfully"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        transfer_id = %transfer_id,
+                        event_id = %&event_id[..20.min(event_id.len())],
+                        error = %e,
+                        "TEE task consensus submission failed"
+                    );
                 }
             }
 
-            // Store locally
-            events_store.insert(event_id.clone(), event);
-            dag_events.write().push(event_id.clone());
-
-            // Update tracker to success
-            Self::update_tracker_success(
-                &transfer_status,
-                &transfer_id,
-                &event_id,
-                execution_time_us,
-                events_processed,
-            );
-
-            info!(
-                transfer_id = %transfer_id,
-                event_id = %&event_id[..20.min(event_id.len())],
-                "TEE task completed successfully"
-            );
-
             pending_count.fetch_sub(1, Ordering::Relaxed);
         });
+    }
+
+    pub async fn submit_executed_event(
+        &self,
+        transfer_id: &str,
+        event: &Event,
+        execution_time_us: u64,
+        events_processed: usize,
+    ) -> Result<String, String> {
+        Self::submit_executed_event_inner(
+            transfer_id,
+            event,
+            execution_time_us,
+            events_processed,
+            self.consensus.as_ref(),
+            &self.events,
+            &self.dag_events,
+            &self.transfer_status,
+            &self.forced_consensus_submit_failure,
+        ).await
+    }
+
+    async fn submit_executed_event_inner(
+        transfer_id: &str,
+        event: &Event,
+        execution_time_us: u64,
+        events_processed: usize,
+        consensus: Option<&Arc<ConsensusValidator>>,
+        events_store: &Arc<DashMap<String, Event>>,
+        dag_events: &Arc<RwLock<Vec<String>>>,
+        transfer_status: &Arc<DashMap<String, TransferTracker>>,
+        forced_consensus_submit_failure: &Arc<RwLock<Option<String>>>,
+    ) -> Result<String, String> {
+        let event_id = event.id.clone();
+
+        if let Some(message) = forced_consensus_submit_failure.write().take() {
+            Self::update_tracker_failed(transfer_status, transfer_id, &message);
+            return Err(message);
+        }
+
+        if let Some(consensus_validator) = consensus {
+            if let Err(e) = consensus_validator.submit_event(event.clone()).await {
+                let message = format!("Consensus submission failed: {}", e);
+                error!(
+                    event_id = %&event_id[..20.min(event_id.len())],
+                    error = %e,
+                    "Failed to submit event to consensus"
+                );
+                Self::update_tracker_failed(transfer_status, transfer_id, &message);
+                return Err(message);
+            }
+            info!(
+                event_id = %&event_id[..20.min(event_id.len())],
+                "Event submitted to consensus DAG"
+            );
+        }
+
+        events_store.insert(event_id.clone(), event.clone());
+        dag_events.write().push(event_id.clone());
+        Self::update_tracker_success(
+            transfer_status,
+            transfer_id,
+            &event_id,
+            execution_time_us,
+            events_processed,
+        );
+
+        Ok(event_id)
     }
 
     // ============================================
@@ -569,7 +661,8 @@ impl TeeExecutor {
     /// Spawn an async TEE task (non-blocking)
     ///
     /// **Note**: For single transfers, prefer `execute_solver_inline()` +
-    /// `spawn_post_execution()` to avoid tokio runtime starvation.
+    /// `submit_executed_event()` to avoid tokio runtime starvation and return
+    /// direct submit failure synchronously.
     /// This method is kept for batch transfer processing where multiple
     /// tasks are spawned together.
     pub fn spawn_tee_task(
@@ -584,7 +677,8 @@ impl TeeExecutor {
     /// Spawn an async TEE task with coin reservation (non-blocking)
     ///
     /// **Note**: For single transfers, prefer `execute_solver_inline()` +
-    /// `spawn_post_execution()` to avoid tokio runtime starvation.
+    /// `submit_executed_event()` to avoid tokio runtime starvation and return
+    /// direct submit failure synchronously.
     ///
     /// Similar to `spawn_tee_task`, but also releases the coin reservation
     /// after task completion (success or failure). Used by batch processing.
@@ -612,6 +706,7 @@ impl TeeExecutor {
         let consensus = self.consensus.clone();
         let validator_id = self.validator_id.clone();
         let reservation_mgr = self.coin_reservation_manager.clone();
+        let forced_consensus_submit_failure = Arc::clone(&self.forced_consensus_submit_failure);
 
         tokio::spawn(async move {
             Self::execute_tee_task_internal(
@@ -629,6 +724,7 @@ impl TeeExecutor {
                 validator_id,
                 reservation_mgr,
                 reservation,
+                forced_consensus_submit_failure,
             )
             .await;
         });
@@ -659,6 +755,7 @@ impl TeeExecutor {
         validator_id: String,
         reservation_mgr: Option<Arc<CoinReservationManager>>,
         reservation: Option<ReservationHandle>,
+        forced_consensus_submit_failure: Arc<RwLock<Option<String>>>,
     ) {
         let task_id_hex = hex::encode(&task.task_id[..8]);
 
@@ -760,9 +857,12 @@ impl TeeExecutor {
                             // 5a. Success: Build ExecutionResult and set on Event
                             let execution_result = setu_types::event::ExecutionResult {
                                 success: result_dto.events_failed == 0,
-                                message: Some(format!(
-                                    "TEE executed: {} events in {}μs",
-                                    result_dto.events_processed, result_dto.execution_time_us
+                                message: Some(solver_execution_message(
+                                    result_dto.events_processed,
+                                    result_dto.events_failed,
+                                    result_dto.execution_time_us,
+                                    &exec_resp.message,
+                                    "",
                                 )),
                                 state_changes: result_dto
                                     .state_changes
@@ -785,44 +885,35 @@ impl TeeExecutor {
                             // will be rejected at CF commit time.
                             reservation_guard.release();
 
-                            // 6. Submit to consensus (if enabled)
-                            if let Some(ref consensus_validator) = consensus {
-                                match consensus_validator.submit_event(event.clone()).await {
-                                    Ok(_) => {
-                                        info!(
-                                            event_id = %&event_id[..20.min(event_id.len())],
-                                            "Event submitted to consensus DAG"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            event_id = %&event_id[..20.min(event_id.len())],
-                                            error = %e,
-                                            "Failed to submit event to consensus"
-                                        );
-                                    }
-                                }
-                            }
-
-                            // 7. Store locally
-                            events.insert(event_id.clone(), event);
-                            dag_events.write().push(event_id.clone());
-
-                            // 8. Update tracker to success
-                            Self::update_tracker_success(
-                                &transfer_status,
+                            match Self::submit_executed_event_inner(
                                 &transfer_id,
-                                &event_id,
+                                &event,
                                 result_dto.execution_time_us,
                                 result_dto.events_processed,
-                            );
-
-                            info!(
-                                transfer_id = %transfer_id,
-                                task_id = %task_id_hex,
-                                event_id = %&event_id[..20.min(event_id.len())],
-                                "TEE task completed successfully"
-                            );
+                                consensus.as_ref(),
+                                &events,
+                                &dag_events,
+                                &transfer_status,
+                                &forced_consensus_submit_failure,
+                            ).await {
+                                Ok(_) => {
+                                    info!(
+                                        transfer_id = %transfer_id,
+                                        task_id = %task_id_hex,
+                                        event_id = %&event_id[..20.min(event_id.len())],
+                                        "TEE task completed successfully"
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(
+                                        transfer_id = %transfer_id,
+                                        task_id = %task_id_hex,
+                                        event_id = %&event_id[..20.min(event_id.len())],
+                                        error = %e,
+                                        "TEE task consensus submission failed"
+                                    );
+                                }
+                            }
                         } else {
                             Self::update_tracker_failed(
                                 &transfer_status,
@@ -1276,10 +1367,12 @@ impl TeeExecutor {
                         let mut event = entry.event;
                         let execution_result = setu_types::event::ExecutionResult {
                             success: result_dto.events_failed == 0,
-                            message: Some(format!(
-                                "TEE executed: {} events in {}μs (batch)",
+                            message: Some(solver_execution_message(
                                 result_dto.events_processed,
+                                result_dto.events_failed,
                                 result_dto.execution_time_us,
+                                &resp.message,
+                                " (batch)",
                             )),
                             state_changes: result_dto
                                 .state_changes
@@ -1302,6 +1395,7 @@ impl TeeExecutor {
                             event,
                             result_dto.execution_time_us,
                             result_dto.events_processed,
+                            result_dto.gas_used,
                         ))
                     } else {
                         Err("No result in batch response".to_string())
@@ -1351,9 +1445,12 @@ impl TeeExecutor {
                             let mut event = entry.event;
                             let execution_result = setu_types::event::ExecutionResult {
                                 success: result_dto.events_failed == 0,
-                                message: Some(format!(
-                                    "TEE executed: {} events in {}μs (fallback-single)",
-                                    result_dto.events_processed, result_dto.execution_time_us,
+                                message: Some(solver_execution_message(
+                                    result_dto.events_processed,
+                                    result_dto.events_failed,
+                                    result_dto.execution_time_us,
+                                    &exec_resp.message,
+                                    " (fallback-single)",
                                 )),
                                 state_changes: result_dto.state_changes.iter()
                                     .map(|sc| setu_types::event::StateChange {
@@ -1368,7 +1465,7 @@ impl TeeExecutor {
                             event.status = setu_types::event::EventStatus::Executed;
                             entry.reservations.release();
                             let _ = entry.result_tx.send(
-                                Ok((event, result_dto.execution_time_us, result_dto.events_processed))
+                                Ok((event, result_dto.execution_time_us, result_dto.events_processed, result_dto.gas_used))
                             );
                         } else {
                             let _ = entry.result_tx.send(Err("No result in response".to_string()));
@@ -1416,6 +1513,147 @@ impl TeeExecutor {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_vlc_snapshot() -> setu_vlc::VLCSnapshot {
+        setu_vlc::VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: 1,
+            physical_time: 1,
+        }
+    }
+
+    fn executed_event() -> Event {
+        let mut event = Event::new(
+            setu_types::EventType::Transfer,
+            vec![],
+            test_vlc_snapshot(),
+            "validator-1".to_string(),
+        );
+        event.set_execution_result(setu_types::ExecutionResult::success());
+        event.status = setu_types::event::EventStatus::Executed;
+        event
+    }
+
+    fn test_executor() -> (
+        TeeExecutor,
+        Arc<DashMap<String, TransferTracker>>,
+        Arc<DashMap<String, Event>>,
+        Arc<RwLock<Vec<String>>>,
+    ) {
+        let transfer_status = Arc::new(DashMap::new());
+        let events = Arc::new(DashMap::new());
+        let dag_events = Arc::new(RwLock::new(Vec::new()));
+        let executor = TeeExecutor::new(
+            reqwest::Client::new(),
+            Arc::new(DashMap::new()),
+            Arc::clone(&transfer_status),
+            Arc::clone(&events),
+            Arc::clone(&dag_events),
+            None,
+            "validator-1".to_string(),
+            10,
+        );
+        (executor, transfer_status, events, dag_events)
+    }
+
+    fn seed_tracker(transfer_status: &Arc<DashMap<String, TransferTracker>>, transfer_id: &str) {
+        transfer_status.insert(
+            transfer_id.to_string(),
+            TransferTracker {
+                transfer_id: transfer_id.to_string(),
+                status: "pending_tee_execution".to_string(),
+                solver_id: Some("solver-1".to_string()),
+                event_id: None,
+                processing_steps: vec![setu_rpc::ProcessingStep {
+                    step: "test".to_string(),
+                    status: "completed".to_string(),
+                    details: None,
+                    timestamp: 1,
+                }],
+                created_at: 1,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_executed_event_forced_failure_writes_no_accepted_state() {
+        let (executor, transfer_status, events, dag_events) = test_executor();
+        seed_tracker(&transfer_status, "tx-submit-fail");
+        executor.force_next_consensus_submit_failure("forced direct submit failure");
+
+        let result = executor
+            .submit_executed_event("tx-submit-fail", &executed_event(), 12, 1)
+            .await;
+
+        assert!(result.is_err());
+        assert!(events.is_empty());
+        assert!(dag_events.read().is_empty());
+        let tracker = transfer_status
+            .get("tx-submit-fail")
+            .expect("tracker should remain queryable");
+        assert_eq!(tracker.status, "failed");
+        assert_eq!(tracker.event_id, None);
+        assert!(tracker
+            .processing_steps
+            .iter()
+            .any(|step| step.status == "failed" && step.details.as_deref() == Some("forced direct submit failure")));
+    }
+
+    #[tokio::test]
+    async fn submit_executed_event_success_writes_cache_and_tracker() {
+        let (executor, transfer_status, events, dag_events) = test_executor();
+        seed_tracker(&transfer_status, "tx-submit-ok");
+        let event = executed_event();
+        let event_id = event.id.clone();
+
+        let result = executor
+            .submit_executed_event("tx-submit-ok", &event, 12, 1)
+            .await;
+
+        assert_eq!(result.as_deref(), Ok(event_id.as_str()));
+        assert!(events.contains_key(&event_id));
+        assert_eq!(dag_events.read().as_slice(), &[event_id.clone()]);
+        let tracker = transfer_status
+            .get("tx-submit-ok")
+            .expect("tracker should remain queryable");
+        assert_eq!(tracker.status, "executed");
+        assert_eq!(tracker.event_id.as_deref(), Some(event_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn spawn_post_execution_forced_failure_writes_no_accepted_state() {
+        let (executor, transfer_status, events, dag_events) = test_executor();
+        seed_tracker(&transfer_status, "tx-spawn-submit-fail");
+        executor.force_next_consensus_submit_failure("forced spawn submit failure");
+
+        executor.spawn_post_execution(
+            "tx-spawn-submit-fail".to_string(),
+            executed_event(),
+            12,
+            1,
+        );
+        executor
+            .wait_for_pending_tasks(Duration::from_secs(1))
+            .await
+            .expect("spawned post-execution task should finish");
+
+        assert!(events.is_empty());
+        assert!(dag_events.read().is_empty());
+        let tracker = transfer_status
+            .get("tx-spawn-submit-fail")
+            .expect("tracker should remain queryable");
+        assert_eq!(tracker.status, "failed");
+        assert_eq!(tracker.event_id, None);
+        assert!(tracker
+            .processing_steps
+            .iter()
+            .any(|step| step.status == "failed" && step.details.as_deref() == Some("forced spawn submit failure")));
     }
 }
 
@@ -1528,9 +1766,12 @@ pub async fn send_solver_task_sync(
     // Convert DTO to ExecutionResult and set on Event
     let execution_result = setu_types::event::ExecutionResult {
         success: result_dto.events_failed == 0,
-        message: Some(format!(
-            "TEE executed: {} events in {}μs",
-            result_dto.events_processed, result_dto.execution_time_us
+        message: Some(solver_execution_message(
+            result_dto.events_processed,
+            result_dto.events_failed,
+            result_dto.execution_time_us,
+            &exec_response.message,
+            "",
         )),
         state_changes: result_dto
             .state_changes

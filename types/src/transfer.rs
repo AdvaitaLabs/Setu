@@ -173,6 +173,14 @@ impl Transfer {
         self.subnet_id.as_deref().unwrap_or("ROOT")
     }
     
+    /// Get the SubnetId for routing, defaulting to ROOT if not specified or invalid
+    pub fn get_subnet_id(&self) -> crate::SubnetId {
+        self.subnet_id
+            .as_ref()
+            .and_then(|s| crate::SubnetId::from_hex(s).ok())
+            .unwrap_or(crate::SubnetId::ROOT)
+    }
+    
     /// Set assigned VLC from validator
     pub fn with_assigned_vlc(mut self, vlc: AssignedVlc) -> Self {
         self.assigned_vlc = Some(vlc);

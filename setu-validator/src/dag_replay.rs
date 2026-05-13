@@ -28,7 +28,7 @@ pub enum ReplayKind {
     ValidatorUnregister,
     SolverRegister,
     SolverUnregister,
-    GovernancePropose([u8; 32], ProposalContent),
+    GovernancePropose([u8; 32], ProposalContent, u64),
     GovernanceExecute([u8; 32]),
     /// System subnet endpoint registered directly into GovernanceService registry.
     SystemSubnetRegister,
@@ -50,7 +50,7 @@ pub struct ReplayStats {
     /// System subnet registrations replayed.
     pub system_subnet_registers: usize,
     /// Unmatched Propose events (no Execute) — pending governance proposals to re-dispatch.
-    pub pending_governance: Vec<([u8; 32], ProposalContent)>,
+    pub pending_governance: Vec<([u8; 32], ProposalContent, u64)>,
     pub errors: usize,
     pub duration_ms: u64,
 }
@@ -95,7 +95,7 @@ impl DagReplayManager {
         let start = Instant::now();
         let mut stats = ReplayStats::default();
         // Track Propose→Execute matching for pending governance discovery
-        let mut governance_pending: HashMap<[u8; 32], ProposalContent> = HashMap::new();
+        let mut governance_pending: HashMap<[u8; 32], (ProposalContent, u64)> = HashMap::new();
 
         // 1. Determine the depth range
         let max_depth = match self.event_store.get_max_depth().await {
@@ -132,9 +132,9 @@ impl DagReplayManager {
                             ReplayKind::ValidatorUnregister => stats.validators_unregistered += 1,
                             ReplayKind::SolverRegister => stats.solvers_registered += 1,
                             ReplayKind::SolverUnregister => stats.solvers_unregistered += 1,
-                            ReplayKind::GovernancePropose(id, content) => {
+                            ReplayKind::GovernancePropose(id, content, timestamp) => {
                                 stats.governance_proposals += 1;
-                                governance_pending.insert(id, content);
+                                governance_pending.insert(id, (content, timestamp));
                             }
                             ReplayKind::GovernanceExecute(id) => {
                                 stats.governance_executions += 1;
@@ -159,7 +159,9 @@ impl DagReplayManager {
         }
 
         // Unmatched proposals → pending governance (need re-dispatch)
-        stats.pending_governance = governance_pending.into_iter().collect();
+        stats.pending_governance = governance_pending.into_iter()
+            .map(|(id, (content, ts))| (id, content, ts))
+            .collect();
 
         stats.duration_ms = start.elapsed().as_millis() as u64;
         Ok(stats)

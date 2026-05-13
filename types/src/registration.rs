@@ -100,10 +100,21 @@ pub struct SolverRegistration {
     // ========== Capability Parameters ==========
     /// Maximum concurrent tasks capacity
     pub capacity: u32,
-    /// Optional shard assignment
+    /// Optional shard assignment (legacy, string-based)
     pub shard_id: Option<String>,
+    /// Assigned shard ID (numeric, for shard-based routing)
+    /// Takes precedence over shard_id if both are present
+    #[serde(default)]
+    pub assigned_shard: Option<u16>,
     /// Resource types this solver can handle
     pub resources: Vec<String>,
+    
+    // ========== Subnet Affinity ==========
+    /// Subnets this solver is permitted to serve.
+    /// Empty = universal solver (can serve any subnet).
+    /// Non-empty = dedicated solver (only serves specified subnets).
+    #[serde(default)]
+    pub permitted_subnets: Vec<crate::SubnetId>,
 }
 
 impl SolverRegistration {
@@ -125,7 +136,9 @@ impl SolverRegistration {
             signature,
             capacity: 100,
             shard_id: None,
+            assigned_shard: None,
             resources: vec![],
+            permitted_subnets: vec![],
         }
     }
     
@@ -136,6 +149,11 @@ impl SolverRegistration {
     
     pub fn with_shard(mut self, shard_id: impl Into<String>) -> Self {
         self.shard_id = Some(shard_id.into());
+        self
+    }
+    
+    pub fn with_assigned_shard(mut self, shard: u16) -> Self {
+        self.assigned_shard = Some(shard);
         self
     }
     
@@ -446,18 +464,19 @@ pub struct UserRegistration {
     
     /// Optional: Nostr public key (32 bytes, Schnorr x-only public key)
     /// Only present for Nostr-based registrations
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Note: must NOT use skip_serializing_if — bincode requires all fields present.
+    #[serde(default)]
     pub nostr_pubkey: Option<Vec<u8>>,
     
     /// Signature proving ownership
     /// - For MetaMask: ECDSA signature (65 bytes)
     /// - For Nostr: Schnorr signature (64 bytes)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub signature: Option<Vec<u8>>,
     
     /// Signed message (for verification)
     /// Format: "Register to Setu: {timestamp}"
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub message: Option<String>,
     
     /// Timestamp (for replay attack prevention)
@@ -479,7 +498,8 @@ pub struct UserRegistration {
     pub invite_code: Option<String>,
 
     /// Setu-native users: Base64-encoded PublicKey (flag || pk_bytes)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Note: must NOT use skip_serializing_if — bincode requires all fields present.
+    #[serde(default)]
     pub public_key: Option<String>,
 }
 

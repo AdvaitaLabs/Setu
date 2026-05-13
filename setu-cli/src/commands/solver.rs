@@ -128,7 +128,9 @@ pub async fn handle(action: crate::SolverAction, _config: &Config) -> Result<()>
                 signature,
                 capacity,
                 shard_id: shard.clone(),
+                assigned_shard: None, // Auto-assigned by validator
                 resources: resources.clone(),
+                permitted_subnets: vec![], // Universal solver by default
             };
             
             // Send registration request

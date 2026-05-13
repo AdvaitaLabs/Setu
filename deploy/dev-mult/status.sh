@@ -11,22 +11,30 @@ VERBOSE="${1:-}"
 
 print_header "Setu 集群状态"
 
-printf "  %-14s %-18s %-10s %-10s %-10s %s\n" \
-    "节点" "IP" "进程" "HTTP" "P2P" "备注"
-echo "  ────────────── ────────────────── ────────── ────────── ────────── ──────"
+printf "  %-14s %-18s %-10s %-10s %-10s %-10s %s\n" \
+    "节点" "IP" "Validator" "Solver" "HTTP" "P2P" "备注"
+echo "  ────────────── ────────────────── ────────── ────────── ────────── ────────── ──────"
 
 for i in "${!SERVERS[@]}"; do
     host="${SERVERS[$i]}"
     vid="${VALIDATOR_IDS[$i]}"
     
-    # 检查进程
+    # 检查 Validator 进程
     proc_status="✗"
     if remote_exec "$host" "pgrep -f setu-validator" &>/dev/null; then
         proc_status="✓ 运行"
     else
         proc_status="✗ 停止"
     fi
-    
+
+    # 检查 Solver 进程
+    solver_status="✗"
+    if remote_exec "$host" "pgrep -f setu-solver" &>/dev/null; then
+        solver_status="✓ 运行"
+    else
+        solver_status="✗ 停止"
+    fi
+
     # 检查 HTTP 健康
     http_status="✗"
     health_resp=$(curl -sf --connect-timeout 3 "http://${host}:${HTTP_PORT}/api/v1/health" 2>/dev/null || echo "")
@@ -50,8 +58,8 @@ for i in "${!SERVERS[@]}"; do
         note="(构建服务器)"
     fi
     
-    printf "  %-14s %-18s %-10s %-10s %-10s %s\n" \
-        "$vid" "$host" "$proc_status" "$http_status" "$p2p_status" "$note"
+    printf "  %-14s %-18s %-10s %-10s %-10s %-10s %s\n" \
+        "$vid" "$host" "$proc_status" "$solver_status" "$http_status" "$p2p_status" "$note"
 done
 
 if [ "$VERBOSE" = "--verbose" ] || [ "$VERBOSE" = "-v" ]; then
@@ -67,11 +75,15 @@ if [ "$VERBOSE" = "--verbose" ] || [ "$VERBOSE" = "-v" ]; then
         # 进程信息
         echo "  进程:"
         remote_exec "$host" "ps aux | grep -E 'setu-(validator|solver)' | grep -v grep || echo '    (无运行进程)'" 2>/dev/null
-        
+
+        # Solver 日志
+        echo "  Solver 日志:"
+        remote_exec "$host" "tail -3 ${REMOTE_LOGS}/solver.log 2>/dev/null || echo '    (无日志)'" 2>/dev/null
+
         # 磁盘空间
         echo "  磁盘:"
         remote_exec "$host" "df -h ${REMOTE_BASE} 2>/dev/null | tail -1 || echo '    (未知)'" 2>/dev/null
-        
+
         # RocksDB 大小
         echo "  数据:"
         remote_exec "$host" "du -sh ${REMOTE_DATA}/db 2>/dev/null || echo '    (无数据)'" 2>/dev/null
