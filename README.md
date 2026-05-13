@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/AdvaitaLabs/Setu/main/docs/assets/setu-banner.png" alt="Setu" width="100%" onerror="this.style.display='none'" />
-
 <pre>
  ███████╗███████╗████████╗██╗   ██╗
  ██╔════╝██╔════╝╚══██╔══╝██║   ██║
@@ -47,7 +45,6 @@ Replace <em>physical time + miners</em> with <em>verifiable work + TEE attestati
 
 <img src="https://raw.githubusercontent.com/AdvaitaLabs/Setu/main/docs/assets/setu-demo.gif" alt="Setu Demo" width="700" onerror="this.style.display='none'" />
 
-<sub><i>📹 Live demo GIF coming soon — meanwhile try the <a href="#-quick-demo">60-second Quick Demo</a></i></sub>
 
 </div>
 
